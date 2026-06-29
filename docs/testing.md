@@ -31,7 +31,7 @@ test code は共通（Samba を起動 → golden path）で、**起動手段だ�
 ゴールデンパス（probe → 認証 → 操作）:
 
 ```
-probe   : NEGOTIATE 結果 (dialect/signing/cipher) が想定 (3.1.1 / GMAC / GCM) か
+probe   : NEGOTIATE 結果 (dialect/signing/contexts) が想定 (macOS mirror: 3.0.2 / signing required / contexts なし) か
 ls      : QUERY_DIRECTORY
 stat    : QUERY_INFO
 cat     : READ（full / range）。download sha256 を期待値と照合
@@ -49,13 +49,14 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 ### ⚠️ Samba と macOS SMBX の差（重要・要確認 ⓥ）
 
 - MVP の**対象サーバは macOS SMBX**だが、E2E は **Samba（Linux）**。両者は別実装。
-- **signing/cipher の交渉差**: SMBee MVP は **GMAC+GCM のみ**に pin している。**Samba が
-  既定で AES-CMAC 署名に倒れると、GMAC-only の SMBee は接続できない**。E2E では Samba を
-  **SMB 3.1.1 + AES-128-GMAC + AES-128-GCM を出す設定**にする（`smb.conf` で
-  `server signing` / `smb encrypt` / 対応 Samba バージョン ⓥ）。
-- これが満たせない場合の判断: (a) Samba 設定で GMAC を出させる / (b) SMBee の signing 許容を
-  CMAC まで広げる（= MVP scope 拡張）/ (c) E2E は CMAC でやり macOS SMBX 向けに GMAC を別途
-  確認。**どれを採るかは probe の実測（Samba と macOS 双方）後に決める**。
+- **signing/cipher の交渉差**: macOS SMBX は macOS 26.5.1 でも negotiated dialect が
+  **0x0302 (SMB 3.0.2)** で上限。SMB 3.0.2 は 3.1.1 negotiate contexts を返さず、
+  signing/encryption は CMAC/CCM 系になる。
+- 当面の E2E は Samba を **SMB3_02 上限 + signing required** に固定し、実 macOS の probe-only
+  挙動をミラーする。3.0.2 用 AES-CMAC / AES-128-CCM は swift-crypto に無いため Phase 2 で
+  pure-Swift 実装または pure-Swift cross-platform lib を検討する。
+- Samba の **SMB 3.1.1 + AES-128-GMAC + AES-128-GCM** 交渉は別途 probe で確認する。Samba 3.1.1
+  response parser が `truncated` になる既知課題があり、macOS 実上限が 3.0.2 のため優先度は低い。
 - したがって E2E（Samba）green ≠ macOS SMBX 動作保証。**macOS SMBX への手動 smoke（Tier 3）を併用**する。
 
 ### CI 実行 — Docker / Linux runner

@@ -4,7 +4,7 @@ import Foundation
 ///
 /// SMB protocol / framing / NTLMv2 flow / SMB3 crypto framing は本ライブラリで
 /// 自作し、AES-GCM / HMAC / SHA の計算は swift-crypto に委ねる。
-/// MVP の対象サーバは macOS の SMB サーバ (SMBX)、dialect は SMB 3.1.1。
+/// MVP の対象サーバは macOS の SMB サーバ (SMBX)、dialect は SMB 3.0.2 / 3.1.1。
 public enum SMBee {
     /// ライブラリのバージョン (暫定)。
     public static let version = "0.0.1"

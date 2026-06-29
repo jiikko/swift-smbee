@@ -2,7 +2,7 @@ import XCTest
 @testable import SMBee
 
 final class SMBeeE2ETests: XCTestCase {
-    func testProbeNegotiatesSMB311GMACAndGCM() async throws {
+    func testProbeNegotiatesMacOSMirrorSMB302WithSigningRequired() async throws {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
             throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
         }
@@ -16,8 +16,10 @@ final class SMBeeE2ETests: XCTestCase {
         }
 
         let result = try await SMBProbe.probe(host: host, port: port)
-        XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect311)
-        XCTAssertEqual(result.signingAlgorithm, SMBNegotiateConstants.aesGMAC)
-        XCTAssertEqual(result.cipher, SMBNegotiateConstants.aes128GCM)
+        XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect302)
+        XCTAssertTrue(result.signingRequired)
+        XCTAssertNil(result.signingAlgorithm)
+        XCTAssertNil(result.cipher)
+        XCTAssertNil(result.preauthHashAlgorithm)
     }
 }

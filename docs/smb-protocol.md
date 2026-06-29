@@ -32,23 +32,26 @@ Specifications**。周辺の暗号・交渉メカニズムの一部だけが IET
 | RFC 2104 | HMAC | HMAC-MD5（NTLMv2）/ HMAC-SHA256（KDF） |
 | NIST SP 800-108 | KDF（counter mode） | SMB 3.x の鍵導出 |
 | NIST SP 800-38D | GCM / GMAC | 3.1.1 の encryption(GCM)・signing(GMAC) |
-| RFC 4493 / RFC 3610 | AES-CMAC / AES-CCM | **MVP スコープ外**（3.0.x / 非 GCM 用。将来） |
+| RFC 4493 / RFC 3610 / NIST SP 800-38C | AES-CMAC / AES-CCM | 3.0.2 の signing(CMAC)・encryption(CCM)。swift-crypto に無いため Phase 2 で pure-Swift 実装 |
 | RFC 1001 / 1002 | NetBIOS | direct TCP 445 の 4 byte length header はこれ由来（445 では name service は使わない） |
 
 ## MVP スコープ（SMBee）
 
 - **transport**: direct TCP、**port 445**、各 SMB2 メッセージの前に **4 byte の big-endian length**（最上位 byte は 0）。NetBIOS session service は使わない。
-- **dialect**: **SMB 3.1.1 のみ**（NEGOTIATE で 0x0311 だけ提示）。
+- **dialect**: **SMB 3.0.2 と SMB 3.1.1 の両対応**。macOS SMBX の実上限は 3.0.2
+  （macOS 26.5.1 でも 0x0302 が上限）、Samba 等は 3.1.1 を想定。
 - **auth**: **NTLMv2**（SPNEGO 包装）。**Kerberos は対象外**。
-- **signing**: **AES-128-GMAC** / **encryption**: **AES-128-GCM**（交渉できた場合のみ。サーバが
-  CMAC / CCM しか出さない場合は MVP unsupported として loud fail）。
-- **対象サーバ**: **macOS の SMB サーバ（SMBX）**。
+- **signing / encryption**: negotiated dialect 依存。
+  - **3.1.1**: AES-128-GMAC / AES-128-GCM（swift-crypto）。
+  - **3.0.2**: AES-CMAC / AES-128-CCM。swift-crypto に無いため Phase 2 で pure-Swift 実装
+    または pure-Swift cross-platform lib（例: CryptoSwift, MIT）を踏襲する。Linux ビルド維持が条件。
+- **対象サーバ**: **macOS の SMB サーバ（SMBX、実上限 3.0.2）**。Samba は E2E / 互換確認対象。
 
 ## 接続ライフサイクルと実装する command
 
 ```
 TCP connect :445
- └ NEGOTIATE        … dialect 3.1.1 + negotiate contexts を提示
+ └ NEGOTIATE        … dialect 3.0.2 / 3.1.1 を提示（3.1.1 用 negotiate contexts 付き）
      └ SESSION_SETUP … SPNEGO+NTLMv2 (type1 → CHALLENGE(type2) → type3)。複数往復
          └ TREE_CONNECT … \\host\share へ接続 (share = namespace)
              └ CREATE → {READ | WRITE | QUERY_DIRECTORY | QUERY_INFO | SET_INFO} → CLOSE
@@ -68,7 +71,8 @@ TCP connect :445
 - **SMB2_ENCRYPTION_CAPABILITIES**: ciphers（**AES-128-GCM** / AES-256-GCM / AES-128-CCM の優先順）
 - **SMB2_SIGNING_CAPABILITIES**: signing algorithms（**AES-GMAC** / AES-CMAC）
 
-応答で server が選んだ hash / cipher / signing algo を読み、MVP の許容（SHA-512 + GCM + GMAC）か検証する。
+応答で server が選んだ hash / cipher / signing algo を読み、3.1.1 では SHA-512 + GCM + GMAC を検証する。
+3.0.2 では negotiate contexts は返らず、signing/encryption は CMAC/CCM 系として扱う。
 
 ### SMB2 メッセージ構文 ⓥ
 
@@ -130,6 +134,6 @@ TCP connect :445
 - **test vector を並行で書く**: NTLMv2（MS-NLMP / RFC のベクタ）/ MD4（RFC1320）/ GMAC・GCM（NIST）/
   KDF / preauth transcript / SMB2 packet round-trip。primitive が通っても **SMB framing が正しいとは
   限らない**ので packet-level fixture（pcap or 既存実装由来）も用意する。
-- **probe で交渉結果を先に観測**してから auth/crypto を実装すると、前提（3.1.1+GMAC+GCM）の成否を
-  早期に確定できる。
+- **probe で交渉結果を先に観測**してから auth/crypto を実装すると、macOS SMBX の 3.0.2 上限や
+  Samba の 3.1.1 挙動を早期に確定できる。
 - secret（password / NT hash / session key）は log に出さない。

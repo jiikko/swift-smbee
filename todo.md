@@ -4,7 +4,11 @@
 [docs/testing.md](docs/testing.md) を正本とする。各タスクは **その doc を読んでから**着手。
 `ⓥ` = 実装中に spec / 実測で確認する判断点。
 
-MVP scope: **SMB 3.1.1 / NTLMv2 / AES-128-GMAC 署名 + AES-128-GCM 暗号 / 対象=macOS SMBX + Samba**。
+MVP scope: **SMB 3.0.2 + 3.1.1 / NTLMv2 / negotiated dialect 依存の署名・暗号 /
+対象=macOS SMBX(実上限 3.0.2) + Samba(3.1.1 想定)**。
+3.1.1 は AES-128-GMAC 署名 + AES-128-GCM 暗号（swift-crypto）。3.0.2 は
+AES-CMAC 署名 + AES-128-CCM 暗号（swift-crypto に無いため Phase 2 で pure-Swift 実装または
+pure-Swift cross-platform lib を踏襲、Linux ビルド維持）。
 read 先行 → write。**read 成功を理由に write へ自動 GO しない**（各 Phase 末でレビュー）。
 
 ---
@@ -28,15 +32,18 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 
 ## Phase 1 — probe（NEGOTIATE）
 
-- [x] NEGOTIATE request（dialect 0x0311 のみ + negotiate contexts: preauth=SHA-512 /
+- [x] NEGOTIATE request（dialect 0x0302 / 0x0311 + 3.1.1 用 negotiate contexts: preauth=SHA-512 /
       encryption=AES-128-GCM(+256) / signing=AES-GMAC）encode
 - [x] NEGOTIATE response parse（選択 dialect / security mode(signing required) /
       negotiate contexts の選択結果）
 - [x] `probe(host:port:)` API → `{dialect, signingRequired, signingAlgo, cipher, preauthHashAlgo, serverGuid}`
 - [x] `smbcli probe smb://host[:445]` で表示
-- [ ] **実測**: macOS SMBX と Samba 双方が **3.1.1 + GMAC + GCM** を交渉するか ⓥ
-  - 倒れる場合の判断（Samba 設定で GMAC を出す / scope に CMAC 追加 / 経路分け）を記録
-- 撤退判断: macOS/Samba が GMAC/GCM を交渉しない & 設定で出せない → scope 見直し
+- [x] **実測**: macOS SMBX は macOS 26.5.1 でも **3.0.2 上限**。3.1.1 は喋らない。
+  - probe(NEGOTIATE) は 3.0.2 macOS に対して成功済み。
+- [ ] **実測**: Samba が **3.1.1 + GMAC + GCM** を交渉するか ⓥ
+- [ ] 既知課題: Samba 3.1.1 response の parser が `truncated` になるバグを調査（macOS 実上限が
+      3.0.2 のため優先度低）
+- 撤退判断: Samba が GMAC/GCM を交渉しない & 設定で出せない → 3.1.1 側 scope 見直し
 
 ## Phase 2 — 認証（NTLMv2 / SPNEGO）+ TREE_CONNECT
 
@@ -51,6 +58,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - [ ] signing = AES-GMAC を packet に適用 / 検証
   - [ ] encryption = TRANSFORM_HEADER + AES-GCM（nonce/AAD/tag レイアウト ⓥ）
   - [ ] preauth transcript / KDF / transform header の fixture test
+- [ ] **SMB 3.0.2 crypto framing**:
+  - [ ] signing = AES-CMAC（RFC4493）を pure-Swift 実装または pure-Swift cross-platform lib で対応
+  - [ ] encryption = AES-128-CCM（RFC3610 / NIST SP800-38C）を pure-Swift 実装または pure-Swift cross-platform lib で対応
+  - [ ] CommonCrypto は Linux 非対応なので使わない
 - [ ] TREE_CONNECT（`\\host\share`）
 - 撤退判断: NTLMv2 SESSION_SETUP が 2〜3 日 opaque に失敗（packet capture でも追えない）→ 方針再考
 
@@ -78,8 +89,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 
 ## Phase 5 — E2E（コンテナ Samba）
 
-- [x] E2E test target（`SMBEE_E2E` env gate）— probe-only（NEGOTIATE: 3.1.1 / AES-GMAC / AES-128-GCM）
-- [x] Samba イメージ + smb.conf 確定（3.1.1 + GMAC + GCM を出す）ⓥ CI 実測で継続確認
+- [x] E2E test target（`SMBEE_E2E` env gate）— probe-only（NEGOTIATE: 3.0.2 / signing required /
+      3.1.1 negotiate contexts なし）
+- [x] Samba イメージ + smb.conf 確定（macOS SMBX ミラーとして SMB3_02 上限、signing required）
 - [x] `.github/workflows/e2e.yml` の TODO を埋め、push トリガを有効化
 - [ ] ローカル Apple container 起動スクリプト（手動）
 
@@ -90,11 +102,14 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [ ] retry 粒度: stat=透過 / list=全体再実行 / read=stream 未 yield なら先頭再試行 / write・delete・rename=原則 retry しない
 - [ ] secret（password / NT hash / session key / signing key）を log に出さない
 - [ ] SMB1 を一切提示しない
+- [ ] 3.0.2 用 CMAC(RFC4493) / CCM(RFC3610 / SP800-38C) を Phase 2 で pure-Swift 実装または
+      pure-Swift cross-platform lib を踏襲（Linux ビルド維持）
 - [ ] 公開 API は async + cancellation + streaming（read/write）= consumer がそのまま被せられる形
 - [ ] SwiftLint plugin green を維持（CI=macos-26）
 
 ## 完了の目安（MVP）
 
 - [ ] Phase 0–3（read）+ Phase 5 の read E2E が green
-- [ ] probe が macOS SMBX / Samba 双方で 3.1.1+GMAC+GCM を確認
+- [ ] probe が macOS SMBX で 3.0.2 + signing required、Samba で 3.1.1+GMAC+GCM または
+      3.0.2 mirror E2E green を確認
 - [ ] write（Phase 4）は read 安定後に着手判断

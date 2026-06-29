@@ -109,9 +109,7 @@ enum SMB2Create {
 
     static func decodeFileId(_ bytes: [UInt8]) throws -> [UInt8] {
         let header = try SMB2Header.decode(bytes)
-        guard header.status == SMB2Status.success else {
-            throw SMBCodecError.invalidValue(String(format: "CREATE failed with NTSTATUS 0x%08x", header.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "CREATE")
         let offset = responseFileIdOffset
         guard bytes.count >= offset + 16 else { throw SMBCodecError.truncated }
         return Array(bytes[offset..<offset + 16])
@@ -290,9 +288,7 @@ enum SMB2Write {
 
     static func decodeResponseCount(_ bytes: [UInt8]) throws -> UInt32 {
         let header = try SMB2Header.decode(bytes)
-        guard header.status == SMB2Status.success else {
-            throw SMBCodecError.invalidValue(String(format: "WRITE failed with NTSTATUS 0x%08x", header.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "WRITE")
         var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
         guard try reader.readUInt16LE() == 17 else {
             throw SMBCodecError.invalidValue("invalid WRITE response structure size")

@@ -80,9 +80,7 @@ public enum SMBNegotiateCodec {
         guard header.command == SMBNegotiateConstants.commandNegotiate else {
             throw SMBCodecError.invalidValue("not an SMB2 NEGOTIATE response")
         }
-        guard header.status == 0 else {
-            throw SMBCodecError.invalidValue(String(format: "NEGOTIATE failed with NTSTATUS 0x%08x", header.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "NEGOTIATE")
         var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
         guard try reader.readUInt16LE() == 65 else {
             throw SMBCodecError.invalidValue("invalid NEGOTIATE response structure size")

@@ -7,6 +7,81 @@ final class SMBeeTests: XCTestCase {
         XCTAssertFalse(SMBee.version.isEmpty)
     }
 
+    func testSMBErrorMapperMapsRepresentativeNTSTATUSValues() {
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.objectNameNotFound, operation: "CREATE"),
+            .notFound(status: SMB2Status.objectNameNotFound, operation: "CREATE")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.objectPathNotFound, operation: "CREATE"),
+            .notFound(status: SMB2Status.objectPathNotFound, operation: "CREATE")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.accessDenied, operation: "READ"),
+            .accessDenied(status: SMB2Status.accessDenied, operation: "READ")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.sharingViolation, operation: "CREATE"),
+            .sharingViolation(status: SMB2Status.sharingViolation, operation: "CREATE")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.objectNameCollision, operation: "CREATE"),
+            .nameCollision(status: SMB2Status.objectNameCollision, operation: "CREATE")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.directoryNotEmpty, operation: "CLOSE"),
+            .directoryNotEmpty(status: SMB2Status.directoryNotEmpty, operation: "CLOSE")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.fileIsADirectory, operation: "READ"),
+            .fileIsADirectory(status: SMB2Status.fileIsADirectory, operation: "READ")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.notADirectory, operation: "QUERY_DIRECTORY"),
+            .notADirectory(status: SMB2Status.notADirectory, operation: "QUERY_DIRECTORY")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.diskFull, operation: "WRITE"),
+            .diskFull(status: SMB2Status.diskFull, operation: "WRITE")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.networkNameDeleted, operation: "TREE_CONNECT"),
+            .networkNameDeleted(status: SMB2Status.networkNameDeleted, operation: "TREE_CONNECT")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.logonFailure, operation: "SESSION_SETUP"),
+            .logonFailure(status: SMB2Status.logonFailure, operation: "SESSION_SETUP")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.objectNameInvalid, operation: "CREATE"),
+            .objectNameInvalid(status: SMB2Status.objectNameInvalid, operation: "CREATE")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.endOfFile, operation: "READ"),
+            .endOfFile(status: SMB2Status.endOfFile, operation: "READ")
+        )
+        XCTAssertEqual(
+            SMBErrorMapper.map(status: 0xc000_000d, operation: "QUERY_INFO"),
+            .unsupported(status: 0xc000_000d, operation: "QUERY_INFO")
+        )
+    }
+
+    func testTransportCancellationPropagatesCancellationError() async {
+        let transport = InMemoryTransport(inbound: [0x01])
+        let task = Task {
+            try await transport.receive(maxLength: 1)
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("expected CancellationError")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+    }
+
     func testSMB2HeaderRoundTrip() throws {
         let header = SMB2Header(
             creditCharge: 7,

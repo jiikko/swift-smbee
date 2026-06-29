@@ -16,19 +16,23 @@ public final class InMemoryTransport: SMBTransport, @unchecked Sendable {
     }
 
     public func connect(host: String, port: UInt16) async throws {
+        try Task.checkCancellation()
         _ = host
         _ = port
     }
 
     public func send(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
         outbound.append(contentsOf: bytes)
     }
 
     public func receive(maxLength: Int) async throws -> [UInt8] {
+        try Task.checkCancellation()
         guard !inbound.isEmpty else { return [] }
         let count = min(maxLength, inbound.count)
         let chunk = Array(inbound.prefix(count))
         inbound.removeFirst(count)
+        try Task.checkCancellation()
         return chunk
     }
 

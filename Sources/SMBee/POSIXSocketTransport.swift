@@ -20,21 +20,28 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     public init() {}
 
     public func connect(host: String, port: UInt16) async throws {
+        try Task.checkCancellation()
         try await Task.detached {
             try self.connectBlocking(host: host, port: port)
         }.value
+        try Task.checkCancellation()
     }
 
     public func send(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
         try await Task.detached {
             try self.sendBlocking(bytes)
         }.value
+        try Task.checkCancellation()
     }
 
     public func receive(maxLength: Int) async throws -> [UInt8] {
-        try await Task.detached {
+        try Task.checkCancellation()
+        let bytes = try await Task.detached {
             try self.receiveBlocking(maxLength: maxLength)
         }.value
+        try Task.checkCancellation()
+        return bytes
     }
 
     public func close() {

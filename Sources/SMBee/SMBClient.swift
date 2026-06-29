@@ -281,6 +281,7 @@ final class SMBSession {
     }
 
     func connect() async throws {
+        try Task.checkCancellation()
         try await transport.connect(host: host, port: port)
         let negotiate = try SMBNegotiateCodec.encodeRequest(clientGuid: UUID(), messageId: nextMessageId())
         debugDump("NEGOTIATE request", negotiate)
@@ -306,9 +307,7 @@ final class SMBSession {
         let challengeResponse = try await receive(label: "SESSION_SETUP#1 response")
         let challengeHeader = try SMB2Header.decode(challengeResponse)
         guard challengeHeader.status == SMB2Status.moreProcessingRequired else {
-            throw SMBCodecError.invalidValue(
-                String(format: "expected STATUS_MORE_PROCESSING_REQUIRED, got NTSTATUS 0x%08x", challengeHeader.status)
-            )
+            throw SMBErrorMapper.map(status: challengeHeader.status, operation: "SESSION_SETUP#1")
         }
         sessionId = challengeHeader.sessionId
         let challengeBlob = try SMB2SessionSetup.decodeResponse(challengeResponse)
@@ -331,9 +330,7 @@ final class SMBSession {
         try await sendUnsigned(authPacket)
         let authResponse = try await receive(label: "SESSION_SETUP#2 response")
         let authHeader = try SMB2Header.decode(authResponse)
-        guard authHeader.status == SMB2Status.success else {
-            throw SMBCodecError.invalidValue(String(format: "SESSION_SETUP failed with NTSTATUS 0x%08x", authHeader.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: authHeader.status, operation: "SESSION_SETUP")
         sessionId = authHeader.sessionId
         signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.exportedSessionKey)
         encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
@@ -351,9 +348,7 @@ final class SMBSession {
         let response = try await receive(label: "TREE_CONNECT response")
         try verifySigned(response)
         let header = try SMB2Header.decode(response)
-        guard header.status == SMB2Status.success else {
-            throw SMBCodecError.invalidValue(String(format: "TREE_CONNECT failed with NTSTATUS 0x%08x", header.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_CONNECT")
         return header.treeId
     }
 
@@ -378,6 +373,7 @@ final class SMBSession {
     }
 
     func queryDirectory(treeId: UInt32, fileId: [UInt8]) async throws -> [SMBDirectoryEntry] {
+        try Task.checkCancellation()
         let packet = try SMB2QueryDirectory.encodeRequest(
             messageId: nextMessageId(),
             sessionId: sessionId,
@@ -392,9 +388,8 @@ final class SMBSession {
         if header.status == SMB2Status.noMoreFiles {
             return []
         }
-        guard header.status == SMB2Status.success else {
-            throw SMBCodecError.invalidValue(String(format: "QUERY_DIRECTORY failed with NTSTATUS 0x%08x", header.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_DIRECTORY")
+        try Task.checkCancellation()
         return try SMB2QueryDirectory.decodeResponse(response)
     }
 
@@ -410,9 +405,7 @@ final class SMBSession {
         let response = try await receive(label: "QUERY_INFO response")
         try verifySigned(response)
         let header = try SMB2Header.decode(response)
-        guard header.status == SMB2Status.success else {
-            throw SMBCodecError.invalidValue(String(format: "QUERY_INFO failed with NTSTATUS 0x%08x", header.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_INFO")
         return try SMB2QueryInfo.decodeNetworkOpenInformation(response)
     }
 
@@ -422,6 +415,7 @@ final class SMBSession {
         var remaining = length
         var result: [UInt8] = []
         while remaining > 0 {
+            try Task.checkCancellation()
             let requestLength = UInt32(min(chunkSize, remaining))
             let packet = try SMB2Read.encodeRequest(
                 messageId: nextMessageId(),
@@ -439,9 +433,7 @@ final class SMBSession {
             if header.status == SMB2Status.endOfFile {
                 break
             }
-            guard header.status == SMB2Status.success else {
-                throw SMBCodecError.invalidValue(String(format: "READ failed with NTSTATUS 0x%08x", header.status))
-            }
+            try SMBErrorMapper.throwIfFailure(status: header.status, operation: "READ")
             let data = try SMB2Read.decodeResponse(response)
             if data.isEmpty { break }
             result += data
@@ -460,6 +452,7 @@ final class SMBSession {
         let chunkSize = negotiatedWriteChunkSize()
         var cursor = 0
         while let range = try SMBChunkedTransfer.nextWriteRange(cursor: cursor, dataCount: data.count, chunkSize: chunkSize) {
+            try Task.checkCancellation()
             let chunk = Array(data[range])
             let packet = try SMB2Write.encodeRequest(
                 messageId: nextMessageId(),
@@ -485,6 +478,7 @@ final class SMBSession {
         let chunkSize = negotiatedWriteChunkSize()
         var offset: UInt64 = 0
         while true {
+            try Task.checkCancellation()
             let chunk = try nextChunk(chunkSize)
             if chunk.isEmpty { break }
             let packet = try SMB2Write.encodeRequest(
@@ -518,18 +512,18 @@ final class SMBSession {
         let response = try await receive(label: "FLUSH response")
         try verifySigned(response)
         let header = try SMB2Header.decode(response)
-        guard header.status == SMB2Status.success else {
-            throw SMBCodecError.invalidValue(String(format: "FLUSH failed with NTSTATUS 0x%08x", header.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "FLUSH")
     }
 
     func deleteRecursively(treeId: UInt32, path: String, directory: Bool) async throws {
+        try Task.checkCancellation()
         if directory {
             let fileId = try await create(treeId: treeId, path: path, directory: true)
             do {
                 let entries = try await queryDirectory(treeId: treeId, fileId: fileId)
                 try? await close(treeId: treeId, fileId: fileId)
                 for entry in entries {
+                    try Task.checkCancellation()
                     try await deleteRecursively(treeId: treeId, path: joinSMBPath(path, entry.name), directory: entry.isDirectory)
                 }
             } catch {
@@ -555,9 +549,7 @@ final class SMBSession {
         let response = try await receive(label: "SET_INFO rename response")
         try verifySigned(response)
         let header = try SMB2Header.decode(response)
-        guard header.status == SMB2Status.success else {
-            throw SMBCodecError.invalidValue(String(format: "SET_INFO rename failed with NTSTATUS 0x%08x", header.status))
-        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "SET_INFO rename")
     }
 
     func close(treeId: UInt32, fileId: [UInt8]) async throws {
@@ -568,10 +560,13 @@ final class SMBSession {
     }
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {
+        try Task.checkCancellation()
         try await transport.send(DirectTCPFraming.frame(packet))
+        try Task.checkCancellation()
     }
 
     private func sendSigned(_ packet: [UInt8]) async throws {
+        try Task.checkCancellation()
         if encryptionKey != nil {
             try await sendEncrypted(packet)
             return
@@ -583,6 +578,7 @@ final class SMBSession {
         let signature = try AESCMAC.authenticationCode(key: signingKey, message: signed)
         signed.replaceSubrange(48..<64, with: signature)
         try await transport.send(DirectTCPFraming.frame(signed))
+        try Task.checkCancellation()
     }
 
     private func sendEncrypted(_ packet: [UInt8]) async throws {
@@ -604,7 +600,9 @@ final class SMBSession {
             tagLength: 16
         )
         header.signature = sealed.tag
+        try Task.checkCancellation()
         try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
+        try Task.checkCancellation()
     }
 
     private func verifySigned(_ packet: [UInt8]) throws {
@@ -622,6 +620,7 @@ final class SMBSession {
 
     private func receive(label: String) async throws -> [UInt8] {
         for pendingCount in 0...SMB2AsyncInterim.maxPendingResponses {
+            try Task.checkCancellation()
             let packet = try await receiveDecryptedFrame(label: label)
             guard try SMB2AsyncInterim.shouldDiscard(packet) else {
                 return packet
@@ -671,10 +670,12 @@ final class SMBSession {
     private func receiveExactly(_ count: Int) async throws -> [UInt8] {
         var bytes: [UInt8] = []
         while bytes.count < count {
+            try Task.checkCancellation()
             let chunk = try await transport.receive(maxLength: count - bytes.count)
             guard !chunk.isEmpty else { throw SMBTransportError.connectionClosed }
             bytes += chunk
         }
+        try Task.checkCancellation()
         return bytes
     }
 
@@ -732,8 +733,20 @@ enum SMB2Status {
     static let success: UInt32 = 0x0000_0000
     static let pending: UInt32 = 0x0000_0103
     static let noMoreFiles: UInt32 = 0x8000_0006
-    static let moreProcessingRequired: UInt32 = 0xc000_0016
     static let endOfFile: UInt32 = 0xc000_0011
+    static let moreProcessingRequired: UInt32 = 0xc000_0016
+    static let accessDenied: UInt32 = 0xc000_0022
+    static let objectNameInvalid: UInt32 = 0xc000_0033
+    static let objectNameNotFound: UInt32 = 0xc000_0034
+    static let objectNameCollision: UInt32 = 0xc000_0035
+    static let objectPathNotFound: UInt32 = 0xc000_003a
+    static let sharingViolation: UInt32 = 0xc000_0043
+    static let logonFailure: UInt32 = 0xc000_006d
+    static let diskFull: UInt32 = 0xc000_007f
+    static let fileIsADirectory: UInt32 = 0xc000_00ba
+    static let networkNameDeleted: UInt32 = 0xc000_00c9
+    static let directoryNotEmpty: UInt32 = 0xc000_0101
+    static let notADirectory: UInt32 = 0xc000_0103
 }
 
 enum SMB2Flags {

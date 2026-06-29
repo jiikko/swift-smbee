@@ -169,6 +169,48 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(cursor, token.count)
     }
 
+    func testSPNEGONegTokenRespDERLengthMatchesSessionSetupSecurityBuffer() throws {
+        let challenge = NTLMChallenge(
+            targetName: [],
+            flags: NTLM.negotiateFlags,
+            serverChallenge: hexBytes("0123456789abcdef"),
+            targetInfo: hexBytes(
+                "02000c0044004f004d00410049004e00" +
+                "01000c00530045005200560045005200" +
+                "00000000"
+            )
+        )
+        let type3 = try NTLM.makeType3(
+            credential: SMBCredential(username: "User", password: "Password", domain: "Domain"),
+            challenge: challenge,
+            timestamp: 0,
+            clientChallenge: hexBytes("ffffff0011223344")
+        ).message
+        let blob = SPNEGO.wrapNegTokenResp(type3)
+
+        var cursor = 0
+        let negTokenRespEnd = try expectDERTag(0xa1, in: blob, cursor: &cursor)
+        let sequenceEnd = try expectDERTag(0x30, in: blob, cursor: &cursor)
+        let responseTokenEnd = try expectDERTag(0xa2, in: blob, cursor: &cursor)
+        let octetEnd = try expectDERTag(0x04, in: blob, cursor: &cursor)
+        XCTAssertEqual(octetEnd - cursor, type3.count)
+        XCTAssertEqual(Array(blob[cursor..<octetEnd]), type3)
+        cursor = octetEnd
+        XCTAssertEqual(cursor, responseTokenEnd)
+        XCTAssertEqual(cursor, sequenceEnd)
+        XCTAssertEqual(cursor, negTokenRespEnd)
+        XCTAssertEqual(cursor, blob.count)
+
+        let request = try SMB2SessionSetup.encodeRequest(
+            messageId: 8,
+            sessionId: 0x1122,
+            securityBlob: blob,
+            signed: false
+        )
+        XCTAssertEqual(readUInt16LE(request, at: 78), UInt16(blob.count))
+        XCTAssertEqual(Array(request[88..<request.count]), blob)
+    }
+
     func testSessionSetupRequestFixedFieldsAndSecurityBuffer() throws {
         let blob = SPNEGO.wrapNegTokenInit(NTLM.makeType1())
         let request = try SMB2SessionSetup.encodeRequest(

@@ -62,8 +62,11 @@ public struct SMB2Header: Equatable, Sendable {
     public static func decode(_ bytes: [UInt8]) throws -> SMB2Header {
         guard bytes.count >= encodedSize else { throw SMBCodecError.truncated }
         var reader = SMBByteReader(bytes: bytes)
-        guard try reader.readBytes(count: 4) == [0xfe, 0x53, 0x4d, 0x42] else {
-            throw SMBCodecError.invalidValue("invalid SMB2 protocol id")
+        let protocolId = try reader.readBytes(count: 4)
+        guard protocolId == [0xfe, 0x53, 0x4d, 0x42] else {
+            throw SMBCodecError.invalidValue(
+                "invalid SMB2 protocol id: firstBytes=\(SMBDebug.hexPrefix(bytes, count: 32)) length=\(bytes.count)"
+            )
         }
         guard try reader.readUInt16LE() == 64 else {
             throw SMBCodecError.invalidValue("invalid SMB2 header size")

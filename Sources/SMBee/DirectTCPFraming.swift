@@ -18,7 +18,9 @@ enum DirectTCPFraming {
     static func length(from header: [UInt8]) throws -> Int {
         guard header.count == 4 else { throw SMBCodecError.truncated }
         guard header[0] == 0 else {
-            throw SMBCodecError.invalidValue("NetBIOS direct-TCP reserved byte must be zero")
+            throw SMBCodecError.invalidValue(
+                "NetBIOS direct-TCP reserved byte must be zero: header=\(SMBDebug.hex(header))"
+            )
         }
         return (Int(header[1]) << 16) | (Int(header[2]) << 8) | Int(header[3])
     }

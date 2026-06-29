@@ -45,8 +45,9 @@ final class SMBSession {
     func connect() async throws {
         try await transport.connect(host: host, port: port)
         let negotiate = try SMBNegotiateCodec.encodeRequest(clientGuid: UUID(), messageId: nextMessageId())
+        debugDump("NEGOTIATE request", negotiate)
         try await sendUnsigned(negotiate)
-        let negotiateResponse = try await receive()
+        let negotiateResponse = try await receive(label: "NEGOTIATE response")
         let result = try SMBNegotiateCodec.decodeResponse(negotiateResponse)
         guard result.dialect == SMBNegotiateConstants.dialect302 || result.dialect == SMBNegotiateConstants.dialect300 else {
             throw SMBCodecError.invalidValue("authenticated read path currently supports SMB 3.0.x")
@@ -59,17 +60,10 @@ final class SMBSession {
             securityBlob: type1,
             signed: false
         )
-        if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {
-            let hex = challengePacket.map { String(format: "%02x", $0) }.joined()
-            FileHandle.standardError.write(Data("SESSION_SETUP#1 request (\(challengePacket.count) bytes): \(hex)\n".utf8))
-        }
+        debugDump("SESSION_SETUP#1 request", challengePacket)
         try await sendUnsigned(challengePacket)
-        let challengeResponse = try await receive()
+        let challengeResponse = try await receive(label: "SESSION_SETUP#1 response")
         let challengeHeader = try SMB2Header.decode(challengeResponse)
-        if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {
-            let hex = challengeResponse.map { String(format: "%02x", $0) }.joined()
-            FileHandle.standardError.write(Data("SESSION_SETUP#1 response (\(challengeResponse.count) bytes): \(hex)\n".utf8))
-        }
         guard challengeHeader.status == SMB2Status.moreProcessingRequired else {
             throw SMBCodecError.invalidValue(
                 String(format: "expected STATUS_MORE_PROCESSING_REQUIRED, got NTSTATUS 0x%08x", challengeHeader.status)
@@ -86,8 +80,9 @@ final class SMBSession {
             securityBlob: authBlob,
             signed: false
         )
+        debugDump("SESSION_SETUP#2 request", authPacket)
         try await sendUnsigned(authPacket)
-        let authResponse = try await receive()
+        let authResponse = try await receive(label: "SESSION_SETUP#2 response")
         let authHeader = try SMB2Header.decode(authResponse)
         guard authHeader.status == SMB2Status.success else {
             throw SMBCodecError.invalidValue(String(format: "SESSION_SETUP failed with NTSTATUS 0x%08x", authHeader.status))
@@ -102,8 +97,9 @@ final class SMBSession {
             sessionId: sessionId,
             path: "\\\\\(host)\\\(share)"
         )
+        debugDump("TREE_CONNECT request", packet)
         try await sendSigned(packet)
-        let response = try await receive()
+        let response = try await receive(label: "TREE_CONNECT response")
         try verifySigned(response)
         let header = try SMB2Header.decode(response)
         guard header.status == SMB2Status.success else {
@@ -120,8 +116,9 @@ final class SMBSession {
             path: path,
             directory: directory
         )
+        debugDump("CREATE request", packet)
         try await sendSigned(packet)
-        let response = try await receive()
+        let response = try await receive(label: "CREATE response")
         try verifySigned(response)
         return try SMB2Create.decodeFileId(response)
     }
@@ -133,8 +130,9 @@ final class SMBSession {
             treeId: treeId,
             fileId: fileId
         )
+        debugDump("QUERY_DIRECTORY request", packet)
         try await sendSigned(packet)
-        let response = try await receive()
+        let response = try await receive(label: "QUERY_DIRECTORY response")
         try verifySigned(response)
         let header = try SMB2Header.decode(response)
         guard header.status == SMB2Status.success else {
@@ -145,8 +143,9 @@ final class SMBSession {
 
     func close(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Close.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
+        debugDump("CLOSE request", packet)
         try await sendSigned(packet)
-        _ = try await receive()
+        _ = try await receive(label: "CLOSE response")
     }
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {
@@ -175,9 +174,13 @@ final class SMBSession {
         }
     }
 
-    private func receive() async throws -> [UInt8] {
+    private func receive(label: String) async throws -> [UInt8] {
         let header = try await receiveExactly(4)
-        return try await receiveExactly(DirectTCPFraming.length(from: header))
+        let length = try DirectTCPFraming.length(from: header)
+        debugDump("\(label) direct-TCP header length=\(length)", header)
+        let body = try await receiveExactly(length)
+        debugDump(label, body)
+        return body
     }
 
     private func receiveExactly(_ count: Int) async throws -> [UInt8] {
@@ -193,6 +196,11 @@ final class SMBSession {
     private func nextMessageId() -> UInt64 {
         defer { messageId += 1 }
         return messageId
+    }
+
+    private func debugDump(_ label: String, _ bytes: [UInt8]) {
+        guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
+        FileHandle.standardError.write(Data("\(label) (\(bytes.count) bytes): \(SMBDebug.hex(bytes))\n".utf8))
     }
 }
 

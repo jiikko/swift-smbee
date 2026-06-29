@@ -224,8 +224,14 @@ enum SPNEGO {
     }
 
     private static func derLength(_ length: Int) -> [UInt8] {
+        precondition(length >= 0, "DER length must be non-negative")
         if length < 0x80 { return [UInt8(length)] }
-        if length <= 0xff { return [0x81, UInt8(length)] }
-        return [0x82, UInt8((length >> 8) & 0xff), UInt8(length & 0xff)]
+        var value = length
+        var octets: [UInt8] = []
+        while value > 0 {
+            octets.insert(UInt8(value & 0xff), at: 0)
+            value >>= 8
+        }
+        return [0x80 | UInt8(octets.count)] + octets
     }
 }

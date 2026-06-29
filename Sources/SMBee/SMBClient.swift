@@ -252,8 +252,7 @@ public enum SMBClient {
                 try await session.deleteRecursively(treeId: treeId, path: path, directory: directory)
                 return
             }
-            let fileId = try await session.create(treeId: treeId, request: .delete(path: path, directory: directory))
-            try await session.close(treeId: treeId, fileId: fileId)
+            try await session.deleteNonRecursive(treeId: treeId, path: path, directory: directory)
         }
     }
 }
@@ -273,11 +272,12 @@ final class SMBSession {
     private var maxReadSize: UInt32 = UInt32.max
     private var maxWriteSize: UInt32 = UInt32.max
 
-    init(host: String, port: UInt16, credential: SMBCredential, transport: SMBTransport) {
+    init(host: String, port: UInt16, credential: SMBCredential, transport: SMBTransport, signingKey: [UInt8]? = nil) {
         self.host = host
         self.port = port
         self.credential = credential
         self.transport = transport
+        self.signingKey = signingKey
     }
 
     func connect() async throws {
@@ -372,6 +372,16 @@ final class SMBSession {
         let fileId = try SMB2Create.decodeFileId(response)
         debugLine("CREATE response FileId: \(SMBDebug.hex(fileId))")
         return fileId
+    }
+
+    func deleteNonRecursive(treeId: UInt32, path: String, directory: Bool) async throws {
+        do {
+            let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: directory))
+            try await close(treeId: treeId, fileId: fileId)
+        } catch SMBError.fileIsADirectory where !directory {
+            let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: true))
+            try await close(treeId: treeId, fileId: fileId)
+        }
     }
 
     func queryDirectory(treeId: UInt32, fileId: [UInt8]) async throws -> [SMBDirectoryEntry] {

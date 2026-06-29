@@ -751,6 +751,34 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_1040)
     }
 
+    func testDeleteNonRecursiveRetriesAsDirectoryWhenCreateReportsFileIsADirectory() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2StatusResponse(status: SMB2Status.fileIsADirectory, command: SMB2Commands.create, messageId: 0, treeId: 0x3344),
+            try smb2CreateResponse(fileId: fileId, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        try await session.deleteNonRecursive(treeId: 0x3344, path: "dir", directory: false)
+
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 3)
+        XCTAssertEqual(try SMB2Header.decode(requests[0]).command, SMB2Commands.create)
+        XCTAssertEqual(readUInt32LE(requests[0], at: 104), 0x0000_1040)
+        XCTAssertEqual(try SMB2Header.decode(requests[1]).command, SMB2Commands.create)
+        XCTAssertEqual(readUInt32LE(requests[1], at: 104), 0x0000_1001)
+        XCTAssertEqual(try SMB2Header.decode(requests[2]).command, SMB2Commands.close)
+        XCTAssertEqual(Array(requests[2][72..<88]), fileId)
+    }
+
     func testCreateResponseDecodesFileIdAtResponseStructureOffset64() throws {
         var response = try SMB2Header(
             command: SMB2Commands.create,
@@ -1447,5 +1475,36 @@ final class SMBeeTests: XCTestCase {
     private func writeUInt64LE(_ value: UInt64, to bytes: inout [UInt8], at offset: Int) {
         writeUInt32LE(UInt32(value & 0xffff_ffff), to: &bytes, at: offset)
         writeUInt32LE(UInt32((value >> 32) & 0xffff_ffff), to: &bytes, at: offset + 4)
+    }
+
+    private func smb2StatusResponse(status: UInt32, command: UInt16, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+        try SMB2Header(status: status, command: command, messageId: messageId, treeId: treeId).encode()
+    }
+
+    private func smb2CreateResponse(fileId: [UInt8], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.create, messageId: messageId, treeId: treeId).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 88))
+        writeUInt16LE(89, to: &response, at: 64)
+        response.replaceSubrange(128..<144, with: fileId)
+        return response
+    }
+
+    private func framed(_ messages: [[UInt8]]) throws -> [UInt8] {
+        try messages.reduce(into: []) { result, message in
+            result.append(contentsOf: try DirectTCPFraming.frame(message))
+        }
+    }
+
+    private func unframed(_ bytes: [UInt8]) throws -> [[UInt8]] {
+        var frames: [[UInt8]] = []
+        var cursor = 0
+        while cursor < bytes.count {
+            let length = try DirectTCPFraming.length(from: Array(bytes[cursor..<cursor + 4]))
+            let start = cursor + 4
+            let end = start + length
+            frames.append(Array(bytes[start..<end]))
+            cursor = end
+        }
+        return frames
     }
 }

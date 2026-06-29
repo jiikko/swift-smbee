@@ -33,6 +33,78 @@ private final class BlockingReceiveTransport: SMBTransport, @unchecked Sendable 
     }
 }
 
+private final class FailingReceiveTransport: SMBTransport, @unchecked Sendable {
+    let failure: Error
+
+    init(failure: Error) {
+        self.failure = failure
+    }
+
+    func connect(host: String, port: UInt16) async throws {
+        try Task.checkCancellation()
+        _ = host
+        _ = port
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
+        _ = bytes
+    }
+
+    func receive(maxLength: Int) async throws -> [UInt8] {
+        try Task.checkCancellation()
+        _ = maxLength
+        throw failure
+    }
+
+    func close() {}
+}
+
+private final class FailingConnectTransport: SMBTransport, @unchecked Sendable {
+    let failure: Error
+
+    init(failure: Error) {
+        self.failure = failure
+    }
+
+    func connect(host: String, port: UInt16) async throws {
+        try Task.checkCancellation()
+        _ = host
+        _ = port
+        throw failure
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
+        _ = bytes
+    }
+
+    func receive(maxLength: Int) async throws -> [UInt8] {
+        try Task.checkCancellation()
+        _ = maxLength
+        return []
+    }
+
+    func close() {}
+}
+
+private final class TransportFactorySequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var transports: [SMBTransport]
+    private(set) var makeCount = 0
+
+    init(_ transports: [SMBTransport]) {
+        self.transports = transports
+    }
+
+    func make() -> SMBTransport {
+        lock.lock()
+        defer { lock.unlock() }
+        makeCount += 1
+        return transports.removeFirst()
+    }
+}
+
 private final class ReceiveState: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<[UInt8], Error>?
@@ -145,6 +217,60 @@ final class SMBeeTests: XCTestCase {
         } catch is CancellationError {
         } catch {
             XCTFail("expected CancellationError, got \(error)")
+        }
+    }
+
+    func testProbeRetriesConnectionLossOnceAndSucceedsWithNewTransport() async throws {
+        let first = FailingReceiveTransport(failure: SMBTransportError.connectionClosed)
+        let second = InMemoryTransport(inbound: try framed([negotiateResponse(messageId: 0)]))
+        let factory = TransportFactorySequence([first, second])
+
+        let result = try await SMBProbe.probe(host: "server", makeTransport: factory.make)
+
+        XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect302)
+        XCTAssertEqual(factory.makeCount, 2)
+    }
+
+    func testDeleteDoesNotRetryConnectionLossAndThrowsConnectionLost() async {
+        let factory = TransportFactorySequence([
+            FailingConnectTransport(failure: SMBTransportError.connectionClosed),
+        ])
+
+        do {
+            try await SMBClient.delete(
+                host: "server",
+                share: "share",
+                path: "dead.txt",
+                credential: SMBCredential(username: "user", password: "pass"),
+                makeTransport: factory.make
+            )
+            XCTFail("expected connectionLost")
+        } catch SMBError.connectionLost(operation: "DELETE") {
+            XCTAssertEqual(factory.makeCount, 1)
+        } catch {
+            XCTFail("expected connectionLost, got \(error)")
+        }
+    }
+
+    func testSessionSetupLogonFailureDoesNotRetry() async throws {
+        let inbound = try framed([
+            negotiateResponse(messageId: 0),
+            smb2StatusResponse(status: SMB2Status.logonFailure, command: SMB2Commands.sessionSetup, messageId: 1, treeId: 0),
+        ])
+        let factory = TransportFactorySequence([InMemoryTransport(inbound: inbound)])
+
+        do {
+            _ = try await SMBClient.list(
+                host: "server",
+                share: "share",
+                credential: SMBCredential(username: "user", password: "pass"),
+                makeTransport: factory.make
+            )
+            XCTFail("expected logonFailure")
+        } catch SMBError.logonFailure(status: SMB2Status.logonFailure, operation: "SESSION_SETUP#1") {
+            XCTAssertEqual(factory.makeCount, 1)
+        } catch {
+            XCTFail("expected logonFailure, got \(error)")
         }
     }
 
@@ -1486,6 +1612,21 @@ final class SMBeeTests: XCTestCase {
         response.append(contentsOf: Array(repeating: UInt8(0), count: 88))
         writeUInt16LE(89, to: &response, at: 64)
         response.replaceSubrange(128..<144, with: fileId)
+        return response
+    }
+
+    private func negotiateResponse(messageId: UInt64) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 65))
+        writeUInt16LE(65, to: &response, at: 64)
+        writeUInt16LE(SMBNegotiateConstants.signingEnabled, to: &response, at: 66)
+        writeUInt16LE(SMBNegotiateConstants.dialect302, to: &response, at: 68)
+        response.replaceSubrange(72..<88, with: Array(repeating: UInt8(0x42), count: 16))
+        writeUInt32LE(1_048_576, to: &response, at: 92)
+        writeUInt32LE(1_048_576, to: &response, at: 96)
+        writeUInt32LE(1_048_576, to: &response, at: 100)
+        writeUInt16LE(UInt16(response.count), to: &response, at: 116)
+        writeUInt16LE(0, to: &response, at: 118)
         return response
     }
 

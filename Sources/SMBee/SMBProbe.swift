@@ -4,10 +4,34 @@ public enum SMBProbe {
     public static func probe(
         host: String,
         port: UInt16 = 445,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> SMBProbeResult {
+        var retryConnectionLoss = true
+        while true {
+            let transport = makeTransport()
+            do {
+                let result = try await probeOnce(host: host, port: port, transport: transport)
+                transport.close()
+                return result
+            } catch {
+                transport.close()
+                guard error.isSMBConnectionLoss else {
+                    throw error
+                }
+                guard retryConnectionLoss else {
+                    throw SMBError.connectionLost(operation: "PROBE")
+                }
+                retryConnectionLoss = false
+            }
+        }
+    }
+
+    private static func probeOnce(
+        host: String,
+        port: UInt16,
+        transport: SMBTransport
     ) async throws -> SMBProbeResult {
         try await transport.connect(host: host, port: port)
-        defer { transport.close() }
 
         let request = try SMBNegotiateCodec.encodeRequest(clientGuid: UUID())
         if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {

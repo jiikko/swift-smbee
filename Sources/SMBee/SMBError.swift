@@ -14,6 +14,7 @@ public enum SMBError: Error, Equatable, Sendable {
     case objectNameInvalid(status: UInt32, operation: String)
     case endOfFile(status: UInt32, operation: String)
     case unsupported(status: UInt32, operation: String)
+    case connectionLost(operation: String)
     case transport(String)
     case protocolError(String)
 }

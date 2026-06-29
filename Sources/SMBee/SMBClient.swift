@@ -70,14 +70,32 @@ public enum SMBClient {
         port: UInt16,
         share: String,
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport(),
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        idempotent: Bool,
+        operationName: String,
         operation: (SMBSession, UInt32) async throws -> T
     ) async throws -> T {
-        let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
-        try await session.connect()
-        defer { transport.close() }
-        let treeId = try await session.treeConnect(share: share)
-        return try await operation(session, treeId)
+        var retryConnectionLoss = idempotent
+        while true {
+            let transport = makeTransport()
+            do {
+                let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
+                try await session.connect()
+                let treeId = try await session.treeConnect(share: share)
+                let result = try await operation(session, treeId)
+                transport.close()
+                return result
+            } catch {
+                transport.close()
+                guard error.isSMBConnectionLoss else {
+                    throw error
+                }
+                guard retryConnectionLoss else {
+                    throw SMBError.connectionLost(operation: operationName)
+                }
+                retryConnectionLoss = false
+            }
+        }
     }
 
     public static func list(
@@ -86,9 +104,9 @@ public enum SMBClient {
         share: String,
         path: String = "",
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws -> [SMBDirectoryEntry] {
-        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "LIST") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: true)
             let entries = try await session.queryDirectory(treeId: treeId, fileId: fileId)
             try? await session.close(treeId: treeId, fileId: fileId)
@@ -102,9 +120,9 @@ public enum SMBClient {
         share: String,
         path: String,
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws -> SMBFileStat {
-        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "STAT") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: false)
             do {
                 let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
@@ -124,9 +142,9 @@ public enum SMBClient {
         path: String,
         range: SMBReadRange? = nil,
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws -> [UInt8] {
-        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: false)
             do {
                 let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
@@ -155,9 +173,9 @@ public enum SMBClient {
         share: String,
         path: String,
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "MKDIR") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .makeDirectory(path: path))
             try await session.close(treeId: treeId, fileId: fileId)
         }
@@ -171,9 +189,9 @@ public enum SMBClient {
         data: [UInt8],
         overwrite: Bool = true,
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
             do {
                 try await session.write(treeId: treeId, fileId: fileId, data: data)
@@ -194,9 +212,9 @@ public enum SMBClient {
         localFile: URL,
         overwrite: Bool = true,
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
             let handle = try FileHandle(forReadingFrom: localFile)
             defer { try? handle.close() }
@@ -223,9 +241,9 @@ public enum SMBClient {
         toPath: String,
         replaceIfExists: Bool = false,
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "RENAME") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .rename(path: fromPath))
             do {
                 try await session.rename(treeId: treeId, fileId: fileId, newPath: toPath, replaceIfExists: replaceIfExists)
@@ -245,14 +263,26 @@ public enum SMBClient {
         directory: Bool = false,
         recursive: Bool = false,
         credential: SMBCredential,
-        transport: SMBTransport = POSIXSocketTransport()
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "DELETE") { session, treeId in
             if recursive {
                 try await session.deleteRecursively(treeId: treeId, path: path, directory: directory)
                 return
             }
             try await session.deleteNonRecursive(treeId: treeId, path: path, directory: directory)
+        }
+    }
+}
+
+extension Error {
+    var isSMBConnectionLoss: Bool {
+        guard let transportError = self as? SMBTransportError else { return false }
+        switch transportError {
+        case .connectionClosed, .socketFailure:
+            return true
+        case .invalidAddress:
+            return false
         }
     }
 }

@@ -614,6 +614,20 @@ final class SMBSession {
     }
 
     private func receive(label: String) async throws -> [UInt8] {
+        for pendingCount in 0...SMB2AsyncInterim.maxPendingResponses {
+            let packet = try await receiveDecryptedFrame(label: label)
+            guard try SMB2AsyncInterim.shouldDiscard(packet) else {
+                return packet
+            }
+            if pendingCount == SMB2AsyncInterim.maxPendingResponses {
+                break
+            }
+            debugLine("\(label) ignored interim STATUS_PENDING async response")
+        }
+        throw SMBCodecError.invalidValue("too many interim SMB2 STATUS_PENDING responses")
+    }
+
+    private func receiveDecryptedFrame(label: String) async throws -> [UInt8] {
         let header = try await receiveExactly(4)
         let length = try DirectTCPFraming.length(from: header)
         debugDump("\(label) direct-TCP header length=\(length)", header)
@@ -709,11 +723,26 @@ final class SMBSession {
 
 enum SMB2Status {
     static let success: UInt32 = 0x0000_0000
+    static let pending: UInt32 = 0x0000_0103
     static let noMoreFiles: UInt32 = 0x8000_0006
     static let moreProcessingRequired: UInt32 = 0xc000_0016
     static let endOfFile: UInt32 = 0xc000_0011
 }
 
 enum SMB2Flags {
+    static let asyncCommand: UInt32 = 0x0000_0002
     static let signed: UInt32 = 0x0000_0008
+}
+
+enum SMB2AsyncInterim {
+    static let maxPendingResponses = 16
+
+    static func shouldDiscard(_ packet: [UInt8]) throws -> Bool {
+        let header = try SMB2Header.decode(packet)
+        guard header.status == SMB2Status.pending else { return false }
+        guard (header.flags & SMB2Flags.asyncCommand) != 0 else {
+            throw SMBCodecError.invalidValue("SMB2 STATUS_PENDING response missing ASYNC_COMMAND flag")
+        }
+        return true
+    }
 }

@@ -721,6 +721,45 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[72..<88]), fileId)
     }
 
+    func testAsyncPendingInterimResponseIsDiscardedBeforeFinalResponse() throws {
+        let pending = try SMB2Header(
+            status: SMB2Status.pending,
+            command: SMB2Commands.flush,
+            flags: SMB2Flags.asyncCommand,
+            messageId: 17,
+            treeId: 0x5566_7788,
+            sessionId: 0x1122_3344
+        ).encode()
+        let final = try SMB2Header(
+            command: SMB2Commands.flush,
+            messageId: 17,
+            treeId: 0x5566_7788,
+            sessionId: 0x1122_3344
+        ).encode()
+        var mockResponses = [pending, final]
+
+        while try SMB2AsyncInterim.shouldDiscard(mockResponses[0]) {
+            mockResponses.removeFirst()
+        }
+
+        let header = try SMB2Header.decode(mockResponses[0])
+        XCTAssertEqual(header.status, SMB2Status.success)
+        XCTAssertEqual(header.command, SMB2Commands.flush)
+        XCTAssertEqual(header.messageId, 17)
+    }
+
+    func testAsyncPendingRequiresAsyncCommandFlag() throws {
+        let pending = try SMB2Header(
+            status: SMB2Status.pending,
+            command: SMB2Commands.write,
+            messageId: 18
+        ).encode()
+
+        XCTAssertThrowsError(try SMB2AsyncInterim.shouldDiscard(pending)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .invalidValue("SMB2 STATUS_PENDING response missing ASYNC_COMMAND flag"))
+        }
+    }
+
     func testTransferChunkSizeRespectsNegotiatedLimitsAndTransformOverhead() {
         XCTAssertEqual(
             SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: 1_048_576),

@@ -235,6 +235,54 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[88..<request.count]), blob)
     }
 
+    func testCreateRootDirectoryRequestFixedFieldsAndEmptyNameBuffer() throws {
+        let request = try SMB2Create.encodeRequest(
+            messageId: 9,
+            sessionId: 0x1122_3344_5566_7788,
+            treeId: 0xaabb_ccdd,
+            path: "",
+            directory: true
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.create)
+        XCTAssertEqual(header.messageId, 9)
+        XCTAssertEqual(header.treeId, 0xaabb_ccdd)
+        XCTAssertEqual(header.sessionId, 0x1122_3344_5566_7788)
+        XCTAssertEqual(request.count, 120)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 57)
+        XCTAssertEqual(request[66], 0)
+        XCTAssertEqual(request[67], 0)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 2)
+        XCTAssertEqual(readUInt64LE(request, at: 72), 0)
+        XCTAssertEqual(readUInt64LE(request, at: 80), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 88), 0x0000_0089)
+        XCTAssertEqual(readUInt32LE(request, at: 92), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 96), 0x0000_0007)
+        XCTAssertEqual(readUInt32LE(request, at: 100), 0x0000_0001)
+        XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_0001)
+        XCTAssertEqual(readUInt16LE(request, at: 108), 120)
+        XCTAssertEqual(readUInt16LE(request, at: 110), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 112), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 116), 0)
+    }
+
+    func testCreateSubpathRequestUsesRelativeUtf16NameAfterFixedPart() throws {
+        let request = try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            path: "\\dir\\child",
+            directory: true
+        )
+        let expectedName = NTLM.utf16le("dir\\child")
+
+        XCTAssertEqual(readUInt16LE(request, at: 108), 120)
+        XCTAssertEqual(readUInt16LE(request, at: 110), UInt16(expectedName.count))
+        XCTAssertEqual(request.count, 120 + expectedName.count)
+        XCTAssertEqual(Array(request[120..<request.count]), expectedName)
+    }
+
     func testNegotiateRequestRoundTripShape() throws {
         let request = try SMBNegotiateCodec.encodeRequest(
             clientGuid: UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!,

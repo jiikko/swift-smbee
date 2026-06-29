@@ -61,29 +61,35 @@ enum SMB2TreeConnect {
 }
 
 enum SMB2Create {
+    private static let fixedPartSize = 56
+    private static let nameOffset = SMB2Header.encodedSize + fixedPartSize
+
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, path: String, directory: Bool) throws -> [UInt8] {
         let header = try SMB2Header(command: SMB2Commands.create, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
-        let nameBytes = NTLM.utf16le(path)
-        let nameOffset = nameBytes.isEmpty ? 0 : SMB2Header.encodedSize + 56
+        let nameBytes = NTLM.utf16le(relativeCreateName(path))
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(57)
         writer.writeUInt8(0)
         writer.writeUInt8(0)
-        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(0x0000_0002)
         writer.writeUInt64LE(0)
-        writer.writeUInt32LE(directory ? 0x0012_0089 : 0x0012_0089)
+        writer.writeUInt64LE(0)
+        writer.writeUInt32LE(directory ? 0x0000_0089 : 0x0012_0089)
         writer.writeUInt32LE(0)
         writer.writeUInt32LE(0x0000_0007)
         writer.writeUInt32LE(0x0000_0001)
         writer.writeUInt32LE(directory ? 0x0000_0001 : 0x0000_0040)
-        writer.writeUInt32LE(directory ? 0x0000_0001 : 0x0000_0000)
         writer.writeUInt16LE(UInt16(nameOffset))
         writer.writeUInt16LE(UInt16(nameBytes.count))
         writer.writeUInt32LE(0)
         writer.writeUInt32LE(0)
         writer.writeBytes(nameBytes)
         return writer.bytes
+    }
+
+    private static func relativeCreateName(_ path: String) -> String {
+        path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
     }
 
     static func decodeFileId(_ bytes: [UInt8]) throws -> [UInt8] {

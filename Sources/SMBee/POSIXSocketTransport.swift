@@ -53,16 +53,18 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     }
 
     private func connectBlocking(host: String, port: UInt16) throws {
-        var hints = addrinfo(
-            ai_flags: 0,
-            ai_family: AF_UNSPEC,
-            ai_socktype: SOCK_STREAM,
-            ai_protocol: IPPROTO_TCP,
-            ai_addrlen: 0,
-            ai_canonname: nil,
-            ai_addr: nil,
-            ai_next: nil
-        )
+        // `addrinfo` のメンバ順は Darwin と glibc で異なる (Linux は ai_addr が
+        // ai_canonname より前) ため、memberwise initializer は使わず zero 初期化 +
+        // 個別代入でプラットフォーム非依存にする。
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        // glibc では `SOCK_STREAM` が `__socket_type` enum なので Int32 へ変換が要る。
+        #if os(Linux)
+        hints.ai_socktype = Int32(SOCK_STREAM.rawValue)
+        #else
+        hints.ai_socktype = SOCK_STREAM
+        #endif
+        hints.ai_protocol = IPPROTO_TCP
         var result: UnsafeMutablePointer<addrinfo>?
         let service = String(port)
         guard getaddrinfo(host, service, &hints, &result) == 0, let first = result else {

@@ -33,10 +33,6 @@ enum NTLM {
     static let negotiate128: UInt32 = 0x2000_0000
     static let negotiateKeyExchange: UInt32 = 0x4000_0000
     static let negotiate56: UInt32 = 0x8000_0000
-    private static let avIDMsvAvEOL: UInt16 = 0
-    private static let avIDMsvAvFlags: UInt16 = 6
-    private static let avIDMsvAvTimestamp: UInt16 = 7
-    private static let msvAvFlagsMICProvided: UInt32 = 0x0000_0002
 
     static let negotiateFlags: UInt32 = negotiateUnicode
         | requestTarget
@@ -101,18 +97,16 @@ enum NTLM {
         let domainBytes = utf16le(credential.domain)
         let workstationBytes = utf16le("")
         let ntowfv2 = ntowfv2(password: credential.password, username: credential.username, domain: credential.domain)
-        let includeMIC = targetInfoContainsTimestamp(challenge.targetInfo)
-        if includeMIC, negotiateMessage == nil || challengeMessage == nil {
-            throw SMBCodecError.invalidValue("NTLM MIC requires type1 and type2 messages")
-        }
-        let targetInfo = includeMIC ? withMICProvidedFlag(challenge.targetInfo) : ensureTargetInfoEOL(challenge.targetInfo)
         var blob = SMBByteWriter()
         blob.writeUInt32LE(0x0101_0000)
         blob.writeUInt32LE(0)
         blob.writeUInt64LE(timestamp)
         blob.writeBytes(clientChallenge)
         blob.writeUInt32LE(0)
-        blob.writeBytes(targetInfo)
+        blob.writeBytes(challenge.targetInfo)
+        if !challenge.targetInfo.suffix(4).allSatisfy({ $0 == 0 }) {
+            blob.writeUInt32LE(0)
+        }
         let proof = SMBCrypto.hmacMD5(key: ntowfv2, message: challenge.serverChallenge + blob.bytes)
         let ntChallengeResponse = proof + blob.bytes
         let lmChallengeResponse = SMBCrypto.hmacMD5(
@@ -121,6 +115,10 @@ enum NTLM {
         ) + clientChallenge
         let sessionBaseKey = SMBCrypto.hmacMD5(key: ntowfv2, message: proof)
         let encryptedRandomSessionKey = RC4.crypt(key: sessionBaseKey, message: exportedSessionKey)
+        let includeMIC = targetInfoContainsTimestamp(challenge.targetInfo)
+        if includeMIC, negotiateMessage == nil || challengeMessage == nil {
+            throw SMBCodecError.invalidValue("NTLM MIC requires type1 and type2 messages")
+        }
         let flags = (negotiateFlags & challenge.flags) | negotiateKeyExchange
         let fixedSize = includeMIC ? 88 : 72
         var payloadOffset = UInt32(fixedSize)
@@ -193,107 +191,8 @@ enum NTLM {
             let avID = readUInt16LE(bytes, at: offset)
             let length = Int(readUInt16LE(bytes, at: offset + 2))
             offset += 4
-            if avID == avIDMsvAvEOL { return false }
-            if avID == avIDMsvAvTimestamp { return true }
-            guard offset + length <= bytes.count else { return false }
-            offset += length
-        }
-        return false
-    }
-
-    private static func withMICProvidedFlag(_ targetInfo: [UInt8]) -> [UInt8] {
-        var result: [UInt8] = []
-        let hasFlags = targetInfoContainsAVPair(targetInfo, id: avIDMsvAvFlags)
-        var offset = 0
-        var inserted = false
-        while offset + 4 <= targetInfo.count {
-            let avID = readUInt16LE(targetInfo, at: offset)
-            let length = Int(readUInt16LE(targetInfo, at: offset + 2))
-            let headerOffset = offset
-            offset += 4
-            guard offset + length <= targetInfo.count else {
-                return ensureTargetInfoEOL(targetInfo)
-            }
-            let value = Array(targetInfo[offset..<offset + length])
-            offset += length
-
-            if avID == avIDMsvAvEOL {
-                if !inserted {
-                    result.append(contentsOf: msvAvFlagsPair(msvAvFlagsMICProvided))
-                    inserted = true
-                }
-                result.append(contentsOf: targetInfo[headerOffset..<headerOffset + 4 + length])
-                return ensureTargetInfoEOL(result)
-            }
-            if avID == avIDMsvAvFlags, length == 4 {
-                var flags = readUInt32LE(value, at: 0)
-                flags |= msvAvFlagsMICProvided
-                appendAVPair(id: avIDMsvAvFlags, value: uint32LEBytes(flags), to: &result)
-                inserted = true
-                continue
-            }
-
-            result.append(contentsOf: targetInfo[headerOffset..<headerOffset + 4 + length])
-            if avID == avIDMsvAvTimestamp, !hasFlags, !inserted {
-                result.append(contentsOf: msvAvFlagsPair(msvAvFlagsMICProvided))
-                inserted = true
-            }
-        }
-        if !inserted {
-            result.append(contentsOf: msvAvFlagsPair(msvAvFlagsMICProvided))
-        }
-        appendAVPair(id: avIDMsvAvEOL, value: [], to: &result)
-        return result
-    }
-
-    private static func ensureTargetInfoEOL(_ targetInfo: [UInt8]) -> [UInt8] {
-        var offset = 0
-        while offset + 4 <= targetInfo.count {
-            let avID = readUInt16LE(targetInfo, at: offset)
-            let length = Int(readUInt16LE(targetInfo, at: offset + 2))
-            offset += 4
-            guard offset + length <= targetInfo.count else { break }
-            if avID == avIDMsvAvEOL {
-                return targetInfo
-            }
-            offset += length
-        }
-        var result = targetInfo
-        appendAVPair(id: avIDMsvAvEOL, value: [], to: &result)
-        return result
-    }
-
-    private static func msvAvFlagsPair(_ flags: UInt32) -> [UInt8] {
-        var bytes: [UInt8] = []
-        appendAVPair(id: avIDMsvAvFlags, value: uint32LEBytes(flags), to: &bytes)
-        return bytes
-    }
-
-    private static func appendAVPair(id: UInt16, value: [UInt8], to bytes: inout [UInt8]) {
-        bytes.append(UInt8(id & 0xff))
-        bytes.append(UInt8((id >> 8) & 0xff))
-        bytes.append(UInt8(value.count & 0xff))
-        bytes.append(UInt8((value.count >> 8) & 0xff))
-        bytes.append(contentsOf: value)
-    }
-
-    private static func uint32LEBytes(_ value: UInt32) -> [UInt8] {
-        [
-            UInt8(value & 0xff),
-            UInt8((value >> 8) & 0xff),
-            UInt8((value >> 16) & 0xff),
-            UInt8((value >> 24) & 0xff),
-        ]
-    }
-
-    private static func targetInfoContainsAVPair(_ bytes: [UInt8], id: UInt16) -> Bool {
-        var offset = 0
-        while offset + 4 <= bytes.count {
-            let avID = readUInt16LE(bytes, at: offset)
-            let length = Int(readUInt16LE(bytes, at: offset + 2))
-            offset += 4
-            if avID == avIDMsvAvEOL { return false }
-            if avID == id { return true }
+            if avID == 0 { return false }
+            if avID == 7 { return true }
             guard offset + length <= bytes.count else { return false }
             offset += length
         }

@@ -11,6 +11,10 @@ public struct SMBProbeResult: Equatable, Sendable {
 
 public enum SMBNegotiateConstants {
     public static let commandNegotiate: UInt16 = 0
+    public static let dialect202: UInt16 = 0x0202
+    public static let dialect210: UInt16 = 0x0210
+    public static let dialect300: UInt16 = 0x0300
+    public static let dialect302: UInt16 = 0x0302
     public static let dialect311: UInt16 = 0x0311
     public static let signingEnabled: UInt16 = 0x0001
     public static let signingRequired: UInt16 = 0x0002
@@ -26,6 +30,13 @@ public enum SMBNegotiateConstants {
 
 public enum SMBNegotiateCodec {
     private static let negotiateContextCount: UInt16 = 3
+    private static let offeredDialects: [UInt16] = [
+        SMBNegotiateConstants.dialect202,
+        SMBNegotiateConstants.dialect210,
+        SMBNegotiateConstants.dialect300,
+        SMBNegotiateConstants.dialect302,
+        SMBNegotiateConstants.dialect311,
+    ]
 
     public static func encodeRequest(
         clientGuid: UUID,
@@ -34,7 +45,7 @@ public enum SMBNegotiateCodec {
     ) throws -> [UInt8] {
         let contexts = encodeNegotiateContexts(salt: salt)
         let header = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
-        let dialectBytes = MemoryLayout<UInt16>.size
+        let dialectBytes = MemoryLayout<UInt16>.size * offeredDialects.count
         let fixedBodySize = 36
         let contextOffset = alignedTo8(header.count + fixedBodySize + dialectBytes)
         let paddingLength = contextOffset - (header.count + fixedBodySize + dialectBytes)
@@ -42,7 +53,7 @@ public enum SMBNegotiateCodec {
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(36)
-        writer.writeUInt16LE(1)
+        writer.writeUInt16LE(UInt16(offeredDialects.count))
         writer.writeUInt16LE(SMBNegotiateConstants.signingEnabled)
         writer.writeUInt16LE(0)
         writer.writeUInt32LE(SMBNegotiateConstants.globalCapEncryption)
@@ -52,7 +63,9 @@ public enum SMBNegotiateCodec {
         writer.writeUInt32LE(UInt32(contextOffset))
         writer.writeUInt16LE(negotiateContextCount)
         writer.writeUInt16LE(0)
-        writer.writeUInt16LE(SMBNegotiateConstants.dialect311)
+        for dialect in offeredDialects {
+            writer.writeUInt16LE(dialect)
+        }
         writer.writeBytes(Array(repeating: 0, count: paddingLength))
         writer.writeBytes(contexts)
         return writer.bytes

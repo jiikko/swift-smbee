@@ -10,8 +10,18 @@ public enum SMBProbe {
         defer { transport.close() }
 
         let request = try SMBNegotiateCodec.encodeRequest(clientGuid: UUID())
+        if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {
+            let hex = request.map { String(format: "%02x", $0) }.joined()
+            FileHandle.standardError.write(Data("NEGOTIATE request (\(request.count) bytes): \(hex)\n".utf8))
+        }
         try await transport.send(DirectTCPFraming.frame(request))
         let response = try await receiveFramedMessage(from: transport)
+        // 診断用: SMBEE_DEBUG=1 のとき NEGOTIATE response の生バイトを stderr に出す
+        // (実サーバの wire を観測して parser を直すため。secret は含まれない negprot 段階)。
+        if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {
+            let hex = response.map { String(format: "%02x", $0) }.joined()
+            FileHandle.standardError.write(Data("NEGOTIATE response (\(response.count) bytes): \(hex)\n".utf8))
+        }
         return try SMBNegotiateCodec.decodeResponse(response)
     }
 

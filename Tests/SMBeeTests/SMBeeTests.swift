@@ -78,8 +78,8 @@ final class SMBeeTests: XCTestCase {
         let expectedHex =
             "fe534d4240000000000000000000010000000000000000000000000000000000" +
             "0000000000000000000000000000000000000000000000000000000000000000" +
-            "24000100010000004000000000112233445566778899aabbccddeeff68000000" +
-            "03000000110300000100260000000000010020000100aaaaaaaaaaaaaaaaaaaa" +
+            "24000500010000004000000000112233445566778899aabbccddeeff70000000" +
+            "030000000202100200030203110300000100260000000000010020000100aaaaaaaaaaaaaaaaaaaa" +
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000020006000000000002" +
             "00020004000000080004000000000001000200"
         XCTAssertEqual(hex(request), expectedHex)
@@ -90,11 +90,15 @@ final class SMBeeTests: XCTestCase {
 
         var reader = SMBByteReader(bytes: Array(request.dropFirst(64)))
         XCTAssertEqual(try reader.readUInt16LE(), 36)
-        XCTAssertEqual(try reader.readUInt16LE(), 1)
+        XCTAssertEqual(try reader.readUInt16LE(), 5)
         try reader.skip(count: 2 + 2 + 4 + 16)
-        XCTAssertEqual(try reader.readUInt32LE(), 104)
+        XCTAssertEqual(try reader.readUInt32LE(), 112)
         XCTAssertEqual(try reader.readUInt16LE(), 3)
         try reader.skip(count: 2)
+        XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect202)
+        XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect210)
+        XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect300)
+        XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect302)
         XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect311)
     }
 
@@ -106,10 +110,10 @@ final class SMBeeTests: XCTestCase {
 
         let contextOffset = Int(readUInt32LE(request, at: 64 + 28))
         let contextCount = Int(readUInt16LE(request, at: 64 + 32))
-        XCTAssertEqual(contextOffset, 104)
+        XCTAssertEqual(contextOffset, 112)
         XCTAssertEqual(contextOffset % 8, 0)
         XCTAssertEqual(contextCount, 3)
-        XCTAssertEqual(Array(request[102..<104]), [0, 0])
+        XCTAssertEqual(Array(request[110..<112]), [0, 0])
 
         var offset = contextOffset
         var contextTypes: [UInt16] = []
@@ -152,6 +156,22 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(parsed.serverGuid.uuidString, "00112233-4455-6677-8899-AABBCCDDEEFF")
     }
 
+    func testNegotiateResponseBefore311HasNoContexts() throws {
+        let response = try makeNegotiateResponse(
+            dialect: SMBNegotiateConstants.dialect300,
+            contextCount: 0,
+            contextOffset: 0,
+            includeContexts: false
+        )
+        let parsed = try SMBNegotiateCodec.decodeResponse(response)
+        XCTAssertEqual(parsed.dialect, SMBNegotiateConstants.dialect300)
+        XCTAssertTrue(parsed.signingRequired)
+        XCTAssertNil(parsed.signingAlgorithm)
+        XCTAssertNil(parsed.cipher)
+        XCTAssertNil(parsed.preauthHashAlgorithm)
+        XCTAssertEqual(parsed.serverGuid.uuidString, "00112233-4455-6677-8899-AABBCCDDEEFF")
+    }
+
     func testNegotiateResponseRejectsInvalidContextOffset() throws {
         var response = try makeNegotiateResponse()
         writeUInt32LE(128, to: &response, at: 64 + 60)
@@ -181,13 +201,18 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
-    private func makeNegotiateResponse() throws -> [UInt8] {
+    private func makeNegotiateResponse(
+        dialect: UInt16 = SMBNegotiateConstants.dialect311,
+        contextCount: UInt16 = 3,
+        contextOffset: UInt32 = 136,
+        includeContexts: Bool = true
+    ) throws -> [UInt8] {
         let header = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: 0).encode()
         var body = SMBByteWriter()
         body.writeUInt16LE(65)
         body.writeUInt16LE(SMBNegotiateConstants.signingRequired)
-        body.writeUInt16LE(SMBNegotiateConstants.dialect311)
-        body.writeUInt16LE(3)
+        body.writeUInt16LE(dialect)
+        body.writeUInt16LE(contextCount)
         body.writeBytes(UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!.smbWireBytes)
         body.writeUInt32LE(SMBNegotiateConstants.globalCapEncryption)
         body.writeUInt32LE(1_048_576)
@@ -197,13 +222,15 @@ final class SMBeeTests: XCTestCase {
         body.writeUInt64LE(0)
         body.writeUInt16LE(0)
         body.writeUInt16LE(0)
-        body.writeUInt32LE(136)
+        body.writeUInt32LE(contextOffset)
         var packet = header + body.bytes
-        packet.append(contentsOf: Array(repeating: 0, count: 136 - packet.count))
+        if includeContexts {
+            packet.append(contentsOf: Array(repeating: 0, count: Int(contextOffset) - packet.count))
 
-        appendContext(type: SMBNegotiateConstants.preauthContext, data: [1, 0, 0, 0, 1, 0], to: &packet)
-        appendContext(type: SMBNegotiateConstants.encryptionContext, data: [1, 0, 2, 0], to: &packet)
-        appendContext(type: SMBNegotiateConstants.signingContext, data: [1, 0, 2, 0], to: &packet)
+            appendContext(type: SMBNegotiateConstants.preauthContext, data: [1, 0, 0, 0, 1, 0], to: &packet)
+            appendContext(type: SMBNegotiateConstants.encryptionContext, data: [1, 0, 2, 0], to: &packet)
+            appendContext(type: SMBNegotiateConstants.signingContext, data: [1, 0, 2, 0], to: &packet)
+        }
         return packet
     }
 

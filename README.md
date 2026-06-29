@@ -21,4 +21,4 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 
 ## 開発状況
 
-設計・実装の進行中。設計票は obaket の issue 359 / 356 を参照。
+設計・実装の進行中。

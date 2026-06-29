@@ -13,7 +13,10 @@ jobs:
   build-test:
     # public repo なので macOS runner は無料 (.claude/rules gha-runner)。
     # Network.framework / CryptoKit-backed swift-crypto に依存するため macOS で回す。
-    runs-on: macos-15
+    # macos-26 (Swift 6.3 系) を使う: macos-15 (Swift 6.0 系) では SwiftLint の
+    # build-tool plugin が "prebuild command cannot use executables built from source"
+    # で失敗する。新しい toolchain なら plugin が通る (ローカル macOS 26 で確認済)。
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Swift version

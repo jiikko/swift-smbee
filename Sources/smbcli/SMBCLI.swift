@@ -22,7 +22,7 @@ struct Probe: AsyncParsableCommand {
     var url: String
 
     func run() async throws {
-        // TODO(issue 359 Phase 1): NEGOTIATE を実装して交渉結果を出力する。
+        // TODO: NEGOTIATE を実装して交渉結果を出力する。
         throw ValidationError("probe is not implemented yet (\(url))")
     }
 }

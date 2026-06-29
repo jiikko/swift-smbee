@@ -75,6 +75,15 @@ final class SMBeeTests: XCTestCase {
             clientGuid: UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!,
             salt: Array(repeating: 0xaa, count: 32)
         )
+        let expectedHex =
+            "fe534d4240000000000000000000010000000000000000000000000000000000" +
+            "0000000000000000000000000000000000000000000000000000000000000000" +
+            "24000100010000004000000000112233445566778899aabbccddeeff68000000" +
+            "03000000110300000100260000000000010020000100aaaaaaaaaaaaaaaaaaaa" +
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000020006000000000002" +
+            "00020004000000080004000000000001000200"
+        XCTAssertEqual(hex(request), expectedHex)
+
         let header = try SMB2Header.decode(request)
         XCTAssertEqual(header.command, SMBNegotiateConstants.commandNegotiate)
         XCTAssertEqual(header.messageId, 0)
@@ -83,10 +92,53 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try reader.readUInt16LE(), 36)
         XCTAssertEqual(try reader.readUInt16LE(), 1)
         try reader.skip(count: 2 + 2 + 4 + 16)
-        XCTAssertEqual(try reader.readUInt32LE(), 108)
+        XCTAssertEqual(try reader.readUInt32LE(), 104)
         XCTAssertEqual(try reader.readUInt16LE(), 3)
         try reader.skip(count: 2)
         XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect311)
+    }
+
+    func testNegotiateRequestContextAlignmentAndCount() throws {
+        let request = try SMBNegotiateCodec.encodeRequest(
+            clientGuid: UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!,
+            salt: Array(repeating: 0xaa, count: 32)
+        )
+
+        let contextOffset = Int(readUInt32LE(request, at: 64 + 28))
+        let contextCount = Int(readUInt16LE(request, at: 64 + 32))
+        XCTAssertEqual(contextOffset, 104)
+        XCTAssertEqual(contextOffset % 8, 0)
+        XCTAssertEqual(contextCount, 3)
+        XCTAssertEqual(Array(request[102..<104]), [0, 0])
+
+        var offset = contextOffset
+        var contextTypes: [UInt16] = []
+        for index in 0..<contextCount {
+            XCTAssertEqual(offset % 8, 0)
+            let type = readUInt16LE(request, at: offset)
+            let length = Int(readUInt16LE(request, at: offset + 2))
+            contextTypes.append(type)
+            let dataEnd = offset + 8 + length
+            let nextOffset: Int
+            if index == contextCount - 1 {
+                nextOffset = dataEnd
+                XCTAssertEqual(dataEnd, request.count)
+            } else {
+                nextOffset = offset + 8 + ((length + 7) / 8) * 8
+                XCTAssertEqual(
+                    Array(request[dataEnd..<nextOffset]),
+                    Array(repeating: 0, count: nextOffset - dataEnd)
+                )
+            }
+            offset = nextOffset
+        }
+
+        XCTAssertEqual(contextTypes, [
+            SMBNegotiateConstants.preauthContext,
+            SMBNegotiateConstants.encryptionContext,
+            SMBNegotiateConstants.signingContext,
+        ])
+        XCTAssertEqual(offset, request.count)
     }
 
     func testNegotiateResponseRoundTrip() throws {
@@ -98,6 +150,35 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(parsed.cipher, SMBNegotiateConstants.aes128GCM)
         XCTAssertEqual(parsed.preauthHashAlgorithm, SMBNegotiateConstants.sha512)
         XCTAssertEqual(parsed.serverGuid.uuidString, "00112233-4455-6677-8899-AABBCCDDEEFF")
+    }
+
+    func testNegotiateResponseRejectsInvalidContextOffset() throws {
+        var response = try makeNegotiateResponse()
+        writeUInt32LE(128, to: &response, at: 64 + 60)
+
+        XCTAssertThrowsError(try SMBNegotiateCodec.decodeResponse(response)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .invalidValue("invalid NEGOTIATE context offset"))
+        }
+    }
+
+    func testNegotiateResponseRejectsMalformedContextLength() throws {
+        var response = try makeNegotiateResponse()
+        let contextOffset = Int(readUInt32LE(response, at: 64 + 60))
+        writeUInt16LE(5, to: &response, at: contextOffset + 2)
+
+        XCTAssertThrowsError(try SMBNegotiateCodec.decodeResponse(response)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .invalidValue("invalid PREAUTH context length"))
+        }
+    }
+
+    func testNegotiateResponseRejectsContextPastPacketEnd() throws {
+        var response = try makeNegotiateResponse()
+        let contextOffset = Int(readUInt32LE(response, at: 64 + 60))
+        writeUInt16LE(0xff, to: &response, at: contextOffset + 2)
+
+        XCTAssertThrowsError(try SMBNegotiateCodec.decodeResponse(response)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .truncated)
+        }
     }
 
     private func makeNegotiateResponse() throws -> [UInt8] {
@@ -116,9 +197,9 @@ final class SMBeeTests: XCTestCase {
         body.writeUInt64LE(0)
         body.writeUInt16LE(0)
         body.writeUInt16LE(0)
-        body.writeUInt32LE(128)
+        body.writeUInt32LE(136)
         var packet = header + body.bytes
-        packet.append(contentsOf: Array(repeating: 0, count: 128 - packet.count))
+        packet.append(contentsOf: Array(repeating: 0, count: 136 - packet.count))
 
         appendContext(type: SMBNegotiateConstants.preauthContext, data: [1, 0, 0, 0, 1, 0], to: &packet)
         appendContext(type: SMBNegotiateConstants.encryptionContext, data: [1, 0, 2, 0], to: &packet)
@@ -138,5 +219,28 @@ final class SMBeeTests: XCTestCase {
 
     private func hex(_ bytes: [UInt8]) -> String {
         bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {
+        UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+    }
+
+    private func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
+        UInt32(bytes[offset])
+            | (UInt32(bytes[offset + 1]) << 8)
+            | (UInt32(bytes[offset + 2]) << 16)
+            | (UInt32(bytes[offset + 3]) << 24)
+    }
+
+    private func writeUInt16LE(_ value: UInt16, to bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8(value & 0xff)
+        bytes[offset + 1] = UInt8((value >> 8) & 0xff)
+    }
+
+    private func writeUInt32LE(_ value: UInt32, to bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8(value & 0xff)
+        bytes[offset + 1] = UInt8((value >> 8) & 0xff)
+        bytes[offset + 2] = UInt8((value >> 16) & 0xff)
+        bytes[offset + 3] = UInt8((value >> 24) & 0xff)
     }
 }

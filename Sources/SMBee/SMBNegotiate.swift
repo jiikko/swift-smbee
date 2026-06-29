@@ -12,6 +12,7 @@ public struct SMBProbeResult: Equatable, Sendable {
 public enum SMBNegotiateConstants {
     public static let commandNegotiate: UInt16 = 0
     public static let dialect311: UInt16 = 0x0311
+    public static let signingEnabled: UInt16 = 0x0001
     public static let signingRequired: UInt16 = 0x0002
     public static let globalCapEncryption: UInt32 = 0x0000_0040
     public static let preauthContext: UInt16 = 0x0001
@@ -24,6 +25,8 @@ public enum SMBNegotiateConstants {
 }
 
 public enum SMBNegotiateCodec {
+    private static let negotiateContextCount: UInt16 = 3
+
     public static func encodeRequest(
         clientGuid: UUID,
         messageId: UInt64 = 0,
@@ -31,19 +34,26 @@ public enum SMBNegotiateCodec {
     ) throws -> [UInt8] {
         let contexts = encodeNegotiateContexts(salt: salt)
         let header = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
+        let dialectBytes = MemoryLayout<UInt16>.size
+        let fixedBodySize = 36
+        let contextOffset = alignedTo8(header.count + fixedBodySize + dialectBytes)
+        let paddingLength = contextOffset - (header.count + fixedBodySize + dialectBytes)
+
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(36)
         writer.writeUInt16LE(1)
-        writer.writeUInt16LE(0)
+        writer.writeUInt16LE(SMBNegotiateConstants.signingEnabled)
         writer.writeUInt16LE(0)
         writer.writeUInt32LE(SMBNegotiateConstants.globalCapEncryption)
         writer.writeBytes(clientGuid.smbWireBytes)
-        writer.writeUInt32LE(UInt32(header.count + 36 + 8))
-        writer.writeUInt16LE(3)
+        // MS-SMB2 2.2.3 requires NegotiateContextOffset to be relative to the
+        // SMB2 header start and 8-byte aligned when dialect 0x0311 is offered.
+        writer.writeUInt32LE(UInt32(contextOffset))
+        writer.writeUInt16LE(negotiateContextCount)
         writer.writeUInt16LE(0)
         writer.writeUInt16LE(SMBNegotiateConstants.dialect311)
-        writer.writeBytes(Array(repeating: 0, count: 6))
+        writer.writeBytes(Array(repeating: 0, count: paddingLength))
         writer.writeBytes(contexts)
         return writer.bytes
     }
@@ -74,7 +84,13 @@ public enum SMBNegotiateCodec {
         var signingAlgorithm: UInt16?
         var cipher: UInt16?
         var preauthHashAlgorithm: UInt16?
-        if contextOffset > 0, contextCount > 0 {
+        if dialect == SMBNegotiateConstants.dialect311, contextCount > 0 {
+            guard contextOffset >= SMB2Header.encodedSize + 65,
+                  contextOffset % 8 == 0,
+                  contextOffset < bytes.count
+            else {
+                throw SMBCodecError.invalidValue("invalid NEGOTIATE context offset")
+            }
             var offset = Int(contextOffset)
             for _ in 0..<contextCount {
                 guard offset + 8 <= bytes.count else { throw SMBCodecError.truncated }
@@ -82,12 +98,16 @@ public enum SMBNegotiateCodec {
                 let type = try contextReader.readUInt16LE()
                 let length = Int(try contextReader.readUInt16LE())
                 try contextReader.skip(count: 4)
+                guard offset + 8 + length <= bytes.count else { throw SMBCodecError.truncated }
                 let data = try contextReader.readBytes(count: length)
                 switch type {
                 case SMBNegotiateConstants.preauthContext:
                     var dataReader = SMBByteReader(bytes: data)
                     let algorithmCount = try dataReader.readUInt16LE()
                     let saltLength = try dataReader.readUInt16LE()
+                    guard length >= 4 + Int(algorithmCount) * 2 + Int(saltLength) else {
+                        throw SMBCodecError.invalidValue("invalid PREAUTH context length")
+                    }
                     if algorithmCount > 0 {
                         preauthHashAlgorithm = try dataReader.readUInt16LE()
                     }
@@ -95,19 +115,27 @@ public enum SMBNegotiateCodec {
                 case SMBNegotiateConstants.encryptionContext:
                     var dataReader = SMBByteReader(bytes: data)
                     let count = try dataReader.readUInt16LE()
+                    guard length == 2 + Int(count) * 2 else {
+                        throw SMBCodecError.invalidValue("invalid ENCRYPTION context length")
+                    }
                     if count > 0 {
                         cipher = try dataReader.readUInt16LE()
                     }
                 case SMBNegotiateConstants.signingContext:
                     var dataReader = SMBByteReader(bytes: data)
                     let count = try dataReader.readUInt16LE()
+                    guard length == 2 + Int(count) * 2 else {
+                        throw SMBCodecError.invalidValue("invalid SIGNING context length")
+                    }
                     if count > 0 {
                         signingAlgorithm = try dataReader.readUInt16LE()
                     }
                 default:
                     break
                 }
-                offset += 8 + paddedLength(length)
+                let nextOffset = offset + 8 + paddedLength(length)
+                guard nextOffset <= bytes.count else { throw SMBCodecError.truncated }
+                offset = nextOffset
             }
         }
 
@@ -123,9 +151,9 @@ public enum SMBNegotiateCodec {
 
     private static func encodeNegotiateContexts(salt: [UInt8]) -> [UInt8] {
         var bytes: [UInt8] = []
-        appendContext(type: SMBNegotiateConstants.preauthContext, data: encodePreauthData(salt: salt), to: &bytes)
-        appendContext(type: SMBNegotiateConstants.encryptionContext, data: encodeEncryptionData(), to: &bytes)
-        appendContext(type: SMBNegotiateConstants.signingContext, data: encodeSigningData(), to: &bytes)
+        appendContext(type: SMBNegotiateConstants.preauthContext, data: encodePreauthData(salt: salt), padTo8: true, to: &bytes)
+        appendContext(type: SMBNegotiateConstants.encryptionContext, data: encodeEncryptionData(), padTo8: true, to: &bytes)
+        appendContext(type: SMBNegotiateConstants.signingContext, data: encodeSigningData(), padTo8: false, to: &bytes)
         return bytes
     }
 
@@ -153,17 +181,23 @@ public enum SMBNegotiateCodec {
         return writer.bytes
     }
 
-    private static func appendContext(type: UInt16, data: [UInt8], to bytes: inout [UInt8]) {
+    private static func appendContext(type: UInt16, data: [UInt8], padTo8: Bool, to bytes: inout [UInt8]) {
         var writer = SMBByteWriter()
         writer.writeUInt16LE(type)
         writer.writeUInt16LE(UInt16(data.count))
         writer.writeUInt32LE(0)
         writer.writeBytes(data)
-        writer.padTo8()
+        if padTo8 {
+            writer.padTo8()
+        }
         bytes.append(contentsOf: writer.bytes)
     }
 
     private static func paddedLength(_ length: Int) -> Int {
+        alignedTo8(length)
+    }
+
+    private static func alignedTo8(_ length: Int) -> Int {
         ((length + 7) / 8) * 8
     }
 }

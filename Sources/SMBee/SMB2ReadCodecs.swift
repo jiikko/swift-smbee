@@ -84,7 +84,7 @@ enum SMB2Create {
         writer.writeUInt16LE(UInt16(nameBytes.count))
         writer.writeUInt32LE(0)
         writer.writeUInt32LE(0)
-        writer.writeBytes(nameBytes)
+        writer.writeBytes(nameBytes.isEmpty ? [0] : nameBytes)
         return writer.bytes
     }
 
@@ -104,6 +104,9 @@ enum SMB2Create {
 }
 
 enum SMB2QueryDirectory {
+    private static let fixedPartSize = 32
+    private static let fileNameOffset = SMB2Header.encodedSize + fixedPartSize
+
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8]) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
         let header = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
@@ -114,9 +117,10 @@ enum SMB2QueryDirectory {
         writer.writeUInt8(0x01)
         writer.writeUInt32LE(0)
         writer.writeBytes(fileId)
-        writer.writeUInt16LE(0)
+        writer.writeUInt16LE(UInt16(fileNameOffset))
         writer.writeUInt16LE(0)
         writer.writeUInt32LE(65_536)
+        writer.writeUInt8(0)
         return writer.bytes
     }
 

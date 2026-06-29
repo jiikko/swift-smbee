@@ -249,7 +249,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(header.messageId, 9)
         XCTAssertEqual(header.treeId, 0xaabb_ccdd)
         XCTAssertEqual(header.sessionId, 0x1122_3344_5566_7788)
-        XCTAssertEqual(request.count, 120)
+        XCTAssertEqual(request.count, 121)
         XCTAssertEqual(readUInt16LE(request, at: 64), 57)
         XCTAssertEqual(request[66], 0)
         XCTAssertEqual(request[67], 0)
@@ -265,6 +265,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(request, at: 110), 0)
         XCTAssertEqual(readUInt32LE(request, at: 112), 0)
         XCTAssertEqual(readUInt32LE(request, at: 116), 0)
+        XCTAssertEqual(request[120], 0)
     }
 
     func testCreateSubpathRequestUsesRelativeUtf16NameAfterFixedPart() throws {
@@ -281,6 +282,32 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(request, at: 110), UInt16(expectedName.count))
         XCTAssertEqual(request.count, 120 + expectedName.count)
         XCTAssertEqual(Array(request[120..<request.count]), expectedName)
+    }
+
+    func testQueryDirectoryRequestIncludesOneByteEmptySearchPatternBuffer() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2QueryDirectory.encodeRequest(
+            messageId: 11,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.queryDirectory)
+        XCTAssertEqual(header.messageId, 11)
+        XCTAssertEqual(header.treeId, 0x5566_7788)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(request.count, 97)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 33)
+        XCTAssertEqual(request[66], 37)
+        XCTAssertEqual(request[67], 0x01)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 0)
+        XCTAssertEqual(Array(request[72..<88]), fileId)
+        XCTAssertEqual(readUInt16LE(request, at: 88), 96)
+        XCTAssertEqual(readUInt16LE(request, at: 90), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 92), 65_536)
+        XCTAssertEqual(request[96], 0)
     }
 
     func testNegotiateRequestRoundTripShape() throws {

@@ -64,7 +64,8 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         #else
         hints.ai_socktype = SOCK_STREAM
         #endif
-        hints.ai_protocol = IPPROTO_TCP
+        // glibc では `IPPROTO_TCP` が `Int`、Darwin では `Int32`。両対応で Int32 に包む。
+        hints.ai_protocol = Int32(IPPROTO_TCP)
         var result: UnsafeMutablePointer<addrinfo>?
         let service = String(port)
         guard getaddrinfo(host, service, &hints, &result) == 0, let first = result else {

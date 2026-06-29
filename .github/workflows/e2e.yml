@@ -25,12 +25,15 @@ jobs:
         run: |
           set -euxo pipefail
           docker run -d --name smbee-samba -p 445:445 \
-            -v "${PWD}/test/e2e/smb.conf:/etc/samba/smb.conf:ro" \
+            -v "${PWD}/test/e2e/smb.conf:/tmp/smbee-smb.conf:ro" \
             ubuntu:24.04 \
             bash -lc '
               set -euxo pipefail
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends samba
+              # smb.conf を /etc/samba にbind-mountすると samba-common の postinst が
+              # read-only ファイルに書けず失敗するため、install 後に書き込み可能な場所へ cp する。
+              cp /tmp/smbee-smb.conf /etc/samba/smb.conf
               mkdir -p /srv/smbee/public
               useradd -M -s /usr/sbin/nologin smbee
               printf "smbee\nsmbee\n" | smbpasswd -a -s smbee

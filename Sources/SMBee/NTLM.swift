@@ -113,6 +113,7 @@ enum NTLM {
         blob.writeBytes(clientChallenge)
         blob.writeUInt32LE(0)
         blob.writeBytes(targetInfo)
+        blob.writeUInt32LE(0)
         let proof = SMBCrypto.hmacMD5(key: ntowfv2, message: challenge.serverChallenge + blob.bytes)
         let ntChallengeResponse = proof + blob.bytes
         let lmChallengeResponse = SMBCrypto.hmacMD5(
@@ -249,12 +250,13 @@ enum NTLM {
     private static func ensureTargetInfoEOL(_ targetInfo: [UInt8]) -> [UInt8] {
         var offset = 0
         while offset + 4 <= targetInfo.count {
+            let headerOffset = offset
             let avID = readUInt16LE(targetInfo, at: offset)
             let length = Int(readUInt16LE(targetInfo, at: offset + 2))
             offset += 4
             guard offset + length <= targetInfo.count else { break }
             if avID == avIDMsvAvEOL {
-                return targetInfo
+                return Array(targetInfo[0..<headerOffset + 4 + length])
             }
             offset += length
         }

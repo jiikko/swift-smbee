@@ -375,6 +375,29 @@ final class SMBeeTests: XCTestCase {
             "01000c00530045005200560045005200" +
             "00000000"
         ))
+
+        let fields = type3SecurityBuffers(authenticate.message)
+        let expectedNTChallengeResponseLength = 16 + 28 + targetInfo.count + 4
+        XCTAssertEqual(fields.nt.length, expectedNTChallengeResponseLength)
+        XCTAssertEqual(fields.nt.maxLength, expectedNTChallengeResponseLength)
+        XCTAssertEqual(readSecurityBuffer(authenticate.message, at: 20).count, expectedNTChallengeResponseLength)
+        XCTAssertEqual(fields.lm.offset, 88)
+        XCTAssertEqual(fields.nt.offset, fields.lm.offset + UInt32(fields.lm.length))
+        XCTAssertEqual(fields.domain.offset, fields.nt.offset + UInt32(fields.nt.length))
+        XCTAssertEqual(fields.user.offset, fields.domain.offset + UInt32(fields.domain.length))
+        XCTAssertEqual(fields.workstation.offset, fields.user.offset + UInt32(fields.user.length))
+        XCTAssertEqual(fields.sessionKey.offset, fields.workstation.offset + UInt32(fields.workstation.length))
+        XCTAssertEqual(authenticate.message.count, Int(fields.sessionKey.offset) + fields.sessionKey.length)
+
+        var zeroed = authenticate.message
+        zeroed.replaceSubrange(72..<88, with: Array(repeating: 0, count: 16))
+        XCTAssertEqual(
+            Array(authenticate.message[72..<88]),
+            SMBCrypto.hmacMD5(
+                key: hexBytes("00112233445566778899aabbccddeeff"),
+                message: type1 + type2 + zeroed
+            )
+        )
     }
 
     func testNTLMMICOrsExistingMsvAvFlagsProvidedBit() throws {
@@ -1212,6 +1235,32 @@ final class SMBeeTests: XCTestCase {
         let length = Int(readUInt16LE(bytes, at: offset))
         let bufferOffset = Int(readUInt32LE(bytes, at: offset + 4))
         return Array(bytes[bufferOffset..<bufferOffset + length])
+    }
+
+    private func type3SecurityBuffers(_ bytes: [UInt8]) -> (
+        lm: (length: Int, maxLength: Int, offset: UInt32),
+        nt: (length: Int, maxLength: Int, offset: UInt32),
+        domain: (length: Int, maxLength: Int, offset: UInt32),
+        user: (length: Int, maxLength: Int, offset: UInt32),
+        workstation: (length: Int, maxLength: Int, offset: UInt32),
+        sessionKey: (length: Int, maxLength: Int, offset: UInt32)
+    ) {
+        (
+            securityBufferFields(bytes, at: 12),
+            securityBufferFields(bytes, at: 20),
+            securityBufferFields(bytes, at: 28),
+            securityBufferFields(bytes, at: 36),
+            securityBufferFields(bytes, at: 44),
+            securityBufferFields(bytes, at: 52)
+        )
+    }
+
+    private func securityBufferFields(_ bytes: [UInt8], at offset: Int) -> (length: Int, maxLength: Int, offset: UInt32) {
+        (
+            Int(readUInt16LE(bytes, at: offset)),
+            Int(readUInt16LE(bytes, at: offset + 2)),
+            readUInt32LE(bytes, at: offset + 4)
+        )
     }
 
     private func targetInfoFromType3(_ bytes: [UInt8]) -> [UInt8] {

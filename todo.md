@@ -78,9 +78,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 
 ## Phase 5 — E2E（コンテナ Samba）
 
-- [ ] E2E test target（`SMBEE_E2E` env gate）— probe/ls/stat/cat(sha256)/put/mkdir/rename/rm
-- [ ] Samba イメージ + smb.conf 確定（3.1.1 + GMAC + GCM を出す）ⓥ
-- [ ] `.github/workflows/e2e.yml` の TODO を埋め、push/PR トリガを有効化
+- [x] E2E test target（`SMBEE_E2E` env gate）— probe-only（NEGOTIATE: 3.1.1 / AES-GMAC / AES-128-GCM）
+- [x] Samba イメージ + smb.conf 確定（3.1.1 + GMAC + GCM を出す）ⓥ CI 実測で継続確認
+- [x] `.github/workflows/e2e.yml` の TODO を埋め、push トリガを有効化
 - [ ] ローカル Apple container 起動スクリプト（手動）
 
 ## 横断（全 Phase 共通）

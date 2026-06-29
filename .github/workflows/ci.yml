@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    # public repo なので macOS runner は無料 (.claude/rules gha-runner)。
+    # Network.framework / CryptoKit-backed swift-crypto に依存するため macOS で回す。
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      # swift build は SwiftLintBuildToolPlugin も実行する (lint は brew でなく plugin)。
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test

@@ -1,0 +1,11 @@
+included:
+  - Sources
+  - Tests
+
+# プロトコル実装はバイト操作や長い encode/decode が増えるため、初期は緩めに開始する。
+disabled_rules:
+  - line_length
+  - todo
+  - identifier_name
+
+analyzer_rules: []

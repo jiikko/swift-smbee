@@ -293,14 +293,15 @@ final class SMBSession {
             throw SMBCodecError.invalidValue("authenticated read path currently supports SMB 3.0.x")
         }
 
-        let type1 = SPNEGO.wrapNegTokenInit(NTLM.makeType1(domain: credential.domain))
+        let type1Message = NTLM.makeType1(domain: credential.domain)
+        let type1 = SPNEGO.wrapNegTokenInit(type1Message)
         let challengePacket = try SMB2SessionSetup.encodeRequest(
             messageId: nextMessageId(),
             sessionId: 0,
             securityBlob: type1,
             signed: false
         )
-        debugDump("SESSION_SETUP#1 request", challengePacket)
+        debugLine("SESSION_SETUP#1 request length=\(challengePacket.count)")
         try await sendUnsigned(challengePacket)
         let challengeResponse = try await receive(label: "SESSION_SETUP#1 response")
         let challengeHeader = try SMB2Header.decode(challengeResponse)
@@ -311,8 +312,14 @@ final class SMBSession {
         }
         sessionId = challengeHeader.sessionId
         let challengeBlob = try SMB2SessionSetup.decodeResponse(challengeResponse)
-        let challenge = try NTLM.parseChallenge(SPNEGO.unwrapNTLMToken(challengeBlob))
-        let authenticate = try NTLM.makeType3(credential: credential, challenge: challenge)
+        let challengeMessage = try SPNEGO.unwrapNTLMToken(challengeBlob)
+        let challenge = try NTLM.parseChallenge(challengeMessage)
+        let authenticate = try NTLM.makeType3(
+            credential: credential,
+            challenge: challenge,
+            negotiateMessage: type1Message,
+            challengeMessage: challengeMessage
+        )
         let authBlob = SPNEGO.wrapNegTokenResp(authenticate.message)
         let authPacket = try SMB2SessionSetup.encodeRequest(
             messageId: nextMessageId(),
@@ -320,7 +327,7 @@ final class SMBSession {
             securityBlob: authBlob,
             signed: false
         )
-        debugDump("SESSION_SETUP#2 request", authPacket)
+        debugLine("SESSION_SETUP#2 request length=\(authPacket.count)")
         try await sendUnsigned(authPacket)
         let authResponse = try await receive(label: "SESSION_SETUP#2 response")
         let authHeader = try SMB2Header.decode(authResponse)
@@ -328,9 +335,9 @@ final class SMBSession {
             throw SMBCodecError.invalidValue(String(format: "SESSION_SETUP failed with NTSTATUS 0x%08x", authHeader.status))
         }
         sessionId = authHeader.sessionId
-        signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.sessionBaseKey)
-        encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.sessionBaseKey)
-        decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.sessionBaseKey)
+        signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.exportedSessionKey)
+        encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
+        decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
     }
 
     func treeConnect(share: String) async throws -> UInt32 {

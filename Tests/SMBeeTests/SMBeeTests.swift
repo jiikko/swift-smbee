@@ -59,6 +59,11 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testRC4KnownVectors() {
+        XCTAssertEqual(hex(RC4.crypt(key: Array("Key".utf8), message: Array("Plaintext".utf8))), "bbf316e8d940af0ad3")
+        XCTAssertEqual(hex(RC4.crypt(key: Array("Wiki".utf8), message: Array("pedia".utf8))), "1021bf0420")
+    }
+
     func testAESGCMAndGMACNISTVectors() throws {
         let key = Array(repeating: UInt8(0), count: 16)
         let nonce = Array(repeating: UInt8(0), count: 12)
@@ -209,6 +214,65 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(hex(NTLM.ntProofStr(ntowfv2: ntowfv2, serverChallenge: serverChallenge, blob: blob)), "2a8e1bc8a06222ed5301c3fbd2154d0b")
     }
 
+    func testMSNLMPSection424NTLMv2SessionKeyExchangeVector() throws {
+        let targetInfo = hexBytes(
+            "02000c0044004f004d00410049004e00" +
+            "01000c00530045005200560045005200" +
+            "0000000000000000"
+        )
+        let challenge = NTLMChallenge(
+            targetName: NTLM.utf16le("Server"),
+            flags: NTLM.negotiateFlags,
+            serverChallenge: hexBytes("0123456789abcdef"),
+            targetInfo: targetInfo
+        )
+        let authenticate = try NTLM.makeType3(
+            credential: SMBCredential(username: "User", password: "Password", domain: "Domain"),
+            challenge: challenge,
+            timestamp: 0x01c334b736d39000,
+            clientChallenge: hexBytes("ffffff0011223344"),
+            exportedSessionKey: hexBytes("55555555555555555555555555555555")
+        )
+
+        XCTAssertEqual(hex(NTLM.ntowfv2(password: "Password", username: "User", domain: "Domain")), "0c868a403bfd7a93a3001ef22ef02e3f")
+        let ntChallengeResponseOffset = Int(readUInt32LE(authenticate.message, at: 24))
+        XCTAssertEqual(
+            hex(Array(authenticate.message[ntChallengeResponseOffset..<ntChallengeResponseOffset + 16])),
+            "b56335b0aa26a04bdcacf0235fc4b1f4"
+        )
+        XCTAssertEqual(hex(authenticate.sessionBaseKey), "e563f1525289395088d56c26b3bd0dbf")
+        XCTAssertEqual(readUInt32LE(authenticate.message, at: 60) & NTLM.negotiateKeyExchange, NTLM.negotiateKeyExchange)
+        XCTAssertEqual(readUInt16LE(authenticate.message, at: 52), 16)
+        XCTAssertEqual(hex(readSecurityBuffer(authenticate.message, at: 52)), "c73236c501ded70b6fdc493cf8a01636")
+        XCTAssertEqual(authenticate.exportedSessionKey, hexBytes("55555555555555555555555555555555"))
+    }
+
+    func testNTLMMICUsesExportedSessionKeyAndZeroedMICField() throws {
+        let type1 = NTLM.makeType1()
+        let type2 = makeNTLMChallengeMessage(targetInfo: hexBytes("070008000090d336b734c30100000000"))
+        let challenge = try NTLM.parseChallenge(type2)
+        let exportedSessionKey = hexBytes("00112233445566778899aabbccddeeff")
+        let authenticate = try NTLM.makeType3(
+            credential: SMBCredential(username: "User", password: "Password", domain: "Domain"),
+            challenge: challenge,
+            negotiateMessage: type1,
+            challengeMessage: type2,
+            timestamp: 0x01c334b736d39000,
+            clientChallenge: hexBytes("ffffff0011223344"),
+            exportedSessionKey: exportedSessionKey
+        )
+
+        XCTAssertEqual(authenticate.message.count >= 88, true)
+        XCTAssertEqual(readUInt32LE(authenticate.message, at: 60) & NTLM.negotiateKeyExchange, NTLM.negotiateKeyExchange)
+        XCTAssertNotEqual(Array(authenticate.message[72..<88]), Array(repeating: 0, count: 16))
+        var zeroed = authenticate.message
+        zeroed.replaceSubrange(72..<88, with: Array(repeating: 0, count: 16))
+        XCTAssertEqual(
+            Array(authenticate.message[72..<88]),
+            SMBCrypto.hmacMD5(key: exportedSessionKey, message: type1 + type2 + zeroed)
+        )
+    }
+
     func testNTLMType1FixedBytesAndSecurityBuffers() {
         let type1 = NTLM.makeType1()
 
@@ -216,7 +280,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(type1[0..<8]), Array("NTLMSSP\0".utf8))
         XCTAssertEqual(readUInt32LE(type1, at: 8), 1)
         XCTAssertEqual(readUInt32LE(type1, at: 12), NTLM.negotiateFlags)
-        XCTAssertEqual(hex(Array(type1[12..<16])), "358288a2")
+        XCTAssertEqual(hex(Array(type1[12..<16])), "358288e2")
         XCTAssertEqual(readUInt16LE(type1, at: 16), 0)
         XCTAssertEqual(readUInt16LE(type1, at: 18), 0)
         XCTAssertEqual(readUInt32LE(type1, at: 20), 40)
@@ -992,6 +1056,33 @@ final class SMBeeTests: XCTestCase {
         writer.writeBytes(data)
         writer.padTo8()
         bytes.append(contentsOf: writer.bytes)
+    }
+
+    private func makeNTLMChallengeMessage(targetInfo: [UInt8]) -> [UInt8] {
+        let targetName = NTLM.utf16le("Server")
+        let targetNameOffset = UInt32(48)
+        let targetInfoOffset = targetNameOffset + UInt32(targetName.count)
+        var writer = SMBByteWriter()
+        writer.writeBytes(Array("NTLMSSP\0".utf8))
+        writer.writeUInt32LE(2)
+        writer.writeUInt16LE(UInt16(targetName.count))
+        writer.writeUInt16LE(UInt16(targetName.count))
+        writer.writeUInt32LE(targetNameOffset)
+        writer.writeUInt32LE(NTLM.negotiateFlags)
+        writer.writeBytes(hexBytes("0123456789abcdef"))
+        writer.writeBytes(Array(repeating: 0, count: 8))
+        writer.writeUInt16LE(UInt16(targetInfo.count))
+        writer.writeUInt16LE(UInt16(targetInfo.count))
+        writer.writeUInt32LE(targetInfoOffset)
+        writer.writeBytes(targetName)
+        writer.writeBytes(targetInfo)
+        return writer.bytes
+    }
+
+    private func readSecurityBuffer(_ bytes: [UInt8], at offset: Int) -> [UInt8] {
+        let length = Int(readUInt16LE(bytes, at: offset))
+        let bufferOffset = Int(readUInt32LE(bytes, at: offset + 4))
+        return Array(bytes[bufferOffset..<bufferOffset + length])
     }
 
     private func makeDirectoryEntry(

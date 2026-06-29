@@ -31,6 +31,7 @@ enum NTLM {
     static let negotiateTargetInfo: UInt32 = 0x0080_0000
     static let negotiateVersion: UInt32 = 0x0200_0000
     static let negotiate128: UInt32 = 0x2000_0000
+    static let negotiateKeyExchange: UInt32 = 0x4000_0000
     static let negotiate56: UInt32 = 0x8000_0000
 
     static let negotiateFlags: UInt32 = negotiateUnicode
@@ -43,6 +44,7 @@ enum NTLM {
         | negotiateTargetInfo
         | negotiateVersion
         | negotiate128
+        | negotiateKeyExchange
         | negotiate56
 
     static func makeType1(domain: String = "", workstation: String = "") -> [UInt8] {
@@ -79,11 +81,17 @@ enum NTLM {
     static func makeType3(
         credential: SMBCredential,
         challenge: NTLMChallenge,
+        negotiateMessage: [UInt8]? = nil,
+        challengeMessage: [UInt8]? = nil,
         timestamp: UInt64 = currentNTTime(),
-        clientChallenge: [UInt8] = randomBytes(count: 8)
-    ) throws -> (message: [UInt8], sessionBaseKey: [UInt8]) {
+        clientChallenge: [UInt8] = randomBytes(count: 8),
+        exportedSessionKey: [UInt8] = randomBytes(count: 16)
+    ) throws -> (message: [UInt8], sessionBaseKey: [UInt8], exportedSessionKey: [UInt8]) {
         guard clientChallenge.count == 8 else {
             throw SMBCodecError.invalidValue("NTLMv2 client challenge must be 8 bytes")
+        }
+        guard exportedSessionKey.count == 16 else {
+            throw SMBCodecError.invalidValue("NTLMv2 exported session key must be 16 bytes")
         }
         let userBytes = utf16le(credential.username)
         let domainBytes = utf16le(credential.domain)
@@ -106,8 +114,13 @@ enum NTLM {
             message: challenge.serverChallenge + clientChallenge
         ) + clientChallenge
         let sessionBaseKey = SMBCrypto.hmacMD5(key: ntowfv2, message: proof)
-        let flags = negotiateFlags & challenge.flags
-        let fixedSize = 72
+        let encryptedRandomSessionKey = RC4.crypt(key: sessionBaseKey, message: exportedSessionKey)
+        let includeMIC = targetInfoContainsTimestamp(challenge.targetInfo)
+        if includeMIC, negotiateMessage == nil || challengeMessage == nil {
+            throw SMBCodecError.invalidValue("NTLM MIC requires type1 and type2 messages")
+        }
+        let flags = (negotiateFlags & challenge.flags) | negotiateKeyExchange
+        let fixedSize = includeMIC ? 88 : 72
         var payloadOffset = UInt32(fixedSize)
         var payload: [UInt8] = []
         func appendPayload(_ bytes: [UInt8]) -> (Int, UInt32) {
@@ -121,7 +134,7 @@ enum NTLM {
         let domain = appendPayload(domainBytes)
         let user = appendPayload(userBytes)
         let workstation = appendPayload(workstationBytes)
-        let sessionKey = appendPayload([])
+        let sessionKey = appendPayload(encryptedRandomSessionKey)
 
         var writer = SMBByteWriter()
         writer.writeBytes(signature)
@@ -134,8 +147,16 @@ enum NTLM {
         writeSecurityBuffer(&writer, length: sessionKey.0, offset: sessionKey.1)
         writer.writeUInt32LE(flags)
         writer.writeBytes([0x06, 0x01, 0xb1, 0x1d, 0, 0, 0, 0x0f])
+        if includeMIC {
+            writer.writeBytes(Array(repeating: 0, count: 16))
+        }
         writer.writeBytes(payload)
-        return (writer.bytes, sessionBaseKey)
+        var message = writer.bytes
+        if includeMIC, let negotiateMessage, let challengeMessage {
+            let mic = SMBCrypto.hmacMD5(key: exportedSessionKey, message: negotiateMessage + challengeMessage + message)
+            message.replaceSubrange(72..<88, with: mic)
+        }
+        return (message, sessionBaseKey, exportedSessionKey)
     }
 
     static func ntowfv2(password: String, username: String, domain: String) -> [UInt8] {
@@ -164,6 +185,20 @@ enum NTLM {
         return Array(message[bufferOffset..<bufferOffset + length])
     }
 
+    private static func targetInfoContainsTimestamp(_ bytes: [UInt8]) -> Bool {
+        var offset = 0
+        while offset + 4 <= bytes.count {
+            let avID = readUInt16LE(bytes, at: offset)
+            let length = Int(readUInt16LE(bytes, at: offset + 2))
+            offset += 4
+            if avID == 0 { return false }
+            if avID == 7 { return true }
+            guard offset + length <= bytes.count else { return false }
+            offset += length
+        }
+        return false
+    }
+
     private static func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {
         UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
     }
@@ -181,6 +216,27 @@ enum NTLM {
 
     private static func randomBytes(count: Int) -> [UInt8] {
         (0..<count).map { _ in UInt8.random(in: UInt8.min...UInt8.max) }
+    }
+}
+
+enum RC4 {
+    static func crypt(key: [UInt8], message: [UInt8]) -> [UInt8] {
+        precondition(!key.isEmpty, "RC4 key must not be empty")
+        var state = Array(UInt8.min...UInt8.max)
+        var j = 0
+        for index in 0..<256 {
+            j = (j + Int(state[index]) + Int(key[index % key.count])) & 0xff
+            state.swapAt(index, j)
+        }
+        var i = 0
+        j = 0
+        return message.map { byte in
+            i = (i + 1) & 0xff
+            j = (j + Int(state[i])) & 0xff
+            state.swapAt(i, j)
+            let keyStreamByte = state[(Int(state[i]) + Int(state[j])) & 0xff]
+            return byte ^ keyStreamByte
+        }
     }
 }
 

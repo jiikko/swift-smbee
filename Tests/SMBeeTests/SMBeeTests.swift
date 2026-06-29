@@ -131,8 +131,13 @@ final class SMBeeTests: XCTestCase {
         )
         header.signature = sealed.tag
         let encoded = try header.encode()
+        let authenticatedData = try header.authenticatedData()
         XCTAssertEqual(encoded.count, SMB3TransformHeader.encodedSize)
         XCTAssertEqual(try SMB3TransformHeader.decode(encoded), header)
+        XCTAssertEqual(authenticatedData, Array(encoded[20..<52]))
+        XCTAssertEqual(authenticatedData.count, 32)
+        XCTAssertEqual(Array(header.nonce.prefix(11)), nonce11)
+        XCTAssertEqual(Array(header.nonce.dropFirst(11)), Array(repeating: 0, count: 5))
         XCTAssertEqual(
             try AESCCM.open(
                 key: key,
@@ -143,6 +148,14 @@ final class SMBeeTests: XCTestCase {
             ),
             plaintext
         )
+    }
+
+    func testSMB302KeyDerivationLabelAndContextBytes() {
+        XCTAssertEqual(hex(SMBCrypto.smb3SigningLabel), "534d4232414553434d414300")
+        XCTAssertEqual(hex(SMBCrypto.smb3SigningContext), "536d625369676e00")
+        XCTAssertEqual(hex(SMBCrypto.smb302EncryptionLabel), "534d423241455343434d00")
+        XCTAssertEqual(hex(SMBCrypto.smb302EncryptionContext), "536572766572496e2000")
+        XCTAssertEqual(hex(SMBCrypto.smb302DecryptionContext), "5365727665724f757400")
     }
 
     func testSMB302EncryptionKeyDerivationLabels() {
@@ -156,8 +169,26 @@ final class SMBeeTests: XCTestCase {
             encryptionKey,
             SMBCrypto.sp800108CounterModeHMACSHA256(
                 key: sessionKey,
-                label: Array("SMB2AESCCM".utf8) + [0],
-                context: Array("ServerIn ".utf8) + [0],
+                label: SMBCrypto.smb302EncryptionLabel,
+                context: SMBCrypto.smb302EncryptionContext,
+                length: 16
+            )
+        )
+        XCTAssertEqual(
+            decryptionKey,
+            SMBCrypto.sp800108CounterModeHMACSHA256(
+                key: sessionKey,
+                label: SMBCrypto.smb302EncryptionLabel,
+                context: SMBCrypto.smb302DecryptionContext,
+                length: 16
+            )
+        )
+        XCTAssertNotEqual(
+            decryptionKey,
+            SMBCrypto.sp800108CounterModeHMACSHA256(
+                key: sessionKey,
+                label: SMBCrypto.smb302EncryptionLabel,
+                context: Array("ServerOut ".utf8) + [0],
                 length: 16
             )
         )

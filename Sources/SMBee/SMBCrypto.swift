@@ -2,6 +2,12 @@ import Crypto
 import Foundation
 
 public enum SMBCrypto {
+    static let smb3SigningLabel = Array("SMB2AESCMAC".utf8) + [0]
+    static let smb3SigningContext = Array("SmbSign".utf8) + [0]
+    static let smb302EncryptionLabel = Array("SMB2AESCCM".utf8) + [0]
+    static let smb302EncryptionContext = Array("ServerIn ".utf8) + [0]
+    static let smb302DecryptionContext = Array("ServerOut".utf8) + [0]
+
     public static func sha512(_ bytes: [UInt8]) -> [UInt8] {
         Array(SHA512.hash(data: bytes))
     }
@@ -46,8 +52,8 @@ public enum SMBCrypto {
         // MS-SMB2 3.1.4.2 derives the SMB 3.0.x signing key with SP800-108 CTR HMAC-SHA256.
         sp800108CounterModeHMACSHA256(
             key: sessionKey,
-            label: Array("SMB2AESCMAC".utf8) + [0],
-            context: Array("SmbSign".utf8) + [0],
+            label: smb3SigningLabel,
+            context: smb3SigningContext,
             length: 16
         )
     }
@@ -56,8 +62,8 @@ public enum SMBCrypto {
         // MS-SMB2 3.1.4.3 SMB 3.0.x client-to-server AES-128-CCM key.
         sp800108CounterModeHMACSHA256(
             key: sessionKey,
-            label: Array("SMB2AESCCM".utf8) + [0],
-            context: Array("ServerIn ".utf8) + [0],
+            label: smb302EncryptionLabel,
+            context: smb302EncryptionContext,
             length: 16
         )
     }
@@ -66,8 +72,8 @@ public enum SMBCrypto {
         // MS-SMB2 3.1.4.3 SMB 3.0.x server-to-client AES-128-CCM key.
         sp800108CounterModeHMACSHA256(
             key: sessionKey,
-            label: Array("SMB2AESCCM".utf8) + [0],
-            context: Array("ServerOut ".utf8) + [0],
+            label: smb302EncryptionLabel,
+            context: smb302DecryptionContext,
             length: 16
         )
     }

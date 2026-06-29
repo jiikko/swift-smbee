@@ -15,12 +15,15 @@
 - ✅ MaxRead/WriteSize 尊重 / FLUSH / async STATUS_PENDING interim 応答処理
 - ✅ smbcli probe/ls/stat/cat/mkdir/put/mv/rm(-r) / unit 51 + E2E 3 green / CI(macos-26 unit + ubuntu e2e)
 
-**残（後回し）**:
+- ✅ C: NTLMv2 **MIC + NTLMSSP_NEGOTIATE_KEY_EXCH** (RC4) + 公式 MS-NLMP §4.2.4 vector。署名/暗号鍵を
+  ExportedSessionKey 由来に。実 macOS が MIC を要求しても通る
+- ✅ D: **SMBError** 型付きエラー (NTSTATUS→case) + SMBErrorMapper を全 operation に適用 / READ・WRITE・
+  再帰削除・paging・PENDING・transport の各ループに **cancellation** (Task.checkCancellation)
 
-- ⏳ C: NTLMv2 の **MIC / NTLMSSP_NEGOTIATE_KEY_EXCH** + 公式 MS-NLMP vector 検証（最小経路で Samba は通る。
-  厳格サーバ/実 macOS で要る可能性。codex-drive で着手中・codex rate-limit で中断）
-- ⏳ D: SMBErrorMapper (NTSTATUS→型付きエラー) / SMBSession の cancellation・再接続
-- ⏳ #3: 実 macOS (3.0.2) 手動 smoke (要 creds、人間実行)
+**残**:
+
+- ⏳ #3: 実 macOS (3.0.2) 手動 smoke (要 creds、人間実行)。MIC 実装済みで成功率向上
+- ⏳ D 残: SMBSession の **切断検出→自動再接続** (cancellation は実装済)
 - 🧊 E (defer 維持): 3.1.1 GMAC/GCM 経路 + Samba 3.1.1 parser truncated バグ（macOS 上限 3.0.2 のため低優先）
 - 🧊 obaket 組み込み (SMBClient ラッパーで ObjectStorageProtocol 化) は obaket 側 issue 356/359
 

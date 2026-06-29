@@ -22,7 +22,8 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 ## ドキュメント
 
 - [docs/smb-protocol.md](docs/smb-protocol.md) — 実装する SMB wire 仕様と一次ソース（MS-SMB2 / MS-NLMP / NIST 等）
-- [docs/testing.md](docs/testing.md) — テスト戦略（unit vector / Apple container 上の Samba で E2E / 実 macOS smoke）
+- [docs/architecture.md](docs/architecture.md) — 内部構成と transport 抽象（macOS=NWConnection / Linux=POSIX|NIO）
+- [docs/testing.md](docs/testing.md) — テスト戦略（unit vector / コンテナ Samba で E2E: ローカル=Apple container・CI=Docker / 実 macOS smoke）
 
 ## 開発状況
 

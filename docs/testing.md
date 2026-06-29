@@ -24,10 +24,9 @@ SMB サーバ（Samba）をコンテナで起動し、SMBee/`smbcli` でゴー�
 test code は共通（Samba を起動 → golden path）で、**起動手段だけ差し替える**。
 
 > ⚠️ **CI(Docker/Linux) の前提**: Docker は Linux で動かす（macOS hosted runner では Docker 不可）。
-> よって **SMBee が Linux でビルド/実行できる**必要がある。transport を `Network.framework`
-> (Apple 専用) 固定にすると Linux CI で動かせない → **POSIX socket / SwiftNIO で cross-platform に
-> 保つ**か、transport を抽象化して macOS=NWConnection / Linux=NIO を差し替える。これは E2E を CI で
-> 回すための設計制約。
+> よって **SMBee が Linux でビルド/実行できる**必要がある。→ **決定: transport を抽象化**し
+> macOS=NWConnection / Linux=POSIX|NIO を差し替える（[architecture.md](architecture.md)）。
+> `Network.framework` 依存は `NWConnectionTransport` 内に `#if canImport(Network)` で閉じ込める。
 
 ゴールデンパス（probe → 認証 → 操作）:
 

@@ -29,6 +29,39 @@ enum SMBTransferLimits {
     }
 }
 
+enum SMBChunkedTransfer {
+    static func nextWriteRange(cursor: Int, dataCount: Int, chunkSize: Int) throws -> Range<Int>? {
+        guard cursor >= 0, cursor <= dataCount else {
+            throw SMBCodecError.invalidValue("write cursor is outside data bounds")
+        }
+        guard chunkSize > 0 else {
+            throw SMBCodecError.invalidValue("write chunk size must be positive")
+        }
+        guard cursor < dataCount else { return nil }
+        let sum = cursor.addingReportingOverflow(chunkSize)
+        let end = sum.overflow ? dataCount : min(sum.partialValue, dataCount)
+        guard end > cursor, end <= dataCount else {
+            throw SMBCodecError.invalidValue("invalid write chunk range")
+        }
+        return cursor..<end
+    }
+
+    static func advancedReadPosition(cursor: UInt64, remaining: UInt64, receivedCount: Int) throws -> (cursor: UInt64, remaining: UInt64) {
+        guard receivedCount >= 0 else {
+            throw SMBCodecError.invalidValue("read byte count must be non-negative")
+        }
+        let received = UInt64(receivedCount)
+        guard received <= remaining else {
+            throw SMBCodecError.invalidValue("SMB read returned more data than requested")
+        }
+        let nextCursor = cursor.addingReportingOverflow(received)
+        guard !nextCursor.overflow else {
+            throw SMBCodecError.invalidValue("SMB read offset overflow")
+        }
+        return (nextCursor.partialValue, remaining - received)
+    }
+}
+
 public enum SMBClient {
     private static let localWriteChunkLimit = 64 * 1024
 
@@ -405,8 +438,13 @@ final class SMBSession {
             let data = try SMB2Read.decodeResponse(response)
             if data.isEmpty { break }
             result += data
-            cursor += UInt64(data.count)
-            remaining -= UInt64(data.count)
+            let advanced = try SMBChunkedTransfer.advancedReadPosition(
+                cursor: cursor,
+                remaining: remaining,
+                receivedCount: data.count
+            )
+            cursor = advanced.cursor
+            remaining = advanced.remaining
         }
         return result
     }
@@ -414,9 +452,8 @@ final class SMBSession {
     func write(treeId: UInt32, fileId: [UInt8], data: [UInt8]) async throws {
         let chunkSize = negotiatedWriteChunkSize()
         var cursor = 0
-        while cursor < data.count {
-            let end = min(cursor + chunkSize, data.count)
-            let chunk = Array(data[cursor..<end])
+        while let range = try SMBChunkedTransfer.nextWriteRange(cursor: cursor, dataCount: data.count, chunkSize: chunkSize) {
+            let chunk = Array(data[range])
             let packet = try SMB2Write.encodeRequest(
                 messageId: nextMessageId(),
                 sessionId: sessionId,
@@ -433,7 +470,7 @@ final class SMBSession {
             guard count == chunk.count else {
                 throw SMBCodecError.invalidValue("short SMB write: expected \(chunk.count) bytes, got \(count)")
             }
-            cursor += Int(count)
+            cursor = range.upperBound
         }
     }
 
@@ -459,7 +496,11 @@ final class SMBSession {
             guard count == chunk.count else {
                 throw SMBCodecError.invalidValue("short SMB write: expected \(chunk.count) bytes, got \(count)")
             }
-            offset += UInt64(count)
+            let nextOffset = offset.addingReportingOverflow(UInt64(count))
+            guard !nextOffset.overflow else {
+                throw SMBCodecError.invalidValue("SMB write offset overflow")
+            }
+            offset = nextOffset.partialValue
         }
     }
 
@@ -657,7 +698,7 @@ final class SMBSession {
 
     private func debugDump(_ label: String, _ bytes: [UInt8]) {
         guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
-        FileHandle.standardError.write(Data("\(label) (\(bytes.count) bytes): \(SMBDebug.hex(bytes))\n".utf8))
+        FileHandle.standardError.write(Data("\(label) (\(bytes.count) bytes): \(SMBDebug.hexSummary(bytes))\n".utf8))
     }
 
     private func debugLine(_ message: String) {

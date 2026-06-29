@@ -498,6 +498,20 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testQueryDirectoryResponseRejectsInvalidNextEntryOffset() throws {
+        var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: 11).encode()
+        let payload = makeDirectoryEntry(name: "child", isDirectory: true, nextOffset: 1)
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 66)
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+
+        XCTAssertThrowsError(try SMB2QueryDirectory.decodeResponse(response)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .truncated)
+        }
+    }
+
     func testQueryInfoRequestUsesFileNetworkOpenInformationAndOneByteBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let request = try SMB2QueryInfo.encodeRequest(
@@ -606,6 +620,84 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(5, to: &response, at: 68)
 
         XCTAssertEqual(try SMB2Write.decodeResponseCount(response), 5)
+    }
+
+    func testHexSummaryCapsLargeDebugPayloads() {
+        let bytes = (0..<80).map(UInt8.init)
+
+        XCTAssertEqual(
+            SMBDebug.hexSummary(bytes),
+            "000102030405060708090a0b0c0d0e0f" +
+                "101112131415161718191a1b1c1d1e1f" +
+                "202122232425262728292a2b2c2d2e2f" +
+                "303132333435363738393a3b3c3d3e3f" +
+                "... totalBytes=80"
+        )
+    }
+
+    func testWriteChunkRangesCoverBoundarySizes() throws {
+        let chunkSize = 4
+        let cases: [(Int, [Range<Int>])] = [
+            (0, []),
+            (chunkSize - 1, [0..<3]),
+            (chunkSize, [0..<4]),
+            (chunkSize + 1, [0..<4, 4..<5]),
+            (chunkSize * 2 + 1, [0..<4, 4..<8, 8..<9]),
+        ]
+
+        for (dataCount, expectedRanges) in cases {
+            var cursor = 0
+            var ranges: [Range<Int>] = []
+            while let range = try SMBChunkedTransfer.nextWriteRange(
+                cursor: cursor,
+                dataCount: dataCount,
+                chunkSize: chunkSize
+            ) {
+                ranges.append(range)
+                cursor = range.upperBound
+            }
+
+            XCTAssertEqual(ranges.map { "\($0.lowerBound)..<\($0.upperBound)" }, expectedRanges.map { "\($0.lowerBound)..<\($0.upperBound)" })
+            XCTAssertEqual(cursor, dataCount)
+        }
+    }
+
+    func testReadResponseAllowsZeroLengthData() throws {
+        var response = try SMB2Header(command: SMB2Commands.read, messageId: 14).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
+        writeUInt16LE(17, to: &response, at: 64)
+        response[66] = 80
+        writeUInt32LE(0, to: &response, at: 68)
+
+        XCTAssertEqual(try SMB2Read.decodeResponse(response), [])
+    }
+
+    func testReadResponseRejectsDataPastPacketEnd() throws {
+        var response = try SMB2Header(command: SMB2Commands.read, messageId: 14).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
+        writeUInt16LE(17, to: &response, at: 64)
+        response[66] = 80
+        writeUInt32LE(1, to: &response, at: 68)
+
+        XCTAssertThrowsError(try SMB2Read.decodeResponse(response)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .truncated)
+        }
+    }
+
+    func testReadPositionRejectsOverReadAndOffsetOverflow() throws {
+        let advanced = try SMBChunkedTransfer.advancedReadPosition(cursor: 10, remaining: 5, receivedCount: 5)
+        XCTAssertEqual(advanced.cursor, 15)
+        XCTAssertEqual(advanced.remaining, 0)
+
+        XCTAssertThrowsError(try SMBChunkedTransfer.advancedReadPosition(cursor: 10, remaining: 5, receivedCount: 6)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .invalidValue("SMB read returned more data than requested"))
+        }
+
+        XCTAssertThrowsError(
+            try SMBChunkedTransfer.advancedReadPosition(cursor: UInt64.max, remaining: 1, receivedCount: 1)
+        ) { error in
+            XCTAssertEqual(error as? SMBCodecError, .invalidValue("SMB read offset overflow"))
+        }
     }
 
     func testFlushRequestUsesFileIdAndReservedFields() throws {

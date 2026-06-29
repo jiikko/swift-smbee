@@ -404,6 +404,7 @@ enum SMB2QueryDirectory {
                 entries.append(SMBDirectoryEntry(name: name, fileSize: endOfFile, isDirectory: (attributes & 0x10) != 0))
             }
             if next == 0 { break }
+            guard next >= 104, entryOffset + next <= data.count else { throw SMBCodecError.truncated }
             entryOffset += next
         }
         return entries

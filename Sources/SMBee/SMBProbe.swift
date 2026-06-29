@@ -44,6 +44,14 @@ public enum SMBProbe {
 }
 
 public enum SMBURLParser {
+    public struct ReadURL: Equatable, Sendable {
+        public var username: String?
+        public var host: String
+        public var port: UInt16
+        public var share: String
+        public var path: String
+    }
+
     public static func parseProbeURL(_ value: String) throws -> (host: String, port: UInt16) {
         guard let components = URLComponents(string: value), components.scheme == "smb", let host = components.host else {
             throw SMBCodecError.invalidValue("expected smb://host[:port]")
@@ -53,5 +61,21 @@ public enum SMBURLParser {
             throw SMBCodecError.invalidValue("invalid port")
         }
         return (host, UInt16(port))
+    }
+
+    public static func parseReadURL(_ value: String) throws -> ReadURL {
+        guard let components = URLComponents(string: value), components.scheme == "smb", let host = components.host else {
+            throw SMBCodecError.invalidValue("expected smb://[user@]host[:port]/share[/path]")
+        }
+        let port = components.port ?? 445
+        guard (1...65535).contains(port) else {
+            throw SMBCodecError.invalidValue("invalid port")
+        }
+        let parts = components.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard let share = parts.first else {
+            throw SMBCodecError.invalidValue("SMB URL must include a share")
+        }
+        let path = parts.dropFirst().joined(separator: "\\")
+        return ReadURL(username: components.user, host: host, port: UInt16(port), share: share, path: path)
     }
 }

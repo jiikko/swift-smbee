@@ -14,6 +14,14 @@ public enum SMBCrypto {
         return Array(authenticationCode)
     }
 
+    public static func hmacMD5(key: [UInt8], message: [UInt8]) -> [UInt8] {
+        let authenticationCode = HMAC<Insecure.MD5>.authenticationCode(
+            for: message,
+            using: SymmetricKey(data: key)
+        )
+        return Array(authenticationCode)
+    }
+
     public static func aesGCMSeal(
         key: [UInt8],
         nonce: [UInt8],
@@ -32,5 +40,41 @@ public enum SMBCrypto {
     public static func aesGMAC(key: [UInt8], nonce: [UInt8], authenticatedData: [UInt8]) throws -> [UInt8] {
         // MS-SMB2 AES-GMAC signing is GCM authentication with zero-length plaintext and the SMB packet as AAD.
         try aesGCMSeal(key: key, nonce: nonce, plaintext: [], authenticatedData: authenticatedData).tag
+    }
+
+    public static func smb3SigningKey(sessionKey: [UInt8]) -> [UInt8] {
+        // MS-SMB2 3.1.4.2 derives the SMB 3.0.x signing key with SP800-108 CTR HMAC-SHA256.
+        sp800108CounterModeHMACSHA256(
+            key: sessionKey,
+            label: Array("SMB2AESCMAC".utf8) + [0],
+            context: Array("SmbSign".utf8) + [0],
+            length: 16
+        )
+    }
+
+    static func sp800108CounterModeHMACSHA256(key: [UInt8], label: [UInt8], context: [UInt8], length: Int) -> [UInt8] {
+        var output: [UInt8] = []
+        var counter: UInt32 = 1
+        while output.count < length {
+            var input: [UInt8] = [
+                UInt8((counter >> 24) & 0xff),
+                UInt8((counter >> 16) & 0xff),
+                UInt8((counter >> 8) & 0xff),
+                UInt8(counter & 0xff)
+            ]
+            input += label
+            input += [0]
+            input += context
+            let bits = UInt32(length * 8)
+            input += [
+                UInt8((bits >> 24) & 0xff),
+                UInt8((bits >> 16) & 0xff),
+                UInt8((bits >> 8) & 0xff),
+                UInt8(bits & 0xff)
+            ]
+            output += hmacSHA256(key: key, message: input)
+            counter += 1
+        }
+        return Array(output.prefix(length))
     }
 }

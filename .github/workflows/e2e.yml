@@ -37,6 +37,7 @@ jobs:
               mkdir -p /srv/smbee/public
               useradd -M -s /usr/sbin/nologin smbee
               printf "smbee\nsmbee\n" | smbpasswd -a -s smbee
+              printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
               chown -R smbee:smbee /srv/smbee
               testparm -s
               exec smbd --foreground --no-process-group --debug-stdout --debuglevel=3

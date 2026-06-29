@@ -70,6 +70,43 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(hex(gmac), "58e2fccefa7e3061367f1d57a4e7455a")
     }
 
+    func testAESCMACRFC4493Vectors() throws {
+        let key = hexBytes("2b7e151628aed2a6abf7158809cf4f3c")
+        let message = hexBytes(
+            "6bc1bee22e409f96e93d7e117393172a" +
+            "ae2d8a571e03ac9c9eb76fac45af8e51" +
+            "30c81c46a35ce411"
+        )
+        XCTAssertEqual(hex(try AES128.encryptBlock(key: key, block: hexBytes("6bc1bee22e409f96e93d7e117393172a"))), "3ad77bb40d7a3660a89ecaf32466ef97")
+        XCTAssertEqual(hex(try AESCMAC.authenticationCode(key: key, message: [])), "bb1d6929e95937287fa37d129b756746")
+        XCTAssertEqual(hex(try AESCMAC.authenticationCode(key: key, message: Array(message[0..<16]))), "070a16b46b4d4144f79bdd9dd04a287c")
+        XCTAssertEqual(hex(try AESCMAC.authenticationCode(key: key, message: message)), "dfa66747de9ae63030ca32611497c827")
+        XCTAssertEqual(
+            hex(try AESCMAC.authenticationCode(key: key, message: hexBytes(
+                "6bc1bee22e409f96e93d7e117393172a" +
+                "ae2d8a571e03ac9c9eb76fac45af8e51" +
+                "30c81c46a35ce411e5fbc1191a0a52ef" +
+                "f69f2445df4f9b17ad2b417be66c3710"
+            ))),
+            "51f0bebf7e3b9d92fc49741779363cfe"
+        )
+    }
+
+    func testNTLMv2KnownVectors() {
+        let ntowfv2 = NTLM.ntowfv2(password: "SecREt01", username: "User", domain: "Domain")
+        XCTAssertEqual(hex(ntowfv2), "54993fb8ba7bc2d6eacaef6bdc226c49")
+        let serverChallenge = hexBytes("0123456789abcdef")
+        let blob = hexBytes(
+            "01010000000000000090d336b734c301ffffff001122334400000000" +
+            "02000c0044004f004d00410049004e00" +
+            "01000c00530045005200560045005200" +
+            "0400140064006f006d00610069006e002e0063006f006d00" +
+            "030022007300650072007600650072002e0064006f006d00610069006e002e0063006f006d00" +
+            "0000000000000000"
+        )
+        XCTAssertEqual(hex(NTLM.ntProofStr(ntowfv2: ntowfv2, serverChallenge: serverChallenge, blob: blob)), "2a8e1bc8a06222ed5301c3fbd2154d0b")
+    }
+
     func testNegotiateRequestRoundTripShape() throws {
         let request = try SMBNegotiateCodec.encodeRequest(
             clientGuid: UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!,
@@ -246,6 +283,14 @@ final class SMBeeTests: XCTestCase {
 
     private func hex(_ bytes: [UInt8]) -> String {
         bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func hexBytes(_ value: String) -> [UInt8] {
+        stride(from: 0, to: value.count, by: 2).map {
+            let start = value.index(value.startIndex, offsetBy: $0)
+            let end = value.index(start, offsetBy: 2)
+            return UInt8(value[start..<end], radix: 16)!
+        }
     }
 
     private func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {

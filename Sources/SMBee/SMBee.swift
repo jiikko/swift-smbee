@@ -8,4 +8,14 @@ import Foundation
 public enum SMBee {
     /// ライブラリのバージョン (暫定)。
     public static let version = "0.0.1"
+
+    public static func list(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String = ""
+    ) async throws -> [SMBDirectoryEntry] {
+        try await SMBClient.list(host: host, port: port, share: share, path: path, credential: credential)
+    }
 }

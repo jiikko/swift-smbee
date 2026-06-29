@@ -1,0 +1,84 @@
+name: E2E
+
+# E2E: Docker で SMB サーバ (Samba) を起動し、SMBee のゴールデンパスを通す。
+#
+# ⚠️ 足場 (scaffold)。E2E test target と Samba 設定が揃うまで **workflow_dispatch (手動)**
+#    のみで起動する。揃ったら push / pull_request トリガを有効化する。
+#
+# 設計上の前提 (要遵守):
+#  - Docker(Samba) は Linux で動かす → **SMBee は Linux でビルド/実行できる必要がある**。
+#    transport を `Network.framework` (Apple 専用) 固定にすると Linux CI で動かせない。
+#    POSIX socket / SwiftNIO 等で cross-platform に保つか、transport を抽象化して
+#    macOS=NWConnection / Linux=NIO を差し替えられるようにする。
+#  - ローカル E2E は Apple container (macOS 26 の `container`)、CI は本 workflow (Docker)。
+#    どちらも「Samba を起動 → golden path」で test code は共通、起動手段だけ差し替える。
+#  - **Samba の signing/cipher**: SMBee MVP は GMAC+GCM のみ。Samba が CMAC に倒れると
+#    繋がらないため、3.1.1 + AES-128-GMAC + AES-128-GCM を出す設定にする (smb.conf / image ⓥ)。
+
+on:
+  workflow_dispatch:
+  # TODO: E2E が green になったら有効化する
+  # push:
+  #   branches: [master]
+  # pull_request:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    # Docker が使える Linux runner (public repo なので無料)。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"   # ⓥ macos-26 ローカルは 6.3。Linux toolchain と差異が出たら調整
+      - run: swift --version
+
+      # TODO(ⓥ): SMB 3.1.1 + AES-128-GMAC + AES-128-GCM を出す Samba を起動する。
+      #   image / 設定は要選定 (例: ghcr.io/servercontainers/samba)。share + user を用意し、
+      #   smb.conf で `server min protocol = SMB3_11` / signing/encryption を強制する。
+      - name: Start Samba (SMB 3.1.1)
+        run: |
+          set -euxo pipefail
+          # 例 (要確定):
+          # docker run -d --name smbee-samba -p 445:445 \
+          #   -e ... (share=public / user=smbee / pass=...) \
+          #   <samba-image>
+          echo "TODO: start Samba container exposing :445 with SMB 3.1.1 + GMAC/GCM"
+          exit 1   # 足場のため未実装。実装したらこの行を消す
+
+      - name: Wait for SMB (:445)
+        run: |
+          set -euxo pipefail
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/445) 2>/dev/null; then echo "445 open"; exit 0; fi
+            sleep 1
+          done
+          echo "Samba did not become ready"; exit 1
+
+      - name: E2E tests
+        env:
+          SMBEE_E2E: "1"
+          SMBEE_E2E_HOST: "127.0.0.1"
+          SMBEE_E2E_PORT: "445"
+          SMBEE_E2E_SHARE: "public"      # ⓥ Samba 設定に合わせる
+          SMBEE_E2E_USER: "smbee"        # ⓥ
+          SMBEE_E2E_PASSWORD: "smbee"    # ⓥ 公開リポなので機密でない値のみ。実機密は使わない
+        run: |
+          set -euxo pipefail
+          # TODO: E2E test target を実装したら filter で回す
+          # swift test --filter E2E
+          echo "TODO: run E2E golden path against Samba (probe/ls/stat/cat/put/mkdir/rename/rm)"
+
+      - name: Samba logs (debug)
+        if: always()
+        run: docker logs smbee-samba || true
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f smbee-samba || true

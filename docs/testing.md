@@ -13,11 +13,21 @@ SMBee のテストは 3 tier。**ⓥ = 実装/運用前に要確認**。
   TRANSFORM_HEADER round-trip / signed packet 検証 /
   **packet-level fixture**（pcap or 既存実装由来。primitive が通っても framing が正しいとは限らない）
 
-## Tier 2: E2E（Apple container 上の SMB サーバ）— 本 repo のテスト範囲の主役
+## Tier 2: E2E（コンテナ上の SMB サーバ）— 本 repo のテスト範囲の主役
 
-**Apple container（macOS 26 の `container` CLI / Containerization framework, Apple silicon）で
-SMB サーバ（Samba）を起動し、SMBee/`smbcli` でゴールデンパスを通す。**「手動で macOS ファイル
-共有を立てる」依存を排し、E2E を再現可能にする。
+SMB サーバ（Samba）をコンテナで起動し、SMBee/`smbcli` でゴールデンパスを通す。
+**「手動で macOS ファイル共有を立てる」依存を排し、E2E を再現可能にする。**
+
+- **ローカル**: Apple container（macOS 26 の `container` CLI / Containerization framework, Apple silicon）
+- **CI**: Docker（**Linux runner**。GHA: `.github/workflows/e2e.yml`、public repo で無料）
+
+test code は共通（Samba を起動 → golden path）で、**起動手段だけ差し替える**。
+
+> ⚠️ **CI(Docker/Linux) の前提**: Docker は Linux で動かす（macOS hosted runner では Docker 不可）。
+> よって **SMBee が Linux でビルド/実行できる**必要がある。transport を `Network.framework`
+> (Apple 専用) 固定にすると Linux CI で動かせない → **POSIX socket / SwiftNIO で cross-platform に
+> 保つ**か、transport を抽象化して macOS=NWConnection / Linux=NIO を差し替える。これは E2E を CI で
+> 回すための設計制約。
 
 ゴールデンパス（probe → 認証 → 操作）:
 
@@ -49,12 +59,14 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   確認。**どれを採るかは probe の実測（Samba と macOS 双方）後に決める**。
 - したがって E2E（Samba）green ≠ macOS SMBX 動作保証。**macOS SMBX への手動 smoke（Tier 3）を併用**する。
 
-### CI 実行可否 ⓥ
+### CI 実行 — Docker / Linux runner
 
-- Apple container は **macOS 26 + Apple silicon + virtualization** が前提。GitHub hosted の
-  `macos-26` runner で `container`（ネスト仮想化）が動くかは**要検証**。動かなければ E2E は
-  **self-hosted runner / ローカル限定**とし、CI（hosted）は Tier 1 のみ必須にする。
-- E2E テストは env gate（例: `SMBEE_E2E=1` かつ `container` 利用可能時のみ）。未満足なら skip。
+- CI は **`ubuntu-latest` + Docker で Samba を起動**して E2E（`.github/workflows/e2e.yml`）。
+  ローカルは Apple container、CI は Docker、と起動手段を分ける。
+- **前提（再掲）**: Linux で動かす以上、SMBee が Linux ビルド可能であること（上の transport 制約）。
+- E2E テストは env gate（`SMBEE_E2E=1` + 接続情報 env）。未満足ならローカルの通常 `swift test` では skip。
+- 足場段階では e2e.yml は **workflow_dispatch（手動）** のみ。E2E test + Samba 設定が揃ったら
+  push / pull_request トリガを有効化する。
 
 ## Tier 3: 手動 smoke（実 macOS SMBX）— リリース前
 
@@ -67,5 +79,5 @@ MVP の真の対象である **macOS のファイル共有（SMBX）**に対し 
 | Tier | 対象 | CI | 役割 |
 |------|------|----|----|
 | 1 unit | なし（vector/fixture） | ✅ 必須 | ロジック・framing の正しさ |
-| 2 E2E | Apple container 上の Samba | ⓥ（hosted で可なら必須、不可なら self-hosted/local） | 再現可能なゴールデンパス回帰 |
+| 2 E2E | Samba コンテナ（ローカル=Apple container / CI=Docker on Linux） | ✅（e2e.yml。足場は手動、整い次第 push/PR） | 再現可能なゴールデンパス回帰 |
 | 3 smoke | 実 macOS SMBX | 手動 | MVP 本番サーバの最終確認 |

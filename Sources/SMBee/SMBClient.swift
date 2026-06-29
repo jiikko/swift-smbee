@@ -6,6 +6,22 @@ public struct SMBDirectoryEntry: Equatable, Sendable {
     public var isDirectory: Bool
 }
 
+public struct SMBFileStat: Equatable, Sendable {
+    public var size: UInt64
+    public var modifiedTime: Date?
+    public var isDirectory: Bool
+}
+
+public struct SMBReadRange: Equatable, Sendable {
+    public var offset: UInt64
+    public var length: UInt64
+
+    public init(offset: UInt64, length: UInt64) {
+        self.offset = offset
+        self.length = length
+    }
+}
+
 public enum SMBClient {
     public static func list(
         host: String,
@@ -23,6 +39,63 @@ public enum SMBClient {
         let entries = try await session.queryDirectory(treeId: treeId, fileId: fileId)
         try? await session.close(treeId: treeId, fileId: fileId)
         return entries
+    }
+
+    public static func stat(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        credential: SMBCredential,
+        transport: SMBTransport = POSIXSocketTransport()
+    ) async throws -> SMBFileStat {
+        let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
+        try await session.connect()
+        defer { transport.close() }
+        let treeId = try await session.treeConnect(share: share)
+        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+        do {
+            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return stat
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public static func read(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        range: SMBReadRange? = nil,
+        credential: SMBCredential,
+        transport: SMBTransport = POSIXSocketTransport()
+    ) async throws -> [UInt8] {
+        let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
+        try await session.connect()
+        defer { transport.close() }
+        let treeId = try await session.treeConnect(share: share)
+        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+        do {
+            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+            let start = range?.offset ?? 0
+            guard start <= stat.size else {
+                throw SMBCodecError.invalidValue("read range starts past end of file")
+            }
+            let available = stat.size - start
+            let requested = range.map { min($0.length, available) } ?? available
+            let data = try await session.read(treeId: treeId, fileId: fileId, offset: start, length: requested)
+            guard UInt64(data.count) == requested else {
+                throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
+            }
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return data
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
     }
 }
 
@@ -146,6 +219,59 @@ final class SMBSession {
         return try SMB2QueryDirectory.decodeResponse(response)
     }
 
+    func queryInfo(treeId: UInt32, fileId: [UInt8]) async throws -> SMBFileStat {
+        let packet = try SMB2QueryInfo.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId
+        )
+        debugDump("QUERY_INFO request", packet)
+        try await sendSigned(packet)
+        let response = try await receive(label: "QUERY_INFO response")
+        try verifySigned(response)
+        let header = try SMB2Header.decode(response)
+        guard header.status == SMB2Status.success else {
+            throw SMBCodecError.invalidValue(String(format: "QUERY_INFO failed with NTSTATUS 0x%08x", header.status))
+        }
+        return try SMB2QueryInfo.decodeNetworkOpenInformation(response)
+    }
+
+    func read(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
+        let chunkSize = UInt64(64 * 1024)
+        var cursor = offset
+        var remaining = length
+        var result: [UInt8] = []
+        while remaining > 0 {
+            let requestLength = UInt32(min(chunkSize, remaining))
+            let packet = try SMB2Read.encodeRequest(
+                messageId: nextMessageId(),
+                sessionId: sessionId,
+                treeId: treeId,
+                fileId: fileId,
+                offset: cursor,
+                length: requestLength
+            )
+            debugDump("READ request", packet)
+            try await sendSigned(packet)
+            let response = try await receive(label: "READ response")
+            try verifySigned(response)
+            let header = try SMB2Header.decode(response)
+            if header.status == SMB2Status.endOfFile {
+                break
+            }
+            guard header.status == SMB2Status.success else {
+                throw SMBCodecError.invalidValue(String(format: "READ failed with NTSTATUS 0x%08x", header.status))
+            }
+            let data = try SMB2Read.decodeResponse(response)
+            if data.isEmpty { break }
+            result += data
+            cursor += UInt64(data.count)
+            remaining -= UInt64(data.count)
+        }
+        return result
+    }
+
     func close(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Close.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("CLOSE request", packet)
@@ -218,6 +344,7 @@ enum SMB2Status {
     static let success: UInt32 = 0x0000_0000
     static let noMoreFiles: UInt32 = 0x8000_0006
     static let moreProcessingRequired: UInt32 = 0xc000_0016
+    static let endOfFile: UInt32 = 0xc000_0011
 }
 
 enum SMB2Flags {

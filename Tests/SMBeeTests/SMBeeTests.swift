@@ -284,6 +284,19 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[120..<request.count]), expectedName)
     }
 
+    func testCreateFileRequestUsesReadDataAndReadAttributesAccess() throws {
+        let request = try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            path: "known.txt",
+            directory: false
+        )
+
+        XCTAssertEqual(readUInt32LE(request, at: 88), 0x0000_0081)
+        XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_0040)
+    }
+
     func testCreateResponseDecodesFileIdAtResponseStructureOffset64() throws {
         var response = try SMB2Header(
             command: SMB2Commands.create,
@@ -325,6 +338,77 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(request, at: 90), 2)
         XCTAssertEqual(readUInt32LE(request, at: 92), 65_536)
         XCTAssertEqual(Array(request[96..<98]), [0x2a, 0x00])
+    }
+
+    func testQueryInfoRequestUsesFileNetworkOpenInformationAndOneByteBuffer() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2QueryInfo.encodeRequest(
+            messageId: 12,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.queryInfo)
+        XCTAssertEqual(header.messageId, 12)
+        XCTAssertEqual(header.treeId, 0x5566_7788)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(request.count, 105)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 41)
+        XCTAssertEqual(request[66], 0x01)
+        XCTAssertEqual(request[67], 34)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 65_536)
+        XCTAssertEqual(readUInt16LE(request, at: 72), 104)
+        XCTAssertEqual(readUInt16LE(request, at: 74), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 76), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 80), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 84), 0)
+        XCTAssertEqual(Array(request[88..<104]), fileId)
+        XCTAssertEqual(request[104], 0)
+    }
+
+    func testReadRequestUsesOffsetLengthFileIdAndOneByteBuffer() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2Read.encodeRequest(
+            messageId: 13,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            offset: 0x0102_0304_0506_0708,
+            length: 4096
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.read)
+        XCTAssertEqual(header.messageId, 13)
+        XCTAssertEqual(header.treeId, 0x5566_7788)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(request.count, 113)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 49)
+        XCTAssertEqual(request[66], 0x50)
+        XCTAssertEqual(request[67], 0)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 4096)
+        XCTAssertEqual(readUInt64LE(request, at: 72), 0x0102_0304_0506_0708)
+        XCTAssertEqual(Array(request[80..<96]), fileId)
+        XCTAssertEqual(readUInt32LE(request, at: 96), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 100), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 104), 0)
+        XCTAssertEqual(readUInt16LE(request, at: 108), 0)
+        XCTAssertEqual(readUInt16LE(request, at: 110), 0)
+        XCTAssertEqual(request[112], 0)
+    }
+
+    func testReadResponseDecodesDataOffsetAndLength() throws {
+        var response = try SMB2Header(command: SMB2Commands.read, messageId: 14).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
+        let payload = Array("hello".utf8)
+        writeUInt16LE(17, to: &response, at: 64)
+        response[66] = 80
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+
+        XCTAssertEqual(try SMB2Read.decodeResponse(response), payload)
     }
 
     func testNegotiateRequestRoundTripShape() throws {

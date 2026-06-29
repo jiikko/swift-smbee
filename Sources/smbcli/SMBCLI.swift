@@ -53,14 +53,7 @@ struct List: AsyncParsableCommand {
     var domain: String = ""
 
     func run() async throws {
-        let endpoint = try SMBURLParser.parseReadURL(url)
-        guard let username = endpoint.username, !username.isEmpty else {
-            throw ValidationError("SMB URL must include a username")
-        }
-        guard let password = ProcessInfo.processInfo.environment["SMB_PASSWORD"] else {
-            throw ValidationError("Set SMB_PASSWORD in the environment")
-        }
-        let credential = SMBCredential(username: username, password: password, domain: domain)
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, domain: domain)
         let entries = try await SMBee.list(
             host: endpoint.host,
             port: endpoint.port,
@@ -81,9 +74,23 @@ struct Stat: AsyncParsableCommand {
     @Argument(help: "smb://user@host[:445]/share/path")
     var url: String
 
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
     func run() async throws {
-        _ = url
-        throw ValidationError("stat is not implemented yet")
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, domain: domain)
+        let stat = try await SMBee.stat(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path
+        )
+        print("size: \(stat.size)")
+        print("type: \(stat.isDirectory ? "directory" : "file")")
+        if let modifiedTime = stat.modifiedTime {
+            print("mtime: \(formatDate(modifiedTime))")
+        }
     }
 }
 
@@ -96,9 +103,47 @@ struct Cat: AsyncParsableCommand {
     @Option(help: "Byte range a-b")
     var range: String?
 
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
     func run() async throws {
-        _ = url
-        _ = range
-        throw ValidationError("cat is not implemented yet")
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, domain: domain)
+        let data = try await SMBee.read(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            range: try range.map(parseRange)
+        )
+        FileHandle.standardOutput.write(Data(data))
     }
+}
+
+private func makeReadEndpointAndCredential(url: String, domain: String) throws -> (SMBURLParser.ReadURL, SMBCredential) {
+    let endpoint = try SMBURLParser.parseReadURL(url)
+    guard let username = endpoint.username, !username.isEmpty else {
+        throw ValidationError("SMB URL must include a username")
+    }
+    guard let password = ProcessInfo.processInfo.environment["SMB_PASSWORD"] else {
+        throw ValidationError("Set SMB_PASSWORD in the environment")
+    }
+    return (endpoint, SMBCredential(username: username, password: password, domain: domain))
+}
+
+private func parseRange(_ value: String) throws -> SMBReadRange {
+    let parts = value.split(separator: "-", omittingEmptySubsequences: false)
+    guard parts.count == 2,
+          let start = UInt64(parts[0]),
+          let end = UInt64(parts[1]),
+          end >= start else {
+        throw ValidationError("Range must be in a-b form with b >= a")
+    }
+    return SMBReadRange(offset: start, length: end - start + 1)
+}
+
+private func formatDate(_ date: Date) -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: date)
 }

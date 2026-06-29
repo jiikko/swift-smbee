@@ -46,5 +46,25 @@ final class SMBeeE2ETests: XCTestCase {
             share: share
         )
         XCTAssertTrue(entries.contains { $0.name == "known.txt" && !$0.isDirectory })
+
+        let credential = SMBCredential(username: username, password: password)
+        let stat = try await SMBee.stat(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: "known.txt"
+        )
+        XCTAssertEqual(stat.size, 21)
+        XCTAssertFalse(stat.isDirectory)
+
+        let data = try await SMBee.read(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: "known.txt"
+        )
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), "hello from SMBee E2E\n")
     }
 }

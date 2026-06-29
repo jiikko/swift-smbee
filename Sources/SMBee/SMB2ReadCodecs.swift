@@ -5,6 +5,8 @@ enum SMB2Commands {
     static let treeConnect: UInt16 = 3
     static let create: UInt16 = 5
     static let close: UInt16 = 6
+    static let read: UInt16 = 8
+    static let queryInfo: UInt16 = 16
     static let queryDirectory: UInt16 = 14
 }
 
@@ -76,7 +78,7 @@ enum SMB2Create {
         writer.writeUInt32LE(0x0000_0002)
         writer.writeUInt64LE(0)
         writer.writeUInt64LE(0)
-        writer.writeUInt32LE(directory ? 0x0000_0089 : 0x0012_0089)
+        writer.writeUInt32LE(directory ? 0x0000_0089 : 0x0000_0081)
         writer.writeUInt32LE(0)
         writer.writeUInt32LE(0x0000_0007)
         writer.writeUInt32LE(0x0000_0001)
@@ -101,6 +103,93 @@ enum SMB2Create {
         let offset = responseFileIdOffset
         guard bytes.count >= offset + 16 else { throw SMBCodecError.truncated }
         return Array(bytes[offset..<offset + 16])
+    }
+}
+
+enum SMB2QueryInfo {
+    private static let fixedPartSize = 40
+    private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
+
+    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8]) throws -> [UInt8] {
+        guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        let header = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(41)
+        writer.writeUInt8(0x01)
+        writer.writeUInt8(34)
+        writer.writeUInt32LE(65_536)
+        writer.writeUInt16LE(UInt16(bufferOffset))
+        writer.writeUInt16LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeBytes(fileId)
+        // MS-SMB2 QUERY_INFO has a variable Buffer[] field; Samba accepts a one byte pad when InputBufferLength is 0.
+        writer.writeUInt8(0)
+        return writer.bytes
+    }
+
+    static func decodeNetworkOpenInformation(_ bytes: [UInt8]) throws -> SMBFileStat {
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 9 else {
+            throw SMBCodecError.invalidValue("invalid QUERY_INFO response structure size")
+        }
+        let offset = Int(try reader.readUInt16LE())
+        let length = Int(try reader.readUInt32LE())
+        guard offset + length <= bytes.count else { throw SMBCodecError.truncated }
+        let data = Array(bytes[offset..<offset + length])
+        guard data.count >= 56 else { throw SMBCodecError.truncated }
+        let lastWriteTime = readUInt64LE(data, at: 24)
+        let endOfFile = readUInt64LE(data, at: 40)
+        let attributes = readUInt32LE(data, at: 52)
+        return SMBFileStat(size: endOfFile, modifiedTime: filetimeToDate(lastWriteTime), isDirectory: (attributes & 0x10) != 0)
+    }
+}
+
+enum SMB2Read {
+    private static let fixedPartSize = 48
+    private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
+
+    static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset: UInt64,
+        length: UInt32
+    ) throws -> [UInt8] {
+        guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        let header = try SMB2Header(command: SMB2Commands.read, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(49)
+        // MS-SMB2 READ Padding is reserved; 0x50 is the conventional SMB2 header + fixed prefix offset used by clients.
+        writer.writeUInt8(0x50)
+        writer.writeUInt8(0)
+        writer.writeUInt32LE(length)
+        writer.writeUInt64LE(offset)
+        writer.writeBytes(fileId)
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeUInt16LE(0)
+        writer.writeUInt16LE(0)
+        // MS-SMB2 READ has a variable Buffer[] field; keep one byte pad for Samba compatibility.
+        writer.writeUInt8(0)
+        return writer.bytes
+    }
+
+    static func decodeResponse(_ bytes: [UInt8]) throws -> [UInt8] {
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 17 else {
+            throw SMBCodecError.invalidValue("invalid READ response structure size")
+        }
+        let dataOffset = Int(try reader.readUInt8())
+        try reader.skip(count: 1)
+        let dataLength = Int(try reader.readUInt32LE())
+        guard dataOffset + dataLength <= bytes.count else { throw SMBCodecError.truncated }
+        return Array(bytes[dataOffset..<dataOffset + dataLength])
     }
 }
 
@@ -184,4 +273,21 @@ func decodeUTF16LE(_ bytes: [UInt8]) -> String {
         UInt16(bytes[$0]) | (UInt16(bytes[$0 + 1]) << 8)
     }
     return String(decoding: units, as: UTF16.self)
+}
+
+private func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
+    UInt32(bytes[offset])
+        | (UInt32(bytes[offset + 1]) << 8)
+        | (UInt32(bytes[offset + 2]) << 16)
+        | (UInt32(bytes[offset + 3]) << 24)
+}
+
+private func readUInt64LE(_ bytes: [UInt8], at offset: Int) -> UInt64 {
+    UInt64(readUInt32LE(bytes, at: offset)) | (UInt64(readUInt32LE(bytes, at: offset + 4)) << 32)
+}
+
+private func filetimeToDate(_ value: UInt64) -> Date? {
+    guard value != 0 else { return nil }
+    let secondsBetween1601And1970: TimeInterval = 11_644_473_600
+    return Date(timeIntervalSince1970: (TimeInterval(value) / 10_000_000) - secondsBetween1601And1970)
 }

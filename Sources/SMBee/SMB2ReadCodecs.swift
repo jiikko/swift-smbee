@@ -24,7 +24,6 @@ enum SMB2SessionSetup {
         writer.writeUInt8(1)
         writer.writeUInt32LE(0)
         writer.writeUInt32LE(0)
-        writer.writeUInt32LE(0)
         writer.writeUInt16LE(UInt16(securityOffset))
         writer.writeUInt16LE(UInt16(securityBlob.count))
         writer.writeUInt64LE(0)

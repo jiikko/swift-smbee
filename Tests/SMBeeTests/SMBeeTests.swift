@@ -107,6 +107,92 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(hex(NTLM.ntProofStr(ntowfv2: ntowfv2, serverChallenge: serverChallenge, blob: blob)), "2a8e1bc8a06222ed5301c3fbd2154d0b")
     }
 
+    func testNTLMType1FixedBytesAndSecurityBuffers() {
+        let type1 = NTLM.makeType1()
+
+        XCTAssertEqual(type1.count, 40)
+        XCTAssertEqual(Array(type1[0..<8]), Array("NTLMSSP\0".utf8))
+        XCTAssertEqual(readUInt32LE(type1, at: 8), 1)
+        XCTAssertEqual(readUInt32LE(type1, at: 12), NTLM.negotiateFlags)
+        XCTAssertEqual(hex(Array(type1[12..<16])), "358288a2")
+        XCTAssertEqual(readUInt16LE(type1, at: 16), 0)
+        XCTAssertEqual(readUInt16LE(type1, at: 18), 0)
+        XCTAssertEqual(readUInt32LE(type1, at: 20), 40)
+        XCTAssertEqual(readUInt16LE(type1, at: 24), 0)
+        XCTAssertEqual(readUInt16LE(type1, at: 26), 0)
+        XCTAssertEqual(readUInt32LE(type1, at: 28), 40)
+        XCTAssertEqual(hex(Array(type1[32..<40])), "0601b11d0000000f")
+    }
+
+    func testNTLMType1DomainAndWorkstationSecurityBuffers() {
+        let type1 = NTLM.makeType1(domain: "dom", workstation: "wkst")
+
+        XCTAssertEqual(readUInt16LE(type1, at: 16), 3)
+        XCTAssertEqual(readUInt16LE(type1, at: 18), 3)
+        XCTAssertEqual(readUInt32LE(type1, at: 20), 40)
+        XCTAssertEqual(readUInt16LE(type1, at: 24), 4)
+        XCTAssertEqual(readUInt16LE(type1, at: 26), 4)
+        XCTAssertEqual(readUInt32LE(type1, at: 28), 43)
+        XCTAssertEqual(String(decoding: type1[40..<43], as: UTF8.self), "DOM")
+        XCTAssertEqual(String(decoding: type1[43..<47], as: UTF8.self), "WKST")
+    }
+
+    func testSPNEGONegTokenInitDERStructure() throws {
+        let type1 = NTLM.makeType1()
+        let token = SPNEGO.wrapNegTokenInit(type1)
+
+        var cursor = 0
+        let applicationEnd = try expectDERTag(0x60, in: token, cursor: &cursor)
+
+        let spnegoOIDEnd = try expectDERTag(0x06, in: token, cursor: &cursor)
+        XCTAssertEqual(Array(token[cursor..<spnegoOIDEnd]), [0x2b, 0x06, 0x01, 0x05, 0x05, 0x02])
+        cursor = spnegoOIDEnd
+
+        let negTokenInitEnd = try expectDERTag(0xa0, in: token, cursor: &cursor)
+        let sequenceEnd = try expectDERTag(0x30, in: token, cursor: &cursor)
+        let mechTypesEnd = try expectDERTag(0xa0, in: token, cursor: &cursor)
+        let listEnd = try expectDERTag(0x30, in: token, cursor: &cursor)
+        let ntlmOIDEnd = try expectDERTag(0x06, in: token, cursor: &cursor)
+        XCTAssertEqual(Array(token[cursor..<ntlmOIDEnd]), [0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a])
+        cursor = ntlmOIDEnd
+        XCTAssertEqual(cursor, listEnd)
+        XCTAssertEqual(cursor, mechTypesEnd)
+
+        let mechTokenEnd = try expectDERTag(0xa2, in: token, cursor: &cursor)
+        let octetEnd = try expectDERTag(0x04, in: token, cursor: &cursor)
+        XCTAssertEqual(Array(token[cursor..<octetEnd]), type1)
+        cursor = octetEnd
+        XCTAssertEqual(cursor, mechTokenEnd)
+        XCTAssertEqual(cursor, sequenceEnd)
+        XCTAssertEqual(cursor, negTokenInitEnd)
+        XCTAssertEqual(cursor, applicationEnd)
+        XCTAssertEqual(cursor, token.count)
+    }
+
+    func testSessionSetupRequestFixedFieldsAndSecurityBuffer() throws {
+        let blob = SPNEGO.wrapNegTokenInit(NTLM.makeType1())
+        let request = try SMB2SessionSetup.encodeRequest(
+            messageId: 7,
+            sessionId: 0,
+            securityBlob: blob,
+            signed: false
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.sessionSetup)
+        XCTAssertEqual(header.messageId, 7)
+        XCTAssertEqual(header.sessionId, 0)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 25)
+        XCTAssertEqual(request[66], 0)
+        XCTAssertEqual(request[67], 1)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 72), 0)
+        XCTAssertEqual(readUInt16LE(request, at: 76), 88)
+        XCTAssertEqual(readUInt16LE(request, at: 78), UInt16(blob.count))
+        XCTAssertEqual(readUInt64LE(request, at: 80), 0)
+        XCTAssertEqual(Array(request[88..<request.count]), blob)
+    }
+
     func testNegotiateRequestRoundTripShape() throws {
         let request = try SMBNegotiateCodec.encodeRequest(
             clientGuid: UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!,
@@ -302,6 +388,39 @@ final class SMBeeTests: XCTestCase {
             | (UInt32(bytes[offset + 1]) << 8)
             | (UInt32(bytes[offset + 2]) << 16)
             | (UInt32(bytes[offset + 3]) << 24)
+    }
+
+    private func readUInt64LE(_ bytes: [UInt8], at offset: Int) -> UInt64 {
+        UInt64(readUInt32LE(bytes, at: offset)) | (UInt64(readUInt32LE(bytes, at: offset + 4)) << 32)
+    }
+
+    private func expectDERTag(_ expectedTag: UInt8, in bytes: [UInt8], cursor: inout Int) throws -> Int {
+        XCTAssertLessThan(cursor, bytes.count)
+        XCTAssertEqual(bytes[cursor], expectedTag)
+        cursor += 1
+        let length = try readDERLength(bytes, cursor: &cursor)
+        let end = cursor + length
+        XCTAssertLessThanOrEqual(end, bytes.count)
+        return end
+    }
+
+    private func readDERLength(_ bytes: [UInt8], cursor: inout Int) throws -> Int {
+        XCTAssertLessThan(cursor, bytes.count)
+        let first = bytes[cursor]
+        cursor += 1
+        if first & 0x80 == 0 {
+            return Int(first)
+        }
+        let byteCount = Int(first & 0x7f)
+        XCTAssertGreaterThan(byteCount, 0)
+        XCTAssertLessThanOrEqual(byteCount, 2)
+        XCTAssertLessThanOrEqual(cursor + byteCount, bytes.count)
+        var value = 0
+        for _ in 0..<byteCount {
+            value = (value << 8) | Int(bytes[cursor])
+            cursor += 1
+        }
+        return value
     }
 
     private func writeUInt16LE(_ value: UInt16, to bytes: inout [UInt8], at offset: Int) {

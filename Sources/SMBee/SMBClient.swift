@@ -59,6 +59,10 @@ final class SMBSession {
             securityBlob: type1,
             signed: false
         )
+        if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {
+            let hex = challengePacket.map { String(format: "%02x", $0) }.joined()
+            FileHandle.standardError.write(Data("SESSION_SETUP#1 request (\(challengePacket.count) bytes): \(hex)\n".utf8))
+        }
         try await sendUnsigned(challengePacket)
         let challengeResponse = try await receive()
         let challengeHeader = try SMB2Header.decode(challengeResponse)

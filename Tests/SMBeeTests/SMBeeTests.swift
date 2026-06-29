@@ -348,6 +348,60 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testNTLMMICAddsMsvAvFlagsProvidedBitAfterTimestamp() throws {
+        let type1 = NTLM.makeType1()
+        let type2 = makeNTLMChallengeMessage(targetInfo: hexBytes(
+            "02000c0044004f004d00410049004e00" +
+            "070008000090d336b734c301" +
+            "01000c00530045005200560045005200" +
+            "00000000"
+        ))
+        let challenge = try NTLM.parseChallenge(type2)
+        let authenticate = try NTLM.makeType3(
+            credential: SMBCredential(username: "User", password: "Password", domain: "Domain"),
+            challenge: challenge,
+            negotiateMessage: type1,
+            challengeMessage: type2,
+            timestamp: 0x01c334b736d39000,
+            clientChallenge: hexBytes("ffffff0011223344"),
+            exportedSessionKey: hexBytes("00112233445566778899aabbccddeeff")
+        )
+
+        let targetInfo = targetInfoFromType3(authenticate.message)
+        XCTAssertEqual(hex(targetInfo), (
+            "02000c0044004f004d00410049004e00" +
+            "070008000090d336b734c301" +
+            "0600040002000000" +
+            "01000c00530045005200560045005200" +
+            "00000000"
+        ))
+    }
+
+    func testNTLMMICOrsExistingMsvAvFlagsProvidedBit() throws {
+        let type1 = NTLM.makeType1()
+        let type2 = makeNTLMChallengeMessage(targetInfo: hexBytes(
+            "070008000090d336b734c301" +
+            "0600040001000000" +
+            "00000000"
+        ))
+        let challenge = try NTLM.parseChallenge(type2)
+        let authenticate = try NTLM.makeType3(
+            credential: SMBCredential(username: "User", password: "Password", domain: "Domain"),
+            challenge: challenge,
+            negotiateMessage: type1,
+            challengeMessage: type2,
+            timestamp: 0x01c334b736d39000,
+            clientChallenge: hexBytes("ffffff0011223344"),
+            exportedSessionKey: hexBytes("00112233445566778899aabbccddeeff")
+        )
+
+        XCTAssertEqual(hex(targetInfoFromType3(authenticate.message)), (
+            "070008000090d336b734c301" +
+            "0600040003000000" +
+            "00000000"
+        ))
+    }
+
     func testNTLMType1FixedBytesAndSecurityBuffers() {
         let type1 = NTLM.makeType1()
 
@@ -1158,6 +1212,27 @@ final class SMBeeTests: XCTestCase {
         let length = Int(readUInt16LE(bytes, at: offset))
         let bufferOffset = Int(readUInt32LE(bytes, at: offset + 4))
         return Array(bytes[bufferOffset..<bufferOffset + length])
+    }
+
+    private func targetInfoFromType3(_ bytes: [UInt8]) -> [UInt8] {
+        let ntChallengeResponse = readSecurityBuffer(bytes, at: 20)
+        let blob = Array(ntChallengeResponse.dropFirst(16))
+        let targetInfoOffset = 28
+        var cursor = targetInfoOffset
+        while cursor + 4 <= blob.count {
+            let avID = readUInt16LE(blob, at: cursor)
+            let length = Int(readUInt16LE(blob, at: cursor + 2))
+            cursor += 4
+            guard cursor + length <= blob.count else {
+                XCTFail("NTLMv2 target info AV_PAIR exceeds blob length")
+                return []
+            }
+            if avID == 0 {
+                return Array(blob[targetInfoOffset..<cursor])
+            }
+            cursor += length
+        }
+        return Array(blob[targetInfoOffset..<blob.count])
     }
 
     private func makeDirectoryEntry(

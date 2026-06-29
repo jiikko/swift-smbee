@@ -119,9 +119,9 @@ enum SMB2QueryDirectory {
         writer.writeUInt32LE(0)
         writer.writeBytes(fileId)
         writer.writeUInt16LE(UInt16(fileNameOffset))
-        writer.writeUInt16LE(0)
+        writer.writeUInt16LE(2)
         writer.writeUInt32LE(65_536)
-        writer.writeUInt8(0)
+        writer.writeBytes([0x2a, 0x00])
         return writer.bytes
     }
 

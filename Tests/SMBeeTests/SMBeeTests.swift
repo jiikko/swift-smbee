@@ -301,7 +301,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try SMB2Create.decodeFileId(response), expectedFileId)
     }
 
-    func testQueryDirectoryRequestIncludesOneByteEmptySearchPatternBuffer() throws {
+    func testQueryDirectoryRequestUsesWildcardSearchPattern() throws {
         let fileId = (0..<16).map(UInt8.init)
         let request = try SMB2QueryDirectory.encodeRequest(
             messageId: 11,
@@ -315,16 +315,16 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(header.messageId, 11)
         XCTAssertEqual(header.treeId, 0x5566_7788)
         XCTAssertEqual(header.sessionId, 0x1122_3344)
-        XCTAssertEqual(request.count, 97)
+        XCTAssertEqual(request.count, 98)
         XCTAssertEqual(readUInt16LE(request, at: 64), 33)
         XCTAssertEqual(request[66], 37)
         XCTAssertEqual(request[67], 0x01)
         XCTAssertEqual(readUInt32LE(request, at: 68), 0)
         XCTAssertEqual(Array(request[72..<88]), fileId)
         XCTAssertEqual(readUInt16LE(request, at: 88), 96)
-        XCTAssertEqual(readUInt16LE(request, at: 90), 0)
+        XCTAssertEqual(readUInt16LE(request, at: 90), 2)
         XCTAssertEqual(readUInt32LE(request, at: 92), 65_536)
-        XCTAssertEqual(request[96], 0)
+        XCTAssertEqual(Array(request[96..<98]), [0x2a, 0x00])
     }
 
     func testNegotiateRequestRoundTripShape() throws {

@@ -137,6 +137,9 @@ final class SMBSession {
         let response = try await receive(label: "QUERY_DIRECTORY response")
         try verifySigned(response)
         let header = try SMB2Header.decode(response)
+        if header.status == SMB2Status.noMoreFiles {
+            return []
+        }
         guard header.status == SMB2Status.success else {
             throw SMBCodecError.invalidValue(String(format: "QUERY_DIRECTORY failed with NTSTATUS 0x%08x", header.status))
         }
@@ -213,6 +216,7 @@ final class SMBSession {
 
 enum SMB2Status {
     static let success: UInt32 = 0x0000_0000
+    static let noMoreFiles: UInt32 = 0x8000_0006
     static let moreProcessingRequired: UInt32 = 0xc000_0016
 }
 

@@ -243,10 +243,9 @@ final class SMBeeTests: XCTestCase {
         let expectedHex =
             "fe534d4240000000000000000000010000000000000000000000000000000000" +
             "0000000000000000000000000000000000000000000000000000000000000000" +
-            "24000500010000004000000000112233445566778899aabbccddeeff70000000" +
-            "030000000202100200030203110300000100260000000000010020000100aaaaaaaaaaaaaaaaaaaa" +
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000020006000000000002" +
-            "00020004000000080004000000000001000200"
+            "24000500010000000000000000112233445566778899aabbccddeeff70000000" +
+            "020000000202100200030203110300000100260000000000010020000100aaaaaaaaaaaaaaaaaaaa" +
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000080004000000000001000200"
         XCTAssertEqual(hex(request), expectedHex)
 
         let header = try SMB2Header.decode(request)
@@ -258,7 +257,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try reader.readUInt16LE(), 5)
         try reader.skip(count: 2 + 2 + 4 + 16)
         XCTAssertEqual(try reader.readUInt32LE(), 112)
-        XCTAssertEqual(try reader.readUInt16LE(), 3)
+        XCTAssertEqual(try reader.readUInt16LE(), 2)
         try reader.skip(count: 2)
         XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect202)
         XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect210)
@@ -277,7 +276,7 @@ final class SMBeeTests: XCTestCase {
         let contextCount = Int(readUInt16LE(request, at: 64 + 32))
         XCTAssertEqual(contextOffset, 112)
         XCTAssertEqual(contextOffset % 8, 0)
-        XCTAssertEqual(contextCount, 3)
+        XCTAssertEqual(contextCount, 2)
         XCTAssertEqual(Array(request[110..<112]), [0, 0])
 
         var offset = contextOffset
@@ -304,7 +303,6 @@ final class SMBeeTests: XCTestCase {
 
         XCTAssertEqual(contextTypes, [
             SMBNegotiateConstants.preauthContext,
-            SMBNegotiateConstants.encryptionContext,
             SMBNegotiateConstants.signingContext,
         ])
         XCTAssertEqual(offset, request.count)

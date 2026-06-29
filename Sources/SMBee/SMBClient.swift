@@ -23,6 +23,21 @@ public struct SMBReadRange: Equatable, Sendable {
 }
 
 public enum SMBClient {
+    private static func withSession<T>(
+        host: String,
+        port: UInt16,
+        share: String,
+        credential: SMBCredential,
+        transport: SMBTransport = POSIXSocketTransport(),
+        operation: (SMBSession, UInt32) async throws -> T
+    ) async throws -> T {
+        let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
+        try await session.connect()
+        defer { transport.close() }
+        let treeId = try await session.treeConnect(share: share)
+        return try await operation(session, treeId)
+    }
+
     public static func list(
         host: String,
         port: UInt16 = 445,
@@ -31,14 +46,12 @@ public enum SMBClient {
         credential: SMBCredential,
         transport: SMBTransport = POSIXSocketTransport()
     ) async throws -> [SMBDirectoryEntry] {
-        let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
-        try await session.connect()
-        defer { transport.close() }
-        let treeId = try await session.treeConnect(share: share)
-        let fileId = try await session.create(treeId: treeId, path: path, directory: true)
-        let entries = try await session.queryDirectory(treeId: treeId, fileId: fileId)
-        try? await session.close(treeId: treeId, fileId: fileId)
-        return entries
+        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            let fileId = try await session.create(treeId: treeId, path: path, directory: true)
+            let entries = try await session.queryDirectory(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return entries
+        }
     }
 
     public static func stat(
@@ -49,18 +62,16 @@ public enum SMBClient {
         credential: SMBCredential,
         transport: SMBTransport = POSIXSocketTransport()
     ) async throws -> SMBFileStat {
-        let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
-        try await session.connect()
-        defer { transport.close() }
-        let treeId = try await session.treeConnect(share: share)
-        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
-        do {
-            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
-            return stat
-        } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
-            throw error
+        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+            do {
+                let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+                try? await session.close(treeId: treeId, fileId: fileId)
+                return stat
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
         }
     }
 
@@ -73,28 +84,99 @@ public enum SMBClient {
         credential: SMBCredential,
         transport: SMBTransport = POSIXSocketTransport()
     ) async throws -> [UInt8] {
-        let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
-        try await session.connect()
-        defer { transport.close() }
-        let treeId = try await session.treeConnect(share: share)
-        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
-        do {
-            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
-            let start = range?.offset ?? 0
-            guard start <= stat.size else {
-                throw SMBCodecError.invalidValue("read range starts past end of file")
+        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+            do {
+                let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+                let start = range?.offset ?? 0
+                guard start <= stat.size else {
+                    throw SMBCodecError.invalidValue("read range starts past end of file")
+                }
+                let available = stat.size - start
+                let requested = range.map { min($0.length, available) } ?? available
+                let data = try await session.read(treeId: treeId, fileId: fileId, offset: start, length: requested)
+                guard UInt64(data.count) == requested else {
+                    throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
+                }
+                try? await session.close(treeId: treeId, fileId: fileId)
+                return data
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
             }
-            let available = stat.size - start
-            let requested = range.map { min($0.length, available) } ?? available
-            let data = try await session.read(treeId: treeId, fileId: fileId, offset: start, length: requested)
-            guard UInt64(data.count) == requested else {
-                throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
+        }
+    }
+
+    public static func makeDirectory(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        credential: SMBCredential,
+        transport: SMBTransport = POSIXSocketTransport()
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .makeDirectory(path: path))
+            try await session.close(treeId: treeId, fileId: fileId)
+        }
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        data: [UInt8],
+        overwrite: Bool = true,
+        credential: SMBCredential,
+        transport: SMBTransport = POSIXSocketTransport()
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
+            do {
+                try await session.write(treeId: treeId, fileId: fileId, data: data)
+                try? await session.close(treeId: treeId, fileId: fileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
             }
-            try? await session.close(treeId: treeId, fileId: fileId)
-            return data
-        } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
-            throw error
+        }
+    }
+
+    public static func rename(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        replaceIfExists: Bool = false,
+        credential: SMBCredential,
+        transport: SMBTransport = POSIXSocketTransport()
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .rename(path: fromPath))
+            do {
+                try await session.rename(treeId: treeId, fileId: fileId, newPath: toPath, replaceIfExists: replaceIfExists)
+                try? await session.close(treeId: treeId, fileId: fileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
+        }
+    }
+
+    public static func delete(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        directory: Bool = false,
+        credential: SMBCredential,
+        transport: SMBTransport = POSIXSocketTransport()
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .delete(path: path, directory: directory))
+            try await session.close(treeId: treeId, fileId: fileId)
         }
     }
 }
@@ -182,12 +264,15 @@ final class SMBSession {
     }
 
     func create(treeId: UInt32, path: String, directory: Bool) async throws -> [UInt8] {
+        try await create(treeId: treeId, request: .read(path: path, directory: directory))
+    }
+
+    func create(treeId: UInt32, request: SMB2CreateRequest) async throws -> [UInt8] {
         let packet = try SMB2Create.encodeRequest(
             messageId: nextMessageId(),
             sessionId: sessionId,
             treeId: treeId,
-            path: path,
-            directory: directory
+            request: request
         )
         debugDump("CREATE request", packet)
         try await sendSigned(packet)
@@ -270,6 +355,51 @@ final class SMBSession {
             remaining -= UInt64(data.count)
         }
         return result
+    }
+
+    func write(treeId: UInt32, fileId: [UInt8], data: [UInt8]) async throws {
+        let chunkSize = 64 * 1024
+        var cursor = 0
+        while cursor < data.count {
+            let end = min(cursor + chunkSize, data.count)
+            let chunk = Array(data[cursor..<end])
+            let packet = try SMB2Write.encodeRequest(
+                messageId: nextMessageId(),
+                sessionId: sessionId,
+                treeId: treeId,
+                fileId: fileId,
+                offset: UInt64(cursor),
+                data: chunk
+            )
+            debugDump("WRITE request", packet)
+            try await sendSigned(packet)
+            let response = try await receive(label: "WRITE response")
+            try verifySigned(response)
+            let count = try SMB2Write.decodeResponseCount(response)
+            guard count == chunk.count else {
+                throw SMBCodecError.invalidValue("short SMB write: expected \(chunk.count) bytes, got \(count)")
+            }
+            cursor += Int(count)
+        }
+    }
+
+    func rename(treeId: UInt32, fileId: [UInt8], newPath: String, replaceIfExists: Bool) async throws {
+        let packet = try SMB2SetInfo.encodeRenameRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            newPath: newPath,
+            replaceIfExists: replaceIfExists
+        )
+        debugDump("SET_INFO rename request", packet)
+        try await sendSigned(packet)
+        let response = try await receive(label: "SET_INFO rename response")
+        try verifySigned(response)
+        let header = try SMB2Header.decode(response)
+        guard header.status == SMB2Status.success else {
+            throw SMBCodecError.invalidValue(String(format: "SET_INFO rename failed with NTSTATUS 0x%08x", header.status))
+        }
     }
 
     func close(treeId: UInt32, fileId: [UInt8]) async throws {

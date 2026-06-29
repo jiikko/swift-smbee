@@ -6,6 +6,8 @@ enum SMB2Commands {
     static let create: UInt16 = 5
     static let close: UInt16 = 6
     static let read: UInt16 = 8
+    static let write: UInt16 = 9
+    static let setInfo: UInt16 = 17
     static let queryInfo: UInt16 = 16
     static let queryDirectory: UInt16 = 14
 }
@@ -68,8 +70,17 @@ enum SMB2Create {
     private static let responseFileIdOffset = SMB2Header.encodedSize + 64
 
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, path: String, directory: Bool) throws -> [UInt8] {
+        try encodeRequest(
+            messageId: messageId,
+            sessionId: sessionId,
+            treeId: treeId,
+            request: SMB2CreateRequest.read(path: path, directory: directory)
+        )
+    }
+
+    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, request: SMB2CreateRequest) throws -> [UInt8] {
         let header = try SMB2Header(command: SMB2Commands.create, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
-        let nameBytes = NTLM.utf16le(relativeCreateName(path))
+        let nameBytes = NTLM.utf16le(relativeCreateName(request.path))
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(57)
@@ -78,11 +89,11 @@ enum SMB2Create {
         writer.writeUInt32LE(0x0000_0002)
         writer.writeUInt64LE(0)
         writer.writeUInt64LE(0)
-        writer.writeUInt32LE(directory ? 0x0000_0089 : 0x0000_0081)
+        writer.writeUInt32LE(request.desiredAccess)
         writer.writeUInt32LE(0)
-        writer.writeUInt32LE(0x0000_0007)
-        writer.writeUInt32LE(0x0000_0001)
-        writer.writeUInt32LE(directory ? 0x0000_0001 : 0x0000_0040)
+        writer.writeUInt32LE(request.shareAccess)
+        writer.writeUInt32LE(request.createDisposition)
+        writer.writeUInt32LE(request.createOptions)
         writer.writeUInt16LE(UInt16(nameOffset))
         writer.writeUInt16LE(UInt16(nameBytes.count))
         writer.writeUInt32LE(0)
@@ -103,6 +114,59 @@ enum SMB2Create {
         let offset = responseFileIdOffset
         guard bytes.count >= offset + 16 else { throw SMBCodecError.truncated }
         return Array(bytes[offset..<offset + 16])
+    }
+}
+
+struct SMB2CreateRequest {
+    var path: String
+    var desiredAccess: UInt32
+    var shareAccess: UInt32 = 0x0000_0007
+    var createDisposition: UInt32
+    var createOptions: UInt32
+
+    static func read(path: String, directory: Bool) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: directory ? 0x0000_0089 : 0x0000_0081,
+            createDisposition: 0x0000_0001,
+            createOptions: directory ? 0x0000_0001 : 0x0000_0040
+        )
+    }
+
+    static func makeDirectory(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0001 | 0x0000_0004 | 0x0000_0080,
+            createDisposition: 0x0000_0002,
+            createOptions: 0x0000_0001
+        )
+    }
+
+    static func upload(path: String, overwrite: Bool) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0002 | 0x0000_0080,
+            createDisposition: overwrite ? 0x0000_0005 : 0x0000_0002,
+            createOptions: 0x0000_0040
+        )
+    }
+
+    static func delete(path: String, directory: Bool) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0001_0000,
+            createDisposition: 0x0000_0001,
+            createOptions: (directory ? 0x0000_0001 : 0x0000_0040) | 0x0000_1000
+        )
+    }
+
+    static func rename(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0001_0000 | 0x0000_0080,
+            createDisposition: 0x0000_0001,
+            createOptions: 0
+        )
     }
 }
 
@@ -190,6 +254,108 @@ enum SMB2Read {
         let dataLength = Int(try reader.readUInt32LE())
         guard dataOffset + dataLength <= bytes.count else { throw SMBCodecError.truncated }
         return Array(bytes[dataOffset..<dataOffset + dataLength])
+    }
+}
+
+enum SMB2Write {
+    private static let fixedPartSize = 48
+    private static let dataOffset = SMB2Header.encodedSize + fixedPartSize
+
+    static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset: UInt64,
+        data: [UInt8]
+    ) throws -> [UInt8] {
+        guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        let header = try SMB2Header(command: SMB2Commands.write, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(49)
+        writer.writeUInt16LE(UInt16(dataOffset))
+        writer.writeUInt32LE(UInt32(data.count))
+        writer.writeUInt64LE(offset)
+        writer.writeBytes(fileId)
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeUInt16LE(0)
+        writer.writeUInt16LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeBytes(data.isEmpty ? [0] : data)
+        return writer.bytes
+    }
+
+    static func decodeResponseCount(_ bytes: [UInt8]) throws -> UInt32 {
+        let header = try SMB2Header.decode(bytes)
+        guard header.status == SMB2Status.success else {
+            throw SMBCodecError.invalidValue(String(format: "WRITE failed with NTSTATUS 0x%08x", header.status))
+        }
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 17 else {
+            throw SMBCodecError.invalidValue("invalid WRITE response structure size")
+        }
+        try reader.skip(count: 2)
+        return try reader.readUInt32LE()
+    }
+}
+
+enum SMB2SetInfo {
+    private static let fixedPartSize = 32
+    private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
+
+    static func encodeRenameRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        newPath: String,
+        replaceIfExists: Bool
+    ) throws -> [UInt8] {
+        let nameBytes = NTLM.utf16le(relativeInfoName(newPath))
+        var buffer = SMBByteWriter()
+        buffer.writeUInt8(replaceIfExists ? 1 : 0)
+        buffer.writeBytes(Array(repeating: 0, count: 7))
+        buffer.writeUInt64LE(0)
+        buffer.writeUInt32LE(UInt32(nameBytes.count))
+        buffer.writeBytes(nameBytes)
+        return try encodeRequest(
+            messageId: messageId,
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            fileInfoClass: 10,
+            buffer: buffer.bytes
+        )
+    }
+
+    private static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        fileInfoClass: UInt8,
+        buffer: [UInt8]
+    ) throws -> [UInt8] {
+        guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        let header = try SMB2Header(command: SMB2Commands.setInfo, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(33)
+        writer.writeUInt8(0x01)
+        writer.writeUInt8(fileInfoClass)
+        writer.writeUInt32LE(UInt32(buffer.count))
+        writer.writeUInt16LE(UInt16(bufferOffset))
+        writer.writeUInt16LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeBytes(fileId)
+        writer.writeBytes(buffer.isEmpty ? [0] : buffer)
+        return writer.bytes
+    }
+
+    private static func relativeInfoName(_ path: String) -> String {
+        path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
     }
 }
 

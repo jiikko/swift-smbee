@@ -67,4 +67,53 @@ final class SMBeeE2ETests: XCTestCase {
         )
         XCTAssertEqual(String(decoding: data, as: UTF8.self), "hello from SMBee E2E\n")
     }
+
+    func testAuthenticatedWriteOperations() async throws {
+        guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
+        let portString = environment["SMBEE_E2E_PORT"] ?? "445"
+        guard let port = UInt16(portString) else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16, got \(portString)")
+            return
+        }
+        let username = environment["SMBEE_E2E_USERNAME"] ?? "smbee"
+        let password = environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
+        let share = environment["SMBEE_E2E_SHARE"] ?? "public"
+        let credential = SMBCredential(username: username, password: password)
+        let suffix = UUID().uuidString
+        let directory = "smbee-e2e-\(suffix)"
+        let original = "\(directory)\\upload.txt"
+        let renamed = "\(directory)\\renamed.txt"
+        let payload = Array("hello write path \(suffix)\n".utf8)
+
+        try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: directory)
+        var entries = try await SMBee.list(host: host, port: port, credential: credential, share: share)
+        XCTAssertTrue(entries.contains { $0.name == directory && $0.isDirectory })
+
+        try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: original, data: payload)
+        let data = try await SMBee.read(host: host, port: port, credential: credential, share: share, path: original)
+        XCTAssertEqual(data, payload)
+
+        try await SMBee.rename(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            fromPath: original,
+            toPath: renamed
+        )
+        entries = try await SMBee.list(host: host, port: port, credential: credential, share: share, path: directory)
+        XCTAssertFalse(entries.contains { $0.name == "upload.txt" })
+        XCTAssertTrue(entries.contains { $0.name == "renamed.txt" })
+
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: renamed)
+        entries = try await SMBee.list(host: host, port: port, credential: credential, share: share, path: directory)
+        XCTAssertFalse(entries.contains { $0.name == "renamed.txt" })
+
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: directory, directory: true)
+    }
 }

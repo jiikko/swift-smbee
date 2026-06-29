@@ -39,4 +39,65 @@ public enum SMBee {
     ) async throws -> [UInt8] {
         try await SMBClient.read(host: host, port: port, share: share, path: path, range: range, credential: credential)
     }
+
+    public static func makeDirectory(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String
+    ) async throws {
+        try await SMBClient.makeDirectory(host: host, port: port, share: share, path: path, credential: credential)
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        data: [UInt8],
+        overwrite: Bool = true
+    ) async throws {
+        try await SMBClient.upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            data: data,
+            overwrite: overwrite,
+            credential: credential
+        )
+    }
+
+    public static func rename(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        replaceIfExists: Bool = false
+    ) async throws {
+        try await SMBClient.rename(
+            host: host,
+            port: port,
+            share: share,
+            fromPath: fromPath,
+            toPath: toPath,
+            replaceIfExists: replaceIfExists,
+            credential: credential
+        )
+    }
+
+    public static func delete(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        directory: Bool = false
+    ) async throws {
+        try await SMBClient.delete(host: host, port: port, share: share, path: path, directory: directory, credential: credential)
+    }
 }

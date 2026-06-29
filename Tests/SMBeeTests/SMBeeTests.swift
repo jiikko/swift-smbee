@@ -297,6 +297,45 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_0040)
     }
 
+    func testCreateDirectoryRequestUsesFileCreateAndDirectoryOption() throws {
+        let request = try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            request: .makeDirectory(path: "newdir")
+        )
+
+        XCTAssertEqual(readUInt32LE(request, at: 88), 0x0000_0085)
+        XCTAssertEqual(readUInt32LE(request, at: 100), 0x0000_0002)
+        XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_0001)
+    }
+
+    func testCreateUploadRequestUsesOverwriteDispositionWhenRequested() throws {
+        let request = try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            request: .upload(path: "out.txt", overwrite: true)
+        )
+
+        XCTAssertEqual(readUInt32LE(request, at: 88), 0x0000_0082)
+        XCTAssertEqual(readUInt32LE(request, at: 100), 0x0000_0005)
+        XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_0040)
+    }
+
+    func testCreateDeleteRequestUsesDeleteAccessAndDeleteOnClose() throws {
+        let request = try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            request: .delete(path: "out.txt", directory: false)
+        )
+
+        XCTAssertEqual(readUInt32LE(request, at: 88), 0x0001_0000)
+        XCTAssertEqual(readUInt32LE(request, at: 100), 0x0000_0001)
+        XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_1040)
+    }
+
     func testCreateResponseDecodesFileIdAtResponseStructureOffset64() throws {
         var response = try SMB2Header(
             command: SMB2Commands.create,
@@ -409,6 +448,72 @@ final class SMBeeTests: XCTestCase {
         response.append(contentsOf: payload)
 
         XCTAssertEqual(try SMB2Read.decodeResponse(response), payload)
+    }
+
+    func testWriteRequestUsesOffsetLengthFileIdAndDataBuffer() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let payload = Array("hello".utf8)
+        let request = try SMB2Write.encodeRequest(
+            messageId: 15,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            offset: 0x0102_0304_0506_0708,
+            data: payload
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.write)
+        XCTAssertEqual(header.messageId, 15)
+        XCTAssertEqual(header.treeId, 0x5566_7788)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 49)
+        XCTAssertEqual(readUInt16LE(request, at: 66), 112)
+        XCTAssertEqual(readUInt32LE(request, at: 68), UInt32(payload.count))
+        XCTAssertEqual(readUInt64LE(request, at: 72), 0x0102_0304_0506_0708)
+        XCTAssertEqual(Array(request[80..<96]), fileId)
+        XCTAssertEqual(readUInt32LE(request, at: 96), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 100), 0)
+        XCTAssertEqual(readUInt16LE(request, at: 104), 0)
+        XCTAssertEqual(readUInt16LE(request, at: 106), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 108), 0)
+        XCTAssertEqual(Array(request[112..<request.count]), payload)
+    }
+
+    func testWriteResponseDecodesCount() throws {
+        var response = try SMB2Header(command: SMB2Commands.write, messageId: 16).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
+        writeUInt16LE(17, to: &response, at: 64)
+        writeUInt32LE(5, to: &response, at: 68)
+
+        XCTAssertEqual(try SMB2Write.decodeResponseCount(response), 5)
+    }
+
+    func testSetInfoRenameRequestUsesFileRenameInformationBuffer() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2SetInfo.encodeRenameRequest(
+            messageId: 17,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            newPath: "\\renamed.txt",
+            replaceIfExists: true
+        )
+        let expectedName = NTLM.utf16le("renamed.txt")
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.setInfo)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 33)
+        XCTAssertEqual(request[66], 0x01)
+        XCTAssertEqual(request[67], 10)
+        XCTAssertEqual(readUInt32LE(request, at: 68), UInt32(20 + expectedName.count))
+        XCTAssertEqual(readUInt16LE(request, at: 72), 96)
+        XCTAssertEqual(Array(request[80..<96]), fileId)
+        XCTAssertEqual(request[96], 1)
+        XCTAssertEqual(Array(request[97..<104]), Array(repeating: 0, count: 7))
+        XCTAssertEqual(readUInt64LE(request, at: 104), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 112), UInt32(expectedName.count))
+        XCTAssertEqual(Array(request[116..<request.count]), expectedName)
     }
 
     func testNegotiateRequestRoundTripShape() throws {

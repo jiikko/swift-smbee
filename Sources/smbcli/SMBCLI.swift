@@ -8,7 +8,7 @@ struct SMBCLI: AsyncParsableCommand {
         commandName: "smbcli",
         abstract: "🐝 SMBee command-line client",
         version: SMBee.version,
-        subcommands: [Probe.self, List.self, Stat.self, Cat.self]
+        subcommands: [Probe.self, List.self, Stat.self, Cat.self, MakeDirectory.self, Put.self, Move.self, Remove.self]
     )
 }
 
@@ -120,7 +120,121 @@ struct Cat: AsyncParsableCommand {
     }
 }
 
+struct MakeDirectory: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "mkdir", abstract: "Create an SMB directory")
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var url: String
+
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
+    func run() async throws {
+        let (endpoint, credential) = try makeEndpointAndCredential(url: url, domain: domain)
+        try await SMBee.makeDirectory(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path
+        )
+    }
+}
+
+struct Put: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "put", abstract: "Upload a local file to SMB")
+
+    @Argument(help: "Local source file")
+    var source: String
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var destination: String
+
+    @Flag(help: "Fail if the destination exists")
+    var noOverwrite = false
+
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
+    func run() async throws {
+        let (endpoint, credential) = try makeEndpointAndCredential(url: destination, domain: domain)
+        // TODO: stream large local files in chunks instead of lifting them into memory.
+        let data = try Data(contentsOf: URL(fileURLWithPath: source))
+        try await SMBee.upload(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            data: Array(data),
+            overwrite: !noOverwrite
+        )
+    }
+}
+
+struct Move: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "mv", abstract: "Rename an SMB path within one share")
+
+    @Argument(help: "smb://user@host[:445]/share/source")
+    var source: String
+
+    @Argument(help: "smb://user@host[:445]/share/destination")
+    var destination: String
+
+    @Flag(help: "Replace destination if it exists")
+    var replace = false
+
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
+    func run() async throws {
+        let (from, credential) = try makeEndpointAndCredential(url: source, domain: domain)
+        let to = try SMBURLParser.parseReadURL(destination)
+        guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
+            throw ValidationError("mv source and destination must use the same user, host, port, and share")
+        }
+        try await SMBee.rename(
+            host: from.host,
+            port: from.port,
+            credential: credential,
+            share: from.share,
+            fromPath: from.path,
+            toPath: to.path,
+            replaceIfExists: replace
+        )
+    }
+}
+
+struct Remove: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "rm", abstract: "Delete an SMB file or empty directory")
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var url: String
+
+    @Flag(help: "Open the target as a directory")
+    var directory = false
+
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
+    func run() async throws {
+        let (endpoint, credential) = try makeEndpointAndCredential(url: url, domain: domain)
+        try await SMBee.delete(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            directory: directory
+        )
+    }
+}
+
 private func makeReadEndpointAndCredential(url: String, domain: String) throws -> (SMBURLParser.ReadURL, SMBCredential) {
+    try makeEndpointAndCredential(url: url, domain: domain)
+}
+
+private func makeEndpointAndCredential(url: String, domain: String) throws -> (SMBURLParser.ReadURL, SMBCredential) {
     let endpoint = try SMBURLParser.parseReadURL(url)
     guard let username = endpoint.username, !username.isEmpty else {
         throw ValidationError("SMB URL must include a username")

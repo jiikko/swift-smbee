@@ -120,7 +120,9 @@ final class SMBSession {
         try await sendSigned(packet)
         let response = try await receive(label: "CREATE response")
         try verifySigned(response)
-        return try SMB2Create.decodeFileId(response)
+        let fileId = try SMB2Create.decodeFileId(response)
+        debugLine("CREATE response FileId: \(SMBDebug.hex(fileId))")
+        return fileId
     }
 
     func queryDirectory(treeId: UInt32, fileId: [UInt8]) async throws -> [SMBDirectoryEntry] {
@@ -201,6 +203,11 @@ final class SMBSession {
     private func debugDump(_ label: String, _ bytes: [UInt8]) {
         guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
         FileHandle.standardError.write(Data("\(label) (\(bytes.count) bytes): \(SMBDebug.hex(bytes))\n".utf8))
+    }
+
+    private func debugLine(_ message: String) {
+        guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
+        FileHandle.standardError.write(Data("\(message)\n".utf8))
     }
 }
 

@@ -284,6 +284,23 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[120..<request.count]), expectedName)
     }
 
+    func testCreateResponseDecodesFileIdAtResponseStructureOffset64() throws {
+        var response = try SMB2Header(
+            command: SMB2Commands.create,
+            messageId: 10,
+            treeId: 0x3344,
+            sessionId: 0x1122
+        ).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 88))
+        let expectedFileId = hexBytes("0123456789abcdeffedcba9876543210")
+
+        writeUInt16LE(89, to: &response, at: 64)
+        response.replaceSubrange(128..<144, with: expectedFileId)
+
+        XCTAssertEqual(response.count, 152)
+        XCTAssertEqual(try SMB2Create.decodeFileId(response), expectedFileId)
+    }
+
     func testQueryDirectoryRequestIncludesOneByteEmptySearchPatternBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let request = try SMB2QueryDirectory.encodeRequest(

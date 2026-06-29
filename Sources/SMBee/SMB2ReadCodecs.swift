@@ -63,6 +63,7 @@ enum SMB2TreeConnect {
 enum SMB2Create {
     private static let fixedPartSize = 56
     private static let nameOffset = SMB2Header.encodedSize + fixedPartSize
+    private static let responseFileIdOffset = SMB2Header.encodedSize + 64
 
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, path: String, directory: Bool) throws -> [UInt8] {
         let header = try SMB2Header(command: SMB2Commands.create, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
@@ -97,7 +98,7 @@ enum SMB2Create {
         guard header.status == SMB2Status.success else {
             throw SMBCodecError.invalidValue(String(format: "CREATE failed with NTSTATUS 0x%08x", header.status))
         }
-        let offset = SMB2Header.encodedSize + 48
+        let offset = responseFileIdOffset
         guard bytes.count >= offset + 16 else { throw SMBCodecError.truncated }
         return Array(bytes[offset..<offset + 16])
     }

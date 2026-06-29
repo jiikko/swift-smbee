@@ -4,6 +4,28 @@
 [docs/testing.md](docs/testing.md) を正本とする。各タスクは **その doc を読んでから**着手。
 `ⓥ` = 実装中に spec / 実測で確認する判断点。
 
+## 実装状況 (2026-06-29 時点)
+
+**SMB 3.0.2 経路は実 Samba E2E で全 green（署名 CMAC + 暗号 CCM 必須下）**:
+
+- ✅ probe (NEGOTIATE, multi-dialect) / NTLMv2 認証 / SESSION_SETUP / TREE_CONNECT
+- ✅ 署名 = AES-128-CMAC (RFC4493 vector) / 暗号 = AES-128-CCM + TRANSFORM_HEADER (RFC3610 vector)
+- ✅ ls (QUERY_DIRECTORY) / stat (QUERY_INFO) / cat (READ)
+- ✅ mkdir / put(streaming) / mv (SET_INFO rename) / rm / 非空 dir 再帰削除
+- ✅ MaxRead/WriteSize 尊重 / FLUSH / async STATUS_PENDING interim 応答処理
+- ✅ smbcli probe/ls/stat/cat/mkdir/put/mv/rm(-r) / unit 51 + E2E 3 green / CI(macos-26 unit + ubuntu e2e)
+
+**残（後回し）**:
+
+- ⏳ C: NTLMv2 の **MIC / NTLMSSP_NEGOTIATE_KEY_EXCH** + 公式 MS-NLMP vector 検証（最小経路で Samba は通る。
+  厳格サーバ/実 macOS で要る可能性。codex-drive で着手中・codex rate-limit で中断）
+- ⏳ D: SMBErrorMapper (NTSTATUS→型付きエラー) / SMBSession の cancellation・再接続
+- ⏳ #3: 実 macOS (3.0.2) 手動 smoke (要 creds、人間実行)
+- 🧊 E (defer 維持): 3.1.1 GMAC/GCM 経路 + Samba 3.1.1 parser truncated バグ（macOS 上限 3.0.2 のため低優先）
+- 🧊 obaket 組み込み (SMBClient ラッパーで ObjectStorageProtocol 化) は obaket 側 issue 356/359
+
+---
+
 MVP scope: **SMB 3.0.2 + 3.1.1 / NTLMv2 / negotiated dialect 依存の署名・暗号 /
 対象=macOS SMBX(実上限 3.0.2) + Samba(3.1.1 想定)**。
 3.1.1 は AES-128-GMAC 署名 + AES-128-GCM 暗号（swift-crypto）。3.0.2 は

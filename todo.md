@@ -11,27 +11,29 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 
 ## Phase 0 — 足場（transport / codec / crypto feasibility）
 
-- [ ] `SMBTransport` protocol を定義（connect / send / receive / close。SMB 概念を持たない）
-- [ ] `POSIXSocketTransport`（または `NIOTransport`）実装 — Linux+macOS 両対応 ⓥ(POSIX 直書き or SwiftNIO)
-- [ ] `NWConnectionTransport` 実装 — `#if canImport(Network)` で隔離（macOS 本番）
-- [ ] in-memory / loopback fake transport（unit test 用）
-- [ ] direct-TCP framing（4 byte big-endian length, 最上位 byte 0）を SMB 層に実装 ⓥ(transport 内/外)
-- [ ] SMB2 packet header (64B) encode/decode + round-trip unit test
-- [ ] crypto feasibility spike（unit）:
-  - [ ] MD4 を pure Swift 実装 + RFC1320 / MS-NLMP vector
-  - [ ] HMAC-MD5 / HMAC-SHA256 / SHA-512（swift-crypto）vector
-  - [ ] AES-128-GCM 暗号化 + **AES-128-GMAC を「平文0 / AAD=msg」の MAC として使えるか**検証（NIST vector）ⓥ
-- [ ] `swift build` / `swift test` が **Linux でも green**（Network.framework 非依存を確認）
+- [x] `SMBTransport` protocol を定義（connect / send / receive / close。SMB 概念を持たない）
+- [x] `POSIXSocketTransport`（または `NIOTransport`）実装 — Linux+macOS 両対応 ⓥ(POSIX 直書き or SwiftNIO)
+- [x] `NWConnectionTransport` 実装 — `#if canImport(Network)` で隔離（macOS 本番）
+- [x] in-memory / loopback fake transport（unit test 用）
+- [x] direct-TCP framing（4 byte big-endian length, 最上位 byte 0）を SMB 層に実装 ⓥ(transport 内/外)
+- [x] SMB2 packet header (64B) encode/decode + round-trip unit test
+- [x] crypto feasibility spike（unit）:
+  - [x] MD4 を pure Swift 実装 + RFC1320 / MS-NLMP vector
+  - [x] HMAC-MD5 / HMAC-SHA256 / SHA-512（swift-crypto）vector
+  - [x] AES-128-GCM 暗号化 + **AES-128-GMAC を「平文0 / AAD=msg」の MAC として使えるか**検証（NIST vector）ⓥ
+- [x] `swift build` / `swift test` が **Linux でも green**（Network.framework 非依存を確認）
+  - 2026-06-29: macOS で `swift build` / `swift test` green。`Network.framework` は
+    `NWConnectionTransport` の `#if canImport(Network)` 内に隔離。Linux 実機/CI での実行確認は未実施。
 - 撤退判断: 上記 crypto/vector が揃わない / Linux build 不可 → 方針再考
 
 ## Phase 1 — probe（NEGOTIATE）
 
-- [ ] NEGOTIATE request（dialect 0x0311 のみ + negotiate contexts: preauth=SHA-512 /
+- [x] NEGOTIATE request（dialect 0x0311 のみ + negotiate contexts: preauth=SHA-512 /
       encryption=AES-128-GCM(+256) / signing=AES-GMAC）encode
-- [ ] NEGOTIATE response parse（選択 dialect / security mode(signing required) /
+- [x] NEGOTIATE response parse（選択 dialect / security mode(signing required) /
       negotiate contexts の選択結果）
-- [ ] `probe(host:port:)` API → `{dialect, signingRequired, signingAlgo, cipher, preauthHashAlgo, serverGuid}`
-- [ ] `smbcli probe smb://host[:445]` で表示
+- [x] `probe(host:port:)` API → `{dialect, signingRequired, signingAlgo, cipher, preauthHashAlgo, serverGuid}`
+- [x] `smbcli probe smb://host[:445]` で表示
 - [ ] **実測**: macOS SMBX と Samba 双方が **3.1.1 + GMAC + GCM** を交渉するか ⓥ
   - 倒れる場合の判断（Samba 設定で GMAC を出す / scope に CMAC 追加 / 経路分け）を記録
 - 撤退判断: macOS/Samba が GMAC/GCM を交渉しない & 設定で出せない → scope 見直し

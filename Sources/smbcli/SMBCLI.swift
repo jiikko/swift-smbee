@@ -1,4 +1,5 @@
 import ArgumentParser
+import Foundation
 import SMBee
 
 @main
@@ -22,7 +23,22 @@ struct Probe: AsyncParsableCommand {
     var url: String
 
     func run() async throws {
-        // TODO: NEGOTIATE を実装して交渉結果を出力する。
-        throw ValidationError("probe is not implemented yet (\(url))")
+        let endpoint = try SMBURLParser.parseProbeURL(url)
+        let result = try await SMBProbe.probe(host: endpoint.host, port: endpoint.port)
+        print("dialect: \(formatHex(result.dialect, width: 4))")
+        print("signingRequired: \(result.signingRequired)")
+        print("signing: \(formatOptionalHex(result.signingAlgorithm, width: 4))")
+        print("cipher: \(formatOptionalHex(result.cipher, width: 4))")
+        print("preauthHash: \(formatOptionalHex(result.preauthHashAlgorithm, width: 4))")
+        print("serverGuid: \(result.serverGuid.uuidString)")
+    }
+
+    private func formatOptionalHex(_ value: UInt16?, width: Int) -> String {
+        guard let value else { return "none" }
+        return formatHex(value, width: width)
+    }
+
+    private func formatHex<T: FixedWidthInteger>(_ value: T, width: Int) -> String {
+        "0x" + String(format: "%0\(width)x", Int(value))
     }
 }

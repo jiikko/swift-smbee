@@ -316,10 +316,12 @@ final class SMBSession {
         let authenticate = try NTLM.makeType3(
             credential: credential,
             challenge: challenge,
+            serverName: host,
             negotiateMessage: type1Message,
             challengeMessage: challengeMessage
         )
-        let authBlob = SPNEGO.wrapNegTokenResp(authenticate.message)
+        let mechListMIC = NTLM.makeMechListMIC(exportedSessionKey: authenticate.exportedSessionKey)
+        let authBlob = SPNEGO.wrapNegTokenResp(authenticate.message, mechListMIC: mechListMIC)
         let authPacket = try SMB2SessionSetup.encodeRequest(
             messageId: nextMessageId(),
             sessionId: sessionId,

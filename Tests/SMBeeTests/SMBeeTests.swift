@@ -1,6 +1,72 @@
 import Crypto
+import Foundation
 import XCTest
 @testable import SMBee
+
+private final class BlockingReceiveTransport: SMBTransport, @unchecked Sendable {
+    private let receiveState = ReceiveState()
+
+    func connect(host: String, port: UInt16) async throws {
+        try Task.checkCancellation()
+        _ = host
+        _ = port
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
+        _ = bytes
+    }
+
+    func receive(maxLength: Int) async throws -> [UInt8] {
+        try Task.checkCancellation()
+        _ = maxLength
+
+        return try await withTaskCancellationHandler {
+            try await receiveState.waitForCancellation()
+        } onCancel: {
+            receiveState.cancel()
+        }
+    }
+
+    func close() {
+        receiveState.cancel()
+    }
+}
+
+private final class ReceiveState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<[UInt8], Error>?
+    private var isCancelled = false
+
+    func waitForCancellation() async throws -> [UInt8] {
+        try await withCheckedThrowingContinuation { continuation in
+            let continuationToResume: CheckedContinuation<[UInt8], Error>?
+
+            lock.lock()
+            if isCancelled {
+                continuationToResume = continuation
+            } else {
+                self.continuation = continuation
+                continuationToResume = nil
+            }
+            lock.unlock()
+
+            continuationToResume?.resume(throwing: CancellationError())
+        }
+    }
+
+    func cancel() {
+        let continuationToResume: CheckedContinuation<[UInt8], Error>?
+
+        lock.lock()
+        isCancelled = true
+        continuationToResume = continuation
+        continuation = nil
+        lock.unlock()
+
+        continuationToResume?.resume(throwing: CancellationError())
+    }
+}
 
 final class SMBeeTests: XCTestCase {
     func testVersionIsNotEmpty() {
@@ -67,7 +133,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testTransportCancellationPropagatesCancellationError() async {
-        let transport = InMemoryTransport(inbound: [0x01])
+        let transport = BlockingReceiveTransport()
         let task = Task {
             try await transport.receive(maxLength: 1)
         }
@@ -289,7 +355,9 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(hex(NTLM.ntProofStr(ntowfv2: ntowfv2, serverChallenge: serverChallenge, blob: blob)), "2a8e1bc8a06222ed5301c3fbd2154d0b")
     }
 
-    func testMSNLMPSection424NTLMv2SessionKeyExchangeVector() throws {
+    func testMSNLMPSection424NTLMv2SessionKeyExchangeRegressionVector() throws {
+        // Regression vector for this implementation's fixed inputs. This is not the
+        // literal MS-NLMP 4.2.4 published vector: timestamp and client challenge differ.
         let targetInfo = hexBytes(
             "02000c0044004f004d00410049004e00" +
             "01000c00530045005200560045005200" +
@@ -313,12 +381,12 @@ final class SMBeeTests: XCTestCase {
         let ntChallengeResponseOffset = Int(readUInt32LE(authenticate.message, at: 24))
         XCTAssertEqual(
             hex(Array(authenticate.message[ntChallengeResponseOffset..<ntChallengeResponseOffset + 16])),
-            "b56335b0aa26a04bdcacf0235fc4b1f4"
+            "11a818b18b5ecd85485ae35d27f6a3df"
         )
-        XCTAssertEqual(hex(authenticate.sessionBaseKey), "e563f1525289395088d56c26b3bd0dbf")
+        XCTAssertEqual(hex(authenticate.sessionBaseKey), "6e03ecfd4e8b43789dcd872557efa026")
         XCTAssertEqual(readUInt32LE(authenticate.message, at: 60) & NTLM.negotiateKeyExchange, NTLM.negotiateKeyExchange)
         XCTAssertEqual(readUInt16LE(authenticate.message, at: 52), 16)
-        XCTAssertEqual(hex(readSecurityBuffer(authenticate.message, at: 52)), "c73236c501ded70b6fdc493cf8a01636")
+        XCTAssertEqual(hex(readSecurityBuffer(authenticate.message, at: 52)), "531734fe4e46f82f46a28fadaaaf0e49")
         XCTAssertEqual(authenticate.exportedSessionKey, hexBytes("55555555555555555555555555555555"))
     }
 
@@ -339,6 +407,7 @@ final class SMBeeTests: XCTestCase {
 
         XCTAssertEqual(authenticate.message.count >= 88, true)
         XCTAssertEqual(readUInt32LE(authenticate.message, at: 60) & NTLM.negotiateKeyExchange, NTLM.negotiateKeyExchange)
+        XCTAssertEqual(readUInt32LE(authenticate.message, at: 60) & NTLM.negotiateSeal, 0)
         XCTAssertNotEqual(Array(authenticate.message[72..<88]), Array(repeating: 0, count: 16))
         var zeroed = authenticate.message
         zeroed.replaceSubrange(72..<88, with: Array(repeating: 0, count: 16))
@@ -346,6 +415,83 @@ final class SMBeeTests: XCTestCase {
             Array(authenticate.message[72..<88]),
             SMBCrypto.hmacMD5(key: exportedSessionKey, message: type1 + type2 + zeroed)
         )
+    }
+
+    func testNTLMType3MICPathAddsRequiredAVPairs() throws {
+        let type1 = NTLM.makeType1()
+        var targetInfo: [UInt8] = []
+        appendAVPair(id: 1, value: NTLM.utf16le("SERVER"), to: &targetInfo)
+        appendAVPair(id: 2, value: NTLM.utf16le("DOMAIN"), to: &targetInfo)
+        appendAVPair(id: 3, value: NTLM.utf16le("server.domain.com"), to: &targetInfo)
+        appendAVPair(id: 4, value: NTLM.utf16le("domain.com"), to: &targetInfo)
+        appendAVPair(id: 7, value: hexBytes("0090d336b734c301"), to: &targetInfo)
+        appendAVPair(id: 0, value: [], to: &targetInfo)
+        let type2 = makeNTLMChallengeMessage(targetInfo: targetInfo)
+        let challenge = try NTLM.parseChallenge(type2)
+        let authenticate = try NTLM.makeType3(
+            credential: SMBCredential(username: "User", password: "Password", domain: "Domain"),
+            challenge: challenge,
+            serverName: "169.254.69.111",
+            negotiateMessage: type1,
+            challengeMessage: type2,
+            timestamp: 0x01c334b736d39000,
+            clientChallenge: hexBytes("ffffff0011223344"),
+            exportedSessionKey: hexBytes("00112233445566778899aabbccddeeff")
+        )
+        let ntChallengeResponse = readSecurityBuffer(authenticate.message, at: 20)
+        let blob = Array(ntChallengeResponse.dropFirst(16))
+        let avPairs = try decodeNTLMv2BlobAVPairs(blob)
+
+        XCTAssertEqual(avPairs.map { $0.id }, [1, 2, 3, 4, 7, 6, 9, 10, 0])
+        XCTAssertEqual(avPairs.first { $0.id == 6 }?.value, [0x02, 0x00, 0x00, 0x00])
+        XCTAssertEqual(avPairs.first { $0.id == 9 }?.value, NTLM.utf16le("cifs/169.254.69.111"))
+        XCTAssertEqual(avPairs.first { $0.id == 10 }?.value, Array(repeating: 0, count: 16))
+    }
+
+    func testNTLMType3MICPathUpdatesExistingRequiredAVPairsWithoutDuplicates() throws {
+        let type1 = NTLM.makeType1()
+        var targetInfo: [UInt8] = []
+        appendAVPair(id: 1, value: NTLM.utf16le("SERVER"), to: &targetInfo)
+        appendAVPair(id: 6, value: [0x01, 0x00, 0x00, 0x00], to: &targetInfo)
+        appendAVPair(id: 7, value: hexBytes("0090d336b734c301"), to: &targetInfo)
+        appendAVPair(id: 9, value: NTLM.utf16le("server-sent-target"), to: &targetInfo)
+        appendAVPair(id: 10, value: Array(repeating: 0xff, count: 16), to: &targetInfo)
+        appendAVPair(id: 0, value: [], to: &targetInfo)
+        let type2 = makeNTLMChallengeMessage(targetInfo: targetInfo)
+        let challenge = try NTLM.parseChallenge(type2)
+        let authenticate = try NTLM.makeType3(
+            credential: SMBCredential(username: "User", password: "Password", domain: "Domain"),
+            challenge: challenge,
+            serverName: "169.254.69.111",
+            negotiateMessage: type1,
+            challengeMessage: type2,
+            timestamp: 0x01c334b736d39000,
+            clientChallenge: hexBytes("ffffff0011223344"),
+            exportedSessionKey: hexBytes("00112233445566778899aabbccddeeff")
+        )
+        let ntChallengeResponse = readSecurityBuffer(authenticate.message, at: 20)
+        let blob = Array(ntChallengeResponse.dropFirst(16))
+        let avPairs = try decodeNTLMv2BlobAVPairs(blob)
+
+        XCTAssertEqual(avPairs.map { $0.id }, [1, 6, 7, 9, 10, 0])
+        XCTAssertEqual(avPairs.filter { $0.id == 6 }.count, 1)
+        XCTAssertEqual(readUInt32LE(avPairs.first { $0.id == 6 }!.value, at: 0), 0x00000003)
+        XCTAssertEqual(avPairs.filter { $0.id == 9 }.count, 1)
+        XCTAssertEqual(avPairs.first { $0.id == 9 }?.value, NTLM.utf16le("cifs/169.254.69.111"))
+        XCTAssertEqual(avPairs.filter { $0.id == 10 }.count, 1)
+        XCTAssertEqual(avPairs.first { $0.id == 10 }?.value, Array(repeating: 0, count: 16))
+    }
+
+    func testNTLMClientSigningKeyAndMechListMICUseFixedVectors() throws {
+        let exportedSessionKey = hexBytes("00112233445566778899aabbccddeeff")
+        let signingKey = NTLM.clientSigningKey(exportedSessionKey: exportedSessionKey)
+        let sealingKey = NTLM.clientSealingKey(exportedSessionKey: exportedSessionKey)
+        let mic = NTLM.makeMechListMIC(exportedSessionKey: exportedSessionKey)
+
+        XCTAssertEqual(hex(signingKey), "59d6baefd8fb9cfe7c66605162a2b238")
+        XCTAssertEqual(hex(sealingKey), "248e660b070223ef5f92354062032e48")
+        XCTAssertEqual(SPNEGO.ntlmMechTypeListDER, hexBytes("300c060a2b06010401823702020a"))
+        XCTAssertEqual(hex(mic), "01000000549d70fe51ab6ebd00000000")
     }
 
     func testNTLMType1FixedBytesAndSecurityBuffers() {
@@ -450,6 +596,34 @@ final class SMBeeTests: XCTestCase {
         )
         XCTAssertEqual(readUInt16LE(request, at: 78), UInt16(blob.count))
         XCTAssertEqual(Array(request[88..<request.count]), blob)
+    }
+
+    func testSPNEGONegTokenRespIncludesMechListMIC() throws {
+        let type3 = Array("type3".utf8)
+        let mechListMIC = hexBytes("01000000549d70fe51ab6ebd00000000")
+        let blob = SPNEGO.wrapNegTokenResp(type3, mechListMIC: mechListMIC)
+
+        var cursor = 0
+        let negTokenRespEnd = try expectDERTag(0xa1, in: blob, cursor: &cursor)
+        let sequenceEnd = try expectDERTag(0x30, in: blob, cursor: &cursor)
+        let responseTokenEnd = try expectDERTag(0xa2, in: blob, cursor: &cursor)
+        let tokenEnd = try expectDERTag(0x04, in: blob, cursor: &cursor)
+        XCTAssertEqual(Array(blob[cursor..<tokenEnd]), type3)
+        cursor = tokenEnd
+        XCTAssertEqual(cursor, responseTokenEnd)
+
+        let micContextStart = cursor
+        let mechListMICEnd = try expectDERTag(0xa3, in: blob, cursor: &cursor)
+        let octetStart = cursor
+        let octetEnd = try expectDERTag(0x04, in: blob, cursor: &cursor)
+        XCTAssertEqual(octetEnd - cursor, 16)
+        XCTAssertEqual(Array(blob[cursor..<octetEnd]), mechListMIC)
+        XCTAssertEqual(Array(blob[micContextStart..<octetStart]), [0xa3, 0x12])
+        cursor = octetEnd
+        XCTAssertEqual(cursor, mechListMICEnd)
+        XCTAssertEqual(cursor, sequenceEnd)
+        XCTAssertEqual(cursor, negTokenRespEnd)
+        XCTAssertEqual(cursor, blob.count)
     }
 
     func testSessionSetupRequestFixedFieldsAndSecurityBuffer() throws {
@@ -1158,6 +1332,29 @@ final class SMBeeTests: XCTestCase {
         let length = Int(readUInt16LE(bytes, at: offset))
         let bufferOffset = Int(readUInt32LE(bytes, at: offset + 4))
         return Array(bytes[bufferOffset..<bufferOffset + length])
+    }
+
+    private func decodeNTLMv2BlobAVPairs(_ blob: [UInt8]) throws -> [(id: UInt16, value: [UInt8])] {
+        var offset = 28
+        var pairs: [(id: UInt16, value: [UInt8])] = []
+        while offset + 4 <= blob.count {
+            let id = readUInt16LE(blob, at: offset)
+            let length = Int(readUInt16LE(blob, at: offset + 2))
+            offset += 4
+            guard offset + length <= blob.count else { throw SMBCodecError.truncated }
+            pairs.append((id, Array(blob[offset..<offset + length])))
+            offset += length
+            if id == 0 { return pairs }
+        }
+        throw SMBCodecError.invalidValue("NTLMv2 blob target info missing EOL")
+    }
+
+    private func appendAVPair(id: UInt16, value: [UInt8], to bytes: inout [UInt8]) {
+        bytes.append(UInt8(id & 0xff))
+        bytes.append(UInt8((id >> 8) & 0xff))
+        bytes.append(UInt8(value.count & 0xff))
+        bytes.append(UInt8((value.count >> 8) & 0xff))
+        bytes.append(contentsOf: value)
     }
 
     private func makeDirectoryEntry(

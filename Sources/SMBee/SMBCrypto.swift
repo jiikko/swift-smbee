@@ -28,6 +28,10 @@ public enum SMBCrypto {
         return Array(authenticationCode)
     }
 
+    public static func md5(_ bytes: [UInt8]) -> [UInt8] {
+        Array(Insecure.MD5.hash(data: bytes))
+    }
+
     public static func aesGCMSeal(
         key: [UInt8],
         nonce: [UInt8],

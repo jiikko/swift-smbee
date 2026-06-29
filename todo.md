@@ -22,7 +22,14 @@
 
 **残**:
 
-- ⏳ #3: 実 macOS (3.0.2) 手動 smoke (要 creds、人間実行)。MIC 実装済みで成功率向上
+- ✅ #3: 実 macOS (3.0.2) フル smoke 完了 (2026-06-30)。probe/ls/stat/cat(content round-trip)/
+  mkdir/put/mv/rm(--directory) すべて成功 = 署名 CMAC + 暗号 CCM が実 macOS セッション上で正しい。
+  通過のため NTLMv2 の 3 バグを修正 (blob header byte order / trailing Z(4) / SPNEGO mechListMIC の
+  KEY_EXCH RC4 sealing)。詳細は `issues/001-bug-macos-ntlm-logon-failure.md`。
+  注: macOS は `rm` でディレクトリを消すとき NON_DIRECTORY_FILE open を拒否する (Samba は許容) ため
+  `smbcli rm --directory` が必要。将来 stat で自動判別する UX 改善余地あり (ぼやき)。
+  再発防止メモ: E2E が Samba のみだと「Samba 通過/macOS 拒否」型バグを取りこぼす。NT ハッシュ有効化済み
+  macOS アカウントへの手動 smoke を維持すること。
 - ⏳ D 残: SMBSession の **切断検出→自動再接続** (cancellation は実装済)
 - 🧊 E (defer 維持): 3.1.1 GMAC/GCM 経路 + Samba 3.1.1 parser truncated バグ（macOS 上限 3.0.2 のため低優先）
 - 🧊 obaket 組み込み (SMBClient ラッパーで ObjectStorageProtocol 化) は obaket 側 issue 356/359

@@ -81,6 +81,7 @@ enum NTLM {
     static func makeType3(
         credential: SMBCredential,
         challenge: NTLMChallenge,
+        serverName: String = "",
         negotiateMessage: [UInt8]? = nil,
         challengeMessage: [UInt8]? = nil,
         timestamp: UInt64 = currentNTTime(),
@@ -97,29 +98,47 @@ enum NTLM {
         let domainBytes = utf16le(credential.domain)
         let workstationBytes = utf16le("")
         let ntowfv2 = ntowfv2(password: credential.password, username: credential.username, domain: credential.domain)
-        var blob = SMBByteWriter()
-        blob.writeUInt32LE(0x0101_0000)
-        blob.writeUInt32LE(0)
-        blob.writeUInt64LE(timestamp)
-        blob.writeBytes(clientChallenge)
-        blob.writeUInt32LE(0)
-        blob.writeBytes(challenge.targetInfo)
-        if !challenge.targetInfo.suffix(4).allSatisfy({ $0 == 0 }) {
-            blob.writeUInt32LE(0)
-        }
-        let proof = SMBCrypto.hmacMD5(key: ntowfv2, message: challenge.serverChallenge + blob.bytes)
-        let ntChallengeResponse = proof + blob.bytes
-        let lmChallengeResponse = SMBCrypto.hmacMD5(
-            key: ntowfv2,
-            message: challenge.serverChallenge + clientChallenge
-        ) + clientChallenge
-        let sessionBaseKey = SMBCrypto.hmacMD5(key: ntowfv2, message: proof)
-        let encryptedRandomSessionKey = RC4.crypt(key: sessionBaseKey, message: exportedSessionKey)
         let includeMIC = targetInfoContainsTimestamp(challenge.targetInfo)
         if includeMIC, negotiateMessage == nil || challengeMessage == nil {
             throw SMBCodecError.invalidValue("NTLM MIC requires type1 and type2 messages")
         }
-        let flags = (negotiateFlags & challenge.flags) | negotiateKeyExchange
+        let targetInfo = includeMIC ? makeMICCompatibleTargetInfo(challenge.targetInfo, serverName: serverName) : challenge.targetInfo
+        // MS-NLMP 3.1.5.1.2: CHALLENGE_MESSAGE の TargetInfo に MsvAvTimestamp(AvId=7) がある場合、
+        // blob の TimeStamp フィールドにはサーバ提供の timestamp をそのまま使う (currentNTTime() で
+        // 上書きしない)。実 macOS SMBX はこの値で NTProofStr を再計算するため、ずれると LOGON_FAILURE。
+        // Samba は許容するため Samba E2E では露見しなかった。
+        let effectiveTimestamp = serverTimestamp(from: challenge.targetInfo) ?? timestamp
+        // NTLMv2_CLIENT_CHALLENGE (MS-NLMP 2.2.2.7): RespType=1, HiRespType=1, Reserved1=0, Reserved2=0。
+        // wire 上は先頭バイトから 01 01 00 00 00 00 00 00。0x0101_0000 を UInt32LE で書くと
+        // 00 00 01 01 となり RespType の位置がずれる (実 macOS/Heimdal は canonical header で
+        // 再構成・照合するため verify ntlm2 hash failed になる。Samba は client blob をそのまま
+        // 使うため露見しなかった)。バイト列で明示する。
+        var blob = SMBByteWriter()
+        blob.writeBytes([0x01, 0x01, 0x00, 0x00])
+        blob.writeUInt32LE(0)
+        blob.writeUInt64LE(effectiveTimestamp)
+        blob.writeBytes(clientChallenge)
+        blob.writeUInt32LE(0)
+        blob.writeBytes(targetInfo)
+        // MS-NLMP 2.2.2.7: temp = ... || ServerName(=targetInfo, MsvAvEOL 込み) || Z(4)。
+        // targetInfo は EOL(0000 0000) で終わるが、その後ろに必ず別の Z(4) を付ける
+        // (EOL の 0 と混同して条件付きスキップすると末尾 Z(4) が欠落し、実 macOS/Heimdal が
+        // canonical 再構成と照合して verify ntlm2 hash failed になる。Samba は露見せず)。
+        blob.writeUInt32LE(0)
+        let proof = SMBCrypto.hmacMD5(key: ntowfv2, message: challenge.serverChallenge + blob.bytes)
+        let ntChallengeResponse = proof + blob.bytes
+        // MS-NLMP 3.1.5.1.2: CHALLENGE_MESSAGE の TargetInfo に MsvAvTimestamp がある場合、
+        // client は LmChallengeResponse を Z(24) (24 byte の 0) にする (実 macOS SMBX は非0の
+        // LM 応答を拒否する。Samba は許容するため Samba E2E では露見しなかった)。
+        let lmChallengeResponse = includeMIC
+            ? Array(repeating: UInt8(0), count: 24)
+            : SMBCrypto.hmacMD5(
+                key: ntowfv2,
+                message: challenge.serverChallenge + clientChallenge
+            ) + clientChallenge
+        let sessionBaseKey = SMBCrypto.hmacMD5(key: ntowfv2, message: proof)
+        let encryptedRandomSessionKey = RC4.crypt(key: sessionBaseKey, message: exportedSessionKey)
+        let flags = ((negotiateFlags & challenge.flags) | negotiateKeyExchange) & ~negotiateSeal
         let fixedSize = includeMIC ? 88 : 72
         var payloadOffset = UInt32(fixedSize)
         var payload: [UInt8] = []
@@ -168,6 +187,28 @@ enum NTLM {
         SMBCrypto.hmacMD5(key: ntowfv2, message: serverChallenge + blob)
     }
 
+    static func clientSigningKey(exportedSessionKey: [UInt8]) -> [UInt8] {
+        let magic = Array("session key to client-to-server signing key magic constant".utf8) + [0]
+        return SMBCrypto.md5(exportedSessionKey + magic)
+    }
+
+    static func clientSealingKey(exportedSessionKey: [UInt8]) -> [UInt8] {
+        let magic = Array("session key to client-to-server sealing key magic constant".utf8) + [0]
+        return SMBCrypto.md5(exportedSessionKey + magic)
+    }
+
+    static func makeMechListMIC(exportedSessionKey: [UInt8], mechList: [UInt8] = SPNEGO.ntlmMechTypeListDER) -> [UInt8] {
+        // NTLM MakeSignature (MS-NLMP 3.4.4.1, extended session security, seqnum=0)。
+        // NTLMSSP_NEGOTIATE_KEY_EXCH が立っているので checksum を sealing key の RC4 stream で
+        // 暗号化する (実 macOS/Heimdal はこれを期待。平文 HMAC のままだと mechListMIC 検証に失敗し
+        // GSS_S_DEFECTIVE_TOKEN になる)。SEAL flag は立てていないが KEY_EXCH 経路の MIC では RC4 する。
+        let signingKey = clientSigningKey(exportedSessionKey: exportedSessionKey)
+        let rawChecksum = Array(SMBCrypto.hmacMD5(key: signingKey, message: [0, 0, 0, 0] + mechList).prefix(8))
+        let sealingKey = clientSealingKey(exportedSessionKey: exportedSessionKey)
+        let checksum = RC4.crypt(key: sealingKey, message: rawChecksum)
+        return [0x01, 0x00, 0x00, 0x00] + checksum + [0x00, 0x00, 0x00, 0x00]
+    }
+
     static func utf16le(_ string: String) -> [UInt8] {
         string.utf16.flatMap { [UInt8($0 & 0xff), UInt8(($0 >> 8) & 0xff)] }
     }
@@ -197,6 +238,94 @@ enum NTLM {
             offset += length
         }
         return false
+    }
+
+    /// TargetInfo の MsvAvTimestamp(AvId=7, 8 byte FILETIME LE) を取り出す。無ければ nil。
+    private static func serverTimestamp(from bytes: [UInt8]) -> UInt64? {
+        var offset = 0
+        while offset + 4 <= bytes.count {
+            let avID = readUInt16LE(bytes, at: offset)
+            let length = Int(readUInt16LE(bytes, at: offset + 2))
+            offset += 4
+            if avID == 0 { return nil }
+            guard offset + length <= bytes.count else { return nil }
+            if avID == 7, length == 8 {
+                var value: UInt64 = 0
+                for i in 0..<8 { value |= UInt64(bytes[offset + i]) << (8 * i) }
+                return value
+            }
+            offset += length
+        }
+        return nil
+    }
+
+    private static func makeMICCompatibleTargetInfo(_ bytes: [UInt8], serverName: String) -> [UInt8] {
+        var result: [UInt8] = []
+        var offset = 0
+        var hasFlags = false
+        var hasTargetName = false
+        var hasChannelBindings = false
+
+        while offset + 4 <= bytes.count {
+            let avID = readUInt16LE(bytes, at: offset)
+            let length = Int(readUInt16LE(bytes, at: offset + 2))
+            offset += 4
+            if avID == 0 { break }
+            guard offset + length <= bytes.count else {
+                result.append(contentsOf: bytes[(offset - 4)...])
+                appendAVPair(id: 0, value: [], to: &result)
+                return result
+            }
+
+            let value = Array(bytes[offset..<offset + length])
+            switch avID {
+            case 6:
+                hasFlags = true
+                let flags = (length == 4 ? readUInt32LE(value, at: 0) : 0) | 0x00000002
+                appendAVPair(
+                    id: avID,
+                    value: [
+                        UInt8(flags & 0xff),
+                        UInt8((flags >> 8) & 0xff),
+                        UInt8((flags >> 16) & 0xff),
+                        UInt8((flags >> 24) & 0xff)
+                    ],
+                    to: &result
+                )
+            case 9 where !serverName.isEmpty:
+                hasTargetName = true
+                // The MIC target name is client-selected, so prefer cifs/<serverName> over a server-sent value.
+                appendAVPair(id: avID, value: utf16le("cifs/" + serverName), to: &result)
+            case 10:
+                hasChannelBindings = true
+                appendAVPair(id: avID, value: Array(repeating: 0, count: 16), to: &result)
+            default:
+                appendAVPair(id: avID, value: value, to: &result)
+            }
+            offset += length
+        }
+
+        if !hasFlags {
+            appendAVPair(id: 6, value: [0x02, 0x00, 0x00, 0x00], to: &result)
+        }
+        if !serverName.isEmpty {
+            if !hasTargetName {
+                appendAVPair(id: 9, value: utf16le("cifs/" + serverName), to: &result)
+            }
+            if !hasChannelBindings {
+                appendAVPair(id: 10, value: Array(repeating: 0, count: 16), to: &result)
+            }
+        }
+        appendAVPair(id: 0, value: [], to: &result)
+        return result
+    }
+
+    private static func appendAVPair(id: UInt16, value: [UInt8], to bytes: inout [UInt8]) {
+        bytes.append(UInt8(id & 0xff))
+        bytes.append(UInt8((id >> 8) & 0xff))
+        bytes.append(UInt8(value.count & 0xff))
+        bytes.append(UInt8((value.count >> 8) & 0xff))
+        bytes.append(contentsOf: value)
     }
 
     private static func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {
@@ -241,15 +370,20 @@ enum RC4 {
 }
 
 enum SPNEGO {
+    private static let ntlmOID: [UInt8] = [0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a]
+    static let ntlmMechTypeListDER: [UInt8] = derSequence(ntlmOID)
+
     static func wrapNegTokenInit(_ token: [UInt8]) -> [UInt8] {
-        let ntlmOID: [UInt8] = [0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a]
-        let mechTypes = derSequence(ntlmOID)
-        let initToken = derContext(0, mechTypes) + derContext(2, derOctetString(token))
+        let initToken = derContext(0, ntlmMechTypeListDER) + derContext(2, derOctetString(token))
         return derApplication(0, derOID([0x2b, 0x06, 0x01, 0x05, 0x05, 0x02]) + derContext(0, derSequence(initToken)))
     }
 
-    static func wrapNegTokenResp(_ token: [UInt8]) -> [UInt8] {
-        derContext(1, derSequence(derContext(2, derOctetString(token))))
+    static func wrapNegTokenResp(_ token: [UInt8], mechListMIC: [UInt8]? = nil) -> [UInt8] {
+        var response = derContext(2, derOctetString(token))
+        if let mechListMIC {
+            response += derContext(3, derOctetString(mechListMIC))
+        }
+        return derContext(1, derSequence(response))
     }
 
     static func unwrapNTLMToken(_ bytes: [UInt8]) throws -> [UInt8] {

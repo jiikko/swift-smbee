@@ -481,6 +481,23 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[96..<98]), [0x2a, 0x00])
     }
 
+    func testQueryDirectoryResponseDropsDotEntriesForRecursiveDeleteWalks() throws {
+        var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: 11).encode()
+        let payload = makeDirectoryEntry(name: ".", isDirectory: true, nextOffset: 112)
+            + makeDirectoryEntry(name: "..", isDirectory: true, nextOffset: 112)
+            + makeDirectoryEntry(name: "child.txt", isDirectory: false, fileSize: 7, nextOffset: 0)
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 66)
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+
+        XCTAssertEqual(
+            try SMB2QueryDirectory.decodeResponse(response),
+            [SMBDirectoryEntry(name: "child.txt", fileSize: 7, isDirectory: false)]
+        )
+    }
+
     func testQueryInfoRequestUsesFileNetworkOpenInformationAndOneByteBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let request = try SMB2QueryInfo.encodeRequest(
@@ -589,6 +606,54 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(5, to: &response, at: 68)
 
         XCTAssertEqual(try SMB2Write.decodeResponseCount(response), 5)
+    }
+
+    func testFlushRequestUsesFileIdAndReservedFields() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2Flush.encodeRequest(
+            messageId: 17,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.flush)
+        XCTAssertEqual(header.messageId, 17)
+        XCTAssertEqual(header.treeId, 0x5566_7788)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(request.count, 88)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 24)
+        XCTAssertEqual(readUInt16LE(request, at: 66), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 0)
+        XCTAssertEqual(Array(request[72..<88]), fileId)
+    }
+
+    func testTransferChunkSizeRespectsNegotiatedLimitsAndTransformOverhead() {
+        XCTAssertEqual(
+            SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: 1_048_576),
+            64 * 1024
+        )
+        XCTAssertEqual(
+            SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: 32 * 1024),
+            32 * 1024
+        )
+        XCTAssertEqual(
+            SMBTransferLimits.negotiatedChunkSize(
+                localLimit: 64 * 1024,
+                negotiatedLimit: UInt32(SMB3TransformHeader.encodedSize + 4096),
+                transformOverhead: SMB3TransformHeader.encodedSize
+            ),
+            4096
+        )
+        XCTAssertEqual(
+            SMBTransferLimits.negotiatedChunkSize(
+                localLimit: 64 * 1024,
+                negotiatedLimit: UInt32(SMB3TransformHeader.encodedSize),
+                transformOverhead: SMB3TransformHeader.encodedSize
+            ),
+            1
+        )
     }
 
     func testSetInfoRenameRequestUsesFileRenameInformationBuffer() throws {
@@ -702,6 +767,9 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(parsed.cipher, SMBNegotiateConstants.aes128GCM)
         XCTAssertEqual(parsed.preauthHashAlgorithm, SMBNegotiateConstants.sha512)
         XCTAssertEqual(parsed.serverGuid.uuidString, "00112233-4455-6677-8899-AABBCCDDEEFF")
+        XCTAssertEqual(parsed.maxTransactSize, 1_048_576)
+        XCTAssertEqual(parsed.maxReadSize, 1_048_576)
+        XCTAssertEqual(parsed.maxWriteSize, 1_048_576)
     }
 
     func testNegotiateResponseBefore311HasNoContexts() throws {
@@ -718,6 +786,9 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNil(parsed.cipher)
         XCTAssertNil(parsed.preauthHashAlgorithm)
         XCTAssertEqual(parsed.serverGuid.uuidString, "00112233-4455-6677-8899-AABBCCDDEEFF")
+        XCTAssertEqual(parsed.maxTransactSize, 1_048_576)
+        XCTAssertEqual(parsed.maxReadSize, 1_048_576)
+        XCTAssertEqual(parsed.maxWriteSize, 1_048_576)
     }
 
     func testNegotiateResponseRejectsInvalidContextOffset() throws {
@@ -792,6 +863,25 @@ final class SMBeeTests: XCTestCase {
         bytes.append(contentsOf: writer.bytes)
     }
 
+    private func makeDirectoryEntry(
+        name: String,
+        isDirectory: Bool,
+        fileSize: UInt64 = 0,
+        nextOffset: UInt32
+    ) -> [UInt8] {
+        let nameBytes = NTLM.utf16le(name)
+        var bytes = Array(repeating: UInt8(0), count: 104 + nameBytes.count)
+        writeUInt32LE(nextOffset, to: &bytes, at: 0)
+        writeUInt64LE(fileSize, to: &bytes, at: 40)
+        writeUInt32LE(isDirectory ? 0x10 : 0x80, to: &bytes, at: 56)
+        writeUInt32LE(UInt32(nameBytes.count), to: &bytes, at: 60)
+        bytes.replaceSubrange(104..<104 + nameBytes.count, with: nameBytes)
+        if Int(nextOffset) > bytes.count {
+            bytes.append(contentsOf: Array(repeating: 0, count: Int(nextOffset) - bytes.count))
+        }
+        return bytes
+    }
+
     private func hex(_ bytes: [UInt8]) -> String {
         bytes.map { String(format: "%02x", $0) }.joined()
     }
@@ -858,5 +948,10 @@ final class SMBeeTests: XCTestCase {
         bytes[offset + 1] = UInt8((value >> 8) & 0xff)
         bytes[offset + 2] = UInt8((value >> 16) & 0xff)
         bytes[offset + 3] = UInt8((value >> 24) & 0xff)
+    }
+
+    private func writeUInt64LE(_ value: UInt64, to bytes: inout [UInt8], at offset: Int) {
+        writeUInt32LE(UInt32(value & 0xffff_ffff), to: &bytes, at: offset)
+        writeUInt32LE(UInt32((value >> 32) & 0xffff_ffff), to: &bytes, at: offset + 4)
     }
 }

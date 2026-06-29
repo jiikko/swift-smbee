@@ -22,7 +22,16 @@ public struct SMBReadRange: Equatable, Sendable {
     }
 }
 
+enum SMBTransferLimits {
+    static func negotiatedChunkSize(localLimit: Int, negotiatedLimit: UInt32, transformOverhead: Int = 0) -> Int {
+        let usableNegotiatedLimit = max(0, Int(negotiatedLimit) - transformOverhead)
+        return max(1, min(localLimit, usableNegotiatedLimit))
+    }
+}
+
 public enum SMBClient {
+    private static let localWriteChunkLimit = 64 * 1024
+
     private static func withSession<T>(
         host: String,
         port: UInt16,
@@ -135,6 +144,36 @@ public enum SMBClient {
             let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
             do {
                 try await session.write(treeId: treeId, fileId: fileId, data: data)
+                try await session.flush(treeId: treeId, fileId: fileId)
+                try? await session.close(treeId: treeId, fileId: fileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
+        }
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true,
+        credential: SMBCredential,
+        transport: SMBTransport = POSIXSocketTransport()
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
+            let handle = try FileHandle(forReadingFrom: localFile)
+            defer { try? handle.close() }
+            do {
+                try await session.write(treeId: treeId, fileId: fileId) { maxLength in
+                    let length = min(maxLength, localWriteChunkLimit)
+                    let data = try handle.read(upToCount: length) ?? Data()
+                    return Array(data)
+                }
+                try await session.flush(treeId: treeId, fileId: fileId)
                 try? await session.close(treeId: treeId, fileId: fileId)
             } catch {
                 try? await session.close(treeId: treeId, fileId: fileId)
@@ -171,16 +210,22 @@ public enum SMBClient {
         share: String,
         path: String,
         directory: Bool = false,
+        recursive: Bool = false,
         credential: SMBCredential,
         transport: SMBTransport = POSIXSocketTransport()
     ) async throws {
         try await withSession(host: host, port: port, share: share, credential: credential, transport: transport) { session, treeId in
+            if recursive {
+                try await session.deleteRecursively(treeId: treeId, path: path, directory: directory)
+                return
+            }
             let fileId = try await session.create(treeId: treeId, request: .delete(path: path, directory: directory))
             try await session.close(treeId: treeId, fileId: fileId)
         }
     }
 }
 
+// swiftlint:disable:next type_body_length
 final class SMBSession {
     private let host: String
     private let port: UInt16
@@ -192,6 +237,8 @@ final class SMBSession {
     private var encryptionKey: [UInt8]?
     private var decryptionKey: [UInt8]?
     private var transformNonceCounter: UInt64 = 0
+    private var maxReadSize: UInt32 = UInt32.max
+    private var maxWriteSize: UInt32 = UInt32.max
 
     init(host: String, port: UInt16, credential: SMBCredential, transport: SMBTransport) {
         self.host = host
@@ -207,6 +254,8 @@ final class SMBSession {
         try await sendUnsigned(negotiate)
         let negotiateResponse = try await receive(label: "NEGOTIATE response")
         let result = try SMBNegotiateCodec.decodeResponse(negotiateResponse)
+        maxReadSize = result.maxReadSize
+        maxWriteSize = result.maxWriteSize
         guard result.dialect == SMBNegotiateConstants.dialect302 || result.dialect == SMBNegotiateConstants.dialect300 else {
             throw SMBCodecError.invalidValue("authenticated read path currently supports SMB 3.0.x")
         }
@@ -328,7 +377,7 @@ final class SMBSession {
     }
 
     func read(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
-        let chunkSize = UInt64(64 * 1024)
+        let chunkSize = UInt64(negotiatedReadChunkSize())
         var cursor = offset
         var remaining = length
         var result: [UInt8] = []
@@ -363,7 +412,7 @@ final class SMBSession {
     }
 
     func write(treeId: UInt32, fileId: [UInt8], data: [UInt8]) async throws {
-        let chunkSize = 64 * 1024
+        let chunkSize = negotiatedWriteChunkSize()
         var cursor = 0
         while cursor < data.count {
             let end = min(cursor + chunkSize, data.count)
@@ -386,6 +435,62 @@ final class SMBSession {
             }
             cursor += Int(count)
         }
+    }
+
+    func write(treeId: UInt32, fileId: [UInt8], nextChunk: (Int) throws -> [UInt8]) async throws {
+        let chunkSize = negotiatedWriteChunkSize()
+        var offset: UInt64 = 0
+        while true {
+            let chunk = try nextChunk(chunkSize)
+            if chunk.isEmpty { break }
+            let packet = try SMB2Write.encodeRequest(
+                messageId: nextMessageId(),
+                sessionId: sessionId,
+                treeId: treeId,
+                fileId: fileId,
+                offset: offset,
+                data: chunk
+            )
+            debugDump("WRITE request", packet)
+            try await sendSigned(packet)
+            let response = try await receive(label: "WRITE response")
+            try verifySigned(response)
+            let count = try SMB2Write.decodeResponseCount(response)
+            guard count == chunk.count else {
+                throw SMBCodecError.invalidValue("short SMB write: expected \(chunk.count) bytes, got \(count)")
+            }
+            offset += UInt64(count)
+        }
+    }
+
+    func flush(treeId: UInt32, fileId: [UInt8]) async throws {
+        let packet = try SMB2Flush.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
+        debugDump("FLUSH request", packet)
+        try await sendSigned(packet)
+        let response = try await receive(label: "FLUSH response")
+        try verifySigned(response)
+        let header = try SMB2Header.decode(response)
+        guard header.status == SMB2Status.success else {
+            throw SMBCodecError.invalidValue(String(format: "FLUSH failed with NTSTATUS 0x%08x", header.status))
+        }
+    }
+
+    func deleteRecursively(treeId: UInt32, path: String, directory: Bool) async throws {
+        if directory {
+            let fileId = try await create(treeId: treeId, path: path, directory: true)
+            do {
+                let entries = try await queryDirectory(treeId: treeId, fileId: fileId)
+                try? await close(treeId: treeId, fileId: fileId)
+                for entry in entries {
+                    try await deleteRecursively(treeId: treeId, path: joinSMBPath(path, entry.name), directory: entry.isDirectory)
+                }
+            } catch {
+                try? await close(treeId: treeId, fileId: fileId)
+                throw error
+            }
+        }
+        let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: directory))
+        try await close(treeId: treeId, fileId: fileId)
     }
 
     func rename(treeId: UInt32, fileId: [UInt8], newPath: String, replaceIfExists: Bool) async throws {
@@ -532,6 +637,22 @@ final class SMBSession {
             0,
             0,
         ]
+    }
+
+    private func negotiatedWriteChunkSize() -> Int {
+        let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
+        return SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: maxWriteSize, transformOverhead: transformOverhead)
+    }
+
+    private func negotiatedReadChunkSize() -> Int {
+        let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
+        return SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: maxReadSize, transformOverhead: transformOverhead)
+    }
+
+    private func joinSMBPath(_ parent: String, _ child: String) -> String {
+        let trimmedParent = parent.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+        if trimmedParent.isEmpty { return child }
+        return "\(trimmedParent)\\\(child)"
     }
 
     private func debugDump(_ label: String, _ bytes: [UInt8]) {

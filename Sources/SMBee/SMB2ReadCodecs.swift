@@ -5,6 +5,7 @@ enum SMB2Commands {
     static let treeConnect: UInt16 = 3
     static let create: UInt16 = 5
     static let close: UInt16 = 6
+    static let flush: UInt16 = 7
     static let read: UInt16 = 8
     static let write: UInt16 = 9
     static let setInfo: UInt16 = 17
@@ -424,6 +425,20 @@ enum SMB2Close {
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8]) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
         let header = try SMB2Header(command: SMB2Commands.close, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(24)
+        writer.writeUInt16LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeBytes(fileId)
+        return writer.bytes
+    }
+}
+
+enum SMB2Flush {
+    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8]) throws -> [UInt8] {
+        guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        let header = try SMB2Header(command: SMB2Commands.flush, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(24)

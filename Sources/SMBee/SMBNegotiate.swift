@@ -7,6 +7,9 @@ public struct SMBProbeResult: Equatable, Sendable {
     public var cipher: UInt16?
     public var preauthHashAlgorithm: UInt16?
     public var serverGuid: UUID
+    public var maxTransactSize: UInt32
+    public var maxReadSize: UInt32
+    public var maxWriteSize: UInt32
 }
 
 public enum SMBNegotiateConstants {
@@ -88,7 +91,11 @@ public enum SMBNegotiateCodec {
         let dialect = try reader.readUInt16LE()
         let contextCount = try reader.readUInt16LE()
         let serverGuid = try UUID(smbWireBytes: reader.readBytes(count: 16))
-        try reader.skip(count: 4 + 4 + 4 + 4 + 8 + 8)
+        try reader.skip(count: 4)
+        let maxTransactSize = try reader.readUInt32LE()
+        let maxReadSize = try reader.readUInt32LE()
+        let maxWriteSize = try reader.readUInt32LE()
+        try reader.skip(count: 8 + 8)
         let securityBufferOffset = try reader.readUInt16LE()
         let securityBufferLength = try reader.readUInt16LE()
         let contextOffset = try reader.readUInt32LE()
@@ -159,7 +166,10 @@ public enum SMBNegotiateCodec {
             signingAlgorithm: signingAlgorithm,
             cipher: cipher,
             preauthHashAlgorithm: preauthHashAlgorithm,
-            serverGuid: serverGuid
+            serverGuid: serverGuid,
+            maxTransactSize: maxTransactSize,
+            maxReadSize: maxReadSize,
+            maxWriteSize: maxWriteSize
         )
     }
 

@@ -70,6 +70,26 @@ public enum SMBee {
         )
     }
 
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true
+    ) async throws {
+        try await SMBClient.upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localFile: localFile,
+            overwrite: overwrite,
+            credential: credential
+        )
+    }
+
     public static func rename(
         host: String,
         port: UInt16 = 445,
@@ -96,8 +116,17 @@ public enum SMBee {
         credential: SMBCredential,
         share: String,
         path: String,
-        directory: Bool = false
+        directory: Bool = false,
+        recursive: Bool = false
     ) async throws {
-        try await SMBClient.delete(host: host, port: port, share: share, path: path, directory: directory, credential: credential)
+        try await SMBClient.delete(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            directory: directory,
+            recursive: recursive,
+            credential: credential
+        )
     }
 }

@@ -31,6 +31,9 @@ struct Probe: AsyncParsableCommand {
         print("cipher: \(formatOptionalHex(result.cipher, width: 4))")
         print("preauthHash: \(formatOptionalHex(result.preauthHashAlgorithm, width: 4))")
         print("serverGuid: \(result.serverGuid.uuidString)")
+        print("maxTransactSize: \(result.maxTransactSize)")
+        print("maxReadSize: \(result.maxReadSize)")
+        print("maxWriteSize: \(result.maxWriteSize)")
     }
 
     private func formatOptionalHex(_ value: UInt16?, width: Int) -> String {
@@ -158,15 +161,13 @@ struct Put: AsyncParsableCommand {
 
     func run() async throws {
         let (endpoint, credential) = try makeEndpointAndCredential(url: destination, domain: domain)
-        // TODO: stream large local files in chunks instead of lifting them into memory.
-        let data = try Data(contentsOf: URL(fileURLWithPath: source))
         try await SMBee.upload(
             host: endpoint.host,
             port: endpoint.port,
             credential: credential,
             share: endpoint.share,
             path: endpoint.path,
-            data: Array(data),
+            localFile: URL(fileURLWithPath: source),
             overwrite: !noOverwrite
         )
     }
@@ -214,6 +215,9 @@ struct Remove: AsyncParsableCommand {
     @Flag(help: "Open the target as a directory")
     var directory = false
 
+    @Flag(name: .shortAndLong, help: "Recursively delete a non-empty directory")
+    var recursive = false
+
     @Option(help: "NTLM domain/workgroup")
     var domain: String = ""
 
@@ -225,7 +229,8 @@ struct Remove: AsyncParsableCommand {
             credential: credential,
             share: endpoint.share,
             path: endpoint.path,
-            directory: directory
+            directory: directory || recursive,
+            recursive: recursive
         )
     }
 }

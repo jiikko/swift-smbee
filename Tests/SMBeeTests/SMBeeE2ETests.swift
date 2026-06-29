@@ -88,6 +88,10 @@ final class SMBeeE2ETests: XCTestCase {
         let directory = "smbee-e2e-\(suffix)"
         let original = "\(directory)\\upload.txt"
         let renamed = "\(directory)\\renamed.txt"
+        let large = "\(directory)\\large.bin"
+        let nested = "\(directory)\\nested"
+        let nestedChild = "\(nested)\\child"
+        let nestedFile = "\(nestedChild)\\delete-me.txt"
         let payload = Array("hello write path \(suffix)\n".utf8)
 
         try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: directory)
@@ -97,6 +101,21 @@ final class SMBeeE2ETests: XCTestCase {
         try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: original, data: payload)
         let data = try await SMBee.read(host: host, port: port, credential: credential, share: share, path: original)
         XCTAssertEqual(data, payload)
+
+        let largePayload = (0..<(1024 * 1024)).map { UInt8($0 & 0xff) }
+        let localLargeFile = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-e2e-\(suffix).bin")
+        try Data(largePayload).write(to: localLargeFile)
+        defer { try? FileManager.default.removeItem(at: localLargeFile) }
+        try await SMBee.upload(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: large,
+            localFile: localLargeFile
+        )
+        let largeData = try await SMBee.read(host: host, port: port, credential: credential, share: share, path: large)
+        XCTAssertEqual(largeData, largePayload)
 
         try await SMBee.rename(
             host: host,
@@ -114,6 +133,14 @@ final class SMBeeE2ETests: XCTestCase {
         entries = try await SMBee.list(host: host, port: port, credential: credential, share: share, path: directory)
         XCTAssertFalse(entries.contains { $0.name == "renamed.txt" })
 
+        try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: nested)
+        try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: nestedChild)
+        try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: nestedFile, data: payload)
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: nested, directory: true, recursive: true)
+        entries = try await SMBee.list(host: host, port: port, credential: credential, share: share, path: directory)
+        XCTAssertFalse(entries.contains { $0.name == "nested" })
+
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: large)
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: directory, directory: true)
     }
 }

@@ -62,8 +62,14 @@ final class SMBSession {
         try await sendUnsigned(challengePacket)
         let challengeResponse = try await receive()
         let challengeHeader = try SMB2Header.decode(challengeResponse)
+        if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {
+            let hex = challengeResponse.map { String(format: "%02x", $0) }.joined()
+            FileHandle.standardError.write(Data("SESSION_SETUP#1 response (\(challengeResponse.count) bytes): \(hex)\n".utf8))
+        }
         guard challengeHeader.status == SMB2Status.moreProcessingRequired else {
-            throw SMBCodecError.invalidValue("expected STATUS_MORE_PROCESSING_REQUIRED")
+            throw SMBCodecError.invalidValue(
+                String(format: "expected STATUS_MORE_PROCESSING_REQUIRED, got NTSTATUS 0x%08x", challengeHeader.status)
+            )
         }
         sessionId = challengeHeader.sessionId
         let challengeBlob = try SMB2SessionSetup.decodeResponse(challengeResponse)

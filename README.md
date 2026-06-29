@@ -19,6 +19,11 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 - `SMBee` — ライブラリ本体
 - `smbcli` — CLI（`smbcli probe smb://host` で交渉結果を表示、など）
 
+## ドキュメント
+
+- [docs/smb-protocol.md](docs/smb-protocol.md) — 実装する SMB wire 仕様と一次ソース（MS-SMB2 / MS-NLMP / NIST 等）
+- [docs/testing.md](docs/testing.md) — テスト戦略（unit vector / Apple container 上の Samba で E2E / 実 macOS smoke）
+
 ## 開発状況
 
 設計・実装の進行中。

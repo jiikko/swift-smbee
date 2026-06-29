@@ -92,6 +92,77 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testAESCCMRFC3610Vector() throws {
+        let key = hexBytes("c0c1c2c3c4c5c6c7c8c9cacbcccdcecf")
+        let nonce = hexBytes("00000003020100a0a1a2a3a4a5")
+        let aad = hexBytes("0001020304050607")
+        let plaintext = hexBytes("08090a0b0c0d0e0f101112131415161718191a1b1c1d1e")
+        let sealed = try AESCCM.seal(
+            key: key,
+            nonce: nonce,
+            plaintext: plaintext,
+            authenticatedData: aad,
+            tagLength: 8
+        )
+        XCTAssertEqual(hex(sealed.ciphertext + sealed.tag), "588c979a61c663d2f066d0c2c0f989806d5f6b61dac38417e8d12cfdf926e0")
+        XCTAssertEqual(
+            try AESCCM.open(key: key, nonce: nonce, ciphertext: sealed.ciphertext, authenticatedData: aad, tag: sealed.tag),
+            plaintext
+        )
+    }
+
+    func testSMB3TransformHeaderRoundTripAndCCM() throws {
+        let key = hexBytes("000102030405060708090a0b0c0d0e0f")
+        let plaintext = Array("plain SMB2 message".utf8)
+        let nonce11 = hexBytes("00112233445566778899aa")
+        var header = SMB3TransformHeader(
+            signature: Array(repeating: 0, count: 16),
+            nonce: nonce11 + Array(repeating: 0, count: 5),
+            originalMessageSize: UInt32(plaintext.count),
+            flags: SMB3TransformHeader.aes128CCM,
+            sessionId: 0x0102_0304_0506_0708
+        )
+        let sealed = try AESCCM.seal(
+            key: key,
+            nonce: nonce11,
+            plaintext: plaintext,
+            authenticatedData: header.authenticatedData(),
+            tagLength: 16
+        )
+        header.signature = sealed.tag
+        let encoded = try header.encode()
+        XCTAssertEqual(encoded.count, SMB3TransformHeader.encodedSize)
+        XCTAssertEqual(try SMB3TransformHeader.decode(encoded), header)
+        XCTAssertEqual(
+            try AESCCM.open(
+                key: key,
+                nonce: nonce11,
+                ciphertext: sealed.ciphertext,
+                authenticatedData: header.authenticatedData(),
+                tag: header.signature
+            ),
+            plaintext
+        )
+    }
+
+    func testSMB302EncryptionKeyDerivationLabels() {
+        let sessionKey = hexBytes("00112233445566778899aabbccddeeff")
+        let encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: sessionKey)
+        let decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: sessionKey)
+        XCTAssertEqual(encryptionKey.count, 16)
+        XCTAssertEqual(decryptionKey.count, 16)
+        XCTAssertNotEqual(encryptionKey, decryptionKey)
+        XCTAssertEqual(
+            encryptionKey,
+            SMBCrypto.sp800108CounterModeHMACSHA256(
+                key: sessionKey,
+                label: Array("SMB2AESCCM".utf8) + [0],
+                context: Array("ServerIn ".utf8) + [0],
+                length: 16
+            )
+        )
+    }
+
     func testNTLMv2KnownVectors() {
         let ntowfv2 = NTLM.ntowfv2(password: "SecREt01", username: "User", domain: "Domain")
         XCTAssertEqual(hex(ntowfv2), "54993fb8ba7bc2d6eacaef6bdc226c49")
@@ -524,9 +595,10 @@ final class SMBeeTests: XCTestCase {
         let expectedHex =
             "fe534d4240000000000000000000010000000000000000000000000000000000" +
             "0000000000000000000000000000000000000000000000000000000000000000" +
-            "24000500010000000000000000112233445566778899aabbccddeeff70000000" +
-            "020000000202100200030203110300000100260000000000010020000100aaaaaaaaaaaaaaaaaaaa" +
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000080004000000000001000200"
+            "24000500010000004000000000112233445566778899aabbccddeeff70000000" +
+            "030000000202100200030203110300000100260000000000010020000100aaaaaaaaaaaaaaaaaaaa" +
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000002000400000000000100010000000000" +
+            "080004000000000001000200"
         XCTAssertEqual(hex(request), expectedHex)
 
         let header = try SMB2Header.decode(request)
@@ -538,7 +610,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try reader.readUInt16LE(), 5)
         try reader.skip(count: 2 + 2 + 4 + 16)
         XCTAssertEqual(try reader.readUInt32LE(), 112)
-        XCTAssertEqual(try reader.readUInt16LE(), 2)
+        XCTAssertEqual(try reader.readUInt16LE(), 3)
         try reader.skip(count: 2)
         XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect202)
         XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect210)
@@ -557,7 +629,7 @@ final class SMBeeTests: XCTestCase {
         let contextCount = Int(readUInt16LE(request, at: 64 + 32))
         XCTAssertEqual(contextOffset, 112)
         XCTAssertEqual(contextOffset % 8, 0)
-        XCTAssertEqual(contextCount, 2)
+        XCTAssertEqual(contextCount, 3)
         XCTAssertEqual(Array(request[110..<112]), [0, 0])
 
         var offset = contextOffset
@@ -584,6 +656,7 @@ final class SMBeeTests: XCTestCase {
 
         XCTAssertEqual(contextTypes, [
             SMBNegotiateConstants.preauthContext,
+            SMBNegotiateConstants.encryptionContext,
             SMBNegotiateConstants.signingContext,
         ])
         XCTAssertEqual(offset, request.count)

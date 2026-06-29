@@ -189,6 +189,9 @@ final class SMBSession {
     private var messageId: UInt64 = 0
     private var sessionId: UInt64 = 0
     private var signingKey: [UInt8]?
+    private var encryptionKey: [UInt8]?
+    private var decryptionKey: [UInt8]?
+    private var transformNonceCounter: UInt64 = 0
 
     init(host: String, port: UInt16, credential: SMBCredential, transport: SMBTransport) {
         self.host = host
@@ -244,6 +247,8 @@ final class SMBSession {
         }
         sessionId = authHeader.sessionId
         signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.sessionBaseKey)
+        encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.sessionBaseKey)
+        decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.sessionBaseKey)
     }
 
     func treeConnect(share: String) async throws -> UInt32 {
@@ -414,6 +419,10 @@ final class SMBSession {
     }
 
     private func sendSigned(_ packet: [UInt8]) async throws {
+        if encryptionKey != nil {
+            try await sendEncrypted(packet)
+            return
+        }
         guard let signingKey else { throw SMBCodecError.invalidValue("missing SMB signing key") }
         var signed = packet
         signed[16] |= UInt8(SMB2Flags.signed & 0xff)
@@ -423,7 +432,30 @@ final class SMBSession {
         try await transport.send(DirectTCPFraming.frame(signed))
     }
 
+    private func sendEncrypted(_ packet: [UInt8]) async throws {
+        guard let encryptionKey else { throw SMBCodecError.invalidValue("missing SMB encryption key") }
+        let nonce11 = nextTransformNonce()
+        let nonce16 = nonce11 + Array(repeating: UInt8(0), count: 5)
+        var header = SMB3TransformHeader(
+            signature: Array(repeating: 0, count: 16),
+            nonce: nonce16,
+            originalMessageSize: UInt32(packet.count),
+            flags: SMB3TransformHeader.aes128CCM,
+            sessionId: sessionId
+        )
+        let sealed = try AESCCM.seal(
+            key: encryptionKey,
+            nonce: nonce11,
+            plaintext: packet,
+            authenticatedData: header.authenticatedData(),
+            tagLength: 16
+        )
+        header.signature = sealed.tag
+        try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
+    }
+
     private func verifySigned(_ packet: [UInt8]) throws {
+        if packet.starts(with: SMB3TransformHeader.protocolId) { return }
         guard let signingKey else { return }
         let header = try SMB2Header.decode(packet)
         guard (header.flags & SMB2Flags.signed) != 0 else { return }
@@ -441,7 +473,32 @@ final class SMBSession {
         debugDump("\(label) direct-TCP header length=\(length)", header)
         let body = try await receiveExactly(length)
         debugDump(label, body)
+        if body.starts(with: SMB3TransformHeader.protocolId) {
+            return try decryptTransform(body)
+        }
         return body
+    }
+
+    private func decryptTransform(_ packet: [UInt8]) throws -> [UInt8] {
+        guard let decryptionKey else { throw SMBCodecError.invalidValue("missing SMB decryption key") }
+        let header = try SMB3TransformHeader.decode(packet)
+        guard header.flags == SMB3TransformHeader.aes128CCM else {
+            throw SMBCodecError.invalidValue("unsupported SMB3 encryption algorithm")
+        }
+        guard header.sessionId == sessionId else { throw SMBCodecError.invalidValue("SMB3 transform session id mismatch") }
+        let ciphertext = Array(packet.dropFirst(SMB3TransformHeader.encodedSize))
+        guard ciphertext.count == Int(header.originalMessageSize) else {
+            throw SMBCodecError.invalidValue("SMB3 transform original message size mismatch")
+        }
+        let plaintext = try AESCCM.open(
+            key: decryptionKey,
+            nonce: Array(header.nonce.prefix(11)),
+            ciphertext: ciphertext,
+            authenticatedData: header.authenticatedData(),
+            tag: header.signature
+        )
+        debugDump("decrypted \(packet.count)-byte SMB3 transform", plaintext)
+        return plaintext
     }
 
     private func receiveExactly(_ count: Int) async throws -> [UInt8] {
@@ -457,6 +514,24 @@ final class SMBSession {
     private func nextMessageId() -> UInt64 {
         defer { messageId += 1 }
         return messageId
+    }
+
+    private func nextTransformNonce() -> [UInt8] {
+        defer { transformNonceCounter += 1 }
+        let value = transformNonceCounter
+        return [
+            UInt8((value >> 56) & 0xff),
+            UInt8((value >> 48) & 0xff),
+            UInt8((value >> 40) & 0xff),
+            UInt8((value >> 32) & 0xff),
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff),
+            0,
+            0,
+            0,
+        ]
     }
 
     private func debugDump(_ label: String, _ bytes: [UInt8]) {

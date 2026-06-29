@@ -52,6 +52,26 @@ public enum SMBCrypto {
         )
     }
 
+    public static func smb302EncryptionKey(sessionKey: [UInt8]) -> [UInt8] {
+        // MS-SMB2 3.1.4.3 SMB 3.0.x client-to-server AES-128-CCM key.
+        sp800108CounterModeHMACSHA256(
+            key: sessionKey,
+            label: Array("SMB2AESCCM".utf8) + [0],
+            context: Array("ServerIn ".utf8) + [0],
+            length: 16
+        )
+    }
+
+    public static func smb302DecryptionKey(sessionKey: [UInt8]) -> [UInt8] {
+        // MS-SMB2 3.1.4.3 SMB 3.0.x server-to-client AES-128-CCM key.
+        sp800108CounterModeHMACSHA256(
+            key: sessionKey,
+            label: Array("SMB2AESCCM".utf8) + [0],
+            context: Array("ServerOut ".utf8) + [0],
+            length: 16
+        )
+    }
+
     static func sp800108CounterModeHMACSHA256(key: [UInt8], label: [UInt8], context: [UInt8], length: Int) -> [UInt8] {
         var output: [UInt8] = []
         var counter: UInt32 = 1

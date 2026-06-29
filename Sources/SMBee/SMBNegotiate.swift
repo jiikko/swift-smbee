@@ -24,12 +24,13 @@ public enum SMBNegotiateConstants {
     public static let signingContext: UInt16 = 0x0008
     public static let sha512: UInt16 = 0x0001
     public static let aes128GCM: UInt16 = 0x0002
+    public static let aes128CCM: UInt16 = 0x0001
     public static let aes256GCM: UInt16 = 0x0004
     public static let aesGMAC: UInt16 = 0x0002
 }
 
 public enum SMBNegotiateCodec {
-    private static let negotiateContextCount: UInt16 = 2
+    private static let negotiateContextCount: UInt16 = 3
     private static let offeredDialects: [UInt16] = [
         SMBNegotiateConstants.dialect202,
         SMBNegotiateConstants.dialect210,
@@ -56,7 +57,7 @@ public enum SMBNegotiateCodec {
         writer.writeUInt16LE(UInt16(offeredDialects.count))
         writer.writeUInt16LE(SMBNegotiateConstants.signingEnabled)
         writer.writeUInt16LE(0)
-        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(SMBNegotiateConstants.globalCapEncryption)
         writer.writeBytes(clientGuid.smbWireBytes)
         // MS-SMB2 2.2.3 requires NegotiateContextOffset to be relative to the
         // SMB2 header start and 8-byte aligned when dialect 0x0311 is offered.
@@ -165,9 +166,7 @@ public enum SMBNegotiateCodec {
     private static func encodeNegotiateContexts(salt: [UInt8]) -> [UInt8] {
         var bytes: [UInt8] = []
         appendContext(type: SMBNegotiateConstants.preauthContext, data: encodePreauthData(salt: salt), padTo8: true, to: &bytes)
-        // Do not advertise encryption until SMB3 transform decryption is implemented.
-        // Samba with "smb encrypt = desired" encrypts later responses when the
-        // client offers SMB2_GLOBAL_CAP_ENCRYPTION or encryption ciphers.
+        appendContext(type: SMBNegotiateConstants.encryptionContext, data: encodeEncryptionData(), padTo8: true, to: &bytes)
         appendContext(type: SMBNegotiateConstants.signingContext, data: encodeSigningData(), padTo8: false, to: &bytes)
         return bytes
     }
@@ -185,6 +184,13 @@ public enum SMBNegotiateCodec {
         var writer = SMBByteWriter()
         writer.writeUInt16LE(1)
         writer.writeUInt16LE(SMBNegotiateConstants.aesGMAC)
+        return writer.bytes
+    }
+
+    private static func encodeEncryptionData() -> [UInt8] {
+        var writer = SMBByteWriter()
+        writer.writeUInt16LE(1)
+        writer.writeUInt16LE(SMBNegotiateConstants.aes128CCM)
         return writer.bytes
     }
 

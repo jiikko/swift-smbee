@@ -28,6 +28,7 @@ jobs:
       - name: Build
         run: swift build
       - name: Test
+        timeout-minutes: 10
         run: swift test
 
   linux-build-test:

@@ -147,7 +147,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 ## 横断（全 Phase 共通）
 
 - [x] `SMBErrorMapper`: NTSTATUS → エラー型（[docs/smb-protocol.md] の表、値は MS-ERREF 確認）
-- [x] `SMBSession`（actor）で全 wire を直列化 / 切断検出→再接続 / cancellation（Task.checkCancellation を READ/WRITE ループに）
+- [x] `SMBSession`（actor）化 / 切断検出→再接続 / cancellation（Task.checkCancellation を READ/WRITE ループに）
+  - 注: 「全 wire 直列化」は **1 セッション=単一フライト前提**で成立（per-operation `withSession` が 1 タスク逐次）。
+    同一セッションへの並行 multi-task 利用（応答 messageId 多重分離）は `issues/002-design-smbsession-concurrent-multiflight.md` で defer。
 - [x] retry 粒度: stat=透過 / list=全体再実行 / read=stream 未 yield なら先頭再試行 / write・delete・rename=原則 retry しない
 - [x] secret（password / NT hash / session key / signing key）を log に出さない
 - [x] SMB1 を一切提示しない

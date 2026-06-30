@@ -173,8 +173,11 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     remote directory download (`SMBee.downloadDirectory`, `smbcli get -r`) を追加。既存 operation の組み合わせで
     実装し、Samba E2E に directory round-trip assertion 追加。
   - 残: server-side copy (`FSCTL_SRV_COPYCHUNK`) の対応可否実測、remote directory → remote directory copy。
-- [ ] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
-  - 大規模ディレクトリ・GUI lazy loading・obaket listing 向け。
+- [x] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
+  - 2026-06-30: `SMBee.withDirectoryStream` / `SMBClient.withDirectoryStream` を追加。`SMBSession`
+    は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で
+    `STATUS_NO_MORE_FILES` まで反復する。既存 `list` は互換維持のため collector で配列集約。
+    `smbcli ls` は streaming 表示に変更。unit で continuation flag と multi-page stream を検証。
 - [ ] persistent session API: 複数 operation で TCP/session/tree を再利用する公開 handle
   - 現状は operation ごとに connect/auth/treeConnect。実装時は `issues/done/002-design-smbsession-concurrent-multiflight.md`
     の serializer or messageId demux を先に片付ける。

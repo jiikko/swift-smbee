@@ -57,14 +57,13 @@ struct List: AsyncParsableCommand {
 
     func run() async throws {
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, domain: domain)
-        let entries = try await SMBee.list(
+        try await SMBee.withDirectoryStream(
             host: endpoint.host,
             port: endpoint.port,
             credential: credential,
             share: endpoint.share,
             path: endpoint.path
-        )
-        for entry in entries {
+        ) { entry in
             let kind = entry.isDirectory ? "d" : "-"
             print("\(kind) \(entry.fileSize) \(entry.name)")
         }

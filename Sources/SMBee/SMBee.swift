@@ -19,6 +19,24 @@ public enum SMBee {
         try await SMBClient.list(host: host, port: port, share: share, path: path, credential: credential)
     }
 
+    public static func withDirectoryStream(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String = "",
+        onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
+    ) async throws {
+        try await SMBClient.withDirectoryStream(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: credential,
+            onEntry: onEntry
+        )
+    }
+
     public static func stat(
         host: String,
         port: UInt16 = 445,

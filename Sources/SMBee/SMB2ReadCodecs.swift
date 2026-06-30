@@ -360,14 +360,14 @@ enum SMB2QueryDirectory {
     private static let fixedPartSize = 32
     private static let fileNameOffset = SMB2Header.encodedSize + fixedPartSize
 
-    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8]) throws -> [UInt8] {
+    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8], restartScan: Bool = true) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
         let header = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(33)
         writer.writeUInt8(37)
-        writer.writeUInt8(0x01)
+        writer.writeUInt8(restartScan ? 0x01 : 0x00)
         writer.writeUInt32LE(0)
         writer.writeBytes(fileId)
         writer.writeUInt16LE(UInt16(fileNameOffset))

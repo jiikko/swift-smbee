@@ -222,6 +222,23 @@ private final class ReceiveState: @unchecked Sendable {
     }
 }
 
+private final class TestDirectoryEntryCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBDirectoryEntry] = []
+
+    var entries: [SMBDirectoryEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ entry: SMBDirectoryEntry) {
+        lock.lock()
+        storage.append(entry)
+        lock.unlock()
+    }
+}
+
 final class SMBeeTests: XCTestCase {
     func testVersionIsNotEmpty() {
         XCTAssertFalse(SMBee.version.isEmpty)
@@ -1090,6 +1107,67 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(request, at: 90), 2)
         XCTAssertEqual(readUInt32LE(request, at: 92), 65_536)
         XCTAssertEqual(Array(request[96..<98]), [0x2a, 0x00])
+    }
+
+    func testQueryDirectoryContinuationRequestClearsRestartScanFlag() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2QueryDirectory.encodeRequest(
+            messageId: 11,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            restartScan: false
+        )
+
+        XCTAssertEqual(request[67], 0x00)
+    }
+
+    func testSessionQueryDirectoryStreamsPagesUntilNoMoreFiles() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(name: "a.txt", isDirectory: false, fileSize: 1, nextOffset: 0),
+                ],
+                messageId: 0,
+                treeId: 0x3344
+            ),
+            try smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(name: "b", isDirectory: true, nextOffset: 0),
+                ],
+                messageId: 1,
+                treeId: 0x3344
+            ),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 2, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let streamed = TestDirectoryEntryCollector()
+        try await session.queryDirectory(treeId: 0x3344, fileId: fileId) { entry in
+            streamed.append(entry)
+        }
+
+        XCTAssertEqual(streamed.entries, [
+            SMBDirectoryEntry(name: "a.txt", fileSize: 1, isDirectory: false),
+            SMBDirectoryEntry(name: "b", fileSize: 0, isDirectory: true),
+        ])
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
+            SMB2Commands.queryDirectory,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.queryDirectory,
+        ])
+        XCTAssertEqual(requests[0][67], 0x01)
+        XCTAssertEqual(requests[1][67], 0x00)
+        XCTAssertEqual(requests[2][67], 0x00)
     }
 
     func testQueryDirectoryResponseDropsDotEntriesForRecursiveDeleteWalks() throws {
@@ -2033,6 +2111,17 @@ final class SMBeeTests: XCTestCase {
         var payload = Array(repeating: UInt8(0), count: 56)
         writeUInt64LE(size, to: &payload, at: 40)
         var response = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 66)
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+        return response
+    }
+
+    private func smb2QueryDirectoryResponse(entries: [[UInt8]], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+        let payload = entries.flatMap { $0 }
+        var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: messageId, treeId: treeId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
         writeUInt16LE(9, to: &response, at: 64)
         writeUInt16LE(72, to: &response, at: 66)

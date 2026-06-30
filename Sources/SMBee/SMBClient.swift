@@ -93,6 +93,23 @@ private final class SMBReadStreamProgress: @unchecked Sendable {
     }
 }
 
+private final class SMBDirectoryEntryCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBDirectoryEntry] = []
+
+    var entries: [SMBDirectoryEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ entry: SMBDirectoryEntry) {
+        lock.lock()
+        storage.append(entry)
+        lock.unlock()
+    }
+}
+
 private final class SMBReadAccumulator: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [UInt8] = []
@@ -154,11 +171,38 @@ public enum SMBClient {
         credential: SMBCredential,
         makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws -> [SMBDirectoryEntry] {
+        let collector = SMBDirectoryEntryCollector()
+        try await withDirectoryStream(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: credential,
+            makeTransport: makeTransport
+        ) { entry in
+            collector.append(entry)
+        }
+        return collector.entries
+    }
+
+    public static func withDirectoryStream(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String = "",
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
+    ) async throws {
         try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "LIST") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: true)
-            let entries = try await session.queryDirectory(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
-            return entries
+            do {
+                try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
+                try? await session.close(treeId: treeId, fileId: fileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
         }
     }
 
@@ -763,18 +807,44 @@ actor SMBSession {
     }
 
     func queryDirectory(treeId: UInt32, fileId: [UInt8]) async throws -> [SMBDirectoryEntry] {
+        let collector = SMBDirectoryEntryCollector()
+        try await queryDirectory(treeId: treeId, fileId: fileId) { entry in
+            collector.append(entry)
+        }
+        return collector.entries
+    }
+
+    func queryDirectory(
+        treeId: UInt32,
+        fileId: [UInt8],
+        onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
+    ) async throws {
+        var restartScan = true
+        while true {
+            let entries = try await queryDirectoryPage(treeId: treeId, fileId: fileId, restartScan: restartScan)
+            restartScan = false
+            guard let entries else { return }
+            for entry in entries {
+                try Task.checkCancellation()
+                try await onEntry(entry)
+            }
+        }
+    }
+
+    private func queryDirectoryPage(treeId: UInt32, fileId: [UInt8], restartScan: Bool) async throws -> [SMBDirectoryEntry]? {
         try Task.checkCancellation()
         let packet = try SMB2QueryDirectory.encodeRequest(
             messageId: nextMessageId(),
             sessionId: sessionId,
             treeId: treeId,
-            fileId: fileId
+            fileId: fileId,
+            restartScan: restartScan
         )
         debugDump("QUERY_DIRECTORY request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_DIRECTORY response")
         let header = try SMB2Header.decode(response)
         if header.status == SMB2Status.noMoreFiles {
-            return []
+            return nil
         }
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_DIRECTORY")
         try Task.checkCancellation()

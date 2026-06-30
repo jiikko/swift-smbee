@@ -73,6 +73,58 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 - `.github/workflows/samba-compat.yml` は重い互換性 matrix。`workflow_dispatch` と週次 schedule で、
   distro-provided Samba と `test/e2e/smb/*.conf` profile の代表組み合わせを回す。
 
+### ローカル実行 — Apple container / macOS
+
+macOS で CI の E2E に近い条件を再現する場合は Apple の `container` CLI を使う。
+この repo では `bin/e2e/container-samba.sh` が次をまとめて実行する。
+
+1. `ubuntu:24.04` コンテナを起動し、`apt-get install samba` で CI と同じ distro Samba を入れる。
+2. `test/e2e/smb/smb302-encrypted-required.conf` を `/etc/samba/smb.conf` に配置する。
+3. `127.0.0.1:1445 -> container:445` で Samba を公開する。
+4. CI と同じ順序で `smbcli probe`、`swift test --filter SMBeeE2ETests`、`smbcli` smoke を実行する。
+5. 成功/失敗にかかわらずコンテナを削除する。
+
+初回だけ `container system start` が kernel download / setup の確認を出すことがある。
+対話セットアップを終えた後、以下を実行する。
+
+```sh
+bin/e2e/container-samba.sh
+```
+
+主な環境変数:
+
+```sh
+SMBEE_E2E_PORT=1446 bin/e2e/container-samba.sh
+SMBEE_E2E_KEEP_CONTAINER=1 bin/e2e/container-samba.sh
+SAMBA_CONFIG=test/e2e/smb/smb311-encrypted-required.conf bin/e2e/container-samba.sh
+```
+
+`SMBEE_E2E_KEEP_CONTAINER=1` を使った場合の後始末:
+
+```sh
+container rm -f smbee-samba-container-e2e
+```
+
+wire を細かく見る場合:
+
+```sh
+SMBEE_TRACE_WIRE=1 SMBEE_TRACE_WIRE_FULL=1 \
+  SMB_PASSWORD=smbee .build/debug/smbcli shares smb://smbee@127.0.0.1:1445
+```
+
+### GitHub Actions での container CLI
+
+GitHub Actions の E2E は引き続き `ubuntu-latest` + Docker を使う。
+Apple `container` CLI は macOS 上で Linux container を動かす仕組みだが、GitHub-hosted macOS runner で
+常に使える CI 前提にはしていない。
+
+- runner image に `container` CLI がプリインストールされている保証がない。
+- `brew install container` できても、初回の `container system start` は kernel download / system service setup を伴う。
+- GitHub-hosted macOS runner は仮想化された環境で、Linux container 用 runtime を安定して動かす前提にしにくい。
+- public repo では Samba E2E は Linux runner + Docker のほうが速く、安定し、ログも取りやすい。
+
+そのため Apple container はローカル再現用、CI は Docker/Linux runner という分担にする。
+
 Samba profile:
 
 - `smb302-encrypted-required`: PR 必須代表。SMB 3.0.2 / signing mandatory / encryption required。

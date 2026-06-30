@@ -196,6 +196,9 @@ PERF_INFO read_stream.wall_clock_ms value=42
 
 - [ ] directory streaming の `QUERY_DIRECTORY` count / `onEntry` callback count を追加する。
 - [ ] recursive download/upload/copy の O(n) scaling counter を追加する。
+  - 2026-06-30: `SMBSession.copyDirectory` / `deleteRecursively` は directory page を配列集約せず、
+    `queryDirectory(... onEntry:)` callback traversal で処理するよう修正済み。残る計測対象は
+    one-shot `downloadDirectory` と recursive upload/download/copy の operation count proxy。
 - [ ] 必要なら CLI が streaming 経路を使うことを test-only hook で確認する。
 
 ## やらないこと

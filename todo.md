@@ -189,6 +189,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30 実装レビュー追記: recursive copy/delete/download は directory page を配列集約してから
     再帰している箇所がある。大規模 tree 向けに streaming traversal 化し、source が destination
     配下にある場合の自己再帰防止、最大 depth、同名衝突時の partial rollback 方針を決める。
+  - 2026-06-30: `SMBSession.copyDirectory` / `deleteRecursively` は `queryDirectory(... onEntry:)`
+    の callback traversal に変更し、directory entry 配列集約を避けるよう修正。残:
+    one-shot `downloadDirectory` の session 境界を含む streaming traversal 化と安全策。
 - [x] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 2026-06-30: `SMBee.withDirectoryStream` / `SMBClient.withDirectoryStream` を追加。`SMBSession`
     は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で

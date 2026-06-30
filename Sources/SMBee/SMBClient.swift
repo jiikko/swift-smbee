@@ -1196,31 +1196,31 @@ actor SMBSession {
     func copyDirectory(treeId: UInt32, fromPath: String, toPath: String, overwrite: Bool) async throws {
         try Task.checkCancellation()
         let sourceFileId = try await create(treeId: treeId, path: fromPath, directory: true)
-        let entries: [SMBDirectoryEntry]
         do {
-            entries = try await queryDirectory(treeId: treeId, fileId: sourceFileId)
-            try? await close(treeId: treeId, fileId: sourceFileId)
+            let destinationFileId = try await create(treeId: treeId, request: .makeDirectory(path: toPath))
+            try await close(treeId: treeId, fileId: destinationFileId)
+        } catch SMBError.nameCollision where overwrite {
+            // Existing destination directories are reused only when overwrite is explicit.
         } catch {
             try? await close(treeId: treeId, fileId: sourceFileId)
             throw error
         }
 
         do {
-            let destinationFileId = try await create(treeId: treeId, request: .makeDirectory(path: toPath))
-            try await close(treeId: treeId, fileId: destinationFileId)
-        } catch SMBError.nameCollision where overwrite {
-            // Existing destination directories are reused only when overwrite is explicit.
-        }
-
-        for entry in entries {
-            try Task.checkCancellation()
-            let sourceChild = joinSMBPath(fromPath, entry.name)
-            let destinationChild = joinSMBPath(toPath, entry.name)
-            if entry.isDirectory {
-                try await copyDirectory(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
-            } else {
-                try await copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+            try await queryDirectory(treeId: treeId, fileId: sourceFileId) { entry in
+                try Task.checkCancellation()
+                let sourceChild = self.joinSMBPath(fromPath, entry.name)
+                let destinationChild = self.joinSMBPath(toPath, entry.name)
+                if entry.isDirectory {
+                    try await self.copyDirectory(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+                } else {
+                    try await self.copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+                }
             }
+            try? await close(treeId: treeId, fileId: sourceFileId)
+        } catch {
+            try? await close(treeId: treeId, fileId: sourceFileId)
+            throw error
         }
     }
 
@@ -1254,12 +1254,11 @@ actor SMBSession {
         if directory {
             let fileId = try await create(treeId: treeId, path: path, directory: true)
             do {
-                let entries = try await queryDirectory(treeId: treeId, fileId: fileId)
-                try? await close(treeId: treeId, fileId: fileId)
-                for entry in entries {
+                try await queryDirectory(treeId: treeId, fileId: fileId) { entry in
                     try Task.checkCancellation()
-                    try await deleteRecursively(treeId: treeId, path: joinSMBPath(path, entry.name), directory: entry.isDirectory)
+                    try await self.deleteRecursively(treeId: treeId, path: self.joinSMBPath(path, entry.name), directory: entry.isDirectory)
                 }
+                try? await close(treeId: treeId, fileId: fileId)
             } catch {
                 try? await close(treeId: treeId, fileId: fileId)
                 throw error
@@ -1525,7 +1524,7 @@ actor SMBSession {
         return SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: maxReadSize, transformOverhead: transformOverhead)
     }
 
-    private func joinSMBPath(_ parent: String, _ child: String) -> String {
+    private nonisolated func joinSMBPath(_ parent: String, _ child: String) -> String {
         let trimmedParent = parent.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
         if trimmedParent.isEmpty { return child }
         return "\(trimmedParent)\\\(child)"

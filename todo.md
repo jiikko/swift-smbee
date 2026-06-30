@@ -90,6 +90,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [x] **実測**: macOS SMBX は macOS 26.5.1 でも **3.0.2 上限**。3.1.1 は喋らない。
   - probe(NEGOTIATE) は 3.0.2 macOS に対して成功済み。
 - [ ] **実測**: Samba が **3.1.1 + GMAC + GCM** を交渉するか ⓥ
+  - 2026-06-30 実装レビュー追記: 現状の `SMBNegotiateCodec.encodeEncryptionData()` は
+    AES-128-CCM だけを提示している一方、3.1.1 authenticated path は AES-128-GCM を必須として
+    guard している。3.1.1 実測前に request context を設計どおり AES-128-GCM 優先
+    (+必要なら AES-256-GCM / AES-128-CCM fallback) へ修正し、unit fixture を追加する。
 - [x] 既知課題: Samba 3.1.1 response の parser が `truncated` になるバグを調査
   - 2026-06-30: NEGOTIATE context parser が「最後の context も 8-byte padding あり」と仮定していた
     ため、最後の context が unpadded の response で `truncated` になり得た。最終 context は padding
@@ -109,6 +113,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - [ ] signing = AES-GMAC を packet に適用 / 検証
     - 2026-06-30: primitive と KDF は実装済み。GMAC 署名 packet の nonce/signature field レイアウトは
       実 packet fixture か 3.1.1 サーバで確認してから配線する。
+    - 2026-06-30 実装レビュー追記: `sendSigned` は GMAC signing 単体を未配線、`verifySigned` は
+      CMAC 固定。暗号化済み transform response は検証できるが、3.1.1 signing-only session や
+      unencrypted response verification は未対応。GMAC nonce source / header signature field /
+      response verify を packet fixture で固める。
   - [x] encryption = TRANSFORM_HEADER + AES-GCM（nonce/AAD/tag レイアウト ⓥ）
     - 2026-06-30: 12-byte nonce + 16-byte TRANSFORM_HEADER nonce field padding / AAD / tag fixture を追加し、
       session の 3.1.1 暗号化・復号分岐へ配線。
@@ -176,6 +184,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `smbcli cp -r`) を追加。既存 READ/WRITE + QUERY_DIRECTORY の client-side recursive copy で実装し、
     unit と Samba E2E smoke に assertion 追加。
   - 残: server-side copy (`FSCTL_SRV_COPYCHUNK`) の対応可否実測。
+  - 2026-06-30 実装レビュー追記: recursive copy/delete/download は directory page を配列集約してから
+    再帰している箇所がある。大規模 tree 向けに streaming traversal 化し、source が destination
+    配下にある場合の自己再帰防止、最大 depth、同名衝突時の partial rollback 方針を決める。
 - [x] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 2026-06-30: `SMBee.withDirectoryStream` / `SMBClient.withDirectoryStream` を追加。`SMBSession`
     は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で
@@ -194,26 +205,59 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: CLI に `--password-stdin` を追加。URL 埋め込み password → stdin → `SMB_PASSWORD` の
     優先順位で `ls/stat/cat/get/mkdir/put/mv/cp/rm` が共通利用する。
   - 2026-06-30: NT hash credential を追加。`SMBCredential(username:ntHash:domain:)` と CLI `--nt-hash` /
-    `SMB_NT_HASH` に対応し、password を保持せず NTOWFv2 を導出できる。残: provider callback /
+    `SMB_NT_HASH` に対応し、平文 password 入力なしで NTOWFv2 を導出できる。残: provider callback /
     keychain / guest or anonymous。
+  - 2026-06-30 実装レビュー追記: `SMBCredential` は source compatibility のため `password: String`
+    を保持しており、NT hash credential では空文字を入れている。将来は `password` 露出を避ける
+    credential enum / provider callback へ移行し、deprecation plan を用意する。
 - [ ] path handling: SMB パス正規化・`.`/`..`・区切り文字・URL percent decoding/encoding の仕様化
   - 2026-06-30: CLI URL parser で share/path component と userinfo の percent decode を実装。
     path component の `.` / `..` と decoded separator (`/` / `\`) は拒否し、URL `/` のみを
     SMB path separator `\` へ変換する方針を `docs/smb-protocol.md` に明記。unit 追加済み。
+  - 2026-06-30 実装レビュー追記: 公開 API (`SMBee.* path:` / `SMBClientSession.* path:`) は
+    URL parser を経由しないため、`.` / `..` / separator / 空 share などの検証が統一されていない。
+    `SMBPath` / `SMBShareName` 型または共通 normalizer を導入し、CLI と API の挙動を揃える。
   - macOS Finder/Samba での Unicode normalization 差も実測する。
 - [ ] metadata operations: chmod 相当ではなく SMB/NTFS 属性として readonly/hidden/system/archive、
       create/access/modify/change time の read/write
   - `QUERY_INFO` / `SET_INFO` の information class を拡張。
 - [ ] symlink / reparse point / DFS referral の扱い
   - follow するか entry metadata として返すか、recursive delete/copy の安全策を先に決める。
+  - 2026-06-30 実装レビュー追記: 現状の directory entry は `isDirectory` しか返さず、reparse point /
+    symlink / DFS referral を判別できない。recursive delete/copy/download は cycle 検出なしで
+    directory 扱いする可能性があるため、FileAttributes / FileId / reparse tag を metadata として
+    返す設計を先に入れる。
 - [ ] ACL / owner / SID metadata
   - `QUERY_SECURITY` / `SET_SECURITY`。MVP では扱わないが、管理系 smbclient としては必要。
 - [ ] locking / durable handle / lease / oplock の扱い
   - concurrent clients や大ファイル操作の堅牢性向け。最初は明示的に unsupported としてエラーを設計する。
+- [ ] dialect / encryption policy の整理
+  - 2026-06-30 実装レビュー追加: NEGOTIATE は 2.0.2 / 2.1 も提示するが authenticated path は
+    3.0+ だけを受ける。probe 専用 dialect と authenticated dialect policy を分けるか、
+    authenticated connect では 3.x のみ提示する。
+  - 2026-06-30 実装レビュー追加: SESSION_SETUP 後は encryption key があれば常に transform 送信する。
+    server global capabilities / tree share flags / encryption required を見ていないため、暗号非対応 share や
+    signing-only 運用との互換性が不明。TREE_CONNECT response の share capabilities / flags を parse し、
+    暗号必須・暗号可能・署名のみの policy を明示する。
+- [ ] SMB2 credit / chunk sizing / multi-credit
+  - 2026-06-30 実装レビュー追加: read/write chunk size は negotiated MaxRead/WriteSize と transform overhead
+    で抑えているが、CreditCharge / CreditRequest / CreditResponse を管理していない。大きな IO や
+    multi-credit server での挙動を MS-SMB2 と実 packet で確認し、必要なら messageId/credit allocator を
+    `SMBWireTransactionGate` の後継として設計する。
+- [ ] session lifecycle: TREE_DISCONNECT / LOGOFF
+  - 2026-06-30 実装レビュー追加: close は TCP close のみで、TREE_DISCONNECT / LOGOFF を送らない。
+    persistent session API の `close()` で graceful teardown するか、best-effort に留めるかを決める。
 - [ ] timeout / progress / cancellation API の整備
   - read/write loop は cancellation 済み。公開 API と CLI に progress callback / transfer rate / timeout を足す。
+  - 2026-06-30 実装レビュー追記: POSIX transport は blocking `connect` / `recv` / `send` を
+    `Task.detached` で包むため、Task cancellation だけでは OS blocking call を即中断できない。
+    socket timeout / nonblocking IO / close-on-cancel の設計が必要。NWConnection も continuation 多重 resume
+    防止を含めた cancellation test を追加する。
 - [ ] CLI UX: `--password-stdin` / interactive password prompt / `--json` / exit code 表 / `--debug` redaction policy
   - 自動化用途と人間操作の両方を想定。
+  - 2026-06-30 実装レビュー追記: `SMBEE_DEBUG=1` は raw SMB packet を出す。SESSION_SETUP 以降は
+    security blob / encrypted payload / signing material に近い情報を含み得るため、command type ごとの
+    redaction policy と `--debug` / `--trace-wire` の分離を決める。
 - [ ] compatibility matrix: macOS SMBX / Samba / Windows Server / NAS (Synology/QNAP 等)
   - dialect/signing/encryption/quirk を記録し、手動 smoke 手順を docs 化する。
 - [ ] NetBIOS name / port 139 / hostname discovery は原則 scope 外だが、必要になったら separate transport として検討

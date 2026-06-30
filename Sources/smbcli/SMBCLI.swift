@@ -13,7 +13,10 @@ struct SMBCLI: AsyncParsableCommand {
         commandName: "smbcli",
         abstract: "🐝 SMBee command-line client",
         version: SMBee.version,
-        subcommands: [Probe.self, List.self, Stat.self, Cat.self, Get.self, MakeDirectory.self, Put.self, Copy.self, Move.self, Remove.self]
+        subcommands: [
+            Probe.self, Shares.self, List.self, Stat.self, Cat.self, Get.self,
+            MakeDirectory.self, Put.self, Copy.self, Move.self, Remove.self
+        ]
     )
 }
 
@@ -32,7 +35,7 @@ struct Probe: AsyncParsableCommand {
 
     func run() async throws {
         debug.apply()
-        let endpoint = try SMBURLParser.parseProbeURL(url)
+        let endpoint = try SMBURLParser.parseServerURL(url)
         let result = try await SMBProbe.probe(host: endpoint.host, port: endpoint.port)
         print("dialect: \(formatHex(result.dialect, width: 4))")
         print("signingRequired: \(result.signingRequired)")
@@ -83,6 +86,37 @@ struct List: AsyncParsableCommand {
     }
 }
 
+struct Shares: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "shares", abstract: "List SMB shares on a server")
+
+    @Argument(help: "smb://user@host[:445]")
+    var url: String
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    func run() async throws {
+        debug.apply()
+        let endpoint = try SMBURLParser.parseServerURL(url)
+        guard let username = endpoint.username, !username.isEmpty else {
+            throw ValidationError("SMB URL must include a username")
+        }
+        let credential = try makeCredential(username: username, password: nil, auth: auth)
+        let shares = try await SMBee.listShares(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential
+        )
+        for share in shares {
+            print(share.name)
+        }
+    }
+}
+
+
 struct Stat: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "stat", abstract: "Stat an SMB path")
 
@@ -107,8 +141,18 @@ struct Stat: AsyncParsableCommand {
         )
         print("size: \(stat.size)")
         print("type: \(stat.isDirectory ? "directory" : "file")")
+        print("attributes: 0x\(String(format: "%08x", stat.attributes))")
+        if let creationTime = stat.creationTime {
+            print("ctime: \(formatDate(creationTime))")
+        }
+        if let lastAccessTime = stat.lastAccessTime {
+            print("atime: \(formatDate(lastAccessTime))")
+        }
         if let modifiedTime = stat.modifiedTime {
             print("mtime: \(formatDate(modifiedTime))")
+        }
+        if let changeTime = stat.changeTime {
+            print("chtime: \(formatDate(changeTime))")
         }
     }
 }
@@ -426,16 +470,20 @@ private func makeEndpointAndCredential(url: String, auth: AuthOptions) throws ->
     guard let username = endpoint.username, !username.isEmpty else {
         throw ValidationError("SMB URL must include a username")
     }
+    return (endpoint, try makeCredential(username: username, password: endpoint.password, auth: auth))
+}
+
+private func makeCredential(username: String, password urlPassword: String?, auth: AuthOptions) throws -> SMBCredential {
     if let ntHash = try readNTHash(options: auth) {
-        guard endpoint.password == nil, !auth.passwordStdin, ProcessInfo.processInfo.environment["SMB_PASSWORD"] == nil else {
+        guard urlPassword == nil, !auth.passwordStdin, ProcessInfo.processInfo.environment["SMB_PASSWORD"] == nil else {
             throw ValidationError("Use either an NT hash or a password, not both")
         }
-        return (endpoint, try SMBCredential(username: username, ntHash: ntHash, domain: auth.domain))
+        return try SMBCredential(username: username, ntHash: ntHash, domain: auth.domain)
     }
-    guard let password = try endpoint.password ?? readPassword(options: auth) else {
+    guard let password = try urlPassword ?? readPassword(options: auth) else {
         throw ValidationError("Set SMB_PASSWORD, SMB_NT_HASH, pass --password-stdin/--nt-hash, or include a password in the SMB URL")
     }
-    return (endpoint, SMBCredential(username: username, password: password, domain: auth.domain))
+    return SMBCredential(username: username, password: password, domain: auth.domain)
 }
 
 private func readNTHash(options: AuthOptions) throws -> [UInt8]? {

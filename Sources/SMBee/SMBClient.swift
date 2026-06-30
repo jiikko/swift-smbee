@@ -6,27 +6,113 @@ public struct SMBDirectoryEntry: Equatable, Sendable {
     public var fileSize: UInt64
     public var isDirectory: Bool
     public var attributes: UInt32
+    public var fileId: UInt64?
 
-    public init(name: String, fileSize: UInt64, isDirectory: Bool, attributes: UInt32 = 0) {
+    public var isReparsePoint: Bool {
+        (attributes & SMBFileAttributes.reparsePoint) != 0
+    }
+
+    public init(name: String, fileSize: UInt64, isDirectory: Bool, attributes: UInt32 = 0, fileId: UInt64? = nil) {
         self.name = name
         self.fileSize = fileSize
         self.isDirectory = isDirectory
         self.attributes = attributes
+        self.fileId = fileId
     }
 }
 
 public struct SMBFileStat: Equatable, Sendable {
     public var size: UInt64
+    public var creationTime: Date?
+    public var lastAccessTime: Date?
     public var modifiedTime: Date?
+    public var changeTime: Date?
     public var isDirectory: Bool
     public var attributes: UInt32
 
-    public init(size: UInt64, modifiedTime: Date?, isDirectory: Bool, attributes: UInt32 = 0) {
+    public var isReparsePoint: Bool {
+        (attributes & SMBFileAttributes.reparsePoint) != 0
+    }
+
+    public init(
+        size: UInt64,
+        modifiedTime: Date?,
+        isDirectory: Bool,
+        attributes: UInt32 = 0,
+        creationTime: Date? = nil,
+        lastAccessTime: Date? = nil,
+        changeTime: Date? = nil
+    ) {
         self.size = size
+        self.creationTime = creationTime
+        self.lastAccessTime = lastAccessTime
         self.modifiedTime = modifiedTime
+        self.changeTime = changeTime
         self.isDirectory = isDirectory
         self.attributes = attributes
     }
+}
+
+public enum SMBFileAttributes {
+    public static let readOnly: UInt32 = 0x0000_0001
+    public static let hidden: UInt32 = 0x0000_0002
+    public static let system: UInt32 = 0x0000_0004
+    public static let directory: UInt32 = 0x0000_0010
+    public static let archive: UInt32 = 0x0000_0020
+    public static let reparsePoint: UInt32 = 0x0000_0400
+    public static let normal: UInt32 = 0x0000_0080
+}
+
+public struct SMBFileMetadataUpdate: Equatable, Sendable {
+    public var creationTime: Date?
+    public var lastAccessTime: Date?
+    public var modifiedTime: Date?
+    public var changeTime: Date?
+    public var attributes: UInt32?
+
+    public init(
+        creationTime: Date? = nil,
+        lastAccessTime: Date? = nil,
+        modifiedTime: Date? = nil,
+        changeTime: Date? = nil,
+        attributes: UInt32? = nil
+    ) {
+        self.creationTime = creationTime
+        self.lastAccessTime = lastAccessTime
+        self.modifiedTime = modifiedTime
+        self.changeTime = changeTime
+        self.attributes = attributes
+    }
+}
+
+public struct SMBShareInfo: Equatable, Sendable {
+    public var name: String
+    public var type: UInt32?
+    public var comment: String?
+
+    public init(name: String, type: UInt32? = nil, comment: String? = nil) {
+        self.name = name
+        self.type = type
+        self.comment = comment
+    }
+}
+
+struct SMBTreeConnectResult: Equatable, Sendable {
+    var treeId: UInt32
+    var shareType: UInt8
+    var shareFlags: UInt32
+    var capabilities: UInt32
+    var maximalAccess: UInt32
+
+    var encryptionRequired: Bool {
+        (shareFlags & SMBTreeConnectConstants.shareFlagEncryptData) != 0 ||
+            (capabilities & SMBTreeConnectConstants.shareCapEncryptData) != 0
+    }
+}
+
+enum SMBTreeConnectConstants {
+    static let shareFlagEncryptData: UInt32 = 0x0000_8000
+    static let shareCapEncryptData: UInt32 = 0x0000_0008
 }
 
 public struct SMBReadRange: Equatable, Sendable {
@@ -293,6 +379,18 @@ public actor SMBClientSession {
         try await session.deleteNonRecursive(treeId: treeId, path: path, directory: directory)
     }
 
+    public func updateMetadata(path: String, update: SMBFileMetadataUpdate, directory: Bool = false) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .metadata(path: path, directory: directory))
+        do {
+            try await session.setBasicInfo(treeId: treeId, fileId: fileId, update: update)
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     private func ensureOpen() throws {
         if isClosed {
             throw SMBError.connectionLost(operation: "SESSION")
@@ -361,6 +459,16 @@ public enum SMBClient {
             await session.closeTransport()
             throw error
         }
+    }
+
+    public static func listShares(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> [SMBShareInfo] {
+        _ = (host, port, credential, makeTransport)
+        throw SMBError.unsupported(status: 0, operation: "SHARE_DISCOVERY_SRVsvc")
     }
 
     public static func list(
@@ -581,6 +689,7 @@ public enum SMBClient {
         )
         for entry in entries {
             try Task.checkCancellation()
+            guard !entry.isReparsePoint else { continue }
             let remoteChild = joinSMBPath(path, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
             if entry.isDirectory {
@@ -816,6 +925,28 @@ public enum SMBClient {
         }
     }
 
+    public static func updateMetadata(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        update: SMBFileMetadataUpdate,
+        directory: Bool = false,
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "SET_METADATA") { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .metadata(path: path, directory: directory))
+            do {
+                try await session.setBasicInfo(treeId: treeId, fileId: fileId, update: update)
+                try? await session.close(treeId: treeId, fileId: fileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
+        }
+    }
+
     public static func rename(
         host: String,
         port: UInt16 = 445,
@@ -1038,9 +1169,11 @@ actor SMBSession {
         )
         debugDump("TREE_CONNECT request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "TREE_CONNECT response")
-        let header = try SMB2Header.decode(response)
-        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_CONNECT")
-        return header.treeId
+        let result = try SMB2TreeConnect.decodeResponse(response)
+        if result.encryptionRequired, encryptionKey == nil {
+            throw SMBError.protocolError("TREE_CONNECT requires encryption but no SMB encryption key was negotiated")
+        }
+        return result.treeId
     }
 
     func create(treeId: UInt32, path: String, directory: Bool) async throws -> [UInt8] {
@@ -1239,7 +1372,7 @@ actor SMBSession {
                 try Task.checkCancellation()
                 let sourceChild = self.joinSMBPath(fromPath, entry.name)
                 let destinationChild = self.joinSMBPath(toPath, entry.name)
-                if entry.isDirectory {
+                if entry.isDirectory && !entry.isReparsePoint {
                     try await self.copyDirectory(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
                 } else {
                     try await self.copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
@@ -1284,6 +1417,7 @@ actor SMBSession {
             do {
                 try await queryDirectory(treeId: treeId, fileId: fileId) { entry in
                     try Task.checkCancellation()
+                    guard !entry.isReparsePoint else { return }
                     try await self.deleteRecursively(treeId: treeId, path: self.joinSMBPath(path, entry.name), directory: entry.isDirectory)
                 }
                 try? await close(treeId: treeId, fileId: fileId)
@@ -1309,6 +1443,20 @@ actor SMBSession {
         let response = try await signedWireTransaction(packet: packet, responseLabel: "SET_INFO rename response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "SET_INFO rename")
+    }
+
+    func setBasicInfo(treeId: UInt32, fileId: [UInt8], update: SMBFileMetadataUpdate) async throws {
+        let packet = try SMB2SetInfo.encodeBasicInfoRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            update: update
+        )
+        debugDump("SET_INFO basic request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "SET_INFO basic response")
+        let header = try SMB2Header.decode(response)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "SET_INFO basic")
     }
 
     func close(treeId: UInt32, fileId: [UInt8]) async throws {

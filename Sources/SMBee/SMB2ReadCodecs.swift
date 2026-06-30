@@ -97,6 +97,27 @@ enum SMB2TreeConnect {
         }
         return "\\\\\(parts[0])\\\(try SMBShareName(parts[1]).rawValue)"
     }
+
+    static func decodeResponse(_ bytes: [UInt8]) throws -> SMBTreeConnectResult {
+        let header = try SMB2Header.decode(bytes)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_CONNECT")
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 16 else {
+            throw SMBCodecError.invalidValue("invalid TREE_CONNECT response structure size")
+        }
+        let shareType = try reader.readUInt8()
+        try reader.skip(count: 1)
+        let shareFlags = try reader.readUInt32LE()
+        let capabilities = try reader.readUInt32LE()
+        let maximalAccess = try reader.readUInt32LE()
+        return SMBTreeConnectResult(
+            treeId: header.treeId,
+            shareType: shareType,
+            shareFlags: shareFlags,
+            capabilities: capabilities,
+            maximalAccess: maximalAccess
+        )
+    }
 }
 
 enum SMB2Create {
@@ -201,6 +222,15 @@ struct SMB2CreateRequest {
             createOptions: 0
         )
     }
+
+    static func metadata(path: String, directory: Bool) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0100 | 0x0000_0080,
+            createDisposition: 0x0000_0001,
+            createOptions: directory ? 0x0000_0001 : 0x0000_0040
+        )
+    }
 }
 
 enum SMB2QueryInfo {
@@ -237,14 +267,20 @@ enum SMB2QueryInfo {
         guard offset + length <= bytes.count else { throw SMBCodecError.truncated }
         let data = Array(bytes[offset..<offset + length])
         guard data.count >= 56 else { throw SMBCodecError.truncated }
+        let creationTime = readUInt64LE(data, at: 0)
+        let lastAccessTime = readUInt64LE(data, at: 16)
         let lastWriteTime = readUInt64LE(data, at: 24)
+        let changeTime = readUInt64LE(data, at: 32)
         let endOfFile = readUInt64LE(data, at: 40)
         let attributes = readUInt32LE(data, at: 52)
         return SMBFileStat(
             size: endOfFile,
             modifiedTime: filetimeToDate(lastWriteTime),
             isDirectory: (attributes & 0x10) != 0,
-            attributes: attributes
+            attributes: attributes,
+            creationTime: filetimeToDate(creationTime),
+            lastAccessTime: filetimeToDate(lastAccessTime),
+            changeTime: filetimeToDate(changeTime)
         )
     }
 }
@@ -366,6 +402,30 @@ enum SMB2SetInfo {
         )
     }
 
+    static func encodeBasicInfoRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        update: SMBFileMetadataUpdate
+    ) throws -> [UInt8] {
+        var buffer = SMBByteWriter()
+        buffer.writeUInt64LE(dateToFiletime(update.creationTime))
+        buffer.writeUInt64LE(dateToFiletime(update.lastAccessTime))
+        buffer.writeUInt64LE(dateToFiletime(update.modifiedTime))
+        buffer.writeUInt64LE(dateToFiletime(update.changeTime))
+        buffer.writeUInt32LE(update.attributes ?? 0)
+        buffer.writeUInt32LE(0)
+        return try encodeRequest(
+            messageId: messageId,
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            fileInfoClass: 4,
+            buffer: buffer.bytes
+        )
+    }
+
     private static func encodeRequest(
         messageId: UInt64,
         sessionId: UInt64,
@@ -432,6 +492,8 @@ enum SMB2QueryDirectory {
             let attributes = readUInt32LE(data, at: entryOffset + 56)
             let endOfFile = readUInt64LE(data, at: entryOffset + 40)
             let nameLength = Int(readUInt32LE(data, at: entryOffset + 60))
+            let rawFileId = readUInt64LE(data, at: entryOffset + 96)
+            let fileId = rawFileId == 0 ? nil : rawFileId
             let nameOffset = entryOffset + 104
             guard nameOffset + nameLength <= data.count else { throw SMBCodecError.truncated }
             let name = decodeUTF16LE(Array(data[nameOffset..<nameOffset + nameLength]))
@@ -440,7 +502,8 @@ enum SMB2QueryDirectory {
                     name: name,
                     fileSize: endOfFile,
                     isDirectory: (attributes & 0x10) != 0,
-                    attributes: attributes
+                    attributes: attributes,
+                    fileId: fileId
                 ))
             }
             if next == 0 { break }
@@ -512,4 +575,10 @@ private func filetimeToDate(_ value: UInt64) -> Date? {
     guard value != 0 else { return nil }
     let secondsBetween1601And1970: TimeInterval = 11_644_473_600
     return Date(timeIntervalSince1970: (TimeInterval(value) / 10_000_000) - secondsBetween1601And1970)
+}
+
+private func dateToFiletime(_ date: Date?) -> UInt64 {
+    guard let date else { return 0 }
+    let secondsBetween1601And1970: TimeInterval = 11_644_473_600
+    return UInt64((date.timeIntervalSince1970 + secondsBetween1601And1970) * 10_000_000)
 }

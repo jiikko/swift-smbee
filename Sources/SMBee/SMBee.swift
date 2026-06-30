@@ -18,6 +18,14 @@ public enum SMBee {
         try await SMBClient.connect(host: host, port: port, share: share, credential: credential)
     }
 
+    public static func listShares(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential
+    ) async throws -> [SMBShareInfo] {
+        try await SMBClient.listShares(host: host, port: port, credential: credential)
+    }
+
     public static func list(
         host: String,
         port: UInt16 = 445,
@@ -54,6 +62,26 @@ public enum SMBee {
         path: String
     ) async throws -> SMBFileStat {
         try await SMBClient.stat(host: host, port: port, share: share, path: path, credential: credential)
+    }
+
+    public static func updateMetadata(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        update: SMBFileMetadataUpdate,
+        directory: Bool = false
+    ) async throws {
+        try await SMBClient.updateMetadata(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            update: update,
+            directory: directory,
+            credential: credential
+        )
     }
 
     public static func read(

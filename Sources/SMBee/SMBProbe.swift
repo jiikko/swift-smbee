@@ -79,6 +79,13 @@ public enum SMBURLParser {
         public var path: String
     }
 
+    public struct ServerURL: Equatable, Sendable {
+        public var username: String?
+        public var password: String?
+        public var host: String
+        public var port: UInt16
+    }
+
     public static func parseProbeURL(_ value: String) throws -> (host: String, port: UInt16) {
         guard let components = URLComponents(string: value), components.scheme == "smb", let host = components.host else {
             throw SMBCodecError.invalidValue("expected smb://host[:port]")
@@ -88,6 +95,22 @@ public enum SMBURLParser {
             throw SMBCodecError.invalidValue("invalid port")
         }
         return (host, UInt16(port))
+    }
+
+    public static func parseServerURL(_ value: String) throws -> ServerURL {
+        guard let components = URLComponents(string: value), components.scheme == "smb", let host = components.host else {
+            throw SMBCodecError.invalidValue("expected smb://[user@]host[:port]")
+        }
+        let port = components.port ?? 445
+        guard (1...65535).contains(port) else {
+            throw SMBCodecError.invalidValue("invalid port")
+        }
+        guard components.percentEncodedPath.isEmpty || components.percentEncodedPath == "/" else {
+            throw SMBCodecError.invalidValue("SMB server URL must not include a share/path")
+        }
+        let username = try components.percentEncodedUser.map(decodeSMBURLUserInfo)
+        let password = try components.percentEncodedPassword.map(decodeSMBURLUserInfo)
+        return ServerURL(username: username, password: password, host: host, port: UInt16(port))
     }
 
     public static func parseReadURL(_ value: String) throws -> ReadURL {

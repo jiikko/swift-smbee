@@ -8,7 +8,7 @@ struct SMBCLI: AsyncParsableCommand {
         commandName: "smbcli",
         abstract: "🐝 SMBee command-line client",
         version: SMBee.version,
-        subcommands: [Probe.self, List.self, Stat.self, Cat.self, MakeDirectory.self, Put.self, Move.self, Remove.self]
+        subcommands: [Probe.self, List.self, Stat.self, Cat.self, Get.self, MakeDirectory.self, Put.self, Copy.self, Move.self, Remove.self]
     )
 }
 
@@ -126,6 +126,35 @@ struct Cat: AsyncParsableCommand {
     }
 }
 
+struct Get: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "get", abstract: "Download an SMB file")
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var source: String
+
+    @Argument(help: "Local destination file")
+    var destination: String
+
+    @Flag(help: "Fail if the destination exists")
+    var noOverwrite = false
+
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
+    func run() async throws {
+        let (endpoint, credential) = try makeEndpointAndCredential(url: source, domain: domain)
+        try await SMBee.download(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            localFile: URL(fileURLWithPath: destination),
+            overwrite: !noOverwrite
+        )
+    }
+}
+
 struct MakeDirectory: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "mkdir", abstract: "Create an SMB directory")
 
@@ -205,6 +234,39 @@ struct Move: AsyncParsableCommand {
             fromPath: from.path,
             toPath: to.path,
             replaceIfExists: replace
+        )
+    }
+}
+
+struct Copy: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "cp", abstract: "Copy an SMB file within one share")
+
+    @Argument(help: "smb://user@host[:445]/share/source")
+    var source: String
+
+    @Argument(help: "smb://user@host[:445]/share/destination")
+    var destination: String
+
+    @Flag(help: "Replace destination if it exists")
+    var replace = false
+
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
+    func run() async throws {
+        let (from, credential) = try makeEndpointAndCredential(url: source, domain: domain)
+        let to = try SMBURLParser.parseReadURL(destination)
+        guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
+            throw ValidationError("cp source and destination must use the same user, host, port, and share")
+        }
+        try await SMBee.copy(
+            host: from.host,
+            port: from.port,
+            credential: credential,
+            share: from.share,
+            fromPath: from.path,
+            toPath: to.path,
+            overwrite: replace
         )
     }
 }

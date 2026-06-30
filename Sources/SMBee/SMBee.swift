@@ -60,6 +60,26 @@ public enum SMBee {
         )
     }
 
+    public static func download(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true
+    ) async throws {
+        try await SMBClient.download(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localFile: localFile,
+            overwrite: overwrite,
+            credential: credential
+        )
+    }
+
     public static func makeDirectory(
         host: String,
         port: UInt16 = 445,
@@ -105,6 +125,26 @@ public enum SMBee {
             share: share,
             path: path,
             localFile: localFile,
+            overwrite: overwrite,
+            credential: credential
+        )
+    }
+
+    public static func copy(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool = false
+    ) async throws {
+        try await SMBClient.copy(
+            host: host,
+            port: port,
+            share: share,
+            fromPath: fromPath,
+            toPath: toPath,
             overwrite: overwrite,
             credential: credential
         )

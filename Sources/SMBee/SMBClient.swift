@@ -270,6 +270,51 @@ public enum SMBClient {
         }
     }
 
+    public static func download(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true,
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        let fileManager = FileManager.default
+        let destination = localFile.standardizedFileURL
+        let directory = destination.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(".\(destination.lastPathComponent).smbee-\(UUID().uuidString).tmp")
+
+        guard overwrite || !fileManager.fileExists(atPath: destination.path) else {
+            throw SMBCodecError.invalidValue("local destination already exists")
+        }
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        fileManager.createFile(atPath: temporary.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: temporary)
+        do {
+            try await withReadStream(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                credential: credential,
+                makeTransport: makeTransport
+            ) { chunk in
+                try handle.write(contentsOf: Data(chunk))
+            }
+            try handle.close()
+            if overwrite, fileManager.fileExists(atPath: destination.path) {
+                _ = try fileManager.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try fileManager.moveItem(at: temporary, to: destination)
+            }
+        } catch {
+            try? handle.close()
+            try? fileManager.removeItem(at: temporary)
+            throw error
+        }
+    }
+
     private static func readAll(session: SMBSession, treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
         let result = SMBReadAccumulator()
         var cursor = offset
@@ -354,6 +399,21 @@ public enum SMBClient {
                 try? await session.close(treeId: treeId, fileId: fileId)
                 throw error
             }
+        }
+    }
+
+    public static func copy(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool = false,
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
+            try await session.copyFile(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
         }
     }
 
@@ -650,22 +710,7 @@ actor SMBSession {
         while let range = try SMBChunkedTransfer.nextWriteRange(cursor: cursor, dataCount: data.count, chunkSize: chunkSize) {
             try Task.checkCancellation()
             let chunk = Array(data[range])
-            let packet = try SMB2Write.encodeRequest(
-                messageId: nextMessageId(),
-                sessionId: sessionId,
-                treeId: treeId,
-                fileId: fileId,
-                offset: UInt64(cursor),
-                data: chunk
-            )
-            debugDump("WRITE request", packet)
-            try await sendSigned(packet)
-            let response = try await receive(label: "WRITE response")
-            try verifySigned(response)
-            let count = try SMB2Write.decodeResponseCount(response)
-            guard count == chunk.count else {
-                throw SMBCodecError.invalidValue("short SMB write: expected \(chunk.count) bytes, got \(count)")
-            }
+            try await writeChunk(treeId: treeId, fileId: fileId, offset: UInt64(cursor), data: chunk)
             cursor = range.upperBound
         }
     }
@@ -677,27 +722,68 @@ actor SMBSession {
             try Task.checkCancellation()
             let chunk = try nextChunk(chunkSize)
             if chunk.isEmpty { break }
-            let packet = try SMB2Write.encodeRequest(
-                messageId: nextMessageId(),
-                sessionId: sessionId,
-                treeId: treeId,
-                fileId: fileId,
-                offset: offset,
-                data: chunk
-            )
-            debugDump("WRITE request", packet)
-            try await sendSigned(packet)
-            let response = try await receive(label: "WRITE response")
-            try verifySigned(response)
-            let count = try SMB2Write.decodeResponseCount(response)
-            guard count == chunk.count else {
-                throw SMBCodecError.invalidValue("short SMB write: expected \(chunk.count) bytes, got \(count)")
-            }
-            let nextOffset = offset.addingReportingOverflow(UInt64(count))
+            try await writeChunk(treeId: treeId, fileId: fileId, offset: offset, data: chunk)
+            let nextOffset = offset.addingReportingOverflow(UInt64(chunk.count))
             guard !nextOffset.overflow else {
                 throw SMBCodecError.invalidValue("SMB write offset overflow")
             }
             offset = nextOffset.partialValue
+        }
+    }
+
+    func copyFile(treeId: UInt32, fromPath: String, toPath: String, overwrite: Bool) async throws {
+        let sourceFileId = try await create(treeId: treeId, request: .read(path: fromPath, directory: false))
+        do {
+            let stat = try await queryInfo(treeId: treeId, fileId: sourceFileId)
+            let destinationFileId = try await create(treeId: treeId, request: .upload(path: toPath, overwrite: overwrite))
+            do {
+                var offset: UInt64 = 0
+                var remaining = stat.size
+                while remaining > 0 {
+                    try Task.checkCancellation()
+                    let chunk = try await readChunk(treeId: treeId, fileId: sourceFileId, offset: offset, length: remaining)
+                    if chunk.isEmpty { break }
+                    let advanced = try SMBChunkedTransfer.advancedReadPosition(
+                        cursor: offset,
+                        remaining: remaining,
+                        receivedCount: chunk.count
+                    )
+                    try await writeChunk(treeId: treeId, fileId: destinationFileId, offset: offset, data: chunk)
+                    offset = advanced.cursor
+                    remaining = advanced.remaining
+                }
+                guard remaining == 0 else {
+                    throw SMBCodecError.invalidValue("short SMB copy: \(remaining) bytes remaining")
+                }
+                try await flush(treeId: treeId, fileId: destinationFileId)
+                try? await close(treeId: treeId, fileId: destinationFileId)
+                try? await close(treeId: treeId, fileId: sourceFileId)
+            } catch {
+                try? await close(treeId: treeId, fileId: destinationFileId)
+                throw error
+            }
+        } catch {
+            try? await close(treeId: treeId, fileId: sourceFileId)
+            throw error
+        }
+    }
+
+    private func writeChunk(treeId: UInt32, fileId: [UInt8], offset: UInt64, data: [UInt8]) async throws {
+        let packet = try SMB2Write.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            offset: offset,
+            data: data
+        )
+        debugDump("WRITE request", packet)
+        try await sendSigned(packet)
+        let response = try await receive(label: "WRITE response")
+        try verifySigned(response)
+        let count = try SMB2Write.decodeResponseCount(response)
+        guard count == data.count else {
+            throw SMBCodecError.invalidValue("short SMB write: expected \(data.count) bytes, got \(count)")
         }
     }
 

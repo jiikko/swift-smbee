@@ -157,12 +157,20 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 ファイルブラウザ基盤としては下記が未実装。obaket 連携や GUI consumer の要件が出た順に着手する。
 
 - [ ] share discovery: `TREE_CONNECT` 前にサーバ上の共有一覧を取る API / `smbcli shares`
-  - 方針候補: MS-RAP / SRVSVC over named pipe / DFS referral のどれを採るか要調査。macOS SMBX と Samba の
-    両方で実測して決める。
-- [ ] download API / `smbcli get`: remote file を local file へ streaming 保存
-  - 既存 `withReadStream` で実装可能。local temp file + atomic rename / overwrite policy / resume 不可時の扱いを決める。
+  - 2026-06-30 調査: SMB2 単体の既存 command set では足りず、現実的には `IPC$` へ TREE_CONNECT →
+    `srvsvc` named pipe CREATE → DCE/RPC bind → SRVSVC `NetrShareEnum` が必要。MS-RAP は古く、
+    DFS referral は share enumeration そのものではないため、第一候補は SRVSVC over named pipe。
+  - 着手前に必要: SMB2 IOCTL または named pipe READ/WRITE の fixture、DCE/RPC bind/request/response codec、
+    `SHARE_INFO_1` 以上の NDR decode、macOS SMBX / Samba の実 packet capture。
+- [x] download API / `smbcli get`: remote file を local file へ streaming 保存
+  - 2026-06-30: `SMBee.download` / `SMBClient.download` / `smbcli get` を追加。既存 `withReadStream` を使い、
+    local temp file へ streaming 書き込み後に move/replace。`--no-overwrite` 対応。Samba E2E に round-trip
+    assertion 追加。
 - [ ] copy primitive: remote→remote copy / local→remote directory upload / remote→local directory download
-  - 同一 share 内 rename とは別。SMB server-side copy (`FSCTL_SRV_COPYCHUNK`) は対応可否を実測してから検討。
+  - 2026-06-30: 同一 share 内 remote file → remote file の client-side copy API / `smbcli cp` を追加。
+    既存 READ/WRITE で streaming copy し、Samba E2E に round-trip assertion 追加。
+  - 残: directory recursive copy、local directory upload、remote directory download、server-side copy
+    (`FSCTL_SRV_COPYCHUNK`) の対応可否実測。
 - [ ] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 大規模ディレクトリ・GUI lazy loading・obaket listing 向け。
 - [ ] persistent session API: 複数 operation で TCP/session/tree を再利用する公開 handle

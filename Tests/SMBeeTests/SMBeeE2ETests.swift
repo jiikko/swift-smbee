@@ -87,6 +87,7 @@ final class SMBeeE2ETests: XCTestCase {
         let suffix = UUID().uuidString
         let directory = "smbee-e2e-\(suffix)"
         let original = "\(directory)\\upload.txt"
+        let copied = "\(directory)\\copied.txt"
         let renamed = "\(directory)\\renamed.txt"
         let large = "\(directory)\\large.bin"
         let nested = "\(directory)\\nested"
@@ -101,6 +102,27 @@ final class SMBeeE2ETests: XCTestCase {
         try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: original, data: payload)
         let data = try await SMBee.read(host: host, port: port, credential: credential, share: share, path: original)
         XCTAssertEqual(data, payload)
+        try await SMBee.copy(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            fromPath: original,
+            toPath: copied
+        )
+        let copiedData = try await SMBee.read(host: host, port: port, credential: credential, share: share, path: copied)
+        XCTAssertEqual(copiedData, payload)
+        let localDownloadFile = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-e2e-download-\(suffix).txt")
+        defer { try? FileManager.default.removeItem(at: localDownloadFile) }
+        try await SMBee.download(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: original,
+            localFile: localDownloadFile
+        )
+        XCTAssertEqual(try Data(contentsOf: localDownloadFile), Data(payload))
 
         let largePayload = (0..<(1024 * 1024)).map { UInt8($0 & 0xff) }
         let localLargeFile = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-e2e-\(suffix).bin")
@@ -132,6 +154,7 @@ final class SMBeeE2ETests: XCTestCase {
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: renamed)
         entries = try await SMBee.list(host: host, port: port, credential: credential, share: share, path: directory)
         XCTAssertFalse(entries.contains { $0.name == "renamed.txt" })
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: copied)
 
         try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: nested)
         try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: nestedChild)

@@ -30,8 +30,17 @@
   `smbcli rm --directory` が必要。将来 stat で自動判別する UX 改善余地あり (ぼやき)。
   再発防止メモ: E2E が Samba のみだと「Samba 通過/macOS 拒否」型バグを取りこぼす。NT ハッシュ有効化済み
   macOS アカウントへの手動 smoke を維持すること。
-- ⏳ D 残: SMBSession の **切断検出→自動再接続** (cancellation は実装済)
-- 🧊 E (defer 維持): 3.1.1 GMAC/GCM 経路 + Samba 3.1.1 parser truncated バグ（macOS 上限 3.0.2 のため低優先）
+- ✅ rm のディレクトリ自動判定 (2026-06-30): 非 recursive delete で STATUS_FILE_IS_A_DIRECTORY を
+  捕まえ directory:true で 1 回自動リトライ。`rm <dir>` が --directory 無しでも macOS で通る。
+- ✅ D 残: **切断検出→自動再接続** 完了 (2026-06-30)。transport を factory 化し、接続喪失
+  (SMBTransportError.connectionClosed/.socketFailure) 時に idempotent 操作 (probe/ls/stat/cat) のみ
+  新 transport で最大 1 回再接続+やり直し。mutation は再試行せず SMBError.connectionLost。
+  非接続喪失エラー・CancellationError は即 rethrow。
+- 🧊 E (defer 維持・2026-06-30 再確認): 3.1.1 GMAC/GCM 経路。**ローカルで E2E 検証不可**
+  (docker/Samba 無し・macOS は 3.0.2 上限・Samba 3.1.1 は parser truncated バグ既知) のため、
+  検証可能な 3.1.1 サーバが用意できるまで保留。NEGOTIATE contexts / aesGMAC / aesGCMSeal /
+  SP800-108 KDF の scaffold は実装済み。残: preauth integrity SHA-512 running hash + 3.1.1 KDF
+  (preauth-hash context) + session への GMAC 署名 / GCM 暗号の配線。
 - 🧊 obaket 組み込み (SMBClient ラッパーで ObjectStorageProtocol 化) は obaket 側 issue 356/359
 
 ---

@@ -52,7 +52,7 @@ enum SMB2SessionSetup {
 enum SMB2TreeConnect {
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, path: String) throws -> [UInt8] {
         let header = try SMB2Header(command: SMB2Commands.treeConnect, messageId: messageId, sessionId: sessionId).encode()
-        let pathBytes = NTLM.utf16le(path)
+        let pathBytes = NTLM.utf16le(try treeConnectPath(path))
         let pathOffset = SMB2Header.encodedSize + 8
         var writer = SMBByteWriter()
         writer.writeBytes(header)
@@ -62,6 +62,15 @@ enum SMB2TreeConnect {
         writer.writeUInt16LE(UInt16(pathBytes.count))
         writer.writeBytes(pathBytes)
         return writer.bytes
+    }
+
+    private static func treeConnectPath(_ path: String) throws -> String {
+        guard path.hasPrefix("\\\\") else { return path }
+        let parts = path.dropFirst(2).split(separator: "\\", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2 else {
+            throw SMBCodecError.invalidValue("TREE_CONNECT path must be \\\\host\\share")
+        }
+        return "\\\\\(parts[0])\\\(try SMBShareName(parts[1]).rawValue)"
     }
 }
 
@@ -81,7 +90,7 @@ enum SMB2Create {
 
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, request: SMB2CreateRequest) throws -> [UInt8] {
         let header = try SMB2Header(command: SMB2Commands.create, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
-        let nameBytes = NTLM.utf16le(relativeCreateName(request.path))
+        let nameBytes = NTLM.utf16le(try relativeCreateName(request.path))
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(57)
@@ -103,8 +112,8 @@ enum SMB2Create {
         return writer.bytes
     }
 
-    private static func relativeCreateName(_ path: String) -> String {
-        path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+    private static func relativeCreateName(_ path: String) throws -> String {
+        try SMBPath.normalize(path)
     }
 
     static func decodeFileId(_ bytes: [UInt8]) throws -> [UInt8] {
@@ -310,7 +319,7 @@ enum SMB2SetInfo {
         newPath: String,
         replaceIfExists: Bool
     ) throws -> [UInt8] {
-        let nameBytes = NTLM.utf16le(relativeInfoName(newPath))
+        let nameBytes = NTLM.utf16le(try relativeInfoName(newPath))
         var buffer = SMBByteWriter()
         buffer.writeUInt8(replaceIfExists ? 1 : 0)
         buffer.writeBytes(Array(repeating: 0, count: 7))
@@ -351,8 +360,8 @@ enum SMB2SetInfo {
         return writer.bytes
     }
 
-    private static func relativeInfoName(_ path: String) -> String {
-        path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+    private static func relativeInfoName(_ path: String) throws -> String {
+        try SMBPath.normalize(path)
     }
 }
 

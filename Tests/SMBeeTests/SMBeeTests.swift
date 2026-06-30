@@ -270,6 +270,22 @@ final class SMBeeTests: XCTestCase {
         XCTAssertThrowsError(try SMBURLParser.parseReadURL("smb://user@server/share/dir%5Cfile.txt"))
     }
 
+    func testSMBPathNormalizesPublicAPIPaths() throws {
+        XCTAssertEqual(try SMBPath.normalize("\\dir/child\\"), "dir\\child")
+        XCTAssertEqual(try SMBPath.normalize(""), "")
+        XCTAssertEqual(try SMBPath.join("\\dir", "/child"), "dir\\child")
+        XCTAssertThrowsError(try SMBPath.normalize("dir//child"))
+        XCTAssertThrowsError(try SMBPath.normalize("dir/./child"))
+        XCTAssertThrowsError(try SMBPath.normalize("dir/../child"))
+    }
+
+    func testSMBShareNameRejectsPathSeparators() {
+        XCTAssertThrowsError(try SMBShareName(""))
+        XCTAssertThrowsError(try SMBShareName("a/b"))
+        XCTAssertThrowsError(try SMBShareName("a\\b"))
+        XCTAssertThrowsError(try SMBShareName(".."))
+    }
+
     func testSMBErrorMapperMapsRepresentativeNTSTATUSValues() {
         XCTAssertEqual(
             SMBErrorMapper.map(status: SMB2Status.objectNameNotFound, operation: "CREATE"),
@@ -1026,6 +1042,21 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(request, at: 110), UInt16(expectedName.count))
         XCTAssertEqual(request.count, 120 + expectedName.count)
         XCTAssertEqual(Array(request[120..<request.count]), expectedName)
+    }
+
+    func testCreateRequestRejectsUnsafeRelativePathComponents() {
+        XCTAssertThrowsError(try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            request: .read(path: "dir\\..\\child", directory: false)
+        ))
+        XCTAssertThrowsError(try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            request: .read(path: "dir//child", directory: false)
+        ))
     }
 
     func testCreateFileRequestUsesReadDataAndReadAttributesAccess() throws {

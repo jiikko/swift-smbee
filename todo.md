@@ -217,6 +217,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30 実装レビュー追記: 公開 API (`SMBee.* path:` / `SMBClientSession.* path:`) は
     URL parser を経由しないため、`.` / `..` / separator / 空 share などの検証が統一されていない。
     `SMBPath` / `SMBShareName` 型または共通 normalizer を導入し、CLI と API の挙動を揃える。
+  - 2026-06-30: `SMBPath` / `SMBShareName` を追加し、URL parser と CREATE / SET_INFO rename /
+    TREE_CONNECT codec の入口で共通 validation を通すようにした。公開 API の String surface は維持。
+    unit で `.` / `..` / 空 component / share separator を検証。
   - macOS Finder/Samba での Unicode normalization 差も実測する。
 - [ ] metadata operations: chmod 相当ではなく SMB/NTFS 属性として readonly/hidden/system/archive、
       create/access/modify/change time の read/write

@@ -100,10 +100,12 @@ public enum SMBURLParser {
         guard let share = parts.first else {
             throw SMBCodecError.invalidValue("SMB URL must include a share")
         }
+        let normalizedShare = try SMBShareName(share).rawValue
         let path = parts.dropFirst().joined(separator: "\\")
+        let normalizedPath = try SMBPath.normalize(path)
         let username = try components.percentEncodedUser.map(decodeSMBURLUserInfo)
         let password = try components.percentEncodedPassword.map(decodeSMBURLUserInfo)
-        return ReadURL(username: username, password: password, host: host, port: UInt16(port), share: share, path: path)
+        return ReadURL(username: username, password: password, host: host, port: UInt16(port), share: normalizedShare, path: normalizedPath)
     }
 
     private static func decodeSMBURLPathComponent(_ value: String) throws -> String {

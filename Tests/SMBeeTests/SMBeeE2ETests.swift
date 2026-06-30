@@ -93,6 +93,7 @@ final class SMBeeE2ETests: XCTestCase {
         let nested = "\(directory)\\nested"
         let nestedChild = "\(nested)\\child"
         let nestedFile = "\(nestedChild)\\delete-me.txt"
+        let uploadedDirectory = "\(directory)\\uploaded-dir"
         let payload = Array("hello write path \(suffix)\n".utf8)
 
         try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: directory)
@@ -162,6 +163,44 @@ final class SMBeeE2ETests: XCTestCase {
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: nested, directory: true, recursive: true)
         entries = try await SMBee.list(host: host, port: port, credential: credential, share: share, path: directory)
         XCTAssertFalse(entries.contains { $0.name == "nested" })
+
+        let localUploadDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-e2e-upload-dir-\(suffix)")
+        let localUploadChildDirectory = localUploadDirectory.appendingPathComponent("child")
+        try FileManager.default.createDirectory(at: localUploadChildDirectory, withIntermediateDirectories: true)
+        try Data(payload).write(to: localUploadChildDirectory.appendingPathComponent("file.txt"))
+        defer { try? FileManager.default.removeItem(at: localUploadDirectory) }
+        try await SMBee.uploadDirectory(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: uploadedDirectory,
+            localDirectory: localUploadDirectory
+        )
+        let uploadedPayload = try await SMBee.read(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: "\(uploadedDirectory)\\child\\file.txt"
+        )
+        XCTAssertEqual(uploadedPayload, payload)
+
+        let localDownloadDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-e2e-download-dir-\(suffix)")
+        defer { try? FileManager.default.removeItem(at: localDownloadDirectory) }
+        try await SMBee.downloadDirectory(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: uploadedDirectory,
+            localDirectory: localDownloadDirectory
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: localDownloadDirectory.appendingPathComponent("child/file.txt")),
+            Data(payload)
+        )
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: uploadedDirectory, directory: true, recursive: true)
 
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: large)
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: directory, directory: true)

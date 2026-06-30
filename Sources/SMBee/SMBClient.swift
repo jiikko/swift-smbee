@@ -315,6 +315,56 @@ public enum SMBClient {
         }
     }
 
+    public static func downloadDirectory(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localDirectory: URL,
+        overwrite: Bool = true,
+        credential: SMBCredential,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+        let entries = try await list(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: credential,
+            makeTransport: makeTransport
+        )
+        for entry in entries {
+            try Task.checkCancellation()
+            let remoteChild = joinSMBPath(path, entry.name)
+            let localChild = localDirectory.appendingPathComponent(entry.name)
+            if entry.isDirectory {
+                try await downloadDirectory(
+                    host: host,
+                    port: port,
+                    share: share,
+                    path: remoteChild,
+                    localDirectory: localChild,
+                    overwrite: overwrite,
+                    credential: credential,
+                    makeTransport: makeTransport
+                )
+            } else {
+                try await download(
+                    host: host,
+                    port: port,
+                    share: share,
+                    path: remoteChild,
+                    localFile: localChild,
+                    overwrite: overwrite,
+                    credential: credential,
+                    makeTransport: makeTransport
+                )
+            }
+        }
+    }
+
     private static func readAll(session: SMBSession, treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
         let result = SMBReadAccumulator()
         var cursor = offset
@@ -369,6 +419,62 @@ public enum SMBClient {
             } catch {
                 try? await session.close(treeId: treeId, fileId: fileId)
                 throw error
+            }
+        }
+    }
+
+    public static func uploadDirectory(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localDirectory: URL,
+        overwrite: Bool = true,
+        credential: SMBCredential,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        if !path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/")).isEmpty {
+            try await createDirectoryIfNeeded(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                credential: credential,
+                makeTransport: makeTransport
+            )
+        }
+        let fileManager = FileManager.default
+        let contents = try fileManager.contentsOfDirectory(
+            at: localDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: []
+        )
+        for localChild in contents {
+            try Task.checkCancellation()
+            let resourceValues = try localChild.resourceValues(forKeys: [.isDirectoryKey])
+            let remoteChild = joinSMBPath(path, localChild.lastPathComponent)
+            if resourceValues.isDirectory == true {
+                try await uploadDirectory(
+                    host: host,
+                    port: port,
+                    share: share,
+                    path: remoteChild,
+                    localDirectory: localChild,
+                    overwrite: overwrite,
+                    credential: credential,
+                    makeTransport: makeTransport
+                )
+            } else {
+                try await upload(
+                    host: host,
+                    port: port,
+                    share: share,
+                    path: remoteChild,
+                    localFile: localChild,
+                    overwrite: overwrite,
+                    credential: credential,
+                    makeTransport: makeTransport
+                )
             }
         }
     }
@@ -456,6 +562,34 @@ public enum SMBClient {
             }
             try await session.deleteNonRecursive(treeId: treeId, path: path, directory: directory)
         }
+    }
+
+    private static func createDirectoryIfNeeded(
+        host: String,
+        port: UInt16,
+        share: String,
+        path: String,
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport
+    ) async throws {
+        do {
+            try await makeDirectory(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                credential: credential,
+                makeTransport: makeTransport
+            )
+        } catch SMBError.nameCollision {
+            return
+        }
+    }
+
+    private static func joinSMBPath(_ parent: String, _ child: String) -> String {
+        let trimmedParent = parent.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+        if trimmedParent.isEmpty { return child }
+        return "\(trimmedParent)\\\(child)"
     }
 }
 

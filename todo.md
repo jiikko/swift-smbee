@@ -169,8 +169,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [ ] copy primitive: remote→remote copy / local→remote directory upload / remote→local directory download
   - 2026-06-30: 同一 share 内 remote file → remote file の client-side copy API / `smbcli cp` を追加。
     既存 READ/WRITE で streaming copy し、Samba E2E に round-trip assertion 追加。
-  - 残: directory recursive copy、local directory upload、remote directory download、server-side copy
-    (`FSCTL_SRV_COPYCHUNK`) の対応可否実測。
+  - 2026-06-30: recursive local directory upload (`SMBee.uploadDirectory`, `smbcli put -r`) と
+    remote directory download (`SMBee.downloadDirectory`, `smbcli get -r`) を追加。既存 operation の組み合わせで
+    実装し、Samba E2E に directory round-trip assertion 追加。
+  - 残: server-side copy (`FSCTL_SRV_COPYCHUNK`) の対応可否実測、remote directory → remote directory copy。
 - [ ] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 大規模ディレクトリ・GUI lazy loading・obaket listing 向け。
 - [ ] persistent session API: 複数 operation で TCP/session/tree を再利用する公開 handle

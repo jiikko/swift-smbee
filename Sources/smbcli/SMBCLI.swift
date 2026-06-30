@@ -138,11 +138,26 @@ struct Get: AsyncParsableCommand {
     @Flag(help: "Fail if the destination exists")
     var noOverwrite = false
 
+    @Flag(name: .shortAndLong, help: "Recursively download a directory")
+    var recursive = false
+
     @Option(help: "NTLM domain/workgroup")
     var domain: String = ""
 
     func run() async throws {
         let (endpoint, credential) = try makeEndpointAndCredential(url: source, domain: domain)
+        if recursive {
+            try await SMBee.downloadDirectory(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                localDirectory: URL(fileURLWithPath: destination),
+                overwrite: !noOverwrite
+            )
+            return
+        }
         try await SMBee.download(
             host: endpoint.host,
             port: endpoint.port,
@@ -188,11 +203,26 @@ struct Put: AsyncParsableCommand {
     @Flag(help: "Fail if the destination exists")
     var noOverwrite = false
 
+    @Flag(name: .shortAndLong, help: "Recursively upload a directory")
+    var recursive = false
+
     @Option(help: "NTLM domain/workgroup")
     var domain: String = ""
 
     func run() async throws {
         let (endpoint, credential) = try makeEndpointAndCredential(url: destination, domain: domain)
+        if recursive {
+            try await SMBee.uploadDirectory(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                localDirectory: URL(fileURLWithPath: source),
+                overwrite: !noOverwrite
+            )
+            return
+        }
         try await SMBee.upload(
             host: endpoint.host,
             port: endpoint.port,

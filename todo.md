@@ -240,6 +240,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30 実装レビュー追加: NEGOTIATE は 2.0.2 / 2.1 も提示するが authenticated path は
     3.0+ だけを受ける。probe 専用 dialect と authenticated dialect policy を分けるか、
     authenticated connect では 3.x のみ提示する。
+  - 2026-06-30: NEGOTIATE codec に dialect list を渡せるようにし、probe は従来通り
+    2.0.2/2.1/3.x、authenticated connect は 3.0/3.0.2/3.1.1 のみ提示するよう分離。
   - 2026-06-30 実装レビュー追加: SESSION_SETUP 後は encryption key があれば常に transform 送信する。
     server global capabilities / tree share flags / encryption required を見ていないため、暗号非対応 share や
     signing-only 運用との互換性が不明。TREE_CONNECT response の share capabilities / flags を parse し、

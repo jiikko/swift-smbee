@@ -1989,6 +1989,20 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try reader.readUInt16LE(), SMBNegotiateConstants.dialect311)
     }
 
+    func testNegotiateRequestCanLimitDialectsForAuthenticatedConnect() throws {
+        let request = try SMBNegotiateCodec.encodeRequest(
+            clientGuid: UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!,
+            salt: Array(repeating: 0xaa, count: 32),
+            offeredDialects: SMBNegotiateCodec.authenticatedDialects
+        )
+
+        XCTAssertEqual(readUInt16LE(request, at: 66), 3)
+        XCTAssertEqual(readUInt16LE(request, at: 100), SMBNegotiateConstants.dialect300)
+        XCTAssertEqual(readUInt16LE(request, at: 102), SMBNegotiateConstants.dialect302)
+        XCTAssertEqual(readUInt16LE(request, at: 104), SMBNegotiateConstants.dialect311)
+        XCTAssertEqual(readUInt32LE(request, at: 92), 112)
+    }
+
     func testNegotiateRequestContextAlignmentAndCount() throws {
         let request = try SMBNegotiateCodec.encodeRequest(
             clientGuid: UUID(uuidString: "00112233-4455-6677-8899-aabbccddeeff")!,

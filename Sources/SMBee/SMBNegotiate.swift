@@ -34,9 +34,14 @@ public enum SMBNegotiateConstants {
 
 public enum SMBNegotiateCodec {
     private static let negotiateContextCount: UInt16 = 3
-    private static let offeredDialects: [UInt16] = [
+    public static let probeDialects: [UInt16] = [
         SMBNegotiateConstants.dialect202,
         SMBNegotiateConstants.dialect210,
+        SMBNegotiateConstants.dialect300,
+        SMBNegotiateConstants.dialect302,
+        SMBNegotiateConstants.dialect311,
+    ]
+    public static let authenticatedDialects: [UInt16] = [
         SMBNegotiateConstants.dialect300,
         SMBNegotiateConstants.dialect302,
         SMBNegotiateConstants.dialect311,
@@ -45,8 +50,12 @@ public enum SMBNegotiateCodec {
     public static func encodeRequest(
         clientGuid: UUID,
         messageId: UInt64 = 0,
-        salt: [UInt8] = Array(repeating: 0, count: 32)
+        salt: [UInt8] = Array(repeating: 0, count: 32),
+        offeredDialects: [UInt16] = probeDialects
     ) throws -> [UInt8] {
+        guard !offeredDialects.isEmpty else {
+            throw SMBCodecError.invalidValue("NEGOTIATE requires at least one dialect")
+        }
         let contexts = encodeNegotiateContexts(salt: salt)
         let header = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
         let dialectBytes = MemoryLayout<UInt16>.size * offeredDialects.count

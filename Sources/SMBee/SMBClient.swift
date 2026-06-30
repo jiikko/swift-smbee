@@ -919,7 +919,11 @@ actor SMBSession {
     func connect() async throws {
         try Task.checkCancellation()
         try await transport.connect(host: host, port: port)
-        let negotiate = try SMBNegotiateCodec.encodeRequest(clientGuid: UUID(), messageId: nextMessageId())
+        let negotiate = try SMBNegotiateCodec.encodeRequest(
+            clientGuid: UUID(),
+            messageId: nextMessageId(),
+            offeredDialects: SMBNegotiateCodec.authenticatedDialects
+        )
         var preauthMessages = [negotiate]
         debugDump("NEGOTIATE request", negotiate)
         let negotiateResponse = try await unsignedWireTransaction(packet: negotiate, responseLabel: "NEGOTIATE response")

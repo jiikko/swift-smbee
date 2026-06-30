@@ -668,6 +668,22 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(hex(NTLM.ntProofStr(ntowfv2: ntowfv2, serverChallenge: serverChallenge, blob: blob)), "2a8e1bc8a06222ed5301c3fbd2154d0b")
     }
 
+    func testNTLMv2CredentialCanUseNTHashInsteadOfPassword() throws {
+        let ntHash = MD4.hash(NTLM.utf16le("Password"))
+        let credential = try SMBCredential(username: "User", ntHash: ntHash, domain: "Domain")
+
+        XCTAssertEqual(credential.password, "")
+        XCTAssertEqual(credential.ntHash, ntHash)
+        XCTAssertEqual(
+            try NTLM.ntowfv2(credential: credential),
+            NTLM.ntowfv2(password: "Password", username: "User", domain: "Domain")
+        )
+    }
+
+    func testNTLMv2CredentialRejectsInvalidNTHashLength() {
+        XCTAssertThrowsError(try SMBCredential(username: "User", ntHash: [0], domain: "Domain"))
+    }
+
     func testMSNLMPSection424NTLMv2SessionKeyExchangeRegressionVector() throws {
         // Regression vector for this implementation's fixed inputs. This is not the
         // literal MS-NLMP 4.2.4 published vector: timestamp and client challenge differ.

@@ -3,11 +3,23 @@ import Foundation
 public struct SMBCredential: Sendable {
     public var username: String
     public var password: String
+    public var ntHash: [UInt8]?
     public var domain: String
 
     public init(username: String, password: String, domain: String = "") {
         self.username = username
         self.password = password
+        self.ntHash = nil
+        self.domain = domain
+    }
+
+    public init(username: String, ntHash: [UInt8], domain: String = "") throws {
+        guard ntHash.count == 16 else {
+            throw SMBCodecError.invalidValue("NT hash must be 16 bytes")
+        }
+        self.username = username
+        self.password = ""
+        self.ntHash = ntHash
         self.domain = domain
     }
 }
@@ -97,7 +109,7 @@ enum NTLM {
         let userBytes = utf16le(credential.username)
         let domainBytes = utf16le(credential.domain)
         let workstationBytes = utf16le("")
-        let ntowfv2 = ntowfv2(password: credential.password, username: credential.username, domain: credential.domain)
+        let ntowfv2 = try ntowfv2(credential: credential)
         let includeMIC = targetInfoContainsTimestamp(challenge.targetInfo)
         if includeMIC, negotiateMessage == nil || challengeMessage == nil {
             throw SMBCodecError.invalidValue("NTLM MIC requires type1 and type2 messages")
@@ -180,7 +192,21 @@ enum NTLM {
 
     static func ntowfv2(password: String, username: String, domain: String) -> [UInt8] {
         let ntHash = MD4.hash(utf16le(password))
+        return ntowfv2(ntHash: ntHash, username: username, domain: domain)
+    }
+
+    static func ntowfv2(ntHash: [UInt8], username: String, domain: String) -> [UInt8] {
         return SMBCrypto.hmacMD5(key: ntHash, message: utf16le(username.uppercased() + domain))
+    }
+
+    static func ntowfv2(credential: SMBCredential) throws -> [UInt8] {
+        if let ntHash = credential.ntHash {
+            guard ntHash.count == 16 else {
+                throw SMBCodecError.invalidValue("NT hash must be 16 bytes")
+            }
+            return ntowfv2(ntHash: ntHash, username: credential.username, domain: credential.domain)
+        }
+        return ntowfv2(password: credential.password, username: credential.username, domain: credential.domain)
     }
 
     static func ntProofStr(ntowfv2: [UInt8], serverChallenge: [UInt8], blob: [UInt8]) -> [UInt8] {

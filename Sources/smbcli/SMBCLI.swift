@@ -348,6 +348,9 @@ struct AuthOptions: ParsableArguments {
     @Option(help: "NTLM domain/workgroup")
     var domain: String = ""
 
+    @Option(help: "NT hash as 32 hexadecimal characters")
+    var ntHash: String?
+
     @Flag(help: "Read password from standard input")
     var passwordStdin = false
 }
@@ -361,10 +364,23 @@ private func makeEndpointAndCredential(url: String, auth: AuthOptions) throws ->
     guard let username = endpoint.username, !username.isEmpty else {
         throw ValidationError("SMB URL must include a username")
     }
+    if let ntHash = try readNTHash(options: auth) {
+        guard endpoint.password == nil, !auth.passwordStdin, ProcessInfo.processInfo.environment["SMB_PASSWORD"] == nil else {
+            throw ValidationError("Use either an NT hash or a password, not both")
+        }
+        return (endpoint, try SMBCredential(username: username, ntHash: ntHash, domain: auth.domain))
+    }
     guard let password = try endpoint.password ?? readPassword(options: auth) else {
-        throw ValidationError("Set SMB_PASSWORD, pass --password-stdin, or include a password in the SMB URL")
+        throw ValidationError("Set SMB_PASSWORD, SMB_NT_HASH, pass --password-stdin/--nt-hash, or include a password in the SMB URL")
     }
     return (endpoint, SMBCredential(username: username, password: password, domain: auth.domain))
+}
+
+private func readNTHash(options: AuthOptions) throws -> [UInt8]? {
+    guard let value = options.ntHash ?? ProcessInfo.processInfo.environment["SMB_NT_HASH"] else {
+        return nil
+    }
+    return try parseNTHash(value)
 }
 
 private func readPassword(options: AuthOptions) throws -> String? {
@@ -375,6 +391,25 @@ private func readPassword(options: AuthOptions) throws -> String? {
         return password.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n"))
     }
     return ProcessInfo.processInfo.environment["SMB_PASSWORD"]
+}
+
+private func parseNTHash(_ value: String) throws -> [UInt8] {
+    let hex = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard hex.count == 32 else {
+        throw ValidationError("NT hash must be 32 hexadecimal characters")
+    }
+    var bytes: [UInt8] = []
+    bytes.reserveCapacity(16)
+    var index = hex.startIndex
+    while index < hex.endIndex {
+        let next = hex.index(index, offsetBy: 2)
+        guard let byte = UInt8(hex[index..<next], radix: 16) else {
+            throw ValidationError("NT hash must contain only hexadecimal characters")
+        }
+        bytes.append(byte)
+        index = next
+    }
+    return bytes
 }
 
 private func parseRange(_ value: String) throws -> SMBReadRange {

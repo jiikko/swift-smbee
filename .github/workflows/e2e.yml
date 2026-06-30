@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [master]
+  pull_request:
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -57,7 +58,7 @@ jobs:
           SMBEE_DEBUG: "1"
         run: swift run smbcli probe smb://127.0.0.1:445
 
-      - name: Probe-only E2E tests
+      - name: Samba-backed E2E tests
         env:
           SMBEE_E2E: "1"
           SMBEE_E2E_HOST: "127.0.0.1"

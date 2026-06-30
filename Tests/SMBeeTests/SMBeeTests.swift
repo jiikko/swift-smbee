@@ -508,6 +508,85 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testDCERPCBindEncodesSrvsvcPresentationContext() throws {
+        let bind = try DCERPC.encodeBind(callId: 1, abstractSyntax: SRVSVC.interfaceUUID, abstractVersion: SRVSVC.interfaceVersion)
+
+        XCTAssertEqual(bind[0], 5)
+        XCTAssertEqual(bind[2], DCERPC.pduTypeBind)
+        XCTAssertEqual(readUInt16LE(bind, at: 8), UInt16(bind.count))
+        XCTAssertEqual(readUInt32LE(bind, at: 12), 1)
+        XCTAssertEqual(readUInt16LE(bind, at: 16), 4_280)
+        XCTAssertEqual(readUInt16LE(bind, at: 18), 4_280)
+        XCTAssertEqual(bind[24], 1)
+        XCTAssertEqual(hex(Array(bind[32..<48])), "c84f324b7016d30112785a47bf6ee188")
+        XCTAssertEqual(readUInt32LE(bind, at: 48), 3)
+        XCTAssertEqual(hex(Array(bind[52..<68])), "045d888aeb1cc9119fe808002b104860")
+        XCTAssertEqual(readUInt32LE(bind, at: 68), 2)
+    }
+
+    func testDCERPCBindAckAcceptsAcceptedContext() throws {
+        var ack: [UInt8] = [
+            0x05, 0x00, DCERPC.pduTypeBindAck, 0x03,
+            0x10, 0x00, 0x00, 0x00,
+            0x44, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+        ]
+        ack.append(contentsOf: [
+            0xb8, 0x10, 0xb8, 0x10, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ])
+        ack.append(contentsOf: hexBytes("045d888aeb1cc9119fe808002b104860"))
+        ack.append(contentsOf: [0x02, 0x00, 0x00, 0x00])
+        writeUInt16LE(UInt16(ack.count), to: &ack, at: 8)
+
+        XCTAssertNoThrow(try DCERPC.decodeBindAck(ack))
+    }
+
+    func testSRVSVCNetrShareEnumRequestUsesLevel1() {
+        let request = SRVSVC.encodeNetrShareEnumRequest()
+
+        XCTAssertEqual(request.count, 28)
+        XCTAssertEqual(readUInt32LE(request, at: 0), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 4), 1)
+        XCTAssertEqual(readUInt32LE(request, at: 8), 1)
+        XCTAssertEqual(readUInt32LE(request, at: 12), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 16), 0)
+        XCTAssertEqual(readUInt32LE(request, at: 20), 0xffff_ffff)
+        XCTAssertEqual(readUInt32LE(request, at: 24), 0)
+    }
+
+    func testSRVSVCNetrShareEnumResponseDecodesShareInfo1() throws {
+        var stub: [UInt8] = []
+        appendUInt32LE(1, to: &stub) // level
+        appendUInt32LE(1, to: &stub) // discriminant
+        appendUInt32LE(2, to: &stub) // entries read
+        appendUInt32LE(0x0002_0000, to: &stub) // buffer referent
+        appendUInt32LE(2, to: &stub) // conformant array count
+        appendUInt32LE(0x0002_0001, to: &stub)
+        appendUInt32LE(0, to: &stub)
+        appendUInt32LE(0x0002_0002, to: &stub)
+        appendUInt32LE(0x0002_0003, to: &stub)
+        appendUInt32LE(0x8000_0000, to: &stub)
+        appendUInt32LE(0x0002_0004, to: &stub)
+        appendNDRString("public", to: &stub)
+        appendNDRString("Public share", to: &stub)
+        appendNDRString("IPC$", to: &stub)
+        appendNDRString("Remote IPC", to: &stub)
+        appendUInt32LE(2, to: &stub) // total entries
+        appendUInt32LE(0, to: &stub) // resume handle null
+        appendUInt32LE(0, to: &stub) // status
+
+        let shares = try SRVSVC.decodeNetrShareEnumResponse(stub)
+
+        XCTAssertEqual(shares, [
+            SMBShareInfo(name: "public", type: 0, comment: "Public share"),
+            SMBShareInfo(name: "IPC$", type: 0x8000_0000, comment: "Remote IPC"),
+        ])
+    }
+
     func testSMB311GMACSignatureZeroesHeaderSignatureField() throws {
         let key = hexBytes("000102030405060708090a0b0c0d0e0f")
         var packet = try SMB2Header(
@@ -2429,6 +2508,27 @@ final class SMBeeTests: XCTestCase {
         bytes.append(UInt8(value.count & 0xff))
         bytes.append(UInt8((value.count >> 8) & 0xff))
         bytes.append(contentsOf: value)
+    }
+
+    private func appendUInt32LE(_ value: UInt32, to bytes: inout [UInt8]) {
+        bytes.append(UInt8(value & 0xff))
+        bytes.append(UInt8((value >> 8) & 0xff))
+        bytes.append(UInt8((value >> 16) & 0xff))
+        bytes.append(UInt8((value >> 24) & 0xff))
+    }
+
+    private func appendNDRString(_ value: String, to bytes: inout [UInt8]) {
+        let units = Array(value.utf16) + [0]
+        appendUInt32LE(UInt32(units.count), to: &bytes)
+        appendUInt32LE(0, to: &bytes)
+        appendUInt32LE(UInt32(units.count), to: &bytes)
+        for unit in units {
+            bytes.append(UInt8(unit & 0xff))
+            bytes.append(UInt8((unit >> 8) & 0xff))
+        }
+        while bytes.count % 4 != 0 {
+            bytes.append(0)
+        }
     }
 
     private func makeDirectoryEntry(

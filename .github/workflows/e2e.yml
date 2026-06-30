@@ -104,6 +104,7 @@ jobs:
           printf "nested payload\n" > "${local_dir}/dir/child/nested.txt"
 
           "${SMBCLI}" ls "${SMB_URL}"
+          "${SMBCLI}" shares "smb://smbee@${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}" | grep -Fx public
           "${SMBCLI}" mkdir "${SMB_URL}/${root}"
           "${SMBCLI}" put "${local_dir}/file.txt" "${SMB_URL}/${root}/file.txt"
           "${SMBCLI}" cat "${SMB_URL}/${root}/file.txt" | cmp "${local_dir}/file.txt" -

@@ -467,8 +467,17 @@ public enum SMBClient {
         credential: SMBCredential,
         makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws -> [SMBShareInfo] {
-        _ = (host, port, credential, makeTransport)
-        throw SMBError.unsupported(status: 0, operation: "SHARE_DISCOVERY_SRVsvc")
+        let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
+        do {
+            try await session.connect()
+            let treeId = try await session.treeConnect(share: "IPC$")
+            let shares = try await session.listShares(treeId: treeId)
+            await session.disconnect(treeId: treeId)
+            return shares
+        } catch {
+            await session.closeTransport()
+            throw error
+        }
     }
 
     public static func list(
@@ -1457,6 +1466,30 @@ actor SMBSession {
         let response = try await signedWireTransaction(packet: packet, responseLabel: "SET_INFO basic response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "SET_INFO basic")
+    }
+
+    func listShares(treeId: UInt32) async throws -> [SMBShareInfo] {
+        let fileId = try await create(treeId: treeId, request: .namedPipe(path: "srvsvc"))
+        do {
+            let bind = try DCERPC.encodeBind(callId: 1, abstractSyntax: SRVSVC.interfaceUUID, abstractVersion: SRVSVC.interfaceVersion)
+            try await write(treeId: treeId, fileId: fileId, data: bind)
+            let bindAck = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: 4_280)
+            try DCERPC.decodeBindAck(bindAck)
+
+            let request = try DCERPC.encodeRequest(
+                callId: 2,
+                opnum: SRVSVC.netrShareEnumOpnum,
+                stub: SRVSVC.encodeNetrShareEnumRequest()
+            )
+            try await write(treeId: treeId, fileId: fileId, data: request)
+            let response = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: 65_536)
+            let shares = try SRVSVC.decodeNetrShareEnumResponse(try DCERPC.decodeResponseStub(response))
+            try? await close(treeId: treeId, fileId: fileId)
+            return shares
+        } catch {
+            try? await close(treeId: treeId, fileId: fileId)
+            throw error
+        }
     }
 
     func close(treeId: UInt32, fileId: [UInt8]) async throws {

@@ -231,6 +231,15 @@ struct SMB2CreateRequest {
             createOptions: directory ? 0x0000_0001 : 0x0000_0040
         )
     }
+
+    static func namedPipe(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x8000_0000 | 0x4000_0000,
+            createDisposition: 0x0000_0001,
+            createOptions: 0
+        )
+    }
 }
 
 enum SMB2QueryInfo {

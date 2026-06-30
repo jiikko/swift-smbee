@@ -32,6 +32,8 @@ test code は共通（Samba を起動 → golden path）で、**起動手段だ�
 
 ```
 probe   : NEGOTIATE 結果 (dialect/signing/contexts) が想定 (macOS mirror: 3.0.2 / signing required / contexts なし) か
+shares  : IPC$ + SRVSVC NetrShareEnum で public share が列挙できるか（既存 SMBCredential による認証必須。
+          guest/anonymous share discovery は未サポート）
 ls      : QUERY_DIRECTORY
 stat    : QUERY_INFO
 cat     : READ（full / range）。download sha256 を期待値と照合

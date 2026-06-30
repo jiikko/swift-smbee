@@ -1533,7 +1533,8 @@ actor SMBSession {
 
     private func debugDump(_ label: String, _ bytes: [UInt8]) {
         guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
-        FileHandle.standardError.write(Data("\(label) (\(bytes.count) bytes): \(SMBDebug.hexSummary(bytes))\n".utf8))
+        let traceWire = ProcessInfo.processInfo.environment["SMBEE_TRACE_WIRE"] == "1"
+        FileHandle.standardError.write(Data("\(label) (\(bytes.count) bytes): \(SMBDebug.packetSummary(bytes, traceWire: traceWire))\n".utf8))
     }
 
     private func debugLine(_ message: String) {

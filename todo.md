@@ -268,6 +268,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30 実装レビュー追記: `SMBEE_DEBUG=1` は raw SMB packet を出す。SESSION_SETUP 以降は
     security blob / encrypted payload / signing material に近い情報を含み得るため、command type ごとの
     redaction policy と `--debug` / `--trace-wire` の分離を決める。
+  - 2026-06-30: `SMBEE_DEBUG=1` は packet label と byte count のみに redaction し、raw hex は
+    `SMBEE_TRACE_WIRE=1` 併用時だけ出すよう分離。残: CLI flag としての `--debug` / `--trace-wire`。
 - [ ] compatibility matrix: macOS SMBX / Samba / Windows Server / NAS (Synology/QNAP 等)
   - dialect/signing/encryption/quirk を記録し、手動 smoke 手順を docs 化する。
 - [ ] NetBIOS name / port 139 / hostname discovery は原則 scope 外だが、必要になったら separate transport として検討

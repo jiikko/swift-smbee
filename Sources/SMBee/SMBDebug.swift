@@ -2,6 +2,7 @@ import Foundation
 
 enum SMBDebug {
     private static let defaultDumpPrefixByteCount = 64
+    private static let redactedPacketSummary = "<redacted; set SMBEE_TRACE_WIRE=1 to dump raw packet hex>"
 
     static func hex(_ bytes: [UInt8]) -> String {
         bytes.map { String(format: "%02x", $0) }.joined()
@@ -18,5 +19,9 @@ enum SMBDebug {
             return prefix
         }
         return "\(prefix)... totalBytes=\(bytes.count)"
+    }
+
+    static func packetSummary(_ bytes: [UInt8], traceWire: Bool) -> String {
+        traceWire ? hexSummary(bytes) : redactedPacketSummary
     }
 }

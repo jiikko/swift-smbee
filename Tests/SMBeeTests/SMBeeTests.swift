@@ -1754,6 +1754,16 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testPacketSummaryRedactsUnlessWireTraceIsEnabled() {
+        let bytes = (0..<4).map(UInt8.init)
+
+        XCTAssertEqual(
+            SMBDebug.packetSummary(bytes, traceWire: false),
+            "<redacted; set SMBEE_TRACE_WIRE=1 to dump raw packet hex>"
+        )
+        XCTAssertEqual(SMBDebug.packetSummary(bytes, traceWire: true), "00010203")
+    }
+
     func testWriteChunkRangesCoverBoundarySizes() throws {
         let chunkSize = 4
         let cases: [(Int, [Range<Int>])] = [

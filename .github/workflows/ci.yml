@@ -26,3 +26,20 @@ jobs:
         run: swift build
       - name: Test
         run: swift test
+
+  linux-build-test:
+    # Linux runner で、Network.framework 依存が SMB 本体へ漏れていないことと、
+    # unit/vector テストが Linux 上でも通ることを PR 時点で明示的に確認する。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+      - name: Swift version
+        run: swift --version
+      - name: Build on Linux
+        run: swift build
+      - name: Unit tests on Linux
+        run: swift test

@@ -39,7 +39,7 @@ jobs:
       - name: Probe negotiated parameters
         env:
           SMBEE_DEBUG: "1"
-        run: swift run smbcli probe smb://127.0.0.1:445
+        run: swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
 
       - name: Samba-backed API E2E tests
         env:
@@ -88,10 +88,11 @@ jobs:
         run: |
           set -euxo pipefail
           SMBCLI=".build/debug/smbcli"
+          SMB_URL="smb://smbee@${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public"
           root="smbee-gha-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           local_dir="$(mktemp -d)"
           cleanup() {
-            "${SMBCLI}" rm -r "smb://smbee@127.0.0.1/public/${root}" || true
+            "${SMBCLI}" rm -r "${SMB_URL}/${root}" || true
             rm -rf "${local_dir}"
           }
           trap cleanup EXIT
@@ -100,19 +101,19 @@ jobs:
           printf "hello smbee command smoke\n" > "${local_dir}/file.txt"
           printf "nested payload\n" > "${local_dir}/dir/child/nested.txt"
 
-          "${SMBCLI}" ls smb://smbee@127.0.0.1/public
-          "${SMBCLI}" mkdir "smb://smbee@127.0.0.1/public/${root}"
-          "${SMBCLI}" put "${local_dir}/file.txt" "smb://smbee@127.0.0.1/public/${root}/file.txt"
-          "${SMBCLI}" cat "smb://smbee@127.0.0.1/public/${root}/file.txt" | cmp "${local_dir}/file.txt" -
-          "${SMBCLI}" get "smb://smbee@127.0.0.1/public/${root}/file.txt" "${local_dir}/downloaded.txt"
+          "${SMBCLI}" ls "${SMB_URL}"
+          "${SMBCLI}" mkdir "${SMB_URL}/${root}"
+          "${SMBCLI}" put "${local_dir}/file.txt" "${SMB_URL}/${root}/file.txt"
+          "${SMBCLI}" cat "${SMB_URL}/${root}/file.txt" | cmp "${local_dir}/file.txt" -
+          "${SMBCLI}" get "${SMB_URL}/${root}/file.txt" "${local_dir}/downloaded.txt"
           cmp "${local_dir}/file.txt" "${local_dir}/downloaded.txt"
-          "${SMBCLI}" cp "smb://smbee@127.0.0.1/public/${root}/file.txt" "smb://smbee@127.0.0.1/public/${root}/copied.txt"
-          "${SMBCLI}" cat "smb://smbee@127.0.0.1/public/${root}/copied.txt" | cmp "${local_dir}/file.txt" -
-          "${SMBCLI}" put -r "${local_dir}/dir" "smb://smbee@127.0.0.1/public/${root}/uploaded-dir"
-          "${SMBCLI}" ls "smb://smbee@127.0.0.1/public/${root}/uploaded-dir/child"
-          "${SMBCLI}" get -r "smb://smbee@127.0.0.1/public/${root}/uploaded-dir" "${local_dir}/downloaded-dir"
+          "${SMBCLI}" cp "${SMB_URL}/${root}/file.txt" "${SMB_URL}/${root}/copied.txt"
+          "${SMBCLI}" cat "${SMB_URL}/${root}/copied.txt" | cmp "${local_dir}/file.txt" -
+          "${SMBCLI}" put -r "${local_dir}/dir" "${SMB_URL}/${root}/uploaded-dir"
+          "${SMBCLI}" ls "${SMB_URL}/${root}/uploaded-dir/child"
+          "${SMBCLI}" get -r "${SMB_URL}/${root}/uploaded-dir" "${local_dir}/downloaded-dir"
           cmp "${local_dir}/dir/child/nested.txt" "${local_dir}/downloaded-dir/child/nested.txt"
-          "${SMBCLI}" rm -r "smb://smbee@127.0.0.1/public/${root}"
+          "${SMBCLI}" rm -r "${SMB_URL}/${root}"
 
       - name: Samba logs (debug)
         if: always()

@@ -37,10 +37,11 @@
   新 transport で最大 1 回再接続+やり直し。mutation は再試行せず SMBError.connectionLost。
   非接続喪失エラー・CancellationError は即 rethrow。
 - 🧊 E (defer 維持・2026-06-30 再確認): 3.1.1 GMAC/GCM 経路。**ローカルで E2E 検証不可**
-  (docker/Samba 無し・macOS は 3.0.2 上限・Samba 3.1.1 は parser truncated バグ既知) のため、
-  検証可能な 3.1.1 サーバが用意できるまで保留。NEGOTIATE contexts / aesGMAC / aesGCMSeal /
-  SP800-108 KDF の scaffold は実装済み。残: preauth integrity SHA-512 running hash + 3.1.1 KDF
-  (preauth-hash context) + session への GMAC 署名 / GCM 暗号の配線。
+  (docker/Samba 無し・macOS は 3.0.2 上限) のため、検証可能な 3.1.1 サーバが用意できるまで
+  実サーバ確認は保留。NEGOTIATE contexts / unpadded final context parser / preauth integrity SHA-512
+  running hash / SP800-108 KDF (preauth-hash context) / AES-GCM TRANSFORM_HEADER fixture /
+  session への 3.1.1 KDF + GCM 暗号配線は実装済み。残: 実 Samba 3.1.1 交渉確認 + GMAC 署名の
+  実 packet fixture / 実サーバ検証。
 - ✅ 公開 read streaming API (2026-06-30): `SMBee.withReadStream(... onChunk:)` (scoped callback)。
   SMBSession.readChunks primitive に集約し既存 `[UInt8]` 一括 read は互換維持。chunk yield 後は透過 retry
   せず connectionLost に昇格。`smbcli cat` も streaming 化 (大ファイルを全量 lift しない)。実機 macOS で
@@ -89,8 +90,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [x] **実測**: macOS SMBX は macOS 26.5.1 でも **3.0.2 上限**。3.1.1 は喋らない。
   - probe(NEGOTIATE) は 3.0.2 macOS に対して成功済み。
 - [ ] **実測**: Samba が **3.1.1 + GMAC + GCM** を交渉するか ⓥ
-- [ ] 既知課題: Samba 3.1.1 response の parser が `truncated` になるバグを調査（macOS 実上限が
-      3.0.2 のため優先度低）
+- [x] 既知課題: Samba 3.1.1 response の parser が `truncated` になるバグを調査
+  - 2026-06-30: NEGOTIATE context parser が「最後の context も 8-byte padding あり」と仮定していた
+    ため、最後の context が unpadded の response で `truncated` になり得た。最終 context は padding
+    なしでも受けるよう修正し、unit fixture 追加済み。実 Samba packet での再確認は上の実測タスクに含める。
 - 撤退判断: Samba が GMAC/GCM を交渉しない & 設定で出せない → 3.1.1 側 scope 見直し
 
 ## Phase 2 — 認証（NTLMv2 / SPNEGO）+ TREE_CONNECT
@@ -101,11 +104,15 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - [x] vector test（MS-NLMP / RFC）
 - [x] SESSION_SETUP の複数往復（STATUS_MORE_PROCESSING_REQUIRED）
 - [ ] **SMB 3.1.1 crypto framing**:
-  - [ ] preauth integrity: NEGOTIATE+SESSION_SETUP の SHA-512 running transcript
-  - [ ] SP800-108 counter KDF（HMAC-SHA256）で signing/encryption/application key 導出（label/context ⓥ）
+  - [x] preauth integrity: NEGOTIATE+SESSION_SETUP の SHA-512 running transcript
+  - [x] SP800-108 counter KDF（HMAC-SHA256）で signing/encryption/application key 導出（label/context ⓥ）
   - [ ] signing = AES-GMAC を packet に適用 / 検証
-  - [ ] encryption = TRANSFORM_HEADER + AES-GCM（nonce/AAD/tag レイアウト ⓥ）
-  - [ ] preauth transcript / KDF / transform header の fixture test
+    - 2026-06-30: primitive と KDF は実装済み。GMAC 署名 packet の nonce/signature field レイアウトは
+      実 packet fixture か 3.1.1 サーバで確認してから配線する。
+  - [x] encryption = TRANSFORM_HEADER + AES-GCM（nonce/AAD/tag レイアウト ⓥ）
+    - 2026-06-30: 12-byte nonce + 16-byte TRANSFORM_HEADER nonce field padding / AAD / tag fixture を追加し、
+      session の 3.1.1 暗号化・復号分岐へ配線。
+  - [x] preauth transcript / KDF / transform header の fixture test
 - [x] **SMB 3.0.2 crypto framing**:
   - [x] signing = AES-CMAC（RFC4493）を pure-Swift 実装または pure-Swift cross-platform lib で対応
   - [x] encryption = AES-128-CCM（RFC3610 / NIST SP800-38C）を pure-Swift 実装または pure-Swift cross-platform lib で対応
@@ -144,6 +151,45 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [x] `.github/workflows/e2e.yml` の TODO を埋め、push トリガを有効化
 - [x] ローカル Apple container 起動スクリプト（手動）
 
+## smbclient としての追加 backlog（MVP 後）
+
+実装済みの `probe/ls/stat/cat/mkdir/put/mv/rm` は最小 SMB client としては動くが、汎用 smbclient /
+ファイルブラウザ基盤としては下記が未実装。obaket 連携や GUI consumer の要件が出た順に着手する。
+
+- [ ] share discovery: `TREE_CONNECT` 前にサーバ上の共有一覧を取る API / `smbcli shares`
+  - 方針候補: MS-RAP / SRVSVC over named pipe / DFS referral のどれを採るか要調査。macOS SMBX と Samba の
+    両方で実測して決める。
+- [ ] download API / `smbcli get`: remote file を local file へ streaming 保存
+  - 既存 `withReadStream` で実装可能。local temp file + atomic rename / overwrite policy / resume 不可時の扱いを決める。
+- [ ] copy primitive: remote→remote copy / local→remote directory upload / remote→local directory download
+  - 同一 share 内 rename とは別。SMB server-side copy (`FSCTL_SRV_COPYCHUNK`) は対応可否を実測してから検討。
+- [ ] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
+  - 大規模ディレクトリ・GUI lazy loading・obaket listing 向け。
+- [ ] persistent session API: 複数 operation で TCP/session/tree を再利用する公開 handle
+  - 現状は operation ごとに connect/auth/treeConnect。実装時は `issues/002-design-smbsession-concurrent-multiflight.md`
+    の serializer or messageId demux を先に片付ける。
+- [ ] authentication options: NT hash 入力 / password provider callback / keychain 連携 / guest or anonymous の扱い
+  - secret を log に出さない方針は維持。CLI は `SMB_PASSWORD` 以外の安全な入力方法を追加する。
+- [ ] path handling: SMB パス正規化・`.`/`..`・区切り文字・URL percent decoding/encoding の仕様化
+  - macOS Finder/Samba での Unicode normalization 差も実測する。
+- [ ] metadata operations: chmod 相当ではなく SMB/NTFS 属性として readonly/hidden/system/archive、
+      create/access/modify/change time の read/write
+  - `QUERY_INFO` / `SET_INFO` の information class を拡張。
+- [ ] symlink / reparse point / DFS referral の扱い
+  - follow するか entry metadata として返すか、recursive delete/copy の安全策を先に決める。
+- [ ] ACL / owner / SID metadata
+  - `QUERY_SECURITY` / `SET_SECURITY`。MVP では扱わないが、管理系 smbclient としては必要。
+- [ ] locking / durable handle / lease / oplock の扱い
+  - concurrent clients や大ファイル操作の堅牢性向け。最初は明示的に unsupported としてエラーを設計する。
+- [ ] timeout / progress / cancellation API の整備
+  - read/write loop は cancellation 済み。公開 API と CLI に progress callback / transfer rate / timeout を足す。
+- [ ] CLI UX: `--password-stdin` / interactive password prompt / `--json` / exit code 表 / `--debug` redaction policy
+  - 自動化用途と人間操作の両方を想定。
+- [ ] compatibility matrix: macOS SMBX / Samba / Windows Server / NAS (Synology/QNAP 等)
+  - dialect/signing/encryption/quirk を記録し、手動 smoke 手順を docs 化する。
+- [ ] NetBIOS name / port 139 / hostname discovery は原則 scope 外だが、必要になったら separate transport として検討
+  - 現状は direct TCP 445 のみ。
+
 ## 横断（全 Phase 共通）
 
 - [x] `SMBErrorMapper`: NTSTATUS → エラー型（[docs/smb-protocol.md] の表、値は MS-ERREF 確認）
@@ -161,6 +207,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 ## 完了の目安（MVP）
 
 - [x] Phase 0–3（read）+ Phase 5 の read E2E が green
-- [ ] probe が macOS SMBX で 3.0.2 + signing required、Samba で 3.1.1+GMAC+GCM または
+- [x] probe が macOS SMBX で 3.0.2 + signing required、Samba で 3.1.1+GMAC+GCM または
       3.0.2 mirror E2E green を確認
+  - 2026-06-30: macOS SMBX 3.0.2 smoke 済み、Samba は 3.0.2 mirror E2E green。Samba 3.1.1+
+    GMAC+GCM の実測は Phase 1 の独立タスクとして残す。
 - [x] write（Phase 4）は read 安定後に着手判断

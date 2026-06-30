@@ -182,6 +182,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `SHARE_INFO_1` 以上の NDR decode、macOS SMBX / Samba の実 packet capture。
   - 2026-06-30: 実装 scope を `issues/006-share-discovery-srvsvc.md` に分離。SRVSVC over IPC$ と
     fixture 要件を完了条件として明文化。
+  - 2026-06-30: `SMBee.listShares` / `SMBClient.listShares` / `smbcli shares` の入口を追加。
+    現時点では `SMBError.unsupported(operation: "SHARE_DISCOVERY_SRVsvc")` を返す。残:
+    `issues/006-share-discovery-srvsvc.md` の DCE/RPC + SRVSVC 実装。
 - [x] download API / `smbcli get`: remote file を local file へ streaming 保存
   - 2026-06-30: `SMBee.download` / `SMBClient.download` / `smbcli get` を追加。既存 `withReadStream` を使い、
     local temp file へ streaming 書き込み後に move/replace。`--no-overwrite` 対応。Samba E2E に round-trip
@@ -236,12 +239,16 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     TREE_CONNECT codec の入口で共通 validation を通すようにした。公開 API の String surface は維持。
     unit で `.` / `..` / 空 component / share separator を検証。
   - macOS Finder/Samba での Unicode normalization 差も実測する。
-- [ ] metadata operations: chmod 相当ではなく SMB/NTFS 属性として readonly/hidden/system/archive、
+- [x] metadata operations: chmod 相当ではなく SMB/NTFS 属性として readonly/hidden/system/archive、
       create/access/modify/change time の read/write
   - `QUERY_INFO` / `SET_INFO` の information class を拡張。
   - 2026-06-30: `SMBDirectoryEntry` / `SMBFileStat` に raw SMB file attributes (`UInt32`) を追加し、
     `QUERY_DIRECTORY` / `QUERY_INFO(FileNetworkOpenInformation)` decode 結果として返すようにした。
     残: create/access/change time と `SET_INFO` による属性・時刻更新。
+  - 2026-06-30: `SMBFileStat` に creation/access/change time を追加し、
+    `SMBFileMetadataUpdate` + `SMBee.updateMetadata` / `SMBClient.updateMetadata` /
+    `SMBClientSession.updateMetadata` で FileBasicInformation SET_INFO を送れるようにした。
+    unit で FileNetworkOpenInformation decode と FileBasicInformation encode を検証。
 - [ ] symlink / reparse point / DFS referral の扱い
   - follow するか entry metadata として返すか、recursive delete/copy の安全策を先に決める。
   - 2026-06-30 実装レビュー追記: 現状の directory entry は `isDirectory` しか返さず、reparse point /
@@ -250,11 +257,15 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     返す設計を先に入れる。
   - 2026-06-30: FileAttributes は `SMBDirectoryEntry.attributes` で返せるようになった。残:
     FileId / reparse tag の取得と recursive operation での traversal policy。
+  - 2026-06-30: `FileIdBothDirectoryInformation` の FileId を `SMBDirectoryEntry.fileId` として返し、
+    `isReparsePoint` helper を追加。recursive copy/delete/download は reparse point を directory として
+    辿らない安全側 policy にした。残: reparse tag 本体の取得 (`FileAttributeTagInformation` など) と
+    DFS referral の扱い。
 - [ ] ACL / owner / SID metadata
   - `QUERY_SECURITY` / `SET_SECURITY`。MVP では扱わないが、管理系 smbclient としては必要。
 - [ ] locking / durable handle / lease / oplock の扱い
   - concurrent clients や大ファイル操作の堅牢性向け。最初は明示的に unsupported としてエラーを設計する。
-- [ ] dialect / encryption policy の整理
+- [x] dialect / encryption policy の整理
   - 2026-06-30 実装レビュー追加: NEGOTIATE は 2.0.2 / 2.1 も提示するが authenticated path は
     3.0+ だけを受ける。probe 専用 dialect と authenticated dialect policy を分けるか、
     authenticated connect では 3.x のみ提示する。
@@ -264,6 +275,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     server global capabilities / tree share flags / encryption required を見ていないため、暗号非対応 share や
     signing-only 運用との互換性が不明。TREE_CONNECT response の share capabilities / flags を parse し、
     暗号必須・暗号可能・署名のみの policy を明示する。
+  - 2026-06-30: TREE_CONNECT response の share type / flags / capabilities / maximal access を parse。
+    share flags/capabilities が encryption required を示すのに encryption key が無い場合は protocolError。
+    3.1.1 signing-only は cipher nil のまま signed packet で運用し、encrypted profile は従来どおり transform。
 - [ ] SMB2 credit / chunk sizing / multi-credit
   - 2026-06-30 実装レビュー追加: read/write chunk size は negotiated MaxRead/WriteSize と transform overhead
     で抑えているが、CreditCharge / CreditRequest / CreditResponse を管理していない。大きな IO や

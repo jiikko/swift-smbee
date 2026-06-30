@@ -35,8 +35,14 @@ SRVSVC `NetrShareEnum` の response を NDR decode する形になる。
 
 ## 完了条件
 
-- [ ] `SMBee.listShares` / `SMBClient.listShares` / `smbcli shares` がある。
+- [x] `SMBee.listShares` / `SMBClient.listShares` / `smbcli shares` がある。
 - [ ] Samba E2E で `public` share が列挙できる。
 - [ ] macOS SMBX 手動 smoke で少なくともユーザーの home share が列挙できる。
 - [ ] DCE/RPC bind と `NetrShareEnum` response の unit fixture がある。
 - [ ] guest/anonymous を許すか、認証必須にするかの policy が docs に記録されている。
+
+## 実装メモ (2026-06-30)
+
+API / CLI の入口は追加済み。ただし本体の SRVSVC は未実装のため、
+`SMBError.unsupported(status: 0, operation: "SHARE_DISCOVERY_SRVsvc")` を返す。
+次は DCE/RPC bind と SRVSVC `NetrShareEnum` の fixture を用意してから実 wire path を実装する。

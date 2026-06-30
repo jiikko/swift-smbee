@@ -202,8 +202,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 
 - [x] `SMBErrorMapper`: NTSTATUS → エラー型（[docs/smb-protocol.md] の表、値は MS-ERREF 確認）
 - [x] `SMBSession`（actor）化 / 切断検出→再接続 / cancellation（Task.checkCancellation を READ/WRITE ループに）
-  - 注: 「全 wire 直列化」は **1 セッション=単一フライト前提**で成立（per-operation `withSession` が 1 タスク逐次）。
-    同一セッションへの並行 multi-task 利用（応答 messageId 多重分離）は `issues/002-design-smbsession-concurrent-multiflight.md` で defer。
+  - 2026-06-30: `SMBWireTransactionGate` で request/response pair を FIFO 直列化。actor reentrancy があっても
+    同一 session 上の並行 wire 操作で応答取り違えが起きないことを unit test 済み。
+    真の messageId/credit multi-flight demux は未実装（必要になったら別 issue）。
 - [x] retry 粒度: stat=透過 / list=全体再実行 / read=stream 未 yield なら先頭再試行 / write・delete・rename=原則 retry しない
 - [x] secret（password / NT hash / session key / signing key）を log に出さない
 - [x] SMB1 を一切提示しない

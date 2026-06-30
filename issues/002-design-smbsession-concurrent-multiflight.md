@@ -1,6 +1,6 @@
 # 002 design: SMBSession を並行 multi-task 利用可能にする (messageId/credit ベース応答多重分離)
 
-状態: **deferred (trigger 待ち)**
+状態: **closed (案 1: wire transaction serializer 実装済み, 2026-06-30)**
 起票: 2026-06-30
 関連: `Sources/SMBee/SMBClient.swift` の `actor SMBSession` doc comment / commit `056f183`
 (read streaming + actor 化) / todo.md 横断「SMBSession (actor) で全 wire を直列化」
@@ -31,7 +31,23 @@ commit `056f183` で `SMBSession` を `final class` → `actor` 化し、mutable
   - streaming read 中に別操作を並行実行したい要件が出る
   - 公開 API として長命セッションハンドルを露出する
 
-## 対応案 (着手時に選択)
+## 対応
+
+2026-06-30 に案 1 を採用。`SMBWireTransactionGate` を追加し、各 SMB request/response pair
+(`sendUnsigned`/`sendSigned` → `receive`) を FIFO で直列化した。
+
+- 同一 `SMBSession` に複数タスクが並行に wire 操作を呼んでも、2 つ目の request は 1 つ目の response
+  処理完了後に送信される。
+- 高レベル操作全体 (`copyFile` など) はロックしない。内部で複数 request/response pair を発行するため、
+  operation 全体をロックすると再入で詰まる。直列化単位は wire transaction のみ。
+- 真の SMB2 multi-flight ではない。messageId/credit demux は将来の性能要件が出たら別 issue で扱う。
+
+追加テスト:
+
+- `testConcurrentReadChunksSerializeWireTransactions`: 2 つの `readChunk` を同一 session へ並行投入し、
+  1 つ目の response を返すまで 2 つ目の request が transport に送られないことを確認。
+
+## 対応案 (記録)
 
 1. **wire transaction の直列化 (serializer)**: send→receive を 1 トランザクション単位で直列化する
    actor 内ゲート (chained Task / async semaphore 等)。**安全だが真の並行性は得られない** (操作は
@@ -43,15 +59,13 @@ commit `056f183` で `SMBSession` を `final class` → `actor` 化し、mutable
 現状の単純な「send 後に次の packet を receive」モデルは案 2 と非互換なので、案 2 採用時は receive 経路の
 リファクタが要る。
 
-## やらないこと (現時点)
+## やらないこと
 
-- 並行 consumer が無いうちに serializer / demux を投機的に実装しない (over-engineering)。
-- 「1 セッション = 単一フライト」契約のまま運用する。違反 (同一セッションへの並行呼び出し) は呼び出し側の
-  責任とし、actor doc comment で明示済み。
+- messageId/credit ベース応答多重分離はまだ実装しない。現行は安全性優先の serializer。
 
-## 完了条件 (着手して close する時)
+## 完了条件
 
-- 案 1 or 2 を実装し、同一セッションへの並行 wire 操作で応答取り違えが起きないことを test で担保
+- [x] 案 1 or 2 を実装し、同一セッションへの並行 wire 操作で応答取り違えが起きないことを test で担保
   (複数 in-flight request を InMemoryTransport で多重化し、応答が正しい呼び出し元へ届くことを assert)。
-- actor SMBSession の「単一フライト前提」doc comment を更新 (制約解除を反映)。
-- todo.md 横断の該当行を同期。
+- [x] actor SMBSession の「単一フライト前提」doc comment を更新 (制約解除を反映)。
+- [x] todo.md 横断の該当行を同期。

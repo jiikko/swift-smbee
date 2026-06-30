@@ -105,6 +105,88 @@ private final class TransportFactorySequence: @unchecked Sendable {
     }
 }
 
+private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendable {
+    private struct PendingReceive {
+        var maxLength: Int
+        var continuation: CheckedContinuation<[UInt8], Error>
+    }
+
+    private let lock = NSLock()
+    private var inbound: [UInt8] = []
+    private var pending: PendingReceive?
+    private var outboundStorage: [UInt8] = []
+
+    var outbound: [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        return outboundStorage
+    }
+
+    func connect(host: String, port: UInt16) async throws {
+        try Task.checkCancellation()
+        _ = host
+        _ = port
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
+        appendOutbound(bytes)
+    }
+
+    private func appendOutbound(_ bytes: [UInt8]) {
+        lock.lock()
+        outboundStorage.append(contentsOf: bytes)
+        lock.unlock()
+    }
+
+    func receive(maxLength: Int) async throws -> [UInt8] {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
+            let chunk: [UInt8]?
+
+            lock.lock()
+            if inbound.isEmpty {
+                pending = PendingReceive(maxLength: maxLength, continuation: continuation)
+                chunk = nil
+            } else {
+                let count = min(maxLength, inbound.count)
+                chunk = Array(inbound.prefix(count))
+                inbound.removeFirst(count)
+            }
+            lock.unlock()
+
+            if let chunk {
+                continuation.resume(returning: chunk)
+            }
+        }
+    }
+
+    func enqueueInbound(_ bytes: [UInt8]) {
+        let pendingReceive: PendingReceive?
+        let chunk: [UInt8]?
+
+        lock.lock()
+        inbound.append(contentsOf: bytes)
+        if let pending {
+            let count = min(pending.maxLength, inbound.count)
+            chunk = Array(inbound.prefix(count))
+            inbound.removeFirst(count)
+            pendingReceive = pending
+            self.pending = nil
+        } else {
+            chunk = nil
+            pendingReceive = nil
+        }
+        lock.unlock()
+
+        if let pendingReceive, let chunk {
+            pendingReceive.continuation.resume(returning: chunk)
+        }
+    }
+
+    func close() {}
+}
+
 private final class ReceiveState: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<[UInt8], Error>?
@@ -1170,6 +1252,40 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testConcurrentReadChunksSerializeWireTransactions() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let first = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        }
+        let second = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 3, length: 2)
+        }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        XCTAssertEqual(try unframed(transport.outbound).count, 1)
+        transport.enqueueInbound(try framed([smb2ReadResponse(Array("hel".utf8), messageId: 0, treeId: 0x3344)]))
+        let firstData = try await first.value
+        XCTAssertEqual(firstData, Array("hel".utf8))
+
+        try await waitForOutboundFrameCount(2, transport: transport)
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(readUInt64LE(requests[0], at: 72), 0)
+        XCTAssertEqual(readUInt64LE(requests[1], at: 72), 3)
+        transport.enqueueInbound(try framed([smb2ReadResponse(Array("lo".utf8), messageId: 1, treeId: 0x3344)]))
+        let secondData = try await second.value
+        XCTAssertEqual(secondData, Array("lo".utf8))
+    }
+
     func testSessionCopyFileReadsAndWritesChunksWithCloseAndFlush() async throws {
         let sourceFileId = hexBytes("00112233445566778899aabbccddeeff")
         let destinationFileId = hexBytes("ffeeddccbbaa99887766554433221100")
@@ -1875,6 +1991,16 @@ final class SMBeeTests: XCTestCase {
 
     private func smb2StatusResponse(status: UInt32, command: UInt16, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
         try SMB2Header(status: status, command: command, messageId: messageId, treeId: treeId).encode()
+    }
+
+    private func waitForOutboundFrameCount(_ expectedCount: Int, transport: ControlledReceiveTransport) async throws {
+        for _ in 0..<100 {
+            if try unframed(transport.outbound).count >= expectedCount {
+                return
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("timed out waiting for \(expectedCount) outbound SMB frames")
     }
 
     private func smb2CreateResponse(fileId: [UInt8], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {

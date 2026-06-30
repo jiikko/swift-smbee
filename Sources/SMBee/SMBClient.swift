@@ -471,24 +471,21 @@ extension Error {
     }
 }
 
-/// 1 セッション = 単一フライト前提。
+/// Wire transaction は直列化する。
 ///
-/// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離するが、
-/// **同一 SMBSession に対して複数タスクが並行に wire 操作を呼ぶことは想定していない**。各 wire 操作は
-/// `sendSigned` → `receive` の間に await (suspension) があり、actor 隔離だけではこの区間を critical section に
-/// できない (actor reentrancy: 並行呼び出しがあると send と receive の間に別 request が割り込み、応答が
-/// messageId で多重分離されていないため取り違える)。
+/// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
+/// actor reentrancy により `sendSigned` → `receive` 間で別の wire 操作が入り得るため、各 request/response
+/// pair は `SMBWireTransactionGate` で直列化する。これにより同一 `SMBSession` への並行呼び出しでも
+/// 応答取り違えは起きないが、SMB2 本来の multi-credit / multi-flight 並行化はまだ行わない。
 ///
-/// 現状の唯一の利用経路 `SMBClient.withSession` は **1 タスクが connect→操作→close を逐次実行**し、
-/// セッション参照を他タスクへ渡さないため、この reentrancy は発生しない (= 現状は安全)。
-/// 並行 multi-task 利用 (将来の persistent session 共有) を解禁する場合は、request→response の直列化
-/// (wire transaction lock) か MS-SMB2 の messageId/credit ベース応答多重分離を別途実装すること。
-/// それまでは「1 セッションは 1 フライト」を契約とする (解禁条件と対応案は issues/002-design-smbsession-concurrent-multiflight.md)。
+/// 真の multi-flight が必要になったら MS-SMB2 の messageId/credit ベース応答多重分離へ置き換える
+/// (背景と対応案は issues/002-design-smbsession-concurrent-multiflight.md)。
 actor SMBSession {
     private let host: String
     private let port: UInt16
     private let credential: SMBCredential
     private let transport: SMBTransport
+    private let wireTransactionGate = SMBWireTransactionGate()
     private var messageId: UInt64 = 0
     private var sessionId: UInt64 = 0
     private var signingKey: [UInt8]?
@@ -514,8 +511,7 @@ actor SMBSession {
         let negotiate = try SMBNegotiateCodec.encodeRequest(clientGuid: UUID(), messageId: nextMessageId())
         var preauthMessages = [negotiate]
         debugDump("NEGOTIATE request", negotiate)
-        try await sendUnsigned(negotiate)
-        let negotiateResponse = try await receive(label: "NEGOTIATE response")
+        let negotiateResponse = try await unsignedWireTransaction(packet: negotiate, responseLabel: "NEGOTIATE response")
         preauthMessages.append(negotiateResponse)
         let result = try SMBNegotiateCodec.decodeResponse(negotiateResponse)
         maxReadSize = result.maxReadSize
@@ -547,8 +543,7 @@ actor SMBSession {
         )
         debugLine("SESSION_SETUP#1 request length=\(challengePacket.count)")
         preauthMessages.append(challengePacket)
-        try await sendUnsigned(challengePacket)
-        let challengeResponse = try await receive(label: "SESSION_SETUP#1 response")
+        let challengeResponse = try await unsignedWireTransaction(packet: challengePacket, responseLabel: "SESSION_SETUP#1 response")
         preauthMessages.append(challengeResponse)
         let challengeHeader = try SMB2Header.decode(challengeResponse)
         guard challengeHeader.status == SMB2Status.moreProcessingRequired else {
@@ -575,8 +570,7 @@ actor SMBSession {
         )
         debugLine("SESSION_SETUP#2 request length=\(authPacket.count)")
         preauthMessages.append(authPacket)
-        try await sendUnsigned(authPacket)
-        let authResponse = try await receive(label: "SESSION_SETUP#2 response")
+        let authResponse = try await unsignedWireTransaction(packet: authPacket, responseLabel: "SESSION_SETUP#2 response")
         preauthMessages.append(authResponse)
         let authHeader = try SMB2Header.decode(authResponse)
         try SMBErrorMapper.throwIfFailure(status: authHeader.status, operation: "SESSION_SETUP")
@@ -600,9 +594,7 @@ actor SMBSession {
             path: "\\\\\(host)\\\(share)"
         )
         debugDump("TREE_CONNECT request", packet)
-        try await sendSigned(packet)
-        let response = try await receive(label: "TREE_CONNECT response")
-        try verifySigned(response)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "TREE_CONNECT response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_CONNECT")
         return header.treeId
@@ -620,9 +612,7 @@ actor SMBSession {
             request: request
         )
         debugDump("CREATE request", packet)
-        try await sendSigned(packet)
-        let response = try await receive(label: "CREATE response")
-        try verifySigned(response)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "CREATE response")
         let fileId = try SMB2Create.decodeFileId(response)
         debugLine("CREATE response FileId: \(SMBDebug.hex(fileId))")
         return fileId
@@ -647,9 +637,7 @@ actor SMBSession {
             fileId: fileId
         )
         debugDump("QUERY_DIRECTORY request", packet)
-        try await sendSigned(packet)
-        let response = try await receive(label: "QUERY_DIRECTORY response")
-        try verifySigned(response)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_DIRECTORY response")
         let header = try SMB2Header.decode(response)
         if header.status == SMB2Status.noMoreFiles {
             return []
@@ -667,9 +655,7 @@ actor SMBSession {
             fileId: fileId
         )
         debugDump("QUERY_INFO request", packet)
-        try await sendSigned(packet)
-        let response = try await receive(label: "QUERY_INFO response")
-        try verifySigned(response)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_INFO response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_INFO")
         return try SMB2QueryInfo.decodeNetworkOpenInformation(response)
@@ -688,9 +674,7 @@ actor SMBSession {
             length: requestLength
         )
         debugDump("READ request", packet)
-        try await sendSigned(packet)
-        let response = try await receive(label: "READ response")
-        try verifySigned(response)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "READ response")
         let header = try SMB2Header.decode(response)
         if header.status == SMB2Status.endOfFile {
             return []
@@ -778,9 +762,7 @@ actor SMBSession {
             data: data
         )
         debugDump("WRITE request", packet)
-        try await sendSigned(packet)
-        let response = try await receive(label: "WRITE response")
-        try verifySigned(response)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "WRITE response")
         let count = try SMB2Write.decodeResponseCount(response)
         guard count == data.count else {
             throw SMBCodecError.invalidValue("short SMB write: expected \(data.count) bytes, got \(count)")
@@ -790,9 +772,7 @@ actor SMBSession {
     func flush(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Flush.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("FLUSH request", packet)
-        try await sendSigned(packet)
-        let response = try await receive(label: "FLUSH response")
-        try verifySigned(response)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "FLUSH response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "FLUSH")
     }
@@ -827,9 +807,7 @@ actor SMBSession {
             replaceIfExists: replaceIfExists
         )
         debugDump("SET_INFO rename request", packet)
-        try await sendSigned(packet)
-        let response = try await receive(label: "SET_INFO rename response")
-        try verifySigned(response)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "SET_INFO rename response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "SET_INFO rename")
     }
@@ -837,12 +815,29 @@ actor SMBSession {
     func close(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Close.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("CLOSE request", packet)
-        try await sendSigned(packet)
-        _ = try await receive(label: "CLOSE response")
+        _ = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response", verifySignature: false)
     }
 
     func closeTransport() {
         transport.close()
+    }
+
+    private func unsignedWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
+        await wireTransactionGate.enter()
+        defer { wireTransactionGate.leave() }
+        try await sendUnsigned(packet)
+        return try await receive(label: responseLabel)
+    }
+
+    private func signedWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
+        await wireTransactionGate.enter()
+        defer { wireTransactionGate.leave() }
+        try await sendSigned(packet)
+        let response = try await receive(label: responseLabel)
+        if verifySignature {
+            try verifySigned(response)
+        }
+        return response
     }
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {

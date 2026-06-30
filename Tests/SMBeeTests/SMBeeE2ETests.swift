@@ -143,4 +143,64 @@ final class SMBeeE2ETests: XCTestCase {
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: large)
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: directory, directory: true)
     }
+
+    func testReadStreamCountsFileLargerThan4GiB() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+        guard environment["SMBEE_E2E_LARGE"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E_LARGE=1 to run the >4GiB read-stream E2E test")
+        }
+
+        let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
+        let portString = environment["SMBEE_E2E_PORT"] ?? "445"
+        guard let port = UInt16(portString) else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16, got \(portString)")
+            return
+        }
+        let username = environment["SMBEE_E2E_USERNAME"] ?? "smbee"
+        let password = environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
+        let share = environment["SMBEE_E2E_SHARE"] ?? "public"
+        let path = environment["SMBEE_E2E_LARGE_PATH"] ?? "large-4gib-plus.bin"
+        let credential = SMBCredential(username: username, password: password)
+
+        // Prepare this file manually; do not store it in git or require it in CI.
+        // With test/e2e/start-local-samba.sh:
+        //   docker exec smbee-samba-local truncate -s 4294967297 /srv/smbee/public/large-4gib-plus.bin
+        //
+        // This test validates that the streaming read path keeps offsets and
+        // lengths on the UInt64 route while crossing the 4GiB boundary. It only
+        // keeps a running byte count, never the full file contents in memory.
+        let stat = try await SMBee.stat(host: host, port: port, credential: credential, share: share, path: path)
+        XCTAssertFalse(stat.isDirectory)
+        XCTAssertGreaterThan(stat.size, UInt64(UInt32.max))
+
+        let accumulator = LargeReadAccumulator()
+        try await SMBee.withReadStream(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: path
+        ) { chunk in
+            XCTAssertFalse(chunk.isEmpty)
+            await accumulator.record(byteCount: chunk.count)
+        }
+
+        let total = await accumulator.total
+        XCTAssertEqual(total, stat.size)
+    }
+}
+
+private actor LargeReadAccumulator {
+    private var byteCount: UInt64 = 0
+
+    var total: UInt64 {
+        byteCount
+    }
+
+    func record(byteCount: Int) {
+        self.byteCount += UInt64(byteCount)
+    }
 }

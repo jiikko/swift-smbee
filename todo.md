@@ -41,6 +41,13 @@
   検証可能な 3.1.1 サーバが用意できるまで保留。NEGOTIATE contexts / aesGMAC / aesGCMSeal /
   SP800-108 KDF の scaffold は実装済み。残: preauth integrity SHA-512 running hash + 3.1.1 KDF
   (preauth-hash context) + session への GMAC 署名 / GCM 暗号の配線。
+- ✅ 公開 read streaming API (2026-06-30): `SMBee.withReadStream(... onChunk:)` (scoped callback)。
+  SMBSession.readChunks primitive に集約し既存 `[UInt8]` 一括 read は互換維持。chunk yield 後は透過 retry
+  せず connectionLost に昇格。`smbcli cat` も streaming 化 (大ファイルを全量 lift しない)。実機 macOS で
+  400KB multi-chunk の round-trip 一致を確認。
+- ✅ SMBSession actor 化 (2026-06-30): `final class` → `actor`。wire orchestration state を isolate
+  (messageId/transformNonce/keys)。codec/crypto は stateless のまま。
+- ✅ ローカル Samba 手動起動スクリプト (2026-06-30): `test/e2e/start-local-samba.sh` (Docker 前提、手動専用)。
 - 🧊 obaket 組み込み (SMBClient ラッパーで ObjectStorageProtocol 化) は obaket 側 issue 356/359
 
 ---
@@ -88,45 +95,46 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 
 ## Phase 2 — 認証（NTLMv2 / SPNEGO）+ TREE_CONNECT
 
-- [ ] SPNEGO 最小ラップ（MS-SPNG / RFC4178）
-- [ ] NTLMv2: NEGOTIATE(type1) → CHALLENGE(type2) parse → AUTHENTICATE(type3)
-  - [ ] NTOWFv2 / NTProofStr / AV pair(target info) / timestamp / clientChallenge / MIC（UTF-16LE）
-  - [ ] vector test（MS-NLMP / RFC）
-- [ ] SESSION_SETUP の複数往復（STATUS_MORE_PROCESSING_REQUIRED）
+- [x] SPNEGO 最小ラップ（MS-SPNG / RFC4178）
+- [x] NTLMv2: NEGOTIATE(type1) → CHALLENGE(type2) parse → AUTHENTICATE(type3)
+  - [x] NTOWFv2 / NTProofStr / AV pair(target info) / timestamp / clientChallenge / MIC（UTF-16LE）
+  - [x] vector test（MS-NLMP / RFC）
+- [x] SESSION_SETUP の複数往復（STATUS_MORE_PROCESSING_REQUIRED）
 - [ ] **SMB 3.1.1 crypto framing**:
   - [ ] preauth integrity: NEGOTIATE+SESSION_SETUP の SHA-512 running transcript
   - [ ] SP800-108 counter KDF（HMAC-SHA256）で signing/encryption/application key 導出（label/context ⓥ）
   - [ ] signing = AES-GMAC を packet に適用 / 検証
   - [ ] encryption = TRANSFORM_HEADER + AES-GCM（nonce/AAD/tag レイアウト ⓥ）
   - [ ] preauth transcript / KDF / transform header の fixture test
-- [ ] **SMB 3.0.2 crypto framing**:
-  - [ ] signing = AES-CMAC（RFC4493）を pure-Swift 実装または pure-Swift cross-platform lib で対応
-  - [ ] encryption = AES-128-CCM（RFC3610 / NIST SP800-38C）を pure-Swift 実装または pure-Swift cross-platform lib で対応
-  - [ ] CommonCrypto は Linux 非対応なので使わない
-- [ ] TREE_CONNECT（`\\host\share`）
+- [x] **SMB 3.0.2 crypto framing**:
+  - [x] signing = AES-CMAC（RFC4493）を pure-Swift 実装または pure-Swift cross-platform lib で対応
+  - [x] encryption = AES-128-CCM（RFC3610 / NIST SP800-38C）を pure-Swift 実装または pure-Swift cross-platform lib で対応
+  - [x] CommonCrypto は Linux 非対応なので使わない
+- [x] TREE_CONNECT（`\\host\share`）
 - 撤退判断: NTLMv2 SESSION_SETUP が 2〜3 日 opaque に失敗（packet capture でも追えない）→ 方針再考
 
 ## Phase 3 — read
 
-- [ ] CREATE（open。desired access / share access / disposition=OPEN）
-- [ ] QUERY_DIRECTORY（`FileIdBothDirectoryInformation`）反復 → STATUS_NO_MORE_FILES = `list`
-- [ ] QUERY_INFO（size/mtime/is-dir）= `stat`
-- [ ] READ（offset/length）反復 = `read`（full / range）
-  - [ ] download 完全性: 受信 byte 積算を `stat().size` と照合
-- [ ] CLOSE / handle 寿命管理
-- [ ] `smbcli ls / stat / cat [--range]`
-- [ ] 大 dir は全件メモリ集約（known limitation。pageToken 化は後回し）
-- [ ] large file read（>4 GiB）でメモリ/速度/cancellation を確認 ⓥ
+- [x] CREATE（open。desired access / share access / disposition=OPEN）
+- [x] QUERY_DIRECTORY（`FileIdBothDirectoryInformation`）反復 → STATUS_NO_MORE_FILES = `list`
+- [x] QUERY_INFO（size/mtime/is-dir）= `stat`
+- [x] READ（offset/length）反復 = `read`（full / range）
+  - [x] download 完全性: 受信 byte 積算を `stat().size` と照合
+- [x] CLOSE / handle 寿命管理
+- [x] `smbcli ls / stat / cat [--range]`
+- [x] 大 dir は全件メモリ集約（known limitation。pageToken 化は後回し）
+- [x] large file read（>4 GiB）: 公開 streaming read API `SMBee.withReadStream` で全量 lift せず読める。
+      gated E2E test (`SMBEE_E2E_LARGE=1`) 追加済。**実 >4GiB 転送の実行確認は要 4GiB サーバ (未実行)**
 - 撤退判断: ls/stat/cat が macOS/Samba で安定しない → 方針再考
 
 ## Phase 4 — write
 
-- [ ] CREATE(disposition: overwrite=false→FILE_CREATE / true→FILE_OVERWRITE_IF ⓥ) + WRITE(offset) 反復
-  - [ ] file URL を memory に lift しない streaming write
-- [ ] mkdir（CREATE dir, FILE_CREATE）
-- [ ] rename / move（SET_INFO `FileRenameInformation`, ReplaceIfExists）— 同一 share / atomic 挙動 ⓥ
-- [ ] delete（SET_INFO `FileDispositionInformation`）/ 空 dir rmdir / 非空は per-file 再帰
-- [ ] `smbcli put / mkdir / mv / rm`
+- [x] CREATE(disposition: overwrite=false→FILE_CREATE / true→FILE_OVERWRITE_IF ⓥ) + WRITE(offset) 反復
+  - [x] file URL を memory に lift しない streaming write
+- [x] mkdir（CREATE dir, FILE_CREATE）
+- [x] rename / move（SET_INFO `FileRenameInformation`, ReplaceIfExists）— 同一 share / atomic 挙動 ⓥ
+- [x] delete（SET_INFO `FileDispositionInformation`）/ 空 dir rmdir / 非空は per-file 再帰
+- [x] `smbcli put / mkdir / mv / rm`
 
 ## Phase 5 — E2E（コンテナ Samba）
 
@@ -134,23 +142,23 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
       3.1.1 negotiate contexts なし）
 - [x] Samba イメージ + smb.conf 確定（macOS SMBX ミラーとして SMB3_02 上限、signing required）
 - [x] `.github/workflows/e2e.yml` の TODO を埋め、push トリガを有効化
-- [ ] ローカル Apple container 起動スクリプト（手動）
+- [x] ローカル Apple container 起動スクリプト（手動）
 
 ## 横断（全 Phase 共通）
 
-- [ ] `SMBErrorMapper`: NTSTATUS → エラー型（[docs/smb-protocol.md] の表、値は MS-ERREF 確認）
-- [ ] `SMBSession`（actor）で全 wire を直列化 / 切断検出→再接続 / cancellation（Task.checkCancellation を READ/WRITE ループに）
-- [ ] retry 粒度: stat=透過 / list=全体再実行 / read=stream 未 yield なら先頭再試行 / write・delete・rename=原則 retry しない
-- [ ] secret（password / NT hash / session key / signing key）を log に出さない
-- [ ] SMB1 を一切提示しない
-- [ ] 3.0.2 用 CMAC(RFC4493) / CCM(RFC3610 / SP800-38C) を Phase 2 で pure-Swift 実装または
+- [x] `SMBErrorMapper`: NTSTATUS → エラー型（[docs/smb-protocol.md] の表、値は MS-ERREF 確認）
+- [x] `SMBSession`（actor）で全 wire を直列化 / 切断検出→再接続 / cancellation（Task.checkCancellation を READ/WRITE ループに）
+- [x] retry 粒度: stat=透過 / list=全体再実行 / read=stream 未 yield なら先頭再試行 / write・delete・rename=原則 retry しない
+- [x] secret（password / NT hash / session key / signing key）を log に出さない
+- [x] SMB1 を一切提示しない
+- [x] 3.0.2 用 CMAC(RFC4493) / CCM(RFC3610 / SP800-38C) を Phase 2 で pure-Swift 実装または
       pure-Swift cross-platform lib を踏襲（Linux ビルド維持）
-- [ ] 公開 API は async + cancellation + streaming（read/write）= consumer がそのまま被せられる形
-- [ ] SwiftLint plugin green を維持（CI=macos-26）
+- [x] 公開 API は async + cancellation + streaming（read/write）= consumer がそのまま被せられる形
+- [x] SwiftLint plugin green を維持（CI=macos-26）
 
 ## 完了の目安（MVP）
 
-- [ ] Phase 0–3（read）+ Phase 5 の read E2E が green
+- [x] Phase 0–3（read）+ Phase 5 の read E2E が green
 - [ ] probe が macOS SMBX で 3.0.2 + signing required、Samba で 3.1.1+GMAC+GCM または
       3.0.2 mirror E2E green を確認
-- [ ] write（Phase 4）は read 安定後に着手判断
+- [x] write（Phase 4）は read 安定後に着手判断

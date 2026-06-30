@@ -7,9 +7,19 @@ public enum SMBCrypto {
     static let smb302EncryptionLabel = Array("SMB2AESCCM".utf8) + [0]
     static let smb302EncryptionContext = Array("ServerIn ".utf8) + [0]
     static let smb302DecryptionContext = Array("ServerOut".utf8) + [0]
+    static let smb311SigningLabel = Array("SMBSigningKey".utf8)
+    static let smb311EncryptionLabel = Array("SMBC2SCipherKey".utf8)
+    static let smb311DecryptionLabel = Array("SMBS2CCipherKey".utf8)
+    static let smb311ApplicationLabel = Array("SMBAppKey".utf8)
 
     public static func sha512(_ bytes: [UInt8]) -> [UInt8] {
         Array(SHA512.hash(data: bytes))
+    }
+
+    public static func smb311PreauthIntegrityHash(_ messages: [[UInt8]]) -> [UInt8] {
+        messages.reduce(Array(repeating: UInt8(0), count: 64)) { currentHash, message in
+            sha512(currentHash + message)
+        }
     }
 
     public static func hmacSHA256(key: [UInt8], message: [UInt8]) -> [UInt8] {
@@ -47,6 +57,25 @@ public enum SMBCrypto {
         return (Array(sealedBox.ciphertext), Array(sealedBox.tag))
     }
 
+    public static func aesGCMOpen(
+        key: [UInt8],
+        nonce: [UInt8],
+        ciphertext: [UInt8],
+        authenticatedData: [UInt8],
+        tag: [UInt8]
+    ) throws -> [UInt8] {
+        let sealedBox = try AES.GCM.SealedBox(
+            nonce: AES.GCM.Nonce(data: nonce),
+            ciphertext: ciphertext,
+            tag: tag
+        )
+        return try Array(AES.GCM.open(
+            sealedBox,
+            using: SymmetricKey(data: key),
+            authenticating: authenticatedData
+        ))
+    }
+
     public static func aesGMAC(key: [UInt8], nonce: [UInt8], authenticatedData: [UInt8]) throws -> [UInt8] {
         // MS-SMB2 AES-GMAC signing is GCM authentication with zero-length plaintext and the SMB packet as AAD.
         try aesGCMSeal(key: key, nonce: nonce, plaintext: [], authenticatedData: authenticatedData).tag
@@ -78,6 +107,31 @@ public enum SMBCrypto {
             key: sessionKey,
             label: smb302EncryptionLabel,
             context: smb302DecryptionContext,
+            length: 16
+        )
+    }
+
+    public static func smb311SigningKey(sessionKey: [UInt8], preauthIntegrityHash: [UInt8]) -> [UInt8] {
+        smb311Key(sessionKey: sessionKey, label: smb311SigningLabel, preauthIntegrityHash: preauthIntegrityHash)
+    }
+
+    public static func smb311EncryptionKey(sessionKey: [UInt8], preauthIntegrityHash: [UInt8]) -> [UInt8] {
+        smb311Key(sessionKey: sessionKey, label: smb311EncryptionLabel, preauthIntegrityHash: preauthIntegrityHash)
+    }
+
+    public static func smb311DecryptionKey(sessionKey: [UInt8], preauthIntegrityHash: [UInt8]) -> [UInt8] {
+        smb311Key(sessionKey: sessionKey, label: smb311DecryptionLabel, preauthIntegrityHash: preauthIntegrityHash)
+    }
+
+    public static func smb311ApplicationKey(sessionKey: [UInt8], preauthIntegrityHash: [UInt8]) -> [UInt8] {
+        smb311Key(sessionKey: sessionKey, label: smb311ApplicationLabel, preauthIntegrityHash: preauthIntegrityHash)
+    }
+
+    private static func smb311Key(sessionKey: [UInt8], label: [UInt8], preauthIntegrityHash: [UInt8]) -> [UInt8] {
+        sp800108CounterModeHMACSHA256(
+            key: sessionKey,
+            label: label,
+            context: preauthIntegrityHash,
             length: 16
         )
     }

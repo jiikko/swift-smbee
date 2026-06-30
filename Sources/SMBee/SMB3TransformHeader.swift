@@ -4,6 +4,7 @@ struct SMB3TransformHeader: Equatable {
     static let encodedSize = 52
     static let protocolId: [UInt8] = [0xfd, 0x53, 0x4d, 0x42]
     static let aes128CCM: UInt16 = 0x0001
+    static let aes128GCM: UInt16 = 0x0002
 
     var signature: [UInt8]
     var nonce: [UInt8]

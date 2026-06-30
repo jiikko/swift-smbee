@@ -111,7 +111,7 @@ public enum SMBNegotiateCodec {
                 throw SMBCodecError.invalidValue("invalid NEGOTIATE context offset")
             }
             var offset = Int(contextOffset)
-            for _ in 0..<contextCount {
+            for index in 0..<contextCount {
                 guard offset + 8 <= bytes.count else { throw SMBCodecError.truncated }
                 var contextReader = SMBByteReader(bytes: Array(bytes[offset..<bytes.count]))
                 let type = try contextReader.readUInt16LE()
@@ -152,7 +152,8 @@ public enum SMBNegotiateCodec {
                 default:
                     break
                 }
-                let nextOffset = offset + 8 + paddedLength(length)
+                let isLastContext = index == contextCount - 1
+                let nextOffset = offset + 8 + (isLastContext ? length : paddedLength(length))
                 guard nextOffset <= bytes.count else { throw SMBCodecError.truncated }
                 offset = nextOffset
             }

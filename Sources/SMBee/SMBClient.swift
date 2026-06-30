@@ -1,4 +1,5 @@
 import Foundation
+// swiftlint:disable file_length type_body_length
 
 public struct SMBDirectoryEntry: Equatable, Sendable {
     public var name: String
@@ -423,7 +424,6 @@ extension Error {
 /// 並行 multi-task 利用 (将来の persistent session 共有) を解禁する場合は、request→response の直列化
 /// (wire transaction lock) か MS-SMB2 の messageId/credit ベース応答多重分離を別途実装すること。
 /// それまでは「1 セッションは 1 フライト」を契約とする (解禁条件と対応案は issues/002-design-smbsession-concurrent-multiflight.md)。
-// swiftlint:disable:next type_body_length
 actor SMBSession {
     private let host: String
     private let port: UInt16
@@ -434,6 +434,8 @@ actor SMBSession {
     private var signingKey: [UInt8]?
     private var encryptionKey: [UInt8]?
     private var decryptionKey: [UInt8]?
+    private var signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC
+    private var encryptionAlgorithm: SMBSessionEncryptionAlgorithm = .aes128CCM
     private var transformNonceCounter: UInt64 = 0
     private var maxReadSize: UInt32 = UInt32.max
     private var maxWriteSize: UInt32 = UInt32.max
@@ -450,14 +452,29 @@ actor SMBSession {
         try Task.checkCancellation()
         try await transport.connect(host: host, port: port)
         let negotiate = try SMBNegotiateCodec.encodeRequest(clientGuid: UUID(), messageId: nextMessageId())
+        var preauthMessages = [negotiate]
         debugDump("NEGOTIATE request", negotiate)
         try await sendUnsigned(negotiate)
         let negotiateResponse = try await receive(label: "NEGOTIATE response")
+        preauthMessages.append(negotiateResponse)
         let result = try SMBNegotiateCodec.decodeResponse(negotiateResponse)
         maxReadSize = result.maxReadSize
         maxWriteSize = result.maxWriteSize
-        guard result.dialect == SMBNegotiateConstants.dialect302 || result.dialect == SMBNegotiateConstants.dialect300 else {
-            throw SMBCodecError.invalidValue("authenticated read path currently supports SMB 3.0.x")
+        guard result.dialect == SMBNegotiateConstants.dialect311
+            || result.dialect == SMBNegotiateConstants.dialect302
+            || result.dialect == SMBNegotiateConstants.dialect300
+        else {
+            throw SMBCodecError.invalidValue("authenticated path currently supports SMB 3.0.x and 3.1.1")
+        }
+        if result.dialect == SMBNegotiateConstants.dialect311 {
+            guard result.preauthHashAlgorithm == SMBNegotiateConstants.sha512,
+                  result.signingAlgorithm == SMBNegotiateConstants.aesGMAC,
+                  result.cipher == SMBNegotiateConstants.aes128GCM
+            else {
+                throw SMBCodecError.invalidValue("unsupported SMB 3.1.1 crypto negotiation")
+            }
+            signingAlgorithm = .aesGMAC
+            encryptionAlgorithm = .aes128GCM
         }
 
         let type1Message = NTLM.makeType1(domain: credential.domain)
@@ -469,8 +486,10 @@ actor SMBSession {
             signed: false
         )
         debugLine("SESSION_SETUP#1 request length=\(challengePacket.count)")
+        preauthMessages.append(challengePacket)
         try await sendUnsigned(challengePacket)
         let challengeResponse = try await receive(label: "SESSION_SETUP#1 response")
+        preauthMessages.append(challengeResponse)
         let challengeHeader = try SMB2Header.decode(challengeResponse)
         guard challengeHeader.status == SMB2Status.moreProcessingRequired else {
             throw SMBErrorMapper.map(status: challengeHeader.status, operation: "SESSION_SETUP#1")
@@ -495,14 +514,23 @@ actor SMBSession {
             signed: false
         )
         debugLine("SESSION_SETUP#2 request length=\(authPacket.count)")
+        preauthMessages.append(authPacket)
         try await sendUnsigned(authPacket)
         let authResponse = try await receive(label: "SESSION_SETUP#2 response")
+        preauthMessages.append(authResponse)
         let authHeader = try SMB2Header.decode(authResponse)
         try SMBErrorMapper.throwIfFailure(status: authHeader.status, operation: "SESSION_SETUP")
         sessionId = authHeader.sessionId
-        signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.exportedSessionKey)
-        encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
-        decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
+        if result.dialect == SMBNegotiateConstants.dialect311 {
+            let preauthHash = SMBCrypto.smb311PreauthIntegrityHash(preauthMessages)
+            signingKey = SMBCrypto.smb311SigningKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
+            encryptionKey = SMBCrypto.smb311EncryptionKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
+            decryptionKey = SMBCrypto.smb311DecryptionKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
+        } else {
+            signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.exportedSessionKey)
+            encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
+            decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
+        }
     }
 
     func treeConnect(share: String) async throws -> UInt32 {
@@ -747,7 +775,13 @@ actor SMBSession {
         var signed = packet
         signed[16] |= UInt8(SMB2Flags.signed & 0xff)
         for index in 48..<64 { signed[index] = 0 }
-        let signature = try AESCMAC.authenticationCode(key: signingKey, message: signed)
+        let signature: [UInt8]
+        switch signingAlgorithm {
+        case .aesCMAC:
+            signature = try AESCMAC.authenticationCode(key: signingKey, message: signed)
+        case .aesGMAC:
+            throw SMBCodecError.invalidValue("SMB 3.1.1 GMAC signing is not wired without encryption")
+        }
         signed.replaceSubrange(48..<64, with: signature)
         try await transport.send(DirectTCPFraming.frame(signed))
         try Task.checkCancellation()
@@ -755,22 +789,35 @@ actor SMBSession {
 
     private func sendEncrypted(_ packet: [UInt8]) async throws {
         guard let encryptionKey else { throw SMBCodecError.invalidValue("missing SMB encryption key") }
-        let nonce11 = nextTransformNonce()
-        let nonce16 = nonce11 + Array(repeating: UInt8(0), count: 5)
+        let nonceLength = encryptionAlgorithm == .aes128GCM ? 12 : 11
+        let nonce = nextTransformNonce(length: nonceLength)
+        let nonce16 = nonce + Array(repeating: UInt8(0), count: 16 - nonceLength)
+        let flags: UInt16 = encryptionAlgorithm == .aes128GCM ? SMB3TransformHeader.aes128GCM : SMB3TransformHeader.aes128CCM
         var header = SMB3TransformHeader(
             signature: Array(repeating: 0, count: 16),
             nonce: nonce16,
             originalMessageSize: UInt32(packet.count),
-            flags: SMB3TransformHeader.aes128CCM,
+            flags: flags,
             sessionId: sessionId
         )
-        let sealed = try AESCCM.seal(
-            key: encryptionKey,
-            nonce: nonce11,
-            plaintext: packet,
-            authenticatedData: header.authenticatedData(),
-            tagLength: 16
-        )
+        let sealed: (ciphertext: [UInt8], tag: [UInt8])
+        switch encryptionAlgorithm {
+        case .aes128CCM:
+            sealed = try AESCCM.seal(
+                key: encryptionKey,
+                nonce: nonce,
+                plaintext: packet,
+                authenticatedData: header.authenticatedData(),
+                tagLength: 16
+            )
+        case .aes128GCM:
+            sealed = try SMBCrypto.aesGCMSeal(
+                key: encryptionKey,
+                nonce: nonce,
+                plaintext: packet,
+                authenticatedData: header.authenticatedData()
+            )
+        }
         header.signature = sealed.tag
         try Task.checkCancellation()
         try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
@@ -820,7 +867,13 @@ actor SMBSession {
     private func decryptTransform(_ packet: [UInt8]) throws -> [UInt8] {
         guard let decryptionKey else { throw SMBCodecError.invalidValue("missing SMB decryption key") }
         let header = try SMB3TransformHeader.decode(packet)
-        guard header.flags == SMB3TransformHeader.aes128CCM else {
+        let algorithm: SMBSessionEncryptionAlgorithm
+        switch header.flags {
+        case SMB3TransformHeader.aes128CCM:
+            algorithm = .aes128CCM
+        case SMB3TransformHeader.aes128GCM:
+            algorithm = .aes128GCM
+        default:
             throw SMBCodecError.invalidValue("unsupported SMB3 encryption algorithm")
         }
         guard header.sessionId == sessionId else { throw SMBCodecError.invalidValue("SMB3 transform session id mismatch") }
@@ -828,13 +881,25 @@ actor SMBSession {
         guard ciphertext.count == Int(header.originalMessageSize) else {
             throw SMBCodecError.invalidValue("SMB3 transform original message size mismatch")
         }
-        let plaintext = try AESCCM.open(
-            key: decryptionKey,
-            nonce: Array(header.nonce.prefix(11)),
-            ciphertext: ciphertext,
-            authenticatedData: header.authenticatedData(),
-            tag: header.signature
-        )
+        let plaintext: [UInt8]
+        switch algorithm {
+        case .aes128CCM:
+            plaintext = try AESCCM.open(
+                key: decryptionKey,
+                nonce: Array(header.nonce.prefix(11)),
+                ciphertext: ciphertext,
+                authenticatedData: header.authenticatedData(),
+                tag: header.signature
+            )
+        case .aes128GCM:
+            plaintext = try SMBCrypto.aesGCMOpen(
+                key: decryptionKey,
+                nonce: Array(header.nonce.prefix(12)),
+                ciphertext: ciphertext,
+                authenticatedData: header.authenticatedData(),
+                tag: header.signature
+            )
+        }
         debugDump("decrypted \(packet.count)-byte SMB3 transform", plaintext)
         return plaintext
     }
@@ -856,10 +921,10 @@ actor SMBSession {
         return messageId
     }
 
-    private func nextTransformNonce() -> [UInt8] {
+    private func nextTransformNonce(length: Int = 11) -> [UInt8] {
         defer { transformNonceCounter += 1 }
         let value = transformNonceCounter
-        return [
+        let bytes = [
             UInt8((value >> 56) & 0xff),
             UInt8((value >> 48) & 0xff),
             UInt8((value >> 40) & 0xff),
@@ -870,8 +935,9 @@ actor SMBSession {
             UInt8(value & 0xff),
             0,
             0,
-            0,
+            0
         ]
+        return Array(bytes.prefix(length))
     }
 
     private func negotiatedWriteChunkSize() -> Int {

@@ -422,12 +422,74 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testSMB3TransformHeaderRoundTripAndGCM() throws {
+        let key = hexBytes("000102030405060708090a0b0c0d0e0f")
+        let plaintext = Array("SMB 3.1.1 encrypted message".utf8)
+        let nonce12 = hexBytes("00112233445566778899aabb")
+        var header = SMB3TransformHeader(
+            signature: Array(repeating: 0, count: 16),
+            nonce: nonce12 + Array(repeating: 0, count: 4),
+            originalMessageSize: UInt32(plaintext.count),
+            flags: SMB3TransformHeader.aes128GCM,
+            sessionId: 0x0102_0304_0506_0708
+        )
+        let sealed = try SMBCrypto.aesGCMSeal(
+            key: key,
+            nonce: nonce12,
+            plaintext: plaintext,
+            authenticatedData: header.authenticatedData()
+        )
+        header.signature = sealed.tag
+        let encoded = try header.encode()
+
+        XCTAssertEqual(encoded.count, SMB3TransformHeader.encodedSize)
+        XCTAssertEqual(try SMB3TransformHeader.decode(encoded), header)
+        XCTAssertEqual(try header.authenticatedData(), Array(encoded[20..<52]))
+        XCTAssertEqual(Array(header.nonce.prefix(12)), nonce12)
+        XCTAssertEqual(Array(header.nonce.dropFirst(12)), Array(repeating: 0, count: 4))
+        XCTAssertEqual(hex(sealed.ciphertext), "be9e094aa4ce9f28c84a63e967be3521f7d7e06e17fc8b098a59ce")
+        XCTAssertEqual(hex(header.signature), "43a216b82c24b2f2740b885b2af8d013")
+        XCTAssertEqual(
+            try SMBCrypto.aesGCMOpen(
+                key: key,
+                nonce: nonce12,
+                ciphertext: sealed.ciphertext,
+                authenticatedData: header.authenticatedData(),
+                tag: header.signature
+            ),
+            plaintext
+        )
+    }
+
     func testSMB302KeyDerivationLabelAndContextBytes() {
         XCTAssertEqual(hex(SMBCrypto.smb3SigningLabel), "534d4232414553434d414300")
         XCTAssertEqual(hex(SMBCrypto.smb3SigningContext), "536d625369676e00")
         XCTAssertEqual(hex(SMBCrypto.smb302EncryptionLabel), "534d423241455343434d00")
         XCTAssertEqual(hex(SMBCrypto.smb302EncryptionContext), "536572766572496e2000")
         XCTAssertEqual(hex(SMBCrypto.smb302DecryptionContext), "5365727665724f757400")
+    }
+
+    func testSMB311PreauthIntegrityHashAndKDFLabels() {
+        let messages = [
+            Array("NEGOTIATE request fixture".utf8),
+            Array("SESSION_SETUP response fixture".utf8),
+        ]
+        let preauthHash = SMBCrypto.smb311PreauthIntegrityHash(messages)
+        let sessionKey = Array(UInt8(0)...UInt8(15))
+
+        XCTAssertEqual(hex(SMBCrypto.smb311SigningLabel), "534d425369676e696e674b6579")
+        XCTAssertEqual(hex(SMBCrypto.smb311EncryptionLabel), "534d424332534369706865724b6579")
+        XCTAssertEqual(hex(SMBCrypto.smb311DecryptionLabel), "534d425332434369706865724b6579")
+        XCTAssertEqual(hex(SMBCrypto.smb311ApplicationLabel), "534d424170704b6579")
+        XCTAssertEqual(
+            hex(preauthHash),
+            "304e5266d152ea390203ff2ebd32632669f607debb5af2f85ece3932fd6d7091" +
+                "42f9e1c44900c1a8e2bf509791c11af65a77fd48f61ddf8a7000ae694ebfb7d2"
+        )
+        XCTAssertEqual(hex(SMBCrypto.smb311SigningKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "dae2715960a353373c17f4081ce84a3e")
+        XCTAssertEqual(hex(SMBCrypto.smb311EncryptionKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "651c2ddb43d0d8efa327d5fe8a755c29")
+        XCTAssertEqual(hex(SMBCrypto.smb311DecryptionKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "e851efe5671dfd7dd362cec27539128b")
+        XCTAssertEqual(hex(SMBCrypto.smb311ApplicationKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "4eabeb1151ac8d2d4fb3445781419c41")
     }
 
     func testSMB302EncryptionKeyDerivationLabels() {
@@ -1428,6 +1490,21 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(parsed.maxWriteSize, 1_048_576)
     }
 
+    func testNegotiateResponseAcceptsUnpaddedFinalContext() throws {
+        let response = try makeNegotiateResponse(padFinalContext: false)
+        let contextOffset = Int(readUInt32LE(response, at: 64 + 60))
+        let signingOffset = contextOffset + 16 + 8 + 8
+
+        XCTAssertEqual(readUInt16LE(response, at: signingOffset), SMBNegotiateConstants.signingContext)
+        XCTAssertEqual(response.count, signingOffset + 8 + 4)
+
+        let parsed = try SMBNegotiateCodec.decodeResponse(response)
+        XCTAssertEqual(parsed.dialect, SMBNegotiateConstants.dialect311)
+        XCTAssertEqual(parsed.signingAlgorithm, SMBNegotiateConstants.aesGMAC)
+        XCTAssertEqual(parsed.cipher, SMBNegotiateConstants.aes128GCM)
+        XCTAssertEqual(parsed.preauthHashAlgorithm, SMBNegotiateConstants.sha512)
+    }
+
     func testNegotiateResponseBefore311HasNoContexts() throws {
         let response = try makeNegotiateResponse(
             dialect: SMBNegotiateConstants.dialect300,
@@ -1480,7 +1557,8 @@ final class SMBeeTests: XCTestCase {
         dialect: UInt16 = SMBNegotiateConstants.dialect311,
         contextCount: UInt16 = 3,
         contextOffset: UInt32 = 136,
-        includeContexts: Bool = true
+        includeContexts: Bool = true,
+        padFinalContext: Bool = true
     ) throws -> [UInt8] {
         let header = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: 0).encode()
         var body = SMBByteWriter()
@@ -1504,18 +1582,20 @@ final class SMBeeTests: XCTestCase {
 
             appendContext(type: SMBNegotiateConstants.preauthContext, data: [1, 0, 0, 0, 1, 0], to: &packet)
             appendContext(type: SMBNegotiateConstants.encryptionContext, data: [1, 0, 2, 0], to: &packet)
-            appendContext(type: SMBNegotiateConstants.signingContext, data: [1, 0, 2, 0], to: &packet)
+            appendContext(type: SMBNegotiateConstants.signingContext, data: [1, 0, 2, 0], padTo8: padFinalContext, to: &packet)
         }
         return packet
     }
 
-    private func appendContext(type: UInt16, data: [UInt8], to bytes: inout [UInt8]) {
+    private func appendContext(type: UInt16, data: [UInt8], padTo8: Bool = true, to bytes: inout [UInt8]) {
         var writer = SMBByteWriter()
         writer.writeUInt16LE(type)
         writer.writeUInt16LE(UInt16(data.count))
         writer.writeUInt32LE(0)
         writer.writeBytes(data)
-        writer.padTo8()
+        if padTo8 {
+            writer.padTo8()
+        }
         bytes.append(contentsOf: writer.bytes)
     }
 

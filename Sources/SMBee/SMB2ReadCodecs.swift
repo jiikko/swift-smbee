@@ -10,6 +10,7 @@ enum SMB2Commands {
     static let flush: UInt16 = 7
     static let read: UInt16 = 8
     static let write: UInt16 = 9
+    static let cancel: UInt16 = 12
     static let setInfo: UInt16 = 17
     static let queryInfo: UInt16 = 16
     static let queryDirectory: UInt16 = 14

@@ -483,6 +483,44 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(hex(gmac), "58e2fccefa7e3061367f1d57a4e7455a")
     }
 
+    func testSMB311GMACSigningNonceUsesMessageIdAndSenderFlags() {
+        XCTAssertEqual(
+            hex(SMBSessionSigning.gmacNonce(messageId: 0x0102_0304_0506_0708, command: SMB2Commands.read, sender: .client)),
+            "080706050403020100000000"
+        )
+        XCTAssertEqual(
+            hex(SMBSessionSigning.gmacNonce(messageId: 0x0102_0304_0506_0708, command: SMB2Commands.read, sender: .server)),
+            "080706050403020101000000"
+        )
+        XCTAssertEqual(
+            hex(SMBSessionSigning.gmacNonce(messageId: 0x0102_0304_0506_0708, command: SMB2Commands.cancel, sender: .client)),
+            "080706050403020102000000"
+        )
+    }
+
+    func testSMB311GMACSignatureZeroesHeaderSignatureField() throws {
+        let key = hexBytes("000102030405060708090a0b0c0d0e0f")
+        var packet = try SMB2Header(
+            command: SMB2Commands.read,
+            flags: SMB2Flags.signed,
+            messageId: 7,
+            treeId: 0x3344,
+            sessionId: 0x1122,
+            signature: Array(repeating: 0xaa, count: 16)
+        ).encode()
+        packet.append(contentsOf: [0x11, 0x22, 0x33, 0x44])
+        var normalized = packet
+        normalized.replaceSubrange(48..<64, with: Array(repeating: 0, count: 16))
+
+        let signature = try SMBSessionSigning.signature(algorithm: .aesGMAC, key: key, packet: packet, sender: .server)
+        let expected = try SMBCrypto.aesGMAC(
+            key: key,
+            nonce: hexBytes("070000000000000001000000"),
+            authenticatedData: normalized
+        )
+        XCTAssertEqual(signature, expected)
+    }
+
     func testAESCMACRFC4493Vectors() throws {
         let key = hexBytes("2b7e151628aed2a6abf7158809cf4f3c")
         let message = hexBytes(
@@ -1475,6 +1513,39 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt32LE(requests[1], at: 68), 2)
     }
 
+    func testSessionReadChunkUsesGMACSigningWithoutEncryption() async throws {
+        let key = hexBytes("000102030405060708090a0b0c0d0e0f")
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let response = try signedSMB2Packet(
+            try smb2ReadResponse(Array("ok".utf8), messageId: 0, treeId: 0x3344),
+            key: key,
+            algorithm: .aesGMAC,
+            sender: .server
+        )
+        let transport = InMemoryTransport(inbound: try framed([response]))
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: key,
+            signingAlgorithm: .aesGMAC
+        )
+
+        let data = try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 2)
+
+        XCTAssertEqual(data, Array("ok".utf8))
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 1)
+        let requestHeader = try SMB2Header.decode(requests[0])
+        XCTAssertEqual(requestHeader.command, SMB2Commands.read)
+        XCTAssertEqual(requestHeader.flags & SMB2Flags.signed, SMB2Flags.signed)
+        XCTAssertEqual(
+            requestHeader.signature,
+            try SMBSessionSigning.signature(algorithm: .aesGMAC, key: key, packet: requests[0], sender: .client)
+        )
+    }
+
     func testSessionReadChunkDoesNotReplayPreviousChunkAfterConnectionLoss() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([
@@ -2418,6 +2489,20 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
         response.append(contentsOf: payload)
         return response
+    }
+
+    private func signedSMB2Packet(
+        _ packet: [UInt8],
+        key: [UInt8],
+        algorithm: SMBSessionSigningAlgorithm,
+        sender: SMBSessionSigningSender
+    ) throws -> [UInt8] {
+        var signed = packet
+        signed[16] |= UInt8(SMB2Flags.signed & 0xff)
+        signed.replaceSubrange(48..<64, with: Array(repeating: 0, count: 16))
+        let signature = try SMBSessionSigning.signature(algorithm: algorithm, key: key, packet: signed, sender: sender)
+        signed.replaceSubrange(48..<64, with: signature)
+        return signed
     }
 
     private func negotiateResponse(messageId: UInt64) throws -> [UInt8] {

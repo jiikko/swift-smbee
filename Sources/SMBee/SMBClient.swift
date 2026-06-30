@@ -924,12 +924,20 @@ actor SMBSession {
     private var maxReadSize: UInt32 = UInt32.max
     private var maxWriteSize: UInt32 = UInt32.max
 
-    init(host: String, port: UInt16, credential: SMBCredential, transport: SMBTransport, signingKey: [UInt8]? = nil) {
+    init(
+        host: String,
+        port: UInt16,
+        credential: SMBCredential,
+        transport: SMBTransport,
+        signingKey: [UInt8]? = nil,
+        signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC
+    ) {
         self.host = host
         self.port = port
         self.credential = credential
         self.transport = transport
         self.signingKey = signingKey
+        self.signingAlgorithm = signingAlgorithm
     }
 
     func connect() async throws {
@@ -956,12 +964,14 @@ actor SMBSession {
         if result.dialect == SMBNegotiateConstants.dialect311 {
             guard result.preauthHashAlgorithm == SMBNegotiateConstants.sha512,
                   result.signingAlgorithm == SMBNegotiateConstants.aesGMAC,
-                  result.cipher == SMBNegotiateConstants.aes128GCM
+                  result.cipher == nil || result.cipher == SMBNegotiateConstants.aes128GCM
             else {
                 throw SMBCodecError.invalidValue("unsupported SMB 3.1.1 crypto negotiation")
             }
             signingAlgorithm = .aesGMAC
-            encryptionAlgorithm = .aes128GCM
+            if result.cipher == SMBNegotiateConstants.aes128GCM {
+                encryptionAlgorithm = .aes128GCM
+            }
         }
 
         let type1Message = NTLM.makeType1(domain: credential.domain)
@@ -1009,8 +1019,10 @@ actor SMBSession {
         if result.dialect == SMBNegotiateConstants.dialect311 {
             let preauthHash = SMBCrypto.smb311PreauthIntegrityHash(preauthMessages)
             signingKey = SMBCrypto.smb311SigningKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
-            encryptionKey = SMBCrypto.smb311EncryptionKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
-            decryptionKey = SMBCrypto.smb311DecryptionKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
+            if result.cipher == SMBNegotiateConstants.aes128GCM {
+                encryptionKey = SMBCrypto.smb311EncryptionKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
+                decryptionKey = SMBCrypto.smb311DecryptionKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
+            }
         } else {
             signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.exportedSessionKey)
             encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
@@ -1365,13 +1377,12 @@ actor SMBSession {
         var signed = packet
         signed[16] |= UInt8(SMB2Flags.signed & 0xff)
         for index in 48..<64 { signed[index] = 0 }
-        let signature: [UInt8]
-        switch signingAlgorithm {
-        case .aesCMAC:
-            signature = try AESCMAC.authenticationCode(key: signingKey, message: signed)
-        case .aesGMAC:
-            throw SMBCodecError.invalidValue("SMB 3.1.1 GMAC signing is not wired without encryption")
-        }
+        let signature = try SMBSessionSigning.signature(
+            algorithm: signingAlgorithm,
+            key: signingKey,
+            packet: signed,
+            sender: .client
+        )
         signed.replaceSubrange(48..<64, with: signature)
         try await transport.send(DirectTCPFraming.frame(signed))
         try Task.checkCancellation()
@@ -1419,9 +1430,12 @@ actor SMBSession {
         guard let signingKey else { return }
         let header = try SMB2Header.decode(packet)
         guard (header.flags & SMB2Flags.signed) != 0 else { return }
-        var normalized = packet
-        normalized.replaceSubrange(48..<64, with: Array(repeating: 0, count: 16))
-        let expected = try AESCMAC.authenticationCode(key: signingKey, message: normalized)
+        let expected = try SMBSessionSigning.signature(
+            algorithm: signingAlgorithm,
+            key: signingKey,
+            packet: packet,
+            sender: .server
+        )
         guard expected == header.signature else {
             throw SMBCodecError.invalidValue("SMB signature verification failed")
         }

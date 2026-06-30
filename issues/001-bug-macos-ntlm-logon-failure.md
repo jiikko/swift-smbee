@@ -20,9 +20,16 @@
 付随修正 (smbutil の wire と一致させた、いずれも MS-NLMP 準拠): EPA AV pair (id6 MsvAvFlags / id9
 MsvAvTargetName=`cifs/<host>` / id10 ChannelBindings)、timestamp 有り時の LmChallengeResponse=Z(24)、
 blob TimeStamp にサーバ MsvAvTimestamp を使用、type3 flags の SEAL クリア、ClientSigningKey/SealingKey 導出。
+codex review P2 対応: `makeMICCompatibleTargetInfo` はサーバ TargetInfo に既に id6 (MsvAvFlags) が
+ある場合に MIC bit (0x02) を既存値へ OR し、id6/id9/id10 を重複させない (本 macOS server は id6 を
+送らないため未顕在化だったが MS-NLMP 準拠の堅牢化)。
 
-検証: 実 macOS server (169.254.69.111 / 127.0.0.1) へ `smbcli ls` 成功 (再現性あり)。unit 59 tests green
-(flaky な transport cancellation test も deterministic 化)。NTLM ベクタは独立計算で裏取り。
+検証: 実 macOS server (169.254.69.111 / 127.0.0.1) へ **フル smoke 成功** —
+probe / ls / stat / cat (content round-trip 一致) / mkdir / put / mv / rm(--directory) すべて成功 =
+署名 CMAC + 暗号 CCM が実 macOS セッション上でも正しい。codex 設計+実装レビュー済 (P2 のみ対応、他は指摘なし)。
+unit tests green (NTLM/blob/mechListMIC ベクタは独立計算で裏取り、循環テストでない)。
+注: rm でディレクトリ削除時 macOS は NON_DIRECTORY_FILE open を拒否 (Samba は許容) → 別途
+非 recursive delete に STATUS_FILE_IS_A_DIRECTORY 自動フォールバックを実装 (todo.md 参照)。
 
 ---
 

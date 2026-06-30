@@ -127,6 +127,167 @@ private final class SMBReadAccumulator: @unchecked Sendable {
     }
 }
 
+public actor SMBClientSession {
+    private let session: SMBSession
+    private let treeId: UInt32
+    private var isClosed = false
+
+    init(session: SMBSession, treeId: UInt32) {
+        self.session = session
+        self.treeId = treeId
+    }
+
+    public func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        await session.closeTransport()
+    }
+
+    public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
+        let collector = SMBDirectoryEntryCollector()
+        try await withDirectoryStream(path: path) { entry in
+            collector.append(entry)
+        }
+        return collector.entries
+    }
+
+    public func withDirectoryStream(
+        path: String = "",
+        onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
+    ) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, path: path, directory: true)
+        do {
+            try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func stat(path: String) async throws -> SMBFileStat {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+        do {
+            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return stat
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func read(path: String, range: SMBReadRange? = nil) async throws -> [UInt8] {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+        do {
+            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+            let (start, requested) = try readBounds(stat: stat, range: range)
+            let data = try await SMBClient.readAll(session: session, treeId: treeId, fileId: fileId, offset: start, length: requested)
+            guard UInt64(data.count) == requested else {
+                throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
+            }
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return data
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func withReadStream(
+        path: String,
+        range: SMBReadRange? = nil,
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        try ensureOpen()
+        let progress = SMBReadStreamProgress()
+        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+        do {
+            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+            let (start, requested) = try readBounds(stat: stat, range: range)
+            try await SMBClient.streamRead(
+                session: session,
+                treeId: treeId,
+                fileId: fileId,
+                offset: start,
+                length: requested,
+                progress: progress,
+                onChunk: onChunk
+            )
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            if progress.startedYielding, error.isSMBConnectionLoss {
+                throw SMBError.connectionLost(operation: "READ")
+            }
+            throw error
+        }
+    }
+
+    public func makeDirectory(path: String) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .makeDirectory(path: path))
+        try await session.close(treeId: treeId, fileId: fileId)
+    }
+
+    public func upload(path: String, data: [UInt8], overwrite: Bool = true) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
+        do {
+            try await session.write(treeId: treeId, fileId: fileId, data: data)
+            try await session.flush(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func copy(fromPath: String, toPath: String, overwrite: Bool = false) async throws {
+        try ensureOpen()
+        try await session.copyFile(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
+    }
+
+    public func rename(fromPath: String, toPath: String, replaceIfExists: Bool = false) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .rename(path: fromPath))
+        do {
+            try await session.rename(treeId: treeId, fileId: fileId, newPath: toPath, replaceIfExists: replaceIfExists)
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func delete(path: String, directory: Bool = false, recursive: Bool = false) async throws {
+        try ensureOpen()
+        if recursive {
+            try await session.deleteRecursively(treeId: treeId, path: path, directory: directory)
+            return
+        }
+        try await session.deleteNonRecursive(treeId: treeId, path: path, directory: directory)
+    }
+
+    private func ensureOpen() throws {
+        if isClosed {
+            throw SMBError.connectionLost(operation: "SESSION")
+        }
+    }
+
+    private func readBounds(stat: SMBFileStat, range: SMBReadRange?) throws -> (offset: UInt64, length: UInt64) {
+        let start = range?.offset ?? 0
+        guard start <= stat.size else {
+            throw SMBCodecError.invalidValue("read range starts past end of file")
+        }
+        let available = stat.size - start
+        return (start, range.map { min($0.length, available) } ?? available)
+    }
+}
+
 public enum SMBClient {
     private static let localWriteChunkLimit = 64 * 1024
 
@@ -160,6 +321,24 @@ public enum SMBClient {
                 }
                 retryConnectionLoss = false
             }
+        }
+    }
+
+    public static func connect(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> SMBClientSession {
+        let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
+        do {
+            try await session.connect()
+            let treeId = try await session.treeConnect(share: share)
+            return SMBClientSession(session: session, treeId: treeId)
+        } catch {
+            await session.closeTransport()
+            throw error
         }
     }
 
@@ -409,7 +588,7 @@ public enum SMBClient {
         }
     }
 
-    private static func readAll(session: SMBSession, treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
+    fileprivate static func readAll(session: SMBSession, treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
         let result = SMBReadAccumulator()
         var cursor = offset
         var remaining = length
@@ -428,6 +607,40 @@ public enum SMBClient {
             remaining = advanced.remaining
         }
         return result.bytes
+    }
+
+    fileprivate static func streamRead(
+        session: SMBSession,
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset: UInt64,
+        length: UInt64,
+        progress: SMBReadStreamProgress,
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        var cursor = offset
+        var remaining = length
+        while remaining > 0 {
+            try Task.checkCancellation()
+            let chunk = try await session.readChunk(treeId: treeId, fileId: fileId, offset: cursor, length: remaining)
+            if chunk.isEmpty { break }
+            let advanced = try SMBChunkedTransfer.advancedReadPosition(
+                cursor: cursor,
+                remaining: remaining,
+                receivedCount: chunk.count
+            )
+            try Task.checkCancellation()
+            progress.markYielding()
+            try await onChunk(chunk)
+            try Task.checkCancellation()
+            progress.recordReceived(byteCount: chunk.count)
+            cursor = advanced.cursor
+            remaining = advanced.remaining
+        }
+        let received = progress.received
+        guard received == length else {
+            throw SMBCodecError.invalidValue("short SMB read: expected \(length) bytes, got \(received)")
+        }
     }
 
     public static func makeDirectory(

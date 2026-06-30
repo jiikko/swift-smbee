@@ -68,6 +68,7 @@ public enum SMBProbe {
 public enum SMBURLParser {
     public struct ReadURL: Equatable, Sendable {
         public var username: String?
+        public var password: String?
         public var host: String
         public var port: UInt16
         public var share: String
@@ -98,6 +99,6 @@ public enum SMBURLParser {
             throw SMBCodecError.invalidValue("SMB URL must include a share")
         }
         let path = parts.dropFirst().joined(separator: "\\")
-        return ReadURL(username: components.user, host: host, port: UInt16(port), share: share, path: path)
+        return ReadURL(username: components.user, password: components.password, host: host, port: UInt16(port), share: share, path: path)
     }
 }

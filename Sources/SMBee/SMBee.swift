@@ -9,6 +9,15 @@ public enum SMBee {
     /// ライブラリのバージョン (暫定)。
     public static let version = "0.0.1"
 
+    public static func connect(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String
+    ) async throws -> SMBClientSession {
+        try await SMBClient.connect(host: host, port: port, share: share, credential: credential)
+    }
+
     public static func list(
         host: String,
         port: UInt16 = 445,

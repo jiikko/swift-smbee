@@ -338,8 +338,8 @@ private func makeEndpointAndCredential(url: String, domain: String) throws -> (S
     guard let username = endpoint.username, !username.isEmpty else {
         throw ValidationError("SMB URL must include a username")
     }
-    guard let password = ProcessInfo.processInfo.environment["SMB_PASSWORD"] else {
-        throw ValidationError("Set SMB_PASSWORD in the environment")
+    guard let password = endpoint.password ?? ProcessInfo.processInfo.environment["SMB_PASSWORD"] else {
+        throw ValidationError("Set SMB_PASSWORD in the environment or include a password in the SMB URL")
     }
     return (endpoint, SMBCredential(username: username, password: password, domain: domain))
 }

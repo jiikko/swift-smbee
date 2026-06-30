@@ -244,6 +244,17 @@ final class SMBeeTests: XCTestCase {
         XCTAssertFalse(SMBee.version.isEmpty)
     }
 
+    func testReadURLParserKeepsUserInfoPassword() throws {
+        let endpoint = try SMBURLParser.parseReadURL("smb://user:pass@server:1445/share/path/to/file.txt")
+
+        XCTAssertEqual(endpoint.username, "user")
+        XCTAssertEqual(endpoint.password, "pass")
+        XCTAssertEqual(endpoint.host, "server")
+        XCTAssertEqual(endpoint.port, 1445)
+        XCTAssertEqual(endpoint.share, "share")
+        XCTAssertEqual(endpoint.path, "path\\to\\file.txt")
+    }
+
     func testSMBErrorMapperMapsRepresentativeNTSTATUSValues() {
         XCTAssertEqual(
             SMBErrorMapper.map(status: SMB2Status.objectNameNotFound, operation: "CREATE"),
@@ -1168,6 +1179,52 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(requests[0][67], 0x01)
         XCTAssertEqual(requests[1][67], 0x00)
         XCTAssertEqual(requests[2][67], 0x00)
+    }
+
+    func testClientSessionReusesConnectedTreeForMultipleOperations() async throws {
+        let directoryFileId = hexBytes("00112233445566778899aabbccddeeff")
+        let statFileId = hexBytes("ffeeddccbbaa99887766554433221100")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: directoryFileId, messageId: 0, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(name: "a.txt", isDirectory: false, fileSize: 7, nextOffset: 0),
+                ],
+                messageId: 1,
+                treeId: 0x3344
+            ),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344),
+            try smb2CreateResponse(fileId: statFileId, messageId: 4, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 7, messageId: 5, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        let entries = try await clientSession.list(path: "")
+        let stat = try await clientSession.stat(path: "a.txt")
+
+        XCTAssertEqual(entries, [SMBDirectoryEntry(name: "a.txt", fileSize: 7, isDirectory: false)])
+        XCTAssertEqual(stat.size, 7)
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.close,
+            SMB2Commands.create,
+            SMB2Commands.queryInfo,
+            SMB2Commands.close,
+        ])
+        XCTAssertTrue(requests.allSatisfy { (try? SMB2Header.decode($0).treeId) == 0x3344 })
     }
 
     func testQueryDirectoryResponseDropsDotEntriesForRecursiveDeleteWalks() throws {

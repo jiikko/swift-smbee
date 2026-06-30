@@ -67,6 +67,37 @@ jobs:
           set -euxo pipefail
           swift test --filter SMBeeE2ETests
 
+      - name: smbcli command smoke
+        env:
+          SMB_PASSWORD: smbee
+        run: |
+          set -euxo pipefail
+          root="smbee-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          local_dir="$(mktemp -d)"
+          cleanup() {
+            swift run smbcli rm -r "smb://smbee@127.0.0.1/public/${root}" || true
+            rm -rf "${local_dir}"
+          }
+          trap cleanup EXIT
+
+          mkdir -p "${local_dir}/dir/child"
+          printf "hello smbee command smoke\n" > "${local_dir}/file.txt"
+          printf "nested payload\n" > "${local_dir}/dir/child/nested.txt"
+
+          swift run smbcli ls smb://smbee@127.0.0.1/public
+          swift run smbcli mkdir "smb://smbee@127.0.0.1/public/${root}"
+          swift run smbcli put "${local_dir}/file.txt" "smb://smbee@127.0.0.1/public/${root}/file.txt"
+          swift run smbcli cat "smb://smbee@127.0.0.1/public/${root}/file.txt" | cmp "${local_dir}/file.txt" -
+          swift run smbcli get "smb://smbee@127.0.0.1/public/${root}/file.txt" "${local_dir}/downloaded.txt"
+          cmp "${local_dir}/file.txt" "${local_dir}/downloaded.txt"
+          swift run smbcli cp "smb://smbee@127.0.0.1/public/${root}/file.txt" "smb://smbee@127.0.0.1/public/${root}/copied.txt"
+          swift run smbcli cat "smb://smbee@127.0.0.1/public/${root}/copied.txt" | cmp "${local_dir}/file.txt" -
+          swift run smbcli put -r "${local_dir}/dir" "smb://smbee@127.0.0.1/public/${root}/uploaded-dir"
+          swift run smbcli ls "smb://smbee@127.0.0.1/public/${root}/uploaded-dir/child"
+          swift run smbcli get -r "smb://smbee@127.0.0.1/public/${root}/uploaded-dir" "${local_dir}/downloaded-dir"
+          cmp "${local_dir}/dir/child/nested.txt" "${local_dir}/downloaded-dir/child/nested.txt"
+          swift run smbcli rm -r "smb://smbee@127.0.0.1/public/${root}"
+
       - name: Samba logs (debug)
         if: always()
         run: docker logs smbee-samba || true

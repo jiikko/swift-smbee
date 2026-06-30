@@ -178,9 +178,14 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で
     `STATUS_NO_MORE_FILES` まで反復する。既存 `list` は互換維持のため collector で配列集約。
     `smbcli ls` は streaming 表示に変更。unit で continuation flag と multi-page stream を検証。
-- [ ] persistent session API: 複数 operation で TCP/session/tree を再利用する公開 handle
-  - 現状は operation ごとに connect/auth/treeConnect。実装時は `issues/done/002-design-smbsession-concurrent-multiflight.md`
-    の serializer or messageId demux を先に片付ける。
+- [x] persistent session API: 複数 operation で TCP/session/tree を再利用する公開 handle
+  - 2026-06-30: `SMBee.connect` / `SMBClient.connect` / `SMBClientSession` を追加。同一 tree 上で
+    `list` / directory stream / `stat` / `read` / read stream / `mkdir` / `upload(data)` / `copy` /
+    `rename` / `delete` を再利用できる。`SMBSession` の wire serializer 前提で安全側に逐次化。
+    自動再接続は従来の static one-shot API 側に限定。
+  - 2026-06-30 手動 smoke: `swift run smbcli ls smb://koji@127.0.0.1/koji` と、実 SMB サーバ上の
+    一時 directory で `mkdir` / `put` / `cat` / `get` / `cp` / `put -r` / `get -r` / `rm -r` を確認。
+    同等の command smoke を `.github/workflows/e2e.yml` に追加。
 - [ ] authentication options: NT hash 入力 / password provider callback / keychain 連携 / guest or anonymous の扱い
   - secret を log に出さない方針は維持。CLI は `SMB_PASSWORD` 以外の安全な入力方法を追加する。
 - [ ] path handling: SMB パス正規化・`.`/`..`・区切り文字・URL percent decoding/encoding の仕様化

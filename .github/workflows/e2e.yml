@@ -11,8 +11,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e:
+  e2e-api:
+    name: API E2E
     runs-on: ubuntu-latest
+    env:
+      SAMBA_CONTAINER: smbee-samba-api
     steps:
       - uses: actions/checkout@v4
 
@@ -25,7 +28,7 @@ jobs:
       - name: Start Samba
         run: |
           set -euxo pipefail
-          docker run -d --name smbee-samba -p 445:445 \
+          docker run -d --name "${SAMBA_CONTAINER}" -p 445:445 \
             -v "${PWD}/test/e2e/smb.conf:/tmp/smbee-smb.conf:ro" \
             ubuntu:24.04 \
             bash -lc '
@@ -58,7 +61,7 @@ jobs:
           SMBEE_DEBUG: "1"
         run: swift run smbcli probe smb://127.0.0.1:445
 
-      - name: Samba-backed E2E tests
+      - name: Samba-backed API E2E tests
         env:
           SMBEE_E2E: "1"
           SMBEE_E2E_HOST: "127.0.0.1"
@@ -68,12 +71,65 @@ jobs:
           set -euxo pipefail
           swift test --filter SMBeeE2ETests
 
+      - name: Samba logs (debug)
+        if: always()
+        run: docker logs "${SAMBA_CONTAINER}" || true
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f "${SAMBA_CONTAINER}" || true
+
+  e2e-cli:
+    name: smbcli E2E
+    runs-on: ubuntu-latest
+    env:
+      SAMBA_CONTAINER: smbee-samba-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+      - run: swift --version
+
+      - name: Start Samba
+        run: |
+          set -euxo pipefail
+          docker run -d --name "${SAMBA_CONTAINER}" -p 445:445 \
+            -v "${PWD}/test/e2e/smb.conf:/tmp/smbee-smb.conf:ro" \
+            ubuntu:24.04 \
+            bash -lc '
+              set -euxo pipefail
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends samba
+              # smb.conf を /etc/samba にbind-mountすると samba-common の postinst が
+              # read-only ファイルに書けず失敗するため、install 後に書き込み可能な場所へ cp する。
+              cp /tmp/smbee-smb.conf /etc/samba/smb.conf
+              mkdir -p /srv/smbee/public
+              useradd -M -s /usr/sbin/nologin smbee
+              printf "smbee\nsmbee\n" | smbpasswd -a -s smbee
+              printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
+              chown -R smbee:smbee /srv/smbee
+              testparm -s
+              exec smbd --foreground --no-process-group --debug-stdout --debuglevel=3
+            '
+
+      - name: Wait for SMB (:445)
+        run: |
+          set -euxo pipefail
+          for i in $(seq 1 120); do
+            if (exec 3<>/dev/tcp/127.0.0.1/445) 2>/dev/null; then echo "445 open"; exit 0; fi
+            sleep 1
+          done
+          echo "Samba did not become ready"; exit 1
+
       - name: smbcli command smoke
         env:
           SMB_PASSWORD: smbee
         run: |
           set -euxo pipefail
-          root="smbee-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          root="smbee-gha-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           local_dir="$(mktemp -d)"
           cleanup() {
             swift run smbcli rm -r "smb://smbee@127.0.0.1/public/${root}" || true
@@ -101,8 +157,8 @@ jobs:
 
       - name: Samba logs (debug)
         if: always()
-        run: docker logs smbee-samba || true
+        run: docker logs "${SAMBA_CONTAINER}" || true
 
       - name: Teardown
         if: always()
-        run: docker rm -f smbee-samba || true
+        run: docker rm -f "${SAMBA_CONTAINER}" || true

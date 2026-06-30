@@ -577,15 +577,16 @@ final class SMBeeTests: XCTestCase {
         var stub: [UInt8] = []
         appendUInt32LE(1, to: &stub) // level
         appendUInt32LE(1, to: &stub) // discriminant
+        appendUInt32LE(0x0002_0000, to: &stub) // SHARE_INFO_1_CONTAINER referent
         appendUInt32LE(2, to: &stub) // entries read
-        appendUInt32LE(0x0002_0000, to: &stub) // buffer referent
+        appendUInt32LE(0x0002_0001, to: &stub) // buffer referent
         appendUInt32LE(2, to: &stub) // conformant array count
-        appendUInt32LE(0x0002_0001, to: &stub)
-        appendUInt32LE(0, to: &stub)
         appendUInt32LE(0x0002_0002, to: &stub)
+        appendUInt32LE(0, to: &stub)
         appendUInt32LE(0x0002_0003, to: &stub)
-        appendUInt32LE(0x8000_0000, to: &stub)
         appendUInt32LE(0x0002_0004, to: &stub)
+        appendUInt32LE(0x8000_0000, to: &stub)
+        appendUInt32LE(0x0002_0005, to: &stub)
         appendNDRString("public", to: &stub)
         appendNDRString("Public share", to: &stub)
         appendNDRString("IPC$", to: &stub)

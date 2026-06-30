@@ -149,6 +149,19 @@ enum SRVSVC {
         guard level == 1 else { throw SMBCodecError.invalidValue("unexpected NetrShareEnum level \(level)") }
         let discriminant = try reader.readUInt32()
         guard discriminant == 1 else { throw SMBCodecError.invalidValue("unexpected NetrShareEnum union \(discriminant)") }
+        let containerReferent = try reader.readUInt32()
+        guard containerReferent != 0 else {
+            _ = try reader.readUInt32() // TotalEntries
+            let resumeReferent = try reader.readUInt32()
+            if resumeReferent != 0 {
+                _ = try reader.readUInt32()
+            }
+            let status = try reader.readUInt32()
+            guard status == 0 else {
+                throw SMBError.unsupported(status: status, operation: "NetrShareEnum")
+            }
+            return []
+        }
         let entriesRead = try reader.readUInt32()
         let bufferReferent = try reader.readUInt32()
         var shares: [SMBShareInfo] = []

@@ -422,7 +422,7 @@ extension Error {
 /// セッション参照を他タスクへ渡さないため、この reentrancy は発生しない (= 現状は安全)。
 /// 並行 multi-task 利用 (将来の persistent session 共有) を解禁する場合は、request→response の直列化
 /// (wire transaction lock) か MS-SMB2 の messageId/credit ベース応答多重分離を別途実装すること。
-/// それまでは「1 セッションは 1 フライト」を契約とする。
+/// それまでは「1 セッションは 1 フライト」を契約とする (解禁条件と対応案は issues/002-design-smbsession-concurrent-multiflight.md)。
 // swiftlint:disable:next type_body_length
 actor SMBSession {
     private let host: String

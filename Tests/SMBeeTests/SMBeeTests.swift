@@ -1170,6 +1170,114 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testSessionCopyFileReadsAndWritesChunksWithCloseAndFlush() async throws {
+        let sourceFileId = hexBytes("00112233445566778899aabbccddeeff")
+        let destinationFileId = hexBytes("ffeeddccbbaa99887766554433221100")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceFileId, messageId: 0, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 5, messageId: 1, treeId: 0x3344),
+            try smb2CreateResponse(fileId: destinationFileId, messageId: 2, treeId: 0x3344),
+            try smb2ReadResponse(Array("hel".utf8), messageId: 3, treeId: 0x3344),
+            try smb2WriteResponse(count: 3, messageId: 4, treeId: 0x3344),
+            try smb2ReadResponse(Array("lo".utf8), messageId: 5, treeId: 0x3344),
+            try smb2WriteResponse(count: 2, messageId: 6, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 7, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 8, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 9, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        try await session.copyFile(treeId: 0x3344, fromPath: "source.txt", toPath: "copy.txt", overwrite: false)
+
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.queryInfo,
+            SMB2Commands.create,
+            SMB2Commands.read,
+            SMB2Commands.write,
+            SMB2Commands.read,
+            SMB2Commands.write,
+            SMB2Commands.flush,
+            SMB2Commands.close,
+            SMB2Commands.close,
+        ])
+        XCTAssertEqual(readUInt32LE(requests[2], at: 100), 0x0000_0002)
+        XCTAssertEqual(readUInt64LE(requests[3], at: 72), 0)
+        XCTAssertEqual(readUInt32LE(requests[3], at: 68), 5)
+        XCTAssertEqual(readUInt64LE(requests[4], at: 72), 0)
+        XCTAssertEqual(Array(requests[4][112..<requests[4].count]), Array("hel".utf8))
+        XCTAssertEqual(readUInt64LE(requests[5], at: 72), 3)
+        XCTAssertEqual(readUInt32LE(requests[5], at: 68), 2)
+        XCTAssertEqual(readUInt64LE(requests[6], at: 72), 3)
+        XCTAssertEqual(Array(requests[6][112..<requests[6].count]), Array("lo".utf8))
+        XCTAssertEqual(Array(requests[8][72..<88]), destinationFileId)
+        XCTAssertEqual(Array(requests[9][72..<88]), sourceFileId)
+    }
+
+    func testSessionCopyFileUsesOverwriteDispositionWhenRequested() async throws {
+        let sourceFileId = hexBytes("00112233445566778899aabbccddeeff")
+        let destinationFileId = hexBytes("ffeeddccbbaa99887766554433221100")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceFileId, messageId: 0, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 0, messageId: 1, treeId: 0x3344),
+            try smb2CreateResponse(fileId: destinationFileId, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 5, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        try await session.copyFile(treeId: 0x3344, fromPath: "source.txt", toPath: "copy.txt", overwrite: true)
+
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(readUInt32LE(requests[2], at: 100), 0x0000_0005)
+    }
+
+    func testSessionCopyFileClosesSourceWhenDestinationCreateFails() async throws {
+        let sourceFileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceFileId, messageId: 0, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 5, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.objectNameCollision, command: SMB2Commands.create, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        do {
+            try await session.copyFile(treeId: 0x3344, fromPath: "source.txt", toPath: "copy.txt", overwrite: false)
+            XCTFail("expected nameCollision")
+        } catch SMBError.nameCollision {
+            let requests = try unframed(transport.outbound)
+            XCTAssertEqual(requests.count, 4)
+            XCTAssertEqual(try SMB2Header.decode(requests[3]).command, SMB2Commands.close)
+            XCTAssertEqual(Array(requests[3][72..<88]), sourceFileId)
+        } catch {
+            XCTFail("expected nameCollision, got \(error)")
+        }
+    }
+
     func testWriteRequestUsesOffsetLengthFileIdAndDataBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let payload = Array("hello".utf8)
@@ -1246,6 +1354,30 @@ final class SMBeeTests: XCTestCase {
 
             XCTAssertEqual(ranges.map { "\($0.lowerBound)..<\($0.upperBound)" }, expectedRanges.map { "\($0.lowerBound)..<\($0.upperBound)" })
             XCTAssertEqual(cursor, dataCount)
+        }
+    }
+
+    func testDownloadRejectsExistingDestinationWhenOverwriteIsFalse() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
+        let destination = directory.appendingPathComponent("download.txt")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("existing".utf8).write(to: destination)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        do {
+            try await SMBClient.download(
+                host: "server",
+                share: "share",
+                path: "remote.txt",
+                localFile: destination,
+                overwrite: false,
+                credential: SMBCredential(username: "user", password: "pass")
+            )
+            XCTFail("expected local destination error")
+        } catch SMBCodecError.invalidValue("local destination already exists") {
+            XCTAssertEqual(try Data(contentsOf: destination), Data("existing".utf8))
+        } catch {
+            XCTFail("expected local destination error, got \(error)")
         }
     }
 
@@ -1758,6 +1890,26 @@ final class SMBeeTests: XCTestCase {
         response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
         writeUInt16LE(17, to: &response, at: 64)
         response[66] = 80
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+        return response
+    }
+
+    private func smb2WriteResponse(count: Int, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.write, messageId: messageId, treeId: treeId).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
+        writeUInt16LE(17, to: &response, at: 64)
+        writeUInt32LE(UInt32(count), to: &response, at: 68)
+        return response
+    }
+
+    private func smb2QueryInfoResponse(size: UInt64, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+        var payload = Array(repeating: UInt8(0), count: 56)
+        writeUInt64LE(size, to: &payload, at: 40)
+        var response = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 66)
         writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
         response.append(contentsOf: payload)
         return response

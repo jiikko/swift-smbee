@@ -1,6 +1,11 @@
 import ArgumentParser
 import Foundation
 import SMBee
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 @main
 struct SMBCLI: AsyncParsableCommand {
@@ -22,7 +27,11 @@ struct Probe: AsyncParsableCommand {
     @Argument(help: "smb://host[:445]")
     var url: String
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let endpoint = try SMBURLParser.parseProbeURL(url)
         let result = try await SMBProbe.probe(host: endpoint.host, port: endpoint.port)
         print("dialect: \(formatHex(result.dialect, width: 4))")
@@ -55,7 +64,11 @@ struct List: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         try await SMBee.withDirectoryStream(
             host: endpoint.host,
@@ -79,7 +92,11 @@ struct Stat: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         let stat = try await SMBee.stat(
             host: endpoint.host,
@@ -108,7 +125,11 @@ struct Cat: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         // ファイル全体をメモリに lift せず streaming で stdout へ流す (大ファイル対応)。
         let stdout = FileHandle.standardOutput
@@ -143,7 +164,11 @@ struct Get: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         if recursive {
             try await SMBee.downloadDirectory(
@@ -178,7 +203,11 @@ struct MakeDirectory: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
         try await SMBee.makeDirectory(
             host: endpoint.host,
@@ -208,7 +237,11 @@ struct Put: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: destination, auth: auth)
         if recursive {
             try await SMBee.uploadDirectory(
@@ -249,7 +282,11 @@ struct Move: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (from, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         let to = try SMBURLParser.parseReadURL(destination)
         guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
@@ -285,7 +322,11 @@ struct Copy: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (from, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         let to = try SMBURLParser.parseReadURL(destination)
         guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
@@ -330,7 +371,11 @@ struct Remove: AsyncParsableCommand {
     @OptionGroup
     var auth: AuthOptions
 
+    @OptionGroup
+    var debug: DebugOptions
+
     func run() async throws {
+        debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
         try await SMBee.delete(
             host: endpoint.host,
@@ -353,6 +398,23 @@ struct AuthOptions: ParsableArguments {
 
     @Flag(help: "Read password from standard input")
     var passwordStdin = false
+}
+
+struct DebugOptions: ParsableArguments {
+    @Flag(help: "Enable redacted SMB debug logging")
+    var debug = false
+
+    @Flag(help: "Dump raw SMB wire hex; implies --debug")
+    var traceWire = false
+
+    func apply() {
+        if debug || traceWire {
+            setenv("SMBEE_DEBUG", "1", 1)
+        }
+        if traceWire {
+            setenv("SMBEE_TRACE_WIRE", "1", 1)
+        }
+    }
 }
 
 private func makeReadEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {

@@ -278,6 +278,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     redaction policy と `--debug` / `--trace-wire` の分離を決める。
   - 2026-06-30: `SMBEE_DEBUG=1` は packet label と byte count のみに redaction し、raw hex は
     `SMBEE_TRACE_WIRE=1` 併用時だけ出すよう分離。残: CLI flag としての `--debug` / `--trace-wire`。
+  - 2026-06-30: `smbcli probe/ls/stat/cat/get/mkdir/put/mv/cp/rm` に `--debug` と
+    `--trace-wire` を追加。`--trace-wire` は `--debug` を暗黙に有効化し、既存の env gate
+    (`SMBEE_DEBUG` / `SMBEE_TRACE_WIRE`) に接続する。
 - [ ] compatibility matrix: macOS SMBX / Samba / Windows Server / NAS (Synology/QNAP 等)
   - dialect/signing/encryption/quirk を記録し、手動 smoke 手順を docs 化する。
 - [ ] NetBIOS name / port 139 / hostname discovery は原則 scope 外だが、必要になったら separate transport として検討

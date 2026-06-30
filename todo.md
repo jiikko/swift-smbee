@@ -96,6 +96,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     (+必要なら AES-256-GCM / AES-128-CCM fallback) へ修正し、unit fixture を追加する。
   - 2026-06-30: NEGOTIATE encryption context を AES-128-GCM 優先 + AES-128-CCM fallback
     に修正し、request fixture で context payload を検証。残: 実 Samba 3.1.1 での交渉確認。
+  - 2026-06-30: `.github/workflows/samba-compat.yml` と `test/e2e/smb/smb311-*.conf` を追加。
+    `smb311-encrypted-required` で 3.1.1 + GMAC + GCM の probe / authenticated E2E を
+    workflow_dispatch / schedule で確認できる状態にした。残: GitHub Actions 上の初回実行結果を記録する。
 - [x] 既知課題: Samba 3.1.1 response の parser が `truncated` になるバグを調査
   - 2026-06-30: NEGOTIATE context parser が「最後の context も 8-byte padding あり」と仮定していた
     ため、最後の context が unpadded の response で `truncated` になり得た。最終 context は padding
@@ -119,6 +122,11 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
       CMAC 固定。暗号化済み transform response は検証できるが、3.1.1 signing-only session や
       unencrypted response verification は未対応。GMAC nonce source / header signature field /
       response verify を packet fixture で固める。
+    - 2026-06-30: MS-SMB2 v20260413 PDF を `docs/references/ms-smb2.pdf` に保存し、
+      §3.1.4.1 / §3.1.5.1 の nonce 仕様 (MessageId + sender/CANCEL flags) に従って
+      AES-GMAC signing-only を配線。unit で nonce / signature / session read path を検証。
+      `smb311-signing-required` profile も authenticated API E2E 対象に変更。残: 実 Samba 3.1.1
+      workflow_dispatch 初回実行結果を記録する。
   - [x] encryption = TRANSFORM_HEADER + AES-GCM（nonce/AAD/tag レイアウト ⓥ）
     - 2026-06-30: 12-byte nonce + 16-byte TRANSFORM_HEADER nonce field padding / AAD / tag fixture を追加し、
       session の 3.1.1 暗号化・復号分岐へ配線。
@@ -172,6 +180,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     DFS referral は share enumeration そのものではないため、第一候補は SRVSVC over named pipe。
   - 着手前に必要: SMB2 IOCTL または named pipe READ/WRITE の fixture、DCE/RPC bind/request/response codec、
     `SHARE_INFO_1` 以上の NDR decode、macOS SMBX / Samba の実 packet capture。
+  - 2026-06-30: 実装 scope を `issues/006-share-discovery-srvsvc.md` に分離。SRVSVC over IPC$ と
+    fixture 要件を完了条件として明文化。
 - [x] download API / `smbcli get`: remote file を local file へ streaming 保存
   - 2026-06-30: `SMBee.download` / `SMBClient.download` / `smbcli get` を追加。既存 `withReadStream` を使い、
     local temp file へ streaming 書き込み後に move/replace。`--no-overwrite` 対応。Samba E2E に round-trip

@@ -62,6 +62,53 @@ enum SMBChunkedTransfer {
     }
 }
 
+private final class SMBReadStreamProgress: @unchecked Sendable {
+    private let lock = NSLock()
+    private var yielded = false
+    private var receivedBytes: UInt64 = 0
+
+    var startedYielding: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return yielded
+    }
+
+    var received: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return receivedBytes
+    }
+
+    func markYielding() {
+        lock.lock()
+        yielded = true
+        lock.unlock()
+    }
+
+    func recordReceived(byteCount: Int) {
+        lock.lock()
+        receivedBytes += UInt64(byteCount)
+        lock.unlock()
+    }
+}
+
+private final class SMBReadAccumulator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [UInt8] = []
+
+    var bytes: [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ chunk: [UInt8]) {
+        lock.lock()
+        storage += chunk
+        lock.unlock()
+    }
+}
+
 public enum SMBClient {
     private static let localWriteChunkLimit = 64 * 1024
 
@@ -78,15 +125,15 @@ public enum SMBClient {
         var retryConnectionLoss = idempotent
         while true {
             let transport = makeTransport()
+            let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
             do {
-                let session = SMBSession(host: host, port: port, credential: credential, transport: transport)
                 try await session.connect()
                 let treeId = try await session.treeConnect(share: share)
                 let result = try await operation(session, treeId)
-                transport.close()
+                await session.closeTransport()
                 return result
             } catch {
-                transport.close()
+                await session.closeTransport()
                 guard error.isSMBConnectionLoss else {
                     throw error
                 }
@@ -154,7 +201,7 @@ public enum SMBClient {
                 }
                 let available = stat.size - start
                 let requested = range.map { min($0.length, available) } ?? available
-                let data = try await session.read(treeId: treeId, fileId: fileId, offset: start, length: requested)
+                let data = try await readAll(session: session, treeId: treeId, fileId: fileId, offset: start, length: requested)
                 guard UInt64(data.count) == requested else {
                     throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
                 }
@@ -165,6 +212,82 @@ public enum SMBClient {
                 throw error
             }
         }
+    }
+
+    public static func withReadStream(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        range: SMBReadRange? = nil,
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        let progress = SMBReadStreamProgress()
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
+            let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+            do {
+                let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+                let start = range?.offset ?? 0
+                guard start <= stat.size else {
+                    throw SMBCodecError.invalidValue("read range starts past end of file")
+                }
+                let available = stat.size - start
+                let requested = range.map { min($0.length, available) } ?? available
+                var cursor = start
+                var remaining = requested
+                while remaining > 0 {
+                    try Task.checkCancellation()
+                    let chunk = try await session.readChunk(treeId: treeId, fileId: fileId, offset: cursor, length: remaining)
+                    if chunk.isEmpty { break }
+                    let advanced = try SMBChunkedTransfer.advancedReadPosition(
+                        cursor: cursor,
+                        remaining: remaining,
+                        receivedCount: chunk.count
+                    )
+                    try Task.checkCancellation()
+                    progress.markYielding()
+                    try await onChunk(chunk)
+                    try Task.checkCancellation()
+                    progress.recordReceived(byteCount: chunk.count)
+                    cursor = advanced.cursor
+                    remaining = advanced.remaining
+                }
+                let received = progress.received
+                guard received == requested else {
+                    throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(received)")
+                }
+                try? await session.close(treeId: treeId, fileId: fileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                if progress.startedYielding, error.isSMBConnectionLoss {
+                    throw SMBError.connectionLost(operation: "READ")
+                }
+                throw error
+            }
+        }
+    }
+
+    private static func readAll(session: SMBSession, treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
+        let result = SMBReadAccumulator()
+        var cursor = offset
+        var remaining = length
+        while remaining > 0 {
+            try Task.checkCancellation()
+            let chunk = try await session.readChunk(treeId: treeId, fileId: fileId, offset: cursor, length: remaining)
+            if chunk.isEmpty { break }
+            let advanced = try SMBChunkedTransfer.advancedReadPosition(
+                cursor: cursor,
+                remaining: remaining,
+                receivedCount: chunk.count
+            )
+            try Task.checkCancellation()
+            result.append(chunk)
+            cursor = advanced.cursor
+            remaining = advanced.remaining
+        }
+        return result.bytes
     }
 
     public static func makeDirectory(
@@ -287,8 +410,21 @@ extension Error {
     }
 }
 
+/// 1 セッション = 単一フライト前提。
+///
+/// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離するが、
+/// **同一 SMBSession に対して複数タスクが並行に wire 操作を呼ぶことは想定していない**。各 wire 操作は
+/// `sendSigned` → `receive` の間に await (suspension) があり、actor 隔離だけではこの区間を critical section に
+/// できない (actor reentrancy: 並行呼び出しがあると send と receive の間に別 request が割り込み、応答が
+/// messageId で多重分離されていないため取り違える)。
+///
+/// 現状の唯一の利用経路 `SMBClient.withSession` は **1 タスクが connect→操作→close を逐次実行**し、
+/// セッション参照を他タスクへ渡さないため、この reentrancy は発生しない (= 現状は安全)。
+/// 並行 multi-task 利用 (将来の persistent session 共有) を解禁する場合は、request→response の直列化
+/// (wire transaction lock) か MS-SMB2 の messageId/credit ベース応答多重分離を別途実装すること。
+/// それまでは「1 セッションは 1 フライト」を契約とする。
 // swiftlint:disable:next type_body_length
-final class SMBSession {
+actor SMBSession {
     private let host: String
     private let port: UInt16
     private let credential: SMBCredential
@@ -451,43 +587,33 @@ final class SMBSession {
         return try SMB2QueryInfo.decodeNetworkOpenInformation(response)
     }
 
-    func read(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
-        let chunkSize = UInt64(negotiatedReadChunkSize())
-        var cursor = offset
-        var remaining = length
-        var result: [UInt8] = []
-        while remaining > 0 {
-            try Task.checkCancellation()
-            let requestLength = UInt32(min(chunkSize, remaining))
-            let packet = try SMB2Read.encodeRequest(
-                messageId: nextMessageId(),
-                sessionId: sessionId,
-                treeId: treeId,
-                fileId: fileId,
-                offset: cursor,
-                length: requestLength
-            )
-            debugDump("READ request", packet)
-            try await sendSigned(packet)
-            let response = try await receive(label: "READ response")
-            try verifySigned(response)
-            let header = try SMB2Header.decode(response)
-            if header.status == SMB2Status.endOfFile {
-                break
-            }
-            try SMBErrorMapper.throwIfFailure(status: header.status, operation: "READ")
-            let data = try SMB2Read.decodeResponse(response)
-            if data.isEmpty { break }
-            result += data
-            let advanced = try SMBChunkedTransfer.advancedReadPosition(
-                cursor: cursor,
-                remaining: remaining,
-                receivedCount: data.count
-            )
-            cursor = advanced.cursor
-            remaining = advanced.remaining
+    func readChunk(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
+        guard length > 0 else { return [] }
+        try Task.checkCancellation()
+        let requestLength = UInt32(min(UInt64(negotiatedReadChunkSize()), length))
+        let packet = try SMB2Read.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            offset: offset,
+            length: requestLength
+        )
+        debugDump("READ request", packet)
+        try await sendSigned(packet)
+        let response = try await receive(label: "READ response")
+        try verifySigned(response)
+        let header = try SMB2Header.decode(response)
+        if header.status == SMB2Status.endOfFile {
+            return []
         }
-        return result
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "READ")
+        let data = try SMB2Read.decodeResponse(response)
+        guard data.count <= Int(requestLength) else {
+            throw SMBCodecError.invalidValue("SMB read returned more data than requested")
+        }
+        try Task.checkCancellation()
+        return data
     }
 
     func write(treeId: UInt32, fileId: [UInt8], data: [UInt8]) async throws {
@@ -599,6 +725,10 @@ final class SMBSession {
         debugDump("CLOSE request", packet)
         try await sendSigned(packet)
         _ = try await receive(label: "CLOSE response")
+    }
+
+    func closeTransport() {
+        transport.close()
     }
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {

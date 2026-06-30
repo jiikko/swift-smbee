@@ -40,6 +40,26 @@ public enum SMBee {
         try await SMBClient.read(host: host, port: port, share: share, path: path, range: range, credential: credential)
     }
 
+    public static func withReadStream(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        range: SMBReadRange? = nil,
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        try await SMBClient.withReadStream(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            range: range,
+            credential: credential,
+            onChunk: onChunk
+        )
+    }
+
     public static func makeDirectory(
         host: String,
         port: UInt16 = 445,

@@ -111,15 +111,18 @@ struct Cat: AsyncParsableCommand {
 
     func run() async throws {
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, domain: domain)
-        let data = try await SMBee.read(
+        // ファイル全体をメモリに lift せず streaming で stdout へ流す (大ファイル対応)。
+        let stdout = FileHandle.standardOutput
+        try await SMBee.withReadStream(
             host: endpoint.host,
             port: endpoint.port,
             credential: credential,
             share: endpoint.share,
             path: endpoint.path,
             range: try range.map(parseRange)
-        )
-        FileHandle.standardOutput.write(Data(data))
+        ) { chunk in
+            stdout.write(Data(chunk))
+        }
     }
 }
 

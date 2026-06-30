@@ -1050,6 +1050,64 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try SMB2Read.decodeResponse(response), payload)
     }
 
+    func testSessionReadChunkReadsOneResponseAtRequestedOffset() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2ReadResponse(Array("hel".utf8), messageId: 0, treeId: 0x3344),
+            try smb2ReadResponse(Array("lo".utf8), messageId: 1, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let first = try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 10, length: 5)
+        let second = try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 13, length: 2)
+
+        XCTAssertEqual(first, Array("hel".utf8))
+        XCTAssertEqual(second, Array("lo".utf8))
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(try SMB2Header.decode(requests[0]).command, SMB2Commands.read)
+        XCTAssertEqual(readUInt64LE(requests[0], at: 72), 10)
+        XCTAssertEqual(readUInt32LE(requests[0], at: 68), 5)
+        XCTAssertEqual(try SMB2Header.decode(requests[1]).command, SMB2Commands.read)
+        XCTAssertEqual(readUInt64LE(requests[1], at: 72), 13)
+        XCTAssertEqual(readUInt32LE(requests[1], at: 68), 2)
+    }
+
+    func testSessionReadChunkDoesNotReplayPreviousChunkAfterConnectionLoss() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2ReadResponse(Array("hel".utf8), messageId: 0, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let first = try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 5)
+        XCTAssertEqual(first, Array("hel".utf8))
+
+        do {
+            _ = try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 3, length: 2)
+            XCTFail("expected connectionClosed")
+        } catch SMBTransportError.connectionClosed {
+            let requests = try unframed(transport.outbound)
+            XCTAssertEqual(requests.count, 2)
+            XCTAssertEqual(readUInt64LE(requests[1], at: 72), 3)
+        } catch {
+            XCTFail("expected connectionClosed, got \(error)")
+        }
+    }
+
     func testWriteRequestUsesOffsetLengthFileIdAndDataBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let payload = Array("hello".utf8)
@@ -1612,6 +1670,16 @@ final class SMBeeTests: XCTestCase {
         response.append(contentsOf: Array(repeating: UInt8(0), count: 88))
         writeUInt16LE(89, to: &response, at: 64)
         response.replaceSubrange(128..<144, with: fileId)
+        return response
+    }
+
+    private func smb2ReadResponse(_ payload: [UInt8], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.read, messageId: messageId, treeId: treeId).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
+        writeUInt16LE(17, to: &response, at: 64)
+        response[66] = 80
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
         return response
     }
 

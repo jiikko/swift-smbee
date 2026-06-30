@@ -1937,7 +1937,7 @@ final class SMBeeTests: XCTestCase {
             "0000000000000000000000000000000000000000000000000000000000000000" +
             "24000500010000004000000000112233445566778899aabbccddeeff70000000" +
             "030000000202100200030203110300000100260000000000010020000100aaaaaaaaaaaaaaaaaaaa" +
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000002000400000000000100010000000000" +
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000002000600000000000200020001000000" +
             "080004000000000001000200"
         XCTAssertEqual(hex(request), expectedHex)
 
@@ -1974,11 +1974,15 @@ final class SMBeeTests: XCTestCase {
 
         var offset = contextOffset
         var contextTypes: [UInt16] = []
+        var encryptionData: [UInt8] = []
         for index in 0..<contextCount {
             XCTAssertEqual(offset % 8, 0)
             let type = readUInt16LE(request, at: offset)
             let length = Int(readUInt16LE(request, at: offset + 2))
             contextTypes.append(type)
+            if type == SMBNegotiateConstants.encryptionContext {
+                encryptionData = Array(request[(offset + 8)..<(offset + 8 + length)])
+            }
             let dataEnd = offset + 8 + length
             let nextOffset: Int
             if index == contextCount - 1 {
@@ -1999,6 +2003,7 @@ final class SMBeeTests: XCTestCase {
             SMBNegotiateConstants.encryptionContext,
             SMBNegotiateConstants.signingContext,
         ])
+        XCTAssertEqual(encryptionData, [0x02, 0x00, 0x02, 0x00, 0x01, 0x00])
         XCTAssertEqual(offset, request.count)
     }
 

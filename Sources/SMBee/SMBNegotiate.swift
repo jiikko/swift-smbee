@@ -198,7 +198,8 @@ public enum SMBNegotiateCodec {
 
     private static func encodeEncryptionData() -> [UInt8] {
         var writer = SMBByteWriter()
-        writer.writeUInt16LE(1)
+        writer.writeUInt16LE(2)
+        writer.writeUInt16LE(SMBNegotiateConstants.aes128GCM)
         writer.writeUInt16LE(SMBNegotiateConstants.aes128CCM)
         return writer.bytes
     }

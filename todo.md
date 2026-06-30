@@ -94,6 +94,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     AES-128-CCM だけを提示している一方、3.1.1 authenticated path は AES-128-GCM を必須として
     guard している。3.1.1 実測前に request context を設計どおり AES-128-GCM 優先
     (+必要なら AES-256-GCM / AES-128-CCM fallback) へ修正し、unit fixture を追加する。
+  - 2026-06-30: NEGOTIATE encryption context を AES-128-GCM 優先 + AES-128-CCM fallback
+    に修正し、request fixture で context payload を検証。残: 実 Samba 3.1.1 での交渉確認。
 - [x] 既知課題: Samba 3.1.1 response の parser が `truncated` になるバグを調査
   - 2026-06-30: NEGOTIATE context parser が「最後の context も 8-byte padding あり」と仮定していた
     ため、最後の context が unpadded の response で `truncated` になり得た。最終 context は padding

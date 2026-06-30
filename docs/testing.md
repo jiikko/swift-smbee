@@ -65,8 +65,17 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   ローカルは Apple container、CI は Docker、と起動手段を分ける。
 - **前提（再掲）**: Linux で動かす以上、SMBee が Linux ビルド可能であること（上の transport 制約）。
 - E2E テストは env gate（`SMBEE_E2E=1` + 接続情報 env）。未満足ならローカルの通常 `swift test` では skip。
-- 足場段階では e2e.yml は **workflow_dispatch（手動）** のみ。E2E test + Samba 設定が揃ったら
-  push / pull_request トリガを有効化する。
+- `.github/workflows/e2e.yml` は PR / push 用の代表 smoke。profile は
+  `test/e2e/smb/smb302-encrypted-required.conf` を使い、macOS SMBX mirror として
+  SMB 3.0.2 + signing mandatory + encryption required を維持する。
+- `.github/workflows/samba-compat.yml` は重い互換性 matrix。`workflow_dispatch` と週次 schedule で、
+  distro-provided Samba と `test/e2e/smb/*.conf` profile の代表組み合わせを回す。
+
+Samba profile:
+
+- `smb302-encrypted-required`: PR 必須代表。SMB 3.0.2 / signing mandatory / encryption required。
+- `smb311-signing-required`: SMB 3.1.1 / signing mandatory / encryption off。GMAC signing-only 経路の検証用。
+- `smb311-encrypted-required`: SMB 3.1.1 / signing mandatory / encryption required。GCM transform 経路の検証用。
 
 ## Tier 3: 手動 smoke（実 macOS SMBX）— リリース前
 

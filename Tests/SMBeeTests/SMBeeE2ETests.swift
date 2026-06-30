@@ -2,7 +2,7 @@ import XCTest
 @testable import SMBee
 
 final class SMBeeE2ETests: XCTestCase {
-    func testProbeNegotiatesMacOSMirrorSMB302WithSigningRequired() async throws {
+    func testProbeNegotiatesExpectedProfile() async throws {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
             throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
         }
@@ -16,11 +16,28 @@ final class SMBeeE2ETests: XCTestCase {
         }
 
         let result = try await SMBProbe.probe(host: host, port: port)
-        XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect302)
-        XCTAssertTrue(result.signingRequired)
-        XCTAssertNil(result.signingAlgorithm)
-        XCTAssertNil(result.cipher)
-        XCTAssertNil(result.preauthHashAlgorithm)
+        switch environment["SMBEE_E2E_PROFILE"] ?? "smb302-encrypted-required" {
+        case "smb302-encrypted-required":
+            XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect302)
+            XCTAssertTrue(result.signingRequired)
+            XCTAssertNil(result.signingAlgorithm)
+            XCTAssertNil(result.cipher)
+            XCTAssertNil(result.preauthHashAlgorithm)
+        case "smb311-signing-required":
+            XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect311)
+            XCTAssertTrue(result.signingRequired)
+            XCTAssertEqual(result.signingAlgorithm, SMBNegotiateConstants.aesGMAC)
+            XCTAssertNil(result.cipher)
+            XCTAssertEqual(result.preauthHashAlgorithm, SMBNegotiateConstants.sha512)
+        case "smb311-encrypted-required":
+            XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect311)
+            XCTAssertTrue(result.signingRequired)
+            XCTAssertEqual(result.signingAlgorithm, SMBNegotiateConstants.aesGMAC)
+            XCTAssertEqual(result.cipher, SMBNegotiateConstants.aes128GCM)
+            XCTAssertEqual(result.preauthHashAlgorithm, SMBNegotiateConstants.sha512)
+        default:
+            XCTFail("Unknown SMBEE_E2E_PROFILE")
+        }
     }
 
     func testAuthenticatedTreeConnectAndListShowsKnownFile() async throws {

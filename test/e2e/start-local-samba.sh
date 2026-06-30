@@ -30,7 +30,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-SMB_CONF="${REPO_ROOT}/test/e2e/smb.conf"
+SMB_CONF="${REPO_ROOT}/${SMBEE_E2E_SAMBA_CONFIG:-test/e2e/smb/smb302-encrypted-required.conf}"
 
 PORT="${1:-${SMBEE_E2E_PORT:-1445}}"
 CONTAINER_NAME="${SMBEE_E2E_CONTAINER_NAME:-smbee-samba-local}"

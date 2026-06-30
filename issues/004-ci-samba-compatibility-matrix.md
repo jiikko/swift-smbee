@@ -1,6 +1,6 @@
 # 004 ci: Samba compatibility matrix を導入する
 
-状態: **open**
+状態: **実装済み。初回 CI 実行結果待ち**
 起票: 2026-06-30
 関連: `.github/workflows/e2e.yml` / `test/e2e/smb.conf` / `Tests/SMBeeTests/SMBeeE2ETests.swift`
 
@@ -189,16 +189,27 @@ matrix job は並列実行される前提で設計する。
 
 ## 完了条件
 
-- [ ] PR 用 E2E は代表 1 ケースとして維持されている。
-- [ ] `workflow_dispatch` / `schedule` 用の Samba compatibility workflow が追加されている。
-- [ ] compatibility workflow は matrix job として並列実行される。
-- [ ] matrix job は `fail-fast: false` で、1 ケース失敗しても他ケースが最後まで実行される。
-- [ ] matrix の各 job で Samba container 名、share root、test root が衝突しない。
-- [ ] profile ごとの smb.conf が分離されている。
-- [ ] job log に Samba version / base image / profile / negotiated dialect / signing / encryption が出る。
-- [ ] `smb302-encrypted-required` が現在の macOS SMBX mirror profile として維持されている。
-- [ ] `smb311-signing-required` と `smb311-encrypted-required` が追加されている。
-- [ ] `docs/testing.md` に PR E2E と compatibility matrix の使い分けを追記する。
+- [x] PR 用 E2E は代表 1 ケースとして維持されている。
+- [x] `workflow_dispatch` / `schedule` 用の Samba compatibility workflow が追加されている。
+- [x] compatibility workflow は matrix job として並列実行される。
+- [x] matrix job は `fail-fast: false` で、1 ケース失敗しても他ケースが最後まで実行される。
+- [x] matrix の各 job で Samba container 名、share root、test root が衝突しない。
+- [x] profile ごとの smb.conf が分離されている。
+- [x] job log に Samba version / base image / profile / negotiated dialect / signing / encryption が出る。
+- [x] `smb302-encrypted-required` が現在の macOS SMBX mirror profile として維持されている。
+- [x] `smb311-signing-required` と `smb311-encrypted-required` が追加されている。
+- [x] `docs/testing.md` に PR E2E と compatibility matrix の使い分けを追記する。
+
+## 実装メモ (2026-06-30)
+
+- `.github/workflows/e2e.yml` は従来どおり PR/push の代表 smoke とし、`smb302-encrypted-required`
+  profile を明示するようにした。
+- `.github/workflows/samba-compat.yml` を追加。`ubuntu:24.04` の 3 profile と
+  `ubuntu:22.04` / `debian:12` の代表 3.0.2 profile を `fail-fast: false` で回す。
+- `smb311-signing-required` は AES-GMAC signing-only を配線したため、他 profile と同じ
+  authenticated API E2E を実行する。
+- profile は `test/e2e/smb/*.conf` に分離。互換用に既存 `test/e2e/smb.conf` は 3.0.2 profile 内容を維持。
+- `SMBEE_E2E_PROFILE` により E2E probe test が 3.0.2 / 3.1.1 profile 別の期待値を検証する。
 
 ## やらないこと
 

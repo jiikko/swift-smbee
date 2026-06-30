@@ -545,6 +545,21 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNoThrow(try DCERPC.decodeBindAck(ack))
     }
 
+    func testDCERPCResponseStubUsesFragmentLengthWhenAllocHintIsLarger() throws {
+        var response: [UInt8] = [
+            0x05, 0x00, DCERPC.pduTypeResponse, 0x03,
+            0x10, 0x00, 0x00, 0x00,
+            0x1c, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00,
+        ]
+        appendUInt32LE(64, to: &response)
+        appendUInt16LE(0, to: &response)
+        appendUInt16LE(0, to: &response)
+        response.append(contentsOf: [0xaa, 0xbb, 0xcc, 0xdd])
+
+        XCTAssertEqual(try DCERPC.decodeResponseStub(response), [0xaa, 0xbb, 0xcc, 0xdd])
+    }
+
     func testSRVSVCNetrShareEnumRequestUsesLevel1() {
         let request = SRVSVC.encodeNetrShareEnumRequest()
 
@@ -2553,6 +2568,11 @@ final class SMBeeTests: XCTestCase {
         bytes.append(UInt8((value >> 8) & 0xff))
         bytes.append(UInt8((value >> 16) & 0xff))
         bytes.append(UInt8((value >> 24) & 0xff))
+    }
+
+    private func appendUInt16LE(_ value: UInt16, to bytes: inout [UInt8]) {
+        bytes.append(UInt8(value & 0xff))
+        bytes.append(UInt8((value >> 8) & 0xff))
     }
 
     private func appendNDRString(_ value: String, to bytes: inout [UInt8]) {

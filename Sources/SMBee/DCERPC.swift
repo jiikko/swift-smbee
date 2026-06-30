@@ -70,8 +70,9 @@ enum DCERPC {
         guard bytes.count >= 24 else { throw SMBCodecError.truncated }
         let allocHint = Int(readUInt32LE(bytes, at: 16))
         let stubOffset = 24
-        guard stubOffset + allocHint <= bytes.count else { throw SMBCodecError.truncated }
-        return Array(bytes[stubOffset..<stubOffset + allocHint])
+        let stubLength = min(allocHint, Int(header.fragLength) - stubOffset)
+        guard stubLength >= 0, stubOffset + stubLength <= bytes.count else { throw SMBCodecError.truncated }
+        return Array(bytes[stubOffset..<stubOffset + stubLength])
     }
 
     private static func encodeHeader(type: UInt8, callId: UInt32, body: [UInt8]) -> [UInt8] {

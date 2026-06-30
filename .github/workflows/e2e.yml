@@ -6,6 +6,9 @@ on:
     branches: [master]
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: true
@@ -14,6 +17,7 @@ jobs:
   e2e-api:
     name: API E2E
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       SAMBA_CONTAINER: smbee-samba-api
     steps:
@@ -43,6 +47,7 @@ jobs:
               printf "smbee\nsmbee\n" | smbpasswd -a -s smbee
               printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
               chown -R smbee:smbee /srv/smbee
+              smbd --version
               testparm -s
               exec smbd --foreground --no-process-group --debug-stdout --debuglevel=3
             '
@@ -82,6 +87,7 @@ jobs:
   e2e-cli:
     name: smbcli E2E
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       SAMBA_CONTAINER: smbee-samba-cli
     steps:
@@ -111,6 +117,7 @@ jobs:
               printf "smbee\nsmbee\n" | smbpasswd -a -s smbee
               printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
               chown -R smbee:smbee /srv/smbee
+              smbd --version
               testparm -s
               exec smbd --foreground --no-process-group --debug-stdout --debuglevel=3
             '
@@ -124,15 +131,19 @@ jobs:
           done
           echo "Samba did not become ready"; exit 1
 
+      - name: Build smbcli
+        run: swift build --product smbcli
+
       - name: smbcli command smoke
         env:
           SMB_PASSWORD: smbee
         run: |
           set -euxo pipefail
+          SMBCLI=".build/debug/smbcli"
           root="smbee-gha-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           local_dir="$(mktemp -d)"
           cleanup() {
-            swift run smbcli rm -r "smb://smbee@127.0.0.1/public/${root}" || true
+            "${SMBCLI}" rm -r "smb://smbee@127.0.0.1/public/${root}" || true
             rm -rf "${local_dir}"
           }
           trap cleanup EXIT
@@ -141,19 +152,19 @@ jobs:
           printf "hello smbee command smoke\n" > "${local_dir}/file.txt"
           printf "nested payload\n" > "${local_dir}/dir/child/nested.txt"
 
-          swift run smbcli ls smb://smbee@127.0.0.1/public
-          swift run smbcli mkdir "smb://smbee@127.0.0.1/public/${root}"
-          swift run smbcli put "${local_dir}/file.txt" "smb://smbee@127.0.0.1/public/${root}/file.txt"
-          swift run smbcli cat "smb://smbee@127.0.0.1/public/${root}/file.txt" | cmp "${local_dir}/file.txt" -
-          swift run smbcli get "smb://smbee@127.0.0.1/public/${root}/file.txt" "${local_dir}/downloaded.txt"
+          "${SMBCLI}" ls smb://smbee@127.0.0.1/public
+          "${SMBCLI}" mkdir "smb://smbee@127.0.0.1/public/${root}"
+          "${SMBCLI}" put "${local_dir}/file.txt" "smb://smbee@127.0.0.1/public/${root}/file.txt"
+          "${SMBCLI}" cat "smb://smbee@127.0.0.1/public/${root}/file.txt" | cmp "${local_dir}/file.txt" -
+          "${SMBCLI}" get "smb://smbee@127.0.0.1/public/${root}/file.txt" "${local_dir}/downloaded.txt"
           cmp "${local_dir}/file.txt" "${local_dir}/downloaded.txt"
-          swift run smbcli cp "smb://smbee@127.0.0.1/public/${root}/file.txt" "smb://smbee@127.0.0.1/public/${root}/copied.txt"
-          swift run smbcli cat "smb://smbee@127.0.0.1/public/${root}/copied.txt" | cmp "${local_dir}/file.txt" -
-          swift run smbcli put -r "${local_dir}/dir" "smb://smbee@127.0.0.1/public/${root}/uploaded-dir"
-          swift run smbcli ls "smb://smbee@127.0.0.1/public/${root}/uploaded-dir/child"
-          swift run smbcli get -r "smb://smbee@127.0.0.1/public/${root}/uploaded-dir" "${local_dir}/downloaded-dir"
+          "${SMBCLI}" cp "smb://smbee@127.0.0.1/public/${root}/file.txt" "smb://smbee@127.0.0.1/public/${root}/copied.txt"
+          "${SMBCLI}" cat "smb://smbee@127.0.0.1/public/${root}/copied.txt" | cmp "${local_dir}/file.txt" -
+          "${SMBCLI}" put -r "${local_dir}/dir" "smb://smbee@127.0.0.1/public/${root}/uploaded-dir"
+          "${SMBCLI}" ls "smb://smbee@127.0.0.1/public/${root}/uploaded-dir/child"
+          "${SMBCLI}" get -r "smb://smbee@127.0.0.1/public/${root}/uploaded-dir" "${local_dir}/downloaded-dir"
           cmp "${local_dir}/dir/child/nested.txt" "${local_dir}/downloaded-dir/child/nested.txt"
-          swift run smbcli rm -r "smb://smbee@127.0.0.1/public/${root}"
+          "${SMBCLI}" rm -r "smb://smbee@127.0.0.1/public/${root}"
 
       - name: Samba logs (debug)
         if: always()

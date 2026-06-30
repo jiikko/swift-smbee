@@ -185,6 +185,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: `SMBee.listShares` / `SMBClient.listShares` / `smbcli shares` の入口を追加。
     現時点では `SMBError.unsupported(operation: "SHARE_DISCOVERY_SRVsvc")` を返す。残:
     `issues/006-share-discovery-srvsvc.md` の DCE/RPC + SRVSVC 実装。
+  - 2026-06-30: SRVSVC over IPC$ の最小実装を追加。`srvsvc` named pipe に DCE/RPC bind →
+    `NetrShareEnum` Level 1 を送り、`SMBShareInfo(name/type/comment)` を decode。unit fixture と
+    Samba E2E/CLI smoke を追加。残: macOS SMBX 手動 smoke、guest/anonymous 方針は認証 backend 拡張時に扱う。
 - [x] download API / `smbcli get`: remote file を local file へ streaming 保存
   - 2026-06-30: `SMBee.download` / `SMBClient.download` / `smbcli get` を追加。既存 `withReadStream` を使い、
     local temp file へ streaming 書き込み後に move/replace。`--no-overwrite` 対応。Samba E2E に round-trip

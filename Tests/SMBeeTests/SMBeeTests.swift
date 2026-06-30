@@ -587,6 +587,44 @@ final class SMBeeTests: XCTestCase {
         ])
     }
 
+    func testSMB2IoctlPipeTransceiveRequestEncodesInputBuffer() throws {
+        let fileId = (0x10...0x1f).map(UInt8.init)
+        let input: [UInt8] = [0xaa, 0xbb, 0xcc]
+        let request = try SMB2Ioctl.encodeRequest(
+            messageId: 9,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            fileId: fileId,
+            ctlCode: SMB2Ioctl.fsctlPipeTransceive,
+            input: input,
+            maxOutputResponse: 65_536
+        )
+
+        XCTAssertEqual(readUInt16LE(request, at: 64), 57)
+        XCTAssertEqual(readUInt32LE(request, at: 68), SMB2Ioctl.fsctlPipeTransceive)
+        XCTAssertEqual(Array(request[72..<88]), fileId)
+        XCTAssertEqual(readUInt32LE(request, at: 88), 120)
+        XCTAssertEqual(readUInt32LE(request, at: 92), UInt32(input.count))
+        XCTAssertEqual(readUInt32LE(request, at: 108), 65_536)
+        XCTAssertEqual(readUInt32LE(request, at: 112), 1)
+        XCTAssertEqual(Array(request[120..<123]), input)
+    }
+
+    func testSMB2IoctlResponseDecodesOutputBuffer() throws {
+        let fileId = (0x20...0x2f).map(UInt8.init)
+        let output: [UInt8] = [0xde, 0xad, 0xbe, 0xef]
+        var response = try SMB2Header(command: SMB2Commands.ioctl, messageId: 9, treeId: 0x3344, sessionId: 0x1122).encode()
+        response.append(contentsOf: Array(repeating: 0, count: 56))
+        writeUInt16LE(49, to: &response, at: 64)
+        writeUInt32LE(SMB2Ioctl.fsctlPipeTransceive, to: &response, at: 68)
+        response.replaceSubrange(72..<88, with: fileId)
+        writeUInt32LE(120, to: &response, at: 96)
+        writeUInt32LE(UInt32(output.count), to: &response, at: 100)
+        response.append(contentsOf: output)
+
+        XCTAssertEqual(try SMB2Ioctl.decodeResponse(response), output)
+    }
+
     func testSMB311GMACSignatureZeroesHeaderSignatureField() throws {
         let key = hexBytes("000102030405060708090a0b0c0d0e0f")
         var packet = try SMB2Header(

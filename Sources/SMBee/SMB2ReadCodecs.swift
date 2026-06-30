@@ -10,6 +10,7 @@ enum SMB2Commands {
     static let flush: UInt16 = 7
     static let read: UInt16 = 8
     static let write: UInt16 = 9
+    static let ioctl: UInt16 = 11
     static let cancel: UInt16 = 12
     static let setInfo: UInt16 = 17
     static let queryInfo: UInt16 = 16
@@ -379,6 +380,62 @@ enum SMB2Write {
         }
         try reader.skip(count: 2)
         return try reader.readUInt32LE()
+    }
+}
+
+enum SMB2Ioctl {
+    static let fsctlPipeTransceive: UInt32 = 0x0011_c017
+
+    private static let fixedPartSize = 56
+    private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
+    private static let isFsctl: UInt32 = 0x0000_0001
+
+    static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        ctlCode: UInt32,
+        input: [UInt8],
+        maxOutputResponse: UInt32
+    ) throws -> [UInt8] {
+        guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        let header = try SMB2Header(command: SMB2Commands.ioctl, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(57)
+        writer.writeUInt16LE(0)
+        writer.writeUInt32LE(ctlCode)
+        writer.writeBytes(fileId)
+        writer.writeUInt32LE(UInt32(bufferOffset))
+        writer.writeUInt32LE(UInt32(input.count))
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(maxOutputResponse)
+        writer.writeUInt32LE(isFsctl)
+        writer.writeUInt32LE(0)
+        writer.writeBytes(input.isEmpty ? [0] : input)
+        return writer.bytes
+    }
+
+    static func decodeResponse(_ bytes: [UInt8]) throws -> [UInt8] {
+        let header = try SMB2Header.decode(bytes)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "IOCTL")
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 49 else {
+            throw SMBCodecError.invalidValue("invalid IOCTL response structure size")
+        }
+        try reader.skip(count: 2)
+        _ = try reader.readUInt32LE()
+        try reader.skip(count: 16)
+        _ = try reader.readUInt32LE()
+        _ = try reader.readUInt32LE()
+        let outputOffset = Int(try reader.readUInt32LE())
+        let outputCount = Int(try reader.readUInt32LE())
+        try reader.skip(count: 8)
+        guard outputOffset + outputCount <= bytes.count else { throw SMBCodecError.truncated }
+        return Array(bytes[outputOffset..<outputOffset + outputCount])
     }
 }
 

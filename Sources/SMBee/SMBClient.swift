@@ -1411,6 +1411,21 @@ actor SMBSession {
         }
     }
 
+    func pipeTransceive(treeId: UInt32, fileId: [UInt8], input: [UInt8], maxOutputResponse: UInt32 = 65_536) async throws -> [UInt8] {
+        let packet = try SMB2Ioctl.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            ctlCode: SMB2Ioctl.fsctlPipeTransceive,
+            input: input,
+            maxOutputResponse: maxOutputResponse
+        )
+        debugDump("IOCTL FSCTL_PIPE_TRANSCEIVE request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "IOCTL FSCTL_PIPE_TRANSCEIVE response")
+        return try SMB2Ioctl.decodeResponse(response)
+    }
+
     func flush(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Flush.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("FLUSH request", packet)
@@ -1481,8 +1496,7 @@ actor SMBSession {
                 opnum: SRVSVC.netrShareEnumOpnum,
                 stub: SRVSVC.encodeNetrShareEnumRequest()
             )
-            try await write(treeId: treeId, fileId: fileId, data: request)
-            let response = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: 65_536)
+            let response = try await pipeTransceive(treeId: treeId, fileId: fileId, input: request)
             let shares = try SRVSVC.decodeNetrShareEnumResponse(try DCERPC.decodeResponseStub(response))
             try? await close(treeId: treeId, fileId: fileId)
             return shares

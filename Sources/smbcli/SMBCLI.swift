@@ -52,11 +52,11 @@ struct List: AsyncParsableCommand {
     @Argument(help: "smb://user@host[:445]/share/path")
     var url: String
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, domain: domain)
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         try await SMBee.withDirectoryStream(
             host: endpoint.host,
             port: endpoint.port,
@@ -76,11 +76,11 @@ struct Stat: AsyncParsableCommand {
     @Argument(help: "smb://user@host[:445]/share/path")
     var url: String
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, domain: domain)
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         let stat = try await SMBee.stat(
             host: endpoint.host,
             port: endpoint.port,
@@ -105,11 +105,11 @@ struct Cat: AsyncParsableCommand {
     @Option(help: "Byte range a-b")
     var range: String?
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, domain: domain)
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         // ファイル全体をメモリに lift せず streaming で stdout へ流す (大ファイル対応)。
         let stdout = FileHandle.standardOutput
         try await SMBee.withReadStream(
@@ -140,11 +140,11 @@ struct Get: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively download a directory")
     var recursive = false
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (endpoint, credential) = try makeEndpointAndCredential(url: source, domain: domain)
+        let (endpoint, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         if recursive {
             try await SMBee.downloadDirectory(
                 host: endpoint.host,
@@ -175,11 +175,11 @@ struct MakeDirectory: AsyncParsableCommand {
     @Argument(help: "smb://user@host[:445]/share/path")
     var url: String
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (endpoint, credential) = try makeEndpointAndCredential(url: url, domain: domain)
+        let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
         try await SMBee.makeDirectory(
             host: endpoint.host,
             port: endpoint.port,
@@ -205,11 +205,11 @@ struct Put: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively upload a directory")
     var recursive = false
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (endpoint, credential) = try makeEndpointAndCredential(url: destination, domain: domain)
+        let (endpoint, credential) = try makeEndpointAndCredential(url: destination, auth: auth)
         if recursive {
             try await SMBee.uploadDirectory(
                 host: endpoint.host,
@@ -246,11 +246,11 @@ struct Move: AsyncParsableCommand {
     @Flag(help: "Replace destination if it exists")
     var replace = false
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (from, credential) = try makeEndpointAndCredential(url: source, domain: domain)
+        let (from, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         let to = try SMBURLParser.parseReadURL(destination)
         guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
             throw ValidationError("mv source and destination must use the same user, host, port, and share")
@@ -279,11 +279,11 @@ struct Copy: AsyncParsableCommand {
     @Flag(help: "Replace destination if it exists")
     var replace = false
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (from, credential) = try makeEndpointAndCredential(url: source, domain: domain)
+        let (from, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         let to = try SMBURLParser.parseReadURL(destination)
         guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
             throw ValidationError("cp source and destination must use the same user, host, port, and share")
@@ -312,11 +312,11 @@ struct Remove: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively delete a non-empty directory")
     var recursive = false
 
-    @Option(help: "NTLM domain/workgroup")
-    var domain: String = ""
+    @OptionGroup
+    var auth: AuthOptions
 
     func run() async throws {
-        let (endpoint, credential) = try makeEndpointAndCredential(url: url, domain: domain)
+        let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
         try await SMBee.delete(
             host: endpoint.host,
             port: endpoint.port,
@@ -329,19 +329,37 @@ struct Remove: AsyncParsableCommand {
     }
 }
 
-private func makeReadEndpointAndCredential(url: String, domain: String) throws -> (SMBURLParser.ReadURL, SMBCredential) {
-    try makeEndpointAndCredential(url: url, domain: domain)
+struct AuthOptions: ParsableArguments {
+    @Option(help: "NTLM domain/workgroup")
+    var domain: String = ""
+
+    @Flag(help: "Read password from standard input")
+    var passwordStdin = false
 }
 
-private func makeEndpointAndCredential(url: String, domain: String) throws -> (SMBURLParser.ReadURL, SMBCredential) {
+private func makeReadEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {
+    try makeEndpointAndCredential(url: url, auth: auth)
+}
+
+private func makeEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {
     let endpoint = try SMBURLParser.parseReadURL(url)
     guard let username = endpoint.username, !username.isEmpty else {
         throw ValidationError("SMB URL must include a username")
     }
-    guard let password = endpoint.password ?? ProcessInfo.processInfo.environment["SMB_PASSWORD"] else {
-        throw ValidationError("Set SMB_PASSWORD in the environment or include a password in the SMB URL")
+    guard let password = try endpoint.password ?? readPassword(options: auth) else {
+        throw ValidationError("Set SMB_PASSWORD, pass --password-stdin, or include a password in the SMB URL")
     }
-    return (endpoint, SMBCredential(username: username, password: password, domain: domain))
+    return (endpoint, SMBCredential(username: username, password: password, domain: auth.domain))
+}
+
+private func readPassword(options: AuthOptions) throws -> String? {
+    if options.passwordStdin {
+        guard let password = String(data: FileHandle.standardInput.readDataToEndOfFile(), encoding: .utf8) else {
+            throw ValidationError("Password from stdin must be valid UTF-8")
+        }
+        return password.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n"))
+    }
+    return ProcessInfo.processInfo.environment["SMB_PASSWORD"]
 }
 
 private func parseRange(_ value: String) throws -> SMBReadRange {

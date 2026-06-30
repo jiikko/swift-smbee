@@ -255,6 +255,21 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(endpoint.path, "path\\to\\file.txt")
     }
 
+    func testReadURLParserDecodesPercentEncodedComponents() throws {
+        let endpoint = try SMBURLParser.parseReadURL("smb://user%40domain:p%40ss@server/share%20name/dir%20one/file%23.txt")
+
+        XCTAssertEqual(endpoint.username, "user@domain")
+        XCTAssertEqual(endpoint.password, "p@ss")
+        XCTAssertEqual(endpoint.share, "share name")
+        XCTAssertEqual(endpoint.path, "dir one\\file#.txt")
+    }
+
+    func testReadURLParserRejectsDotDotAndSeparatorComponents() {
+        XCTAssertThrowsError(try SMBURLParser.parseReadURL("smb://user@server/share/../file.txt"))
+        XCTAssertThrowsError(try SMBURLParser.parseReadURL("smb://user@server/share/dir%2Ffile.txt"))
+        XCTAssertThrowsError(try SMBURLParser.parseReadURL("smb://user@server/share/dir%5Cfile.txt"))
+    }
+
     func testSMBErrorMapperMapsRepresentativeNTSTATUSValues() {
         XCTAssertEqual(
             SMBErrorMapper.map(status: SMB2Status.objectNameNotFound, operation: "CREATE"),

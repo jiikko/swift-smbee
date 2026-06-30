@@ -63,6 +63,19 @@ TCP connect :445
 2. **read**: SESSION_SETUP(NTLMv2) → TREE_CONNECT → CREATE → QUERY_DIRECTORY(list) / QUERY_INFO(stat) / READ(range)
 3. **write**: CREATE(disposition) + WRITE / mkdir(CREATE dir) / rename(SET_INFO FileRenameInformation) / delete(SET_INFO FileDispositionInformation)
 
+### SMB URL / path handling
+
+公開 API の `path` は share ルートからの相対 SMB path とし、区切りは `\` を使う。CLI の
+`smb://user[:password]@host[:port]/share/path` 入力では URL path の `/` を SMB path 区切りへ変換する。
+
+- share 名と path component は URL component ごとに percent decode する。
+- `.` / `..` component は受け付けない。SMB サーバ上の正規化に依存して share root 外へ出る解釈を避ける。
+- decoded component に `/` または `\` が含まれる場合は受け付けない。区切り文字は URL の `/` だけを構造として扱う。
+- user / password も percent decode する。secret は debug log に出さない。
+
+Unicode normalization はサーバ実装差があり得るため、現時点では入力文字列を追加正規化せずそのまま
+UTF-16LE encode する。macOS SMBX / Samba での NFC/NFD 実測は compatibility matrix 側で扱う。
+
 ### NEGOTIATE（3.1.1）の negotiate contexts ⓥ
 
 3.1.1 では NEGOTIATE に **negotiate context** を付ける（MS-SMB2 の NEGOTIATE 節）:

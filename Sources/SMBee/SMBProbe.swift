@@ -94,11 +94,35 @@ public enum SMBURLParser {
         guard (1...65535).contains(port) else {
             throw SMBCodecError.invalidValue("invalid port")
         }
-        let parts = components.path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        let parts = try components.percentEncodedPath
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map { try decodeSMBURLPathComponent(String($0)) }
         guard let share = parts.first else {
             throw SMBCodecError.invalidValue("SMB URL must include a share")
         }
         let path = parts.dropFirst().joined(separator: "\\")
-        return ReadURL(username: components.user, password: components.password, host: host, port: UInt16(port), share: share, path: path)
+        let username = try components.percentEncodedUser.map(decodeSMBURLUserInfo)
+        let password = try components.percentEncodedPassword.map(decodeSMBURLUserInfo)
+        return ReadURL(username: username, password: password, host: host, port: UInt16(port), share: share, path: path)
+    }
+
+    private static func decodeSMBURLPathComponent(_ value: String) throws -> String {
+        guard let decoded = value.removingPercentEncoding else {
+            throw SMBCodecError.invalidValue("SMB URL path contains invalid percent encoding")
+        }
+        guard decoded != ".", decoded != ".." else {
+            throw SMBCodecError.invalidValue("SMB URL path must not contain . or .. components")
+        }
+        guard !decoded.contains("/"), !decoded.contains("\\") else {
+            throw SMBCodecError.invalidValue("SMB URL path component must not contain path separators")
+        }
+        return decoded
+    }
+
+    private static func decodeSMBURLUserInfo(_ value: String) throws -> String {
+        guard let decoded = value.removingPercentEncoding else {
+            throw SMBCodecError.invalidValue("SMB URL user info contains invalid percent encoding")
+        }
+        return decoded
     }
 }

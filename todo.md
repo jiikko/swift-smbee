@@ -188,7 +188,13 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     同等の command smoke を `.github/workflows/e2e.yml` に追加。
 - [ ] authentication options: NT hash 入力 / password provider callback / keychain 連携 / guest or anonymous の扱い
   - secret を log に出さない方針は維持。CLI は `SMB_PASSWORD` 以外の安全な入力方法を追加する。
+  - 2026-06-30: CLI に `--password-stdin` を追加。URL 埋め込み password → stdin → `SMB_PASSWORD` の
+    優先順位で `ls/stat/cat/get/mkdir/put/mv/cp/rm` が共通利用する。残: NT hash 入力 / provider
+    callback / keychain / guest or anonymous。
 - [ ] path handling: SMB パス正規化・`.`/`..`・区切り文字・URL percent decoding/encoding の仕様化
+  - 2026-06-30: CLI URL parser で share/path component と userinfo の percent decode を実装。
+    path component の `.` / `..` と decoded separator (`/` / `\`) は拒否し、URL `/` のみを
+    SMB path separator `\` へ変換する方針を `docs/smb-protocol.md` に明記。unit 追加済み。
   - macOS Finder/Samba での Unicode normalization 差も実測する。
 - [ ] metadata operations: chmod 相当ではなく SMB/NTFS 属性として readonly/hidden/system/archive、
       create/access/modify/change time の read/write

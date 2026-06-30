@@ -22,6 +22,10 @@ enum SMBDebug {
     }
 
     static func packetSummary(_ bytes: [UInt8], traceWire: Bool) -> String {
-        traceWire ? hexSummary(bytes) : redactedPacketSummary
+        guard traceWire else { return redactedPacketSummary }
+        if ProcessInfo.processInfo.environment["SMBEE_TRACE_WIRE_FULL"] == "1" {
+            return hex(bytes)
+        }
+        return hexSummary(bytes)
     }
 }

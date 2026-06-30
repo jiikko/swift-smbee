@@ -5,12 +5,28 @@ public struct SMBDirectoryEntry: Equatable, Sendable {
     public var name: String
     public var fileSize: UInt64
     public var isDirectory: Bool
+    public var attributes: UInt32
+
+    public init(name: String, fileSize: UInt64, isDirectory: Bool, attributes: UInt32 = 0) {
+        self.name = name
+        self.fileSize = fileSize
+        self.isDirectory = isDirectory
+        self.attributes = attributes
+    }
 }
 
 public struct SMBFileStat: Equatable, Sendable {
     public var size: UInt64
     public var modifiedTime: Date?
     public var isDirectory: Bool
+    public var attributes: UInt32
+
+    public init(size: UInt64, modifiedTime: Date?, isDirectory: Bool, attributes: UInt32 = 0) {
+        self.size = size
+        self.modifiedTime = modifiedTime
+        self.isDirectory = isDirectory
+        self.attributes = attributes
+    }
 }
 
 public struct SMBReadRange: Equatable, Sendable {

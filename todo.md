@@ -229,12 +229,17 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [ ] metadata operations: chmod 相当ではなく SMB/NTFS 属性として readonly/hidden/system/archive、
       create/access/modify/change time の read/write
   - `QUERY_INFO` / `SET_INFO` の information class を拡張。
+  - 2026-06-30: `SMBDirectoryEntry` / `SMBFileStat` に raw SMB file attributes (`UInt32`) を追加し、
+    `QUERY_DIRECTORY` / `QUERY_INFO(FileNetworkOpenInformation)` decode 結果として返すようにした。
+    残: create/access/change time と `SET_INFO` による属性・時刻更新。
 - [ ] symlink / reparse point / DFS referral の扱い
   - follow するか entry metadata として返すか、recursive delete/copy の安全策を先に決める。
   - 2026-06-30 実装レビュー追記: 現状の directory entry は `isDirectory` しか返さず、reparse point /
     symlink / DFS referral を判別できない。recursive delete/copy/download は cycle 検出なしで
     directory 扱いする可能性があるため、FileAttributes / FileId / reparse tag を metadata として
     返す設計を先に入れる。
+  - 2026-06-30: FileAttributes は `SMBDirectoryEntry.attributes` で返せるようになった。残:
+    FileId / reparse tag の取得と recursive operation での traversal policy。
 - [ ] ACL / owner / SID metadata
   - `QUERY_SECURITY` / `SET_SECURITY`。MVP では扱わないが、管理系 smbclient としては必要。
 - [ ] locking / durable handle / lease / oplock の扱い

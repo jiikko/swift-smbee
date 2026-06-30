@@ -239,7 +239,12 @@ enum SMB2QueryInfo {
         let lastWriteTime = readUInt64LE(data, at: 24)
         let endOfFile = readUInt64LE(data, at: 40)
         let attributes = readUInt32LE(data, at: 52)
-        return SMBFileStat(size: endOfFile, modifiedTime: filetimeToDate(lastWriteTime), isDirectory: (attributes & 0x10) != 0)
+        return SMBFileStat(
+            size: endOfFile,
+            modifiedTime: filetimeToDate(lastWriteTime),
+            isDirectory: (attributes & 0x10) != 0,
+            attributes: attributes
+        )
     }
 }
 
@@ -430,7 +435,12 @@ enum SMB2QueryDirectory {
             guard nameOffset + nameLength <= data.count else { throw SMBCodecError.truncated }
             let name = decodeUTF16LE(Array(data[nameOffset..<nameOffset + nameLength]))
             if name != "." && name != ".." {
-                entries.append(SMBDirectoryEntry(name: name, fileSize: endOfFile, isDirectory: (attributes & 0x10) != 0))
+                entries.append(SMBDirectoryEntry(
+                    name: name,
+                    fileSize: endOfFile,
+                    isDirectory: (attributes & 0x10) != 0,
+                    attributes: attributes
+                ))
             }
             if next == 0 { break }
             guard next >= 104, entryOffset + next <= data.count else { throw SMBCodecError.truncated }

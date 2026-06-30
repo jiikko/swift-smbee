@@ -2,7 +2,9 @@ import Foundation
 
 enum SMB2Commands {
     static let sessionSetup: UInt16 = 1
+    static let logoff: UInt16 = 2
     static let treeConnect: UInt16 = 3
+    static let treeDisconnect: UInt16 = 4
     static let create: UInt16 = 5
     static let close: UInt16 = 6
     static let flush: UInt16 = 7
@@ -11,6 +13,28 @@ enum SMB2Commands {
     static let setInfo: UInt16 = 17
     static let queryInfo: UInt16 = 16
     static let queryDirectory: UInt16 = 14
+}
+
+enum SMB2Logoff {
+    static func encodeRequest(messageId: UInt64, sessionId: UInt64) throws -> [UInt8] {
+        let header = try SMB2Header(command: SMB2Commands.logoff, messageId: messageId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(4)
+        writer.writeUInt16LE(0)
+        return writer.bytes
+    }
+}
+
+enum SMB2TreeDisconnect {
+    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32) throws -> [UInt8] {
+        let header = try SMB2Header(command: SMB2Commands.treeDisconnect, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(4)
+        writer.writeUInt16LE(0)
+        return writer.bytes
+    }
 }
 
 enum SMB2SessionSetup {

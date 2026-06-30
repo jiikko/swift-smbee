@@ -1289,6 +1289,36 @@ final class SMBeeTests: XCTestCase {
         XCTAssertTrue(requests.allSatisfy { (try? SMB2Header.decode($0).treeId) == 0x3344 })
     }
 
+    func testClientSessionCloseSendsTreeDisconnectAndLogoff() async throws {
+        let inbound = try framed([
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 0, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 1, treeId: 0),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        await clientSession.close()
+        await clientSession.close()
+
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 2)
+        let treeDisconnect = try SMB2Header.decode(requests[0])
+        XCTAssertEqual(treeDisconnect.command, SMB2Commands.treeDisconnect)
+        XCTAssertEqual(treeDisconnect.treeId, 0x3344)
+        XCTAssertEqual(readUInt16LE(requests[0], at: 64), 4)
+        let logoff = try SMB2Header.decode(requests[1])
+        XCTAssertEqual(logoff.command, SMB2Commands.logoff)
+        XCTAssertEqual(logoff.treeId, 0)
+        XCTAssertEqual(readUInt16LE(requests[1], at: 64), 4)
+    }
+
     func testQueryDirectoryResponseDropsDotEntriesForRecursiveDeleteWalks() throws {
         var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: 11).encode()
         let payload = makeDirectoryEntry(name: ".", isDirectory: true, nextOffset: 112)

@@ -140,7 +140,7 @@ public actor SMBClientSession {
     public func close() async {
         guard !isClosed else { return }
         isClosed = true
-        await session.closeTransport()
+        await session.disconnect(treeId: treeId)
     }
 
     public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
@@ -1284,6 +1284,28 @@ actor SMBSession {
         let packet = try SMB2Close.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("CLOSE request", packet)
         _ = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response", verifySignature: false)
+    }
+
+    func treeDisconnect(treeId: UInt32) async throws {
+        let packet = try SMB2TreeDisconnect.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId)
+        debugDump("TREE_DISCONNECT request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "TREE_DISCONNECT response")
+        let header = try SMB2Header.decode(response)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_DISCONNECT")
+    }
+
+    func logoff() async throws {
+        let packet = try SMB2Logoff.encodeRequest(messageId: nextMessageId(), sessionId: sessionId)
+        debugDump("LOGOFF request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "LOGOFF response")
+        let header = try SMB2Header.decode(response)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "LOGOFF")
+    }
+
+    func disconnect(treeId: UInt32) async {
+        try? await treeDisconnect(treeId: treeId)
+        try? await logoff()
+        closeTransport()
     }
 
     func closeTransport() {

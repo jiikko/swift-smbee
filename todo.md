@@ -252,6 +252,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [ ] session lifecycle: TREE_DISCONNECT / LOGOFF
   - 2026-06-30 実装レビュー追加: close は TCP close のみで、TREE_DISCONNECT / LOGOFF を送らない。
     persistent session API の `close()` で graceful teardown するか、best-effort に留めるかを決める。
+  - 2026-06-30: `SMBClientSession.close()` は best-effort で TREE_DISCONNECT → LOGOFF を送ってから
+    transport close するよう修正し、二重 close で再送しない unit test を追加。残: ワンショット API の
+    teardown 方針を決める。
 - [ ] timeout / progress / cancellation API の整備
   - read/write loop は cancellation 済み。公開 API と CLI に progress callback / transfer rate / timeout を足す。
   - 2026-06-30 実装レビュー追記: POSIX transport は blocking `connect` / `recv` / `send` を

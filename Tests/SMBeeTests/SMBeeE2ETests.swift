@@ -94,6 +94,7 @@ final class SMBeeE2ETests: XCTestCase {
         let nestedChild = "\(nested)\\child"
         let nestedFile = "\(nestedChild)\\delete-me.txt"
         let uploadedDirectory = "\(directory)\\uploaded-dir"
+        let copiedDirectory = "\(directory)\\copied-dir"
         let payload = Array("hello write path \(suffix)\n".utf8)
 
         try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: directory)
@@ -200,6 +201,23 @@ final class SMBeeE2ETests: XCTestCase {
             try Data(contentsOf: localDownloadDirectory.appendingPathComponent("child/file.txt")),
             Data(payload)
         )
+        try await SMBee.copyDirectory(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            fromPath: uploadedDirectory,
+            toPath: copiedDirectory
+        )
+        let copiedDirectoryPayload = try await SMBee.read(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: "\(copiedDirectory)\\child\\file.txt"
+        )
+        XCTAssertEqual(copiedDirectoryPayload, payload)
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: copiedDirectory, directory: true, recursive: true)
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: uploadedDirectory, directory: true, recursive: true)
 
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: large)

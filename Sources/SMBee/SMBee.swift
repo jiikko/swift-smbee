@@ -217,6 +217,26 @@ public enum SMBee {
         )
     }
 
+    public static func copyDirectory(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool = false
+    ) async throws {
+        try await SMBClient.copyDirectory(
+            host: host,
+            port: port,
+            share: share,
+            fromPath: fromPath,
+            toPath: toPath,
+            overwrite: overwrite,
+            credential: credential
+        )
+    }
+
     public static func rename(
         host: String,
         port: UInt16 = 445,

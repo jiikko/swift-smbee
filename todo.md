@@ -172,7 +172,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: recursive local directory upload (`SMBee.uploadDirectory`, `smbcli put -r`) と
     remote directory download (`SMBee.downloadDirectory`, `smbcli get -r`) を追加。既存 operation の組み合わせで
     実装し、Samba E2E に directory round-trip assertion 追加。
-  - 残: server-side copy (`FSCTL_SRV_COPYCHUNK`) の対応可否実測、remote directory → remote directory copy。
+  - 2026-06-30: remote directory → remote directory copy (`SMBee.copyDirectory`, `SMBClientSession.copyDirectory`,
+    `smbcli cp -r`) を追加。既存 READ/WRITE + QUERY_DIRECTORY の client-side recursive copy で実装し、
+    unit と Samba E2E smoke に assertion 追加。
+  - 残: server-side copy (`FSCTL_SRV_COPYCHUNK`) の対応可否実測。
 - [x] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 2026-06-30: `SMBee.withDirectoryStream` / `SMBClient.withDirectoryStream` を追加。`SMBSession`
     は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で

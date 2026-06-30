@@ -268,7 +268,7 @@ struct Move: AsyncParsableCommand {
 }
 
 struct Copy: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "cp", abstract: "Copy an SMB file within one share")
+    static let configuration = CommandConfiguration(commandName: "cp", abstract: "Copy an SMB path within one share")
 
     @Argument(help: "smb://user@host[:445]/share/source")
     var source: String
@@ -279,6 +279,9 @@ struct Copy: AsyncParsableCommand {
     @Flag(help: "Replace destination if it exists")
     var replace = false
 
+    @Flag(name: .shortAndLong, help: "Recursively copy a directory")
+    var recursive = false
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -287,6 +290,18 @@ struct Copy: AsyncParsableCommand {
         let to = try SMBURLParser.parseReadURL(destination)
         guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
             throw ValidationError("cp source and destination must use the same user, host, port, and share")
+        }
+        if recursive {
+            try await SMBee.copyDirectory(
+                host: from.host,
+                port: from.port,
+                credential: credential,
+                share: from.share,
+                fromPath: from.path,
+                toPath: to.path,
+                overwrite: replace
+            )
+            return
         }
         try await SMBee.copy(
             host: from.host,

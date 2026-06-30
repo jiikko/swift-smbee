@@ -251,6 +251,11 @@ public actor SMBClientSession {
         try await session.copyFile(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
     }
 
+    public func copyDirectory(fromPath: String, toPath: String, overwrite: Bool = false) async throws {
+        try ensureOpen()
+        try await session.copyDirectory(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
+    }
+
     public func rename(fromPath: String, toPath: String, replaceIfExists: Bool = false) async throws {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, request: .rename(path: fromPath))
@@ -780,6 +785,21 @@ public enum SMBClient {
         }
     }
 
+    public static func copyDirectory(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool = false,
+        credential: SMBCredential,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
+            try await session.copyDirectory(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
+        }
+    }
+
     public static func rename(
         host: String,
         port: UInt16 = 445,
@@ -1166,6 +1186,37 @@ actor SMBSession {
         } catch {
             try? await close(treeId: treeId, fileId: sourceFileId)
             throw error
+        }
+    }
+
+    func copyDirectory(treeId: UInt32, fromPath: String, toPath: String, overwrite: Bool) async throws {
+        try Task.checkCancellation()
+        let sourceFileId = try await create(treeId: treeId, path: fromPath, directory: true)
+        let entries: [SMBDirectoryEntry]
+        do {
+            entries = try await queryDirectory(treeId: treeId, fileId: sourceFileId)
+            try? await close(treeId: treeId, fileId: sourceFileId)
+        } catch {
+            try? await close(treeId: treeId, fileId: sourceFileId)
+            throw error
+        }
+
+        do {
+            let destinationFileId = try await create(treeId: treeId, request: .makeDirectory(path: toPath))
+            try await close(treeId: treeId, fileId: destinationFileId)
+        } catch SMBError.nameCollision where overwrite {
+            // Existing destination directories are reused only when overwrite is explicit.
+        }
+
+        for entry in entries {
+            try Task.checkCancellation()
+            let sourceChild = joinSMBPath(fromPath, entry.name)
+            let destinationChild = joinSMBPath(toPath, entry.name)
+            if entry.isDirectory {
+                try await copyDirectory(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+            } else {
+                try await copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+            }
         }
     }
 

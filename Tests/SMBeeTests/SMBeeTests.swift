@@ -1544,6 +1544,87 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testSessionCopyDirectoryRecursivelyCopiesEntries() async throws {
+        let sourceRootId = hexBytes("00000000000000000000000000000001")
+        let destinationRootId = hexBytes("00000000000000000000000000000002")
+        let sourceFileId = hexBytes("00000000000000000000000000000003")
+        let destinationFileId = hexBytes("00000000000000000000000000000004")
+        let sourceChildDirectoryId = hexBytes("00000000000000000000000000000005")
+        let destinationChildDirectoryId = hexBytes("00000000000000000000000000000006")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceRootId, messageId: 0, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(name: "a.txt", isDirectory: false, fileSize: 4, nextOffset: 0),
+                ],
+                messageId: 1,
+                treeId: 0x3344
+            ),
+            try smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(name: "child", isDirectory: true, nextOffset: 0),
+                ],
+                messageId: 2,
+                treeId: 0x3344
+            ),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344),
+            try smb2CreateResponse(fileId: destinationRootId, messageId: 5, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            try smb2CreateResponse(fileId: sourceFileId, messageId: 7, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 4, messageId: 8, treeId: 0x3344),
+            try smb2CreateResponse(fileId: destinationFileId, messageId: 9, treeId: 0x3344),
+            try smb2ReadResponse(Array("data".utf8), messageId: 10, treeId: 0x3344),
+            try smb2WriteResponse(count: 4, messageId: 11, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 12, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 13, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 14, treeId: 0x3344),
+            try smb2CreateResponse(fileId: sourceChildDirectoryId, messageId: 15, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 16, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 17, treeId: 0x3344),
+            try smb2CreateResponse(fileId: destinationChildDirectoryId, messageId: 18, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 19, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        try await session.copyDirectory(treeId: 0x3344, fromPath: "src", toPath: "dst", overwrite: false)
+
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.close,
+            SMB2Commands.create,
+            SMB2Commands.close,
+            SMB2Commands.create,
+            SMB2Commands.queryInfo,
+            SMB2Commands.create,
+            SMB2Commands.read,
+            SMB2Commands.write,
+            SMB2Commands.flush,
+            SMB2Commands.close,
+            SMB2Commands.close,
+            SMB2Commands.create,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.close,
+            SMB2Commands.create,
+            SMB2Commands.close,
+        ])
+        XCTAssertEqual(readUInt32LE(requests[5], at: 100), 0x0000_0002)
+        XCTAssertEqual(readUInt32LE(requests[9], at: 100), 0x0000_0002)
+        XCTAssertEqual(Array(requests[11][112..<requests[11].count]), Array("data".utf8))
+        XCTAssertEqual(readUInt32LE(requests[18], at: 100), 0x0000_0002)
+    }
+
     func testWriteRequestUsesOffsetLengthFileIdAndDataBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let payload = Array("hello".utf8)

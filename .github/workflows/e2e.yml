@@ -113,6 +113,8 @@ jobs:
           "${SMBCLI}" ls "${SMB_URL}/${root}/uploaded-dir/child"
           "${SMBCLI}" get -r "${SMB_URL}/${root}/uploaded-dir" "${local_dir}/downloaded-dir"
           cmp "${local_dir}/dir/child/nested.txt" "${local_dir}/downloaded-dir/child/nested.txt"
+          "${SMBCLI}" cp -r "${SMB_URL}/${root}/uploaded-dir" "${SMB_URL}/${root}/copied-dir"
+          "${SMBCLI}" cat "${SMB_URL}/${root}/copied-dir/child/nested.txt" | cmp "${local_dir}/dir/child/nested.txt" -
           "${SMBCLI}" rm -r "${SMB_URL}/${root}"
 
       - name: Samba logs (debug)

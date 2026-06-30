@@ -479,7 +479,7 @@ extension Error {
 /// 応答取り違えは起きないが、SMB2 本来の multi-credit / multi-flight 並行化はまだ行わない。
 ///
 /// 真の multi-flight が必要になったら MS-SMB2 の messageId/credit ベース応答多重分離へ置き換える
-/// (背景と対応案は issues/002-design-smbsession-concurrent-multiflight.md)。
+/// (背景と対応案は issues/done/002-design-smbsession-concurrent-multiflight.md)。
 actor SMBSession {
     private let host: String
     private let port: UInt16

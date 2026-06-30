@@ -174,7 +174,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [ ] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 大規模ディレクトリ・GUI lazy loading・obaket listing 向け。
 - [ ] persistent session API: 複数 operation で TCP/session/tree を再利用する公開 handle
-  - 現状は operation ごとに connect/auth/treeConnect。実装時は `issues/002-design-smbsession-concurrent-multiflight.md`
+  - 現状は operation ごとに connect/auth/treeConnect。実装時は `issues/done/002-design-smbsession-concurrent-multiflight.md`
     の serializer or messageId demux を先に片付ける。
 - [ ] authentication options: NT hash 入力 / password provider callback / keychain 連携 / guest or anonymous の扱い
   - secret を log に出さない方針は維持。CLI は `SMB_PASSWORD` 以外の安全な入力方法を追加する。

@@ -235,6 +235,11 @@ final class SMBeeE2ETests: XCTestCase {
         var entries = try await SMBee.list(host: host, port: port, credential: credential, share: share)
         XCTAssertTrue(entries.contains { $0.name == directory && $0.isDirectory })
 
+        // S0c: directory 自身を stat できる (createForMetadata が directory:false→true に
+        // 自動 retry する。実 Samba は directory を directory:false の CREATE で拒否する)。
+        let directoryStat = try await SMBee.stat(host: host, port: port, credential: credential, share: share, path: directory)
+        XCTAssertTrue(directoryStat.isDirectory)
+
         try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: original, data: payload)
         let data = try await SMBee.read(host: host, port: port, credential: credential, share: share, path: original)
         XCTAssertEqual(data, payload)

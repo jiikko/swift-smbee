@@ -246,6 +246,14 @@ struct Stat: AsyncParsableCommand {
         print("size: \(stat.size)")
         print("type: \(stat.isDirectory ? "directory" : "file")")
         print("attributes: 0x\(String(format: "%08x", stat.attributes))")
+        if stat.isReparsePoint {
+            if let reparseTag = stat.reparseTag {
+                print("reparseTag: 0x\(String(format: "%08x", reparseTag))")
+            }
+            if let reparseKind = stat.reparseKind {
+                print("reparseKind: \(reparseKind.description)")
+            }
+        }
         if let creationTime = stat.creationTime {
             print("ctime: \(formatDate(creationTime))")
         }

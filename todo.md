@@ -314,6 +314,14 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `isReparsePoint` helper を追加。recursive copy/delete/download は reparse point を directory として
     辿らない安全側 policy にした。残: reparse tag 本体の取得 (`FileAttributeTagInformation` など) と
     DFS referral の扱い。
+  - 2026-07-01 (codex-drive): **reparse tag 取得を実装**。QUERY_INFO FileAttributeTagInformation
+    (FILE class 35) の decoder を追加し、stat が **reparse bit のある時だけ**追加 query して
+    `SMBFileStat.reparseTag: UInt32?` を埋める (通常ファイルは追加往復なし)。`SMBReparseKind`
+    (symlink 0xA000000C / mountPoint 0xA0000003 / dfs 0x8000000A / nfs / other) + `reparseKind`
+    computed。`smbcli stat` に reparseTag/reparseKind (human + --json)。fixture unit で decode/kind
+    マッピングを検証。Linux 149 / macOS 152 unit green。
+    残: **DFS referral の扱い** (FSCTL_DFS_GET_REFERRALS。別 protocol・大タスク)。symlink target 解決
+    (FSCTL_GET_REPARSE_POINT) も未実装。
 - [x] filesystem / volume information
   - `smbcli df` / API として share の total/free/available capacity、filesystem name、volume label、
     filesystem attributes / max component length を取得する。`QUERY_INFO(FileFsSizeInformation /

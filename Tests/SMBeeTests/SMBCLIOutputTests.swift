@@ -71,6 +71,35 @@ final class SMBCLIOutputTests: XCTestCase {
         XCTAssertEqual(object["changeTime"] as? String, "2024-01-01T00:00:00.125Z")
     }
 
+    func testStatJSONIncludesReparseTagWhenPresent() throws {
+        let stat = SMBFileStat(
+            size: 0,
+            modifiedTime: nil,
+            isDirectory: false,
+            attributes: SMBFileAttributes.reparsePoint,
+            reparseTag: SMBReparseTags.symlink
+        )
+
+        let object = try jsonObject(SMBCLIOutput.jsonData(for: stat))
+
+        XCTAssertEqual(object["reparseTag"] as? String, "0xa000000c")
+        XCTAssertEqual(object["reparseKind"] as? String, "symlink")
+    }
+
+    func testStatJSONOmitsReparseFieldsWhenAbsent() throws {
+        let stat = SMBFileStat(
+            size: 0,
+            modifiedTime: nil,
+            isDirectory: false,
+            attributes: SMBFileAttributes.normal
+        )
+
+        let object = try jsonObject(SMBCLIOutput.jsonData(for: stat))
+
+        XCTAssertNil(object["reparseTag"])
+        XCTAssertNil(object["reparseKind"])
+    }
+
     func testSharesJSONShape() throws {
         let shares = [
             SMBShareInfo(name: "public", type: 0x0000_0000, comment: "Public files"),

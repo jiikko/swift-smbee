@@ -257,6 +257,7 @@ enum SMB2QueryInfo {
     static let infoTypeFilesystem: UInt8 = 0x02
     static let infoTypeSecurity: UInt8 = 0x03
     static let fileNetworkOpenInformation: UInt8 = 34
+    static let fileAttributeTagInformation: UInt8 = 35
     static let fileFsVolumeInformation: UInt8 = 1
     static let fileFsAttributeInformation: UInt8 = 5
     static let fileFsFullSizeInformation: UInt8 = 7
@@ -313,6 +314,15 @@ enum SMB2QueryInfo {
             creationTime: filetimeToDate(creationTime),
             lastAccessTime: filetimeToDate(lastAccessTime),
             changeTime: filetimeToDate(changeTime)
+        )
+    }
+
+    static func decodeAttributeTagInformation(_ bytes: [UInt8]) throws -> (attributes: UInt32, reparseTag: UInt32) {
+        let data = try decodeOutputBuffer(bytes)
+        guard data.count >= 8 else { throw SMBCodecError.truncated }
+        return (
+            attributes: readUInt32LE(data, at: 0),
+            reparseTag: readUInt32LE(data, at: 4)
         )
     }
 

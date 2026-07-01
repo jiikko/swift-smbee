@@ -29,9 +29,14 @@ public struct SMBFileStat: Equatable, Sendable {
     public var changeTime: Date?
     public var isDirectory: Bool
     public var attributes: UInt32
+    public var reparseTag: UInt32?
 
     public var isReparsePoint: Bool {
         (attributes & SMBFileAttributes.reparsePoint) != 0
+    }
+
+    public var reparseKind: SMBReparseKind? {
+        reparseTag.map(SMBReparseKind.init(tag:))
     }
 
     public init(
@@ -41,7 +46,8 @@ public struct SMBFileStat: Equatable, Sendable {
         attributes: UInt32 = 0,
         creationTime: Date? = nil,
         lastAccessTime: Date? = nil,
-        changeTime: Date? = nil
+        changeTime: Date? = nil,
+        reparseTag: UInt32? = nil
     ) {
         self.size = size
         self.creationTime = creationTime
@@ -50,6 +56,47 @@ public struct SMBFileStat: Equatable, Sendable {
         self.changeTime = changeTime
         self.isDirectory = isDirectory
         self.attributes = attributes
+        self.reparseTag = reparseTag
+    }
+}
+
+public enum SMBReparseKind: Equatable, Sendable {
+    case symlink
+    case mountPoint
+    case dfs
+    case nfs
+    case other(UInt32)
+
+    public init(tag: UInt32) {
+        switch tag {
+        case SMBReparseTags.symlink:
+            self = .symlink
+        case SMBReparseTags.mountPoint:
+            self = .mountPoint
+        case SMBReparseTags.dfs:
+            self = .dfs
+        case SMBReparseTags.nfs:
+            self = .nfs
+        default:
+            self = .other(tag)
+        }
+    }
+}
+
+extension SMBReparseKind: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .symlink:
+            "symlink"
+        case .mountPoint:
+            "mountPoint"
+        case .dfs:
+            "dfs"
+        case .nfs:
+            "nfs"
+        case .other(let tag):
+            "other(0x" + String(format: "%08x", tag) + ")"
+        }
     }
 }
 
@@ -118,6 +165,14 @@ public enum SMBFileAttributes {
     public static let archive: UInt32 = 0x0000_0020
     public static let reparsePoint: UInt32 = 0x0000_0400
     public static let normal: UInt32 = 0x0000_0080
+}
+
+public enum SMBReparseTags {
+    public static let symlink: UInt32 = 0xa000_000c
+    public static let mountPoint: UInt32 = 0xa000_0003
+    public static let dfs: UInt32 = 0x8000_000a
+    // ⓥ NFS tag value is included for classification only; resolving NFS reparse data is out of scope.
+    public static let nfs: UInt32 = 0x8000_0027
 }
 
 public struct SMBFileMetadataUpdate: Equatable, Sendable {
@@ -2007,7 +2062,27 @@ actor SMBSession {
         let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_INFO response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_INFO")
-        return try SMB2QueryInfo.decodeNetworkOpenInformation(response)
+        var stat = try SMB2QueryInfo.decodeNetworkOpenInformation(response)
+        guard stat.isReparsePoint else { return stat }
+        let tagInfo = try await queryAttributeTagInfo(treeId: treeId, fileId: fileId)
+        stat.reparseTag = tagInfo.reparseTag
+        return stat
+    }
+
+    private func queryAttributeTagInfo(treeId: UInt32, fileId: [UInt8]) async throws -> (attributes: UInt32, reparseTag: UInt32) {
+        let packet = try SMB2QueryInfo.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            fileInfoClass: SMB2QueryInfo.fileAttributeTagInformation,
+            outputBufferLength: 8
+        )
+        debugDump("QUERY_INFO attribute tag request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_INFO attribute tag response")
+        let header = try SMB2Header.decode(response)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_INFO")
+        return try SMB2QueryInfo.decodeAttributeTagInformation(response)
     }
 
     func querySecurityInfo(treeId: UInt32, fileId: [UInt8]) async throws -> SMBSecurityInfo {

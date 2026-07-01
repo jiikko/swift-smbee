@@ -2369,6 +2369,23 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[88..<104]), fileId)
     }
 
+    func testQueryInfoRequestCanUseFileAttributeTagInformation() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2QueryInfo.encodeRequest(
+            messageId: 12,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            fileInfoClass: SMB2QueryInfo.fileAttributeTagInformation,
+            outputBufferLength: 8
+        )
+
+        XCTAssertEqual(request[66], SMB2QueryInfo.infoTypeFile)
+        XCTAssertEqual(request[67], 35)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 8)
+        XCTAssertEqual(Array(request[88..<104]), fileId)
+    }
+
     func testQueryInfoResponsePreservesFileAttributes() throws {
         let response = try smb2QueryInfoResponse(size: 7, messageId: 12, treeId: 0x3344, attributes: 0x82)
 
@@ -2398,6 +2415,35 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(stat.modifiedTime?.timeIntervalSince1970, 3)
         XCTAssertEqual(stat.changeTime?.timeIntervalSince1970, 4)
         XCTAssertTrue(stat.isReparsePoint)
+    }
+
+    func testFileAttributeTagInformationDecodesReparseTagFixture() throws {
+        var payload = Array(repeating: UInt8(0), count: 8)
+        writeUInt32LE(SMBFileAttributes.reparsePoint, to: &payload, at: 0)
+        writeUInt32LE(SMBReparseTags.symlink, to: &payload, at: 4)
+
+        let info = try SMB2QueryInfo.decodeAttributeTagInformation(smb2QueryInfoResponse(payload: payload))
+
+        XCTAssertEqual(info.attributes, SMBFileAttributes.reparsePoint)
+        XCTAssertEqual(info.reparseTag, 0xa000_000c)
+        XCTAssertEqual(SMBReparseKind(tag: info.reparseTag), .symlink)
+    }
+
+    func testFileAttributeTagInformationRejectsTruncatedPayload() throws {
+        let payload = Array(repeating: UInt8(0), count: 7)
+
+        XCTAssertThrowsError(try SMB2QueryInfo.decodeAttributeTagInformation(smb2QueryInfoResponse(payload: payload))) { error in
+            XCTAssertEqual(error as? SMBCodecError, .truncated)
+        }
+    }
+
+    func testReparseKindMapsKnownAndUnknownTags() {
+        XCTAssertEqual(SMBReparseKind(tag: SMBReparseTags.symlink), .symlink)
+        XCTAssertEqual(SMBReparseKind(tag: SMBReparseTags.mountPoint), .mountPoint)
+        XCTAssertEqual(SMBReparseKind(tag: SMBReparseTags.dfs), .dfs)
+        XCTAssertEqual(SMBReparseKind(tag: SMBReparseTags.nfs), .nfs)
+        XCTAssertEqual(SMBReparseKind(tag: 0x1234_5678), .other(0x1234_5678))
+        XCTAssertNil(SMBFileStat(size: 0, modifiedTime: nil, isDirectory: false).reparseKind)
     }
 
     func testFileFsFullSizeInformationDecodesByteCountsFromFixture() throws {

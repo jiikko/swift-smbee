@@ -140,6 +140,8 @@ private struct FileStatJSON: Encodable {
     var size: UInt64
     var isDirectory: Bool
     var attributes: String
+    var reparseTag: String?
+    var reparseKind: String?
     var creationTime: String?
     var lastAccessTime: String?
     var modifiedTime: String?
@@ -149,6 +151,8 @@ private struct FileStatJSON: Encodable {
         size = stat.size
         isDirectory = stat.isDirectory
         attributes = SMBCLIOutput.hex(stat.attributes, width: 8)
+        reparseTag = stat.reparseTag.map { SMBCLIOutput.hex($0, width: 8) }
+        reparseKind = stat.reparseKind?.description
         creationTime = SMBCLIOutput.dateString(stat.creationTime)
         lastAccessTime = SMBCLIOutput.dateString(stat.lastAccessTime)
         modifiedTime = SMBCLIOutput.dateString(stat.modifiedTime)

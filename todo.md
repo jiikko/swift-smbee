@@ -36,12 +36,11 @@
   (SMBTransportError.connectionClosed/.socketFailure) 時に idempotent 操作 (probe/ls/stat/cat) のみ
   新 transport で最大 1 回再接続+やり直し。mutation は再試行せず SMBError.connectionLost。
   非接続喪失エラー・CancellationError は即 rethrow。
-- 🟡 E (2026-07-01 更新): 3.1.1 経路。**GMAC signing-only は実 Samba E2E green で完了**
+- ✅ E (2026-07-01 更新): 3.1.1 経路。**GMAC signing-only / GCM encrypted session とも実 Samba E2E green**
   (smb311-signing-required。KDF label null + preauth transcript の 2 バグを修正。commit e3468c9)。
-  **残: GCM encrypted session** — smb311-encrypted-required E2E は key 修正後も authenticated
-  encrypted op でサーバが connection を切る (`connectionLost`/`connectionClosed`)。key は
-  正しくなったので次は GCM TRANSFORM_HEADER の nonce/AAD/tag レイアウトを wire trace で
-  検証する段。Apple container + `smb311-encrypted-required` profile で再現可能。
+  GCM encrypted session は TRANSFORM_HEADER Flags に cipher id (GCM=0x0002) を入れていたのが原因。
+  Flags は `SMB2_TRANSFORM_FLAG_ENCRYPTED = 0x0001` 固定で、cipher は negotiate 済み session state から
+  選ぶよう修正。Apple container + `smb311-encrypted-required` profile で API E2E / smbcli smoke green。
 - ✅ 公開 read streaming API (2026-06-30): `SMBee.withReadStream(... onChunk:)` (scoped callback)。
   SMBSession.readChunks primitive に集約し既存 `[UInt8]` 一括 read は互換維持。chunk yield 後は透過 retry
   せず connectionLost に昇格。`smbcli cat` も streaming 化 (大ファイルを全量 lift しない)。実機 macOS で

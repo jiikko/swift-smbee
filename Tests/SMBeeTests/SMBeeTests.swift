@@ -854,7 +854,7 @@ final class SMBeeTests: XCTestCase {
             signature: Array(repeating: 0, count: 16),
             nonce: nonce11 + Array(repeating: 0, count: 5),
             originalMessageSize: UInt32(plaintext.count),
-            flags: SMB3TransformHeader.aes128CCM,
+            flags: SMB3TransformHeader.encryptedFlag,
             sessionId: 0x0102_0304_0506_0708
         )
         let sealed = try AESCCM.seal(
@@ -893,7 +893,7 @@ final class SMBeeTests: XCTestCase {
             signature: Array(repeating: 0, count: 16),
             nonce: nonce12 + Array(repeating: 0, count: 4),
             originalMessageSize: UInt32(plaintext.count),
-            flags: SMB3TransformHeader.aes128GCM,
+            flags: SMB3TransformHeader.encryptedFlag,
             sessionId: 0x0102_0304_0506_0708
         )
         let sealed = try SMBCrypto.aesGCMSeal(
@@ -911,7 +911,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(header.nonce.prefix(12)), nonce12)
         XCTAssertEqual(Array(header.nonce.dropFirst(12)), Array(repeating: 0, count: 4))
         XCTAssertEqual(hex(sealed.ciphertext), "be9e094aa4ce9f28c84a63e967be3521f7d7e06e17fc8b098a59ce")
-        XCTAssertEqual(hex(header.signature), "43a216b82c24b2f2740b885b2af8d013")
+        XCTAssertEqual(hex(header.signature), "312e6806dd9818cfb5ec7d6faf6e49ac")
         XCTAssertEqual(
             try SMBCrypto.aesGCMOpen(
                 key: key,

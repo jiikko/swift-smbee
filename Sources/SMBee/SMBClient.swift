@@ -1757,12 +1757,11 @@ actor SMBSession {
         let nonceLength = encryptionAlgorithm == .aes128GCM ? 12 : 11
         let nonce = nextTransformNonce(length: nonceLength)
         let nonce16 = nonce + Array(repeating: UInt8(0), count: 16 - nonceLength)
-        let flags: UInt16 = encryptionAlgorithm == .aes128GCM ? SMB3TransformHeader.aes128GCM : SMB3TransformHeader.aes128CCM
         var header = SMB3TransformHeader(
             signature: Array(repeating: 0, count: 16),
             nonce: nonce16,
             originalMessageSize: UInt32(packet.count),
-            flags: flags,
+            flags: SMB3TransformHeader.encryptedFlag,
             sessionId: sessionId
         )
         let sealed: (ciphertext: [UInt8], tag: [UInt8])
@@ -1835,14 +1834,8 @@ actor SMBSession {
     private func decryptTransform(_ packet: [UInt8]) throws -> [UInt8] {
         guard let decryptionKey else { throw SMBCodecError.invalidValue("missing SMB decryption key") }
         let header = try SMB3TransformHeader.decode(packet)
-        let algorithm: SMBSessionEncryptionAlgorithm
-        switch header.flags {
-        case SMB3TransformHeader.aes128CCM:
-            algorithm = .aes128CCM
-        case SMB3TransformHeader.aes128GCM:
-            algorithm = .aes128GCM
-        default:
-            throw SMBCodecError.invalidValue("unsupported SMB3 encryption algorithm")
+        guard header.flags == SMB3TransformHeader.encryptedFlag else {
+            throw SMBCodecError.invalidValue("unsupported SMB3 transform flags")
         }
         guard header.sessionId == sessionId else { throw SMBCodecError.invalidValue("SMB3 transform session id mismatch") }
         let ciphertext = Array(packet.dropFirst(SMB3TransformHeader.encodedSize))
@@ -1850,7 +1843,7 @@ actor SMBSession {
             throw SMBCodecError.invalidValue("SMB3 transform original message size mismatch")
         }
         let plaintext: [UInt8]
-        switch algorithm {
+        switch encryptionAlgorithm {
         case .aes128CCM:
             plaintext = try AESCCM.open(
                 key: decryptionKey,

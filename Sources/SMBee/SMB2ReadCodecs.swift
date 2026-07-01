@@ -385,6 +385,8 @@ enum SMB2Write {
 
 enum SMB2Ioctl {
     static let fsctlPipeTransceive: UInt32 = 0x0011_c017
+    static let fsctlSrvRequestResumeKey: UInt32 = 0x0014_0078
+    static let fsctlSrvCopychunkWrite: UInt32 = 0x0014_40f4
 
     private static let fixedPartSize = 56
     private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
@@ -430,7 +432,15 @@ enum SMB2Ioctl {
             try SMBErrorMapper.throwIfFailure(status: header.status, operation: "IOCTL")
         }
         var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
-        guard try reader.readUInt16LE() == 49 else {
+        let structureSize = try reader.readUInt16LE()
+        // An SMB2 ERROR response (StructureSize 9) carries no IOCTL output buffer. Servers
+        // return it for non-success statuses the caller explicitly allows — e.g.
+        // STATUS_INVALID_DEVICE_REQUEST when server-side copychunk is unsupported, which the
+        // copy path uses to fall back to client-side READ/WRITE. Surface status, empty output.
+        if structureSize == 9 && header.status != SMB2Status.success {
+            return SMB2IoctlResponse(status: header.status, output: [])
+        }
+        guard structureSize == 49 else {
             throw SMBCodecError.invalidValue("invalid IOCTL response structure size")
         }
         try reader.skip(count: 2)
@@ -449,6 +459,68 @@ enum SMB2Ioctl {
 struct SMB2IoctlResponse {
     var status: UInt32
     var output: [UInt8]
+}
+
+enum SMB2CopyChunk {
+    static let resumeKeySize = 24
+    // SRV_REQUEST_RESUME_KEY_RSP = ResumeKey(24) + ContextLength(4) + Context(variable).
+    // Requesting only the 24-byte key makes the server reject the IOCTL with
+    // STATUS_BUFFER_TOO_SMALL, so size the output buffer for the full structure.
+    static let resumeKeyResponseMaxSize: UInt32 = 1024
+    static let defaultMaxChunks: UInt32 = 256
+    static let defaultMaxChunkSize: UInt32 = 1_048_576
+    static let defaultMaxTotalSize: UInt32 = 16_777_216
+
+    static func decodeResumeKeyResponse(_ output: [UInt8]) throws -> [UInt8] {
+        guard output.count >= resumeKeySize else { throw SMBCodecError.truncated }
+        return Array(output[..<resumeKeySize])
+    }
+
+    static func encodeCopyChunkRequest(resumeKey: [UInt8], chunks: [SMB2CopyChunkRange]) throws -> [UInt8] {
+        guard resumeKey.count == resumeKeySize else {
+            throw SMBCodecError.invalidValue("SMB copychunk resume key must be 24 bytes")
+        }
+        guard !chunks.isEmpty else {
+            throw SMBCodecError.invalidValue("SMB copychunk request must contain at least one chunk")
+        }
+        guard chunks.count <= Int(UInt32.max) else {
+            throw SMBCodecError.invalidValue("SMB copychunk chunk count overflow")
+        }
+
+        var writer = SMBByteWriter()
+        writer.writeBytes(resumeKey)
+        writer.writeUInt32LE(UInt32(chunks.count))
+        writer.writeUInt32LE(0)
+        for chunk in chunks {
+            writer.writeUInt64LE(chunk.sourceOffset)
+            writer.writeUInt64LE(chunk.targetOffset)
+            writer.writeUInt32LE(chunk.length)
+            writer.writeUInt32LE(0)
+        }
+        return writer.bytes
+    }
+
+    static func decodeCopyChunkResponse(_ output: [UInt8]) throws -> SMB2CopyChunkResponse {
+        guard output.count >= 12 else { throw SMBCodecError.truncated }
+        var reader = SMBByteReader(bytes: output)
+        return SMB2CopyChunkResponse(
+            chunksWritten: try reader.readUInt32LE(),
+            chunkBytesWritten: try reader.readUInt32LE(),
+            totalBytesWritten: try reader.readUInt32LE()
+        )
+    }
+}
+
+struct SMB2CopyChunkRange: Equatable {
+    var sourceOffset: UInt64
+    var targetOffset: UInt64
+    var length: UInt32
+}
+
+struct SMB2CopyChunkResponse: Equatable {
+    var chunksWritten: UInt32
+    var chunkBytesWritten: UInt32
+    var totalBytesWritten: UInt32
 }
 
 enum SMB2SetInfo {

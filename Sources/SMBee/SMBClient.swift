@@ -1335,23 +1335,12 @@ actor SMBSession {
             let stat = try await queryInfo(treeId: treeId, fileId: sourceFileId)
             let destinationFileId = try await create(treeId: treeId, request: .upload(path: toPath, overwrite: overwrite))
             do {
-                var offset: UInt64 = 0
-                var remaining = stat.size
-                while remaining > 0 {
-                    try Task.checkCancellation()
-                    let chunk = try await readChunk(treeId: treeId, fileId: sourceFileId, offset: offset, length: remaining)
-                    if chunk.isEmpty { break }
-                    let advanced = try SMBChunkedTransfer.advancedReadPosition(
-                        cursor: offset,
-                        remaining: remaining,
-                        receivedCount: chunk.count
-                    )
-                    try await writeChunk(treeId: treeId, fileId: destinationFileId, offset: offset, data: chunk)
-                    offset = advanced.cursor
-                    remaining = advanced.remaining
-                }
-                guard remaining == 0 else {
-                    throw SMBCodecError.invalidValue("short SMB copy: \(remaining) bytes remaining")
+                if stat.size > 0 {
+                    do {
+                        try await copyFileServerSide(treeId: treeId, sourceFileId: sourceFileId, destinationFileId: destinationFileId, size: stat.size)
+                    } catch is SMBServerSideCopyFallback {
+                        try await copyFileClientSide(treeId: treeId, sourceFileId: sourceFileId, destinationFileId: destinationFileId, size: stat.size)
+                    }
                 }
                 try await flush(treeId: treeId, fileId: destinationFileId)
                 try? await close(treeId: treeId, fileId: destinationFileId)
@@ -1364,6 +1353,134 @@ actor SMBSession {
             try? await close(treeId: treeId, fileId: sourceFileId)
             throw error
         }
+    }
+
+    private func copyFileClientSide(treeId: UInt32, sourceFileId: [UInt8], destinationFileId: [UInt8], size: UInt64) async throws {
+        var offset: UInt64 = 0
+        var remaining = size
+        while remaining > 0 {
+            try Task.checkCancellation()
+            let chunk = try await readChunk(treeId: treeId, fileId: sourceFileId, offset: offset, length: remaining)
+            if chunk.isEmpty { break }
+            let advanced = try SMBChunkedTransfer.advancedReadPosition(
+                cursor: offset,
+                remaining: remaining,
+                receivedCount: chunk.count
+            )
+            try await writeChunk(treeId: treeId, fileId: destinationFileId, offset: offset, data: chunk)
+            offset = advanced.cursor
+            remaining = advanced.remaining
+        }
+        guard remaining == 0 else {
+            throw SMBCodecError.invalidValue("short SMB copy: \(remaining) bytes remaining")
+        }
+    }
+
+    private func copyFileServerSide(treeId: UInt32, sourceFileId: [UInt8], destinationFileId: [UInt8], size: UInt64) async throws {
+        let resumeKey = try await requestResumeKey(treeId: treeId, sourceFileId: sourceFileId)
+        var limits = SMB2CopyChunkLimits()
+        var offset: UInt64 = 0
+        while offset < size {
+            try Task.checkCancellation()
+            let chunks = try makeCopyChunks(offset: offset, remaining: size - offset, limits: limits)
+            do {
+                let written = try await writeCopyChunks(treeId: treeId, destinationFileId: destinationFileId, resumeKey: resumeKey, chunks: chunks)
+                guard written > 0 else {
+                    throw SMBCodecError.invalidValue("SMB copychunk made no progress")
+                }
+                let next = offset.addingReportingOverflow(written)
+                guard !next.overflow else {
+                    throw SMBCodecError.invalidValue("SMB copychunk offset overflow")
+                }
+                offset = next.partialValue
+            } catch let limitError as SMBCopyChunkLimitError {
+                limits = limitError.limits
+            }
+        }
+
+        let destinationStat = try await queryInfo(treeId: treeId, fileId: destinationFileId)
+        guard destinationStat.size == size else {
+            throw SMBCodecError.invalidValue("server-side SMB copy size mismatch: expected \(size), got \(destinationStat.size)")
+        }
+    }
+
+    private func requestResumeKey(treeId: UInt32, sourceFileId: [UInt8]) async throws -> [UInt8] {
+        let response = try await ioctl(
+            treeId: treeId,
+            fileId: sourceFileId,
+            ctlCode: SMB2Ioctl.fsctlSrvRequestResumeKey,
+            input: [],
+            maxOutputResponse: SMB2CopyChunk.resumeKeyResponseMaxSize,
+            allowedStatuses: SMBServerSideCopyFallback.allowedStatuses
+        )
+        guard response.status == SMB2Status.success else { throw SMBServerSideCopyFallback() }
+        return try SMB2CopyChunk.decodeResumeKeyResponse(response.output)
+    }
+
+    private func writeCopyChunks(
+        treeId: UInt32,
+        destinationFileId: [UInt8],
+        resumeKey: [UInt8],
+        chunks: [SMB2CopyChunkRange]
+    ) async throws -> UInt64 {
+        let input = try SMB2CopyChunk.encodeCopyChunkRequest(resumeKey: resumeKey, chunks: chunks)
+        // Destination upload handles request FILE_WRITE_DATA without FILE_READ_DATA, so use COPYCHUNK_WRITE.
+        let response = try await ioctl(
+            treeId: treeId,
+            fileId: destinationFileId,
+            ctlCode: SMB2Ioctl.fsctlSrvCopychunkWrite,
+            input: input,
+            maxOutputResponse: 12,
+            allowedStatuses: SMBServerSideCopyFallback.allowedStatuses.union([SMB2Status.invalidParameter])
+        )
+        if response.status == SMB2Status.invalidParameter {
+            throw SMBCopyChunkLimitError(limits: try SMB2CopyChunkLimits.decode(response.output))
+        }
+        guard response.status == SMB2Status.success else { throw SMBServerSideCopyFallback() }
+        return UInt64(try SMB2CopyChunk.decodeCopyChunkResponse(response.output).totalBytesWritten)
+    }
+
+    private func ioctl(
+        treeId: UInt32,
+        fileId: [UInt8],
+        ctlCode: UInt32,
+        input: [UInt8],
+        maxOutputResponse: UInt32,
+        allowedStatuses: Set<UInt32>
+    ) async throws -> SMB2IoctlResponse {
+        let packet = try SMB2Ioctl.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            ctlCode: ctlCode,
+            input: input,
+            maxOutputResponse: maxOutputResponse
+        )
+        debugDump("IOCTL request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "IOCTL response")
+        return try SMB2Ioctl.decodeResponseWithStatus(response, allowedStatuses: allowedStatuses.union([SMB2Status.success]))
+    }
+
+    private func makeCopyChunks(offset: UInt64, remaining: UInt64, limits: SMB2CopyChunkLimits) throws -> [SMB2CopyChunkRange] {
+        let maxChunks = max(1, limits.maxChunks)
+        let maxChunkSize = max(1, limits.maxChunkSize)
+        let maxTotalSize = max(1, limits.maxTotalSize)
+        var chunks: [SMB2CopyChunkRange] = []
+        var chunkOffset = offset
+        var requestRemaining = min(remaining, UInt64(maxTotalSize))
+        while requestRemaining > 0 && chunks.count < Int(maxChunks) {
+            let length64 = min(requestRemaining, UInt64(maxChunkSize), UInt64(UInt32.max))
+            guard length64 > 0 else { break }
+            let length = UInt32(length64)
+            chunks.append(SMB2CopyChunkRange(sourceOffset: chunkOffset, targetOffset: chunkOffset, length: length))
+            chunkOffset += UInt64(length)
+            requestRemaining -= UInt64(length)
+        }
+        guard !chunks.isEmpty else {
+            throw SMBCodecError.invalidValue("SMB copychunk limits produced no chunks")
+        }
+        return chunks
     }
 
     func copyDirectory(treeId: UInt32, fromPath: String, toPath: String, overwrite: Bool) async throws {
@@ -1792,6 +1909,8 @@ enum SMB2Status {
     static let pending: UInt32 = 0x0000_0103
     static let bufferOverflow: UInt32 = 0x8000_0005
     static let noMoreFiles: UInt32 = 0x8000_0006
+    static let invalidParameter: UInt32 = 0xc000_000d
+    static let invalidDeviceRequest: UInt32 = 0xc000_0010
     static let endOfFile: UInt32 = 0xc000_0011
     static let moreProcessingRequired: UInt32 = 0xc000_0016
     static let accessDenied: UInt32 = 0xc000_0022
@@ -1803,9 +1922,36 @@ enum SMB2Status {
     static let logonFailure: UInt32 = 0xc000_006d
     static let diskFull: UInt32 = 0xc000_007f
     static let fileIsADirectory: UInt32 = 0xc000_00ba
+    static let notSupported: UInt32 = 0xc000_00bb
     static let networkNameDeleted: UInt32 = 0xc000_00c9
     static let directoryNotEmpty: UInt32 = 0xc000_0101
     static let notADirectory: UInt32 = 0xc000_0103
+}
+
+private struct SMBServerSideCopyFallback: Error {
+    static let allowedStatuses: Set<UInt32> = [
+        SMB2Status.notSupported,
+        SMB2Status.invalidDeviceRequest,
+    ]
+}
+
+private struct SMBCopyChunkLimitError: Error {
+    var limits: SMB2CopyChunkLimits
+}
+
+private struct SMB2CopyChunkLimits {
+    var maxChunks: UInt32 = SMB2CopyChunk.defaultMaxChunks
+    var maxChunkSize: UInt32 = SMB2CopyChunk.defaultMaxChunkSize
+    var maxTotalSize: UInt32 = SMB2CopyChunk.defaultMaxTotalSize
+
+    static func decode(_ output: [UInt8]) throws -> SMB2CopyChunkLimits {
+        let response = try SMB2CopyChunk.decodeCopyChunkResponse(output)
+        return SMB2CopyChunkLimits(
+            maxChunks: response.chunksWritten,
+            maxChunkSize: response.chunkBytesWritten,
+            maxTotalSize: response.totalBytesWritten
+        )
+    }
 }
 
 enum SMB2Flags {

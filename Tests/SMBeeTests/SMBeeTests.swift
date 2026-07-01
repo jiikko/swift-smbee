@@ -3,6 +3,10 @@ import Foundation
 import XCTest
 @testable import SMBee
 
+#if canImport(Network)
+import Network
+#endif
+
 private struct SMBTestTimeoutError: Error, CustomStringConvertible {
     let label: String
     let seconds: Double
@@ -262,6 +266,129 @@ private final class LockedCounter: @unchecked Sendable {
     }
 }
 
+#if canImport(Network)
+private final class LoopbackNWServer: @unchecked Sendable {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "dev.smbee.tests.nwserver")
+    private let state = LoopbackNWServerState()
+    private let echo: Bool
+
+    var port: UInt16 {
+        guard let port = listener.port?.rawValue else {
+            fatalError("listener port is only available after the listener is ready")
+        }
+        return port
+    }
+
+    init(echo: Bool) throws {
+        self.echo = echo
+        listener = try NWListener(using: .tcp, on: .any)
+    }
+
+    func start() async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            let resumer = TestContinuationResumer<Void>()
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    resumer.resume(continuation, with: .success(()))
+                case .failed(let error):
+                    resumer.resume(continuation, with: .failure(error))
+                case .cancelled:
+                    resumer.resume(continuation, with: .failure(CancellationError()))
+                default:
+                    break
+                }
+            }
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.accept(connection)
+            }
+            listener.start(queue: queue)
+        }
+    }
+
+    func waitForConnection() async -> NWConnection {
+        await state.waitForConnection()
+    }
+
+    func stop() {
+        listener.cancel()
+        Task { await state.cancelConnections() }
+    }
+
+    private func accept(_ connection: NWConnection) {
+        Task { await state.accept(connection) }
+        connection.start(queue: queue)
+        if echo {
+            receiveAndEcho(connection)
+        }
+    }
+
+    private func receiveAndEcho(_ connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
+            guard let self, error == nil, !isComplete else { return }
+            if let data, !data.isEmpty {
+                connection.send(content: data, completion: .contentProcessed { _ in
+                    self.receiveAndEcho(connection)
+                })
+            } else {
+                self.receiveAndEcho(connection)
+            }
+        }
+    }
+}
+
+private actor LoopbackNWServerState {
+    private var connections: [NWConnection] = []
+    private var pendingConnectionWaiter: CheckedContinuation<NWConnection, Never>?
+
+    func accept(_ connection: NWConnection) {
+        connections.append(connection)
+        let waiter = pendingConnectionWaiter
+        pendingConnectionWaiter = nil
+        waiter?.resume(returning: connection)
+    }
+
+    func waitForConnection() async -> NWConnection {
+        if let connection = connections.first {
+            return connection
+        }
+        return await withCheckedContinuation { continuation in
+            pendingConnectionWaiter = continuation
+        }
+    }
+
+    func cancelConnections() {
+        let currentConnections = connections
+        connections.removeAll()
+        pendingConnectionWaiter = nil
+        currentConnections.forEach { $0.cancel() }
+    }
+}
+
+private final class TestContinuationResumer<Success: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didResume = false
+
+    func resume(_ continuation: CheckedContinuation<Success, Error>, with result: Result<Success, Error>) {
+        lock.lock()
+        if didResume {
+            lock.unlock()
+            return
+        }
+        didResume = true
+        lock.unlock()
+
+        switch result {
+        case .success(let value):
+            continuation.resume(returning: value)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
+    }
+}
+#endif
+
 final class SMBeeTests: XCTestCase {
     func testVersionIsNotEmpty() {
         XCTAssertFalse(SMBee.version.isEmpty)
@@ -393,6 +520,78 @@ final class SMBeeTests: XCTestCase {
             XCTFail("expected CancellationError, got \(error)")
         }
     }
+
+#if canImport(Network)
+    func testNWConnectionTransportConnectSendReceiveOverLoopback() async throws {
+        let server = try LoopbackNWServer(echo: true)
+        try await awaitWithTimeout("start loopback NWListener") {
+            try await server.start()
+        }
+        defer { server.stop() }
+
+        let transport = NWConnectionTransport()
+        try await awaitWithTimeout("connect NWConnectionTransport") {
+            try await transport.connect(host: "127.0.0.1", port: server.port)
+        }
+        defer { transport.close() }
+
+        let payload: [UInt8] = [0x01, 0x02, 0x03, 0x04]
+        try await awaitWithTimeout("send loopback payload") {
+            try await transport.send(payload)
+        }
+        let received = try await awaitWithTimeout("receive loopback payload") {
+            try await transport.receive(maxLength: payload.count)
+        }
+
+        XCTAssertEqual(received, payload)
+    }
+
+    func testNWConnectionTransportConnectCancellationDoesNotCrash() async throws {
+        let transport = NWConnectionTransport()
+        let task = Task {
+            try await transport.connect(host: "192.0.2.1", port: 445)
+        }
+        task.cancel()
+
+        do {
+            try await awaitWithTimeout("cancel NWConnectionTransport connect") {
+                try await task.value
+            }
+            XCTFail("expected CancellationError")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+    }
+
+    func testNWConnectionTransportReceiveCloseDoesNotCrash() async throws {
+        let server = try LoopbackNWServer(echo: false)
+        try await awaitWithTimeout("start loopback NWListener") {
+            try await server.start()
+        }
+        defer { server.stop() }
+
+        let transport = NWConnectionTransport()
+        try await awaitWithTimeout("connect NWConnectionTransport") {
+            try await transport.connect(host: "127.0.0.1", port: server.port)
+        }
+        _ = await server.waitForConnection()
+
+        let task = Task {
+            try await transport.receive(maxLength: 1)
+        }
+        transport.close()
+
+        do {
+            _ = try await awaitWithTimeout("receive after close") {
+                try await task.value
+            }
+            XCTFail("expected receive to end after close")
+        } catch {
+            XCTAssertTrue(error is CancellationError || error is SMBTransportError || error is NWError)
+        }
+    }
+#endif
 
     func testProbeRetriesConnectionLossOnceAndSucceedsWithNewTransport() async throws {
         let first = FailingReceiveTransport(failure: SMBTransportError.connectionClosed)

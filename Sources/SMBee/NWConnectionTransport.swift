@@ -15,14 +15,21 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
         self.connection = connection
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
+                let resumer = NWContinuationResumer<Void>()
                 connection.stateUpdateHandler = { state in
                     switch state {
                     case .ready:
-                        continuation.resume()
+                        if resumer.resume(continuation, with: .success(())) {
+                            connection.stateUpdateHandler = nil
+                        }
                     case .failed(let error):
-                        continuation.resume(throwing: error)
+                        if resumer.resume(continuation, with: .failure(error)) {
+                            connection.stateUpdateHandler = nil
+                        }
                     case .cancelled:
-                        continuation.resume(throwing: CancellationError())
+                        if resumer.resume(continuation, with: .failure(CancellationError())) {
+                            connection.stateUpdateHandler = nil
+                        }
                     default:
                         break
                     }
@@ -40,11 +47,12 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
         guard let connection else { throw SMBTransportError.connectionClosed }
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                let resumer = NWContinuationResumer<Void>()
                 connection.send(content: Data(bytes), completion: .contentProcessed { error in
                     if let error {
-                        continuation.resume(throwing: error)
+                        resumer.resume(continuation, with: .failure(error))
                     } else {
-                        continuation.resume()
+                        resumer.resume(continuation, with: .success(()))
                     }
                 })
             }
@@ -59,15 +67,16 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
         guard let connection else { throw SMBTransportError.connectionClosed }
         let bytes: [UInt8] = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
+                let resumer = NWContinuationResumer<[UInt8]>()
                 connection.receive(minimumIncompleteLength: 1, maximumLength: maxLength) { data, _, isComplete, error in
                     if let error {
-                        continuation.resume(throwing: error)
+                        resumer.resume(continuation, with: .failure(error))
                     } else if let data, !data.isEmpty {
-                        continuation.resume(returning: Array(data))
+                        resumer.resume(continuation, with: .success(Array(data)))
                     } else if isComplete {
-                        continuation.resume(throwing: SMBTransportError.connectionClosed)
+                        resumer.resume(continuation, with: .failure(SMBTransportError.connectionClosed))
                     } else {
-                        continuation.resume(returning: [])
+                        resumer.resume(continuation, with: .success([]))
                     }
                 }
             }
@@ -81,6 +90,30 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
     public func close() {
         connection?.cancel()
         connection = nil
+    }
+}
+
+private final class NWContinuationResumer<Success: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didResume = false
+
+    @discardableResult
+    func resume(_ continuation: CheckedContinuation<Success, Error>, with result: Result<Success, Error>) -> Bool {
+        lock.lock()
+        if didResume {
+            lock.unlock()
+            return false
+        }
+        didResume = true
+        lock.unlock()
+
+        switch result {
+        case .success(let value):
+            continuation.resume(returning: value)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
+        return true
     }
 }
 #endif

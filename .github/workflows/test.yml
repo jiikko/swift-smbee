@@ -54,4 +54,9 @@ jobs:
       - name: Build on Linux
         run: swift build
       - name: Unit tests on Linux
-        run: swift test
+        timeout-minutes: 10
+        # Samba-backed tests run in the E2E workflows. Match macOS here so the
+        # generic Linux job stays on deterministic unit/vector coverage; Swift
+        # 6.0 Linux can stall after compiling when skipped async E2E XCTest
+        # cases are still part of the selected test plan.
+        run: swift test --skip SMBeeE2ETests

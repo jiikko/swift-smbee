@@ -135,6 +135,29 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func securityInfo(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        timeout: Duration? = nil
+    ) async throws -> SMBSecurityInfo {
+        try await SMBClient.securityInfo(host: host, port: port, share: share, path: path, credential: credential, timeout: timeout)
+    }
+
+    public static func securityInfo(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        timeout: Duration? = nil
+    ) async throws -> SMBSecurityInfo {
+        try await SMBClient.securityInfo(host: host, port: port, share: share, path: path, credentialProvider: credentialProvider, timeout: timeout)
+    }
+
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func volumeInfo(
         host: String,
         port: UInt16 = 445,

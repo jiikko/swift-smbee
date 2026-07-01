@@ -13,7 +13,7 @@ struct SMBCLI: AsyncParsableCommand {
         abstract: "🐝 SMBee command-line client",
         version: SMBee.version,
         subcommands: [
-            Probe.self, Shares.self, List.self, Stat.self, DiskFree.self, Cat.self, Get.self,
+            Probe.self, Shares.self, List.self, Stat.self, ACL.self, DiskFree.self, Cat.self, Get.self,
             MakeDirectory.self, Put.self, Copy.self, Move.self, Remove.self
         ]
     )
@@ -298,6 +298,53 @@ struct DiskFree: AsyncParsableCommand {
         print("available: \(formatByteCount(info.availableBytes)) (\(info.availableBytes))")
         print("label: \(info.volumeLabel)")
         print("filesystem: \(info.filesystemName)")
+    }
+}
+
+struct ACL: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "acl", abstract: "Show SMB owner, group, and DACL information")
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var url: String
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    @Flag(help: "Print JSON output")
+    var json = false
+
+    func run() async throws {
+        debug.apply()
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        let info = try await SMBee.securityInfo(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            timeout: transport.duration
+        )
+        if json {
+            print(try SMBCLIOutput.jsonString(for: info))
+            return
+        }
+        print("owner: \(info.ownerSID ?? "none")")
+        print("group: \(info.groupSID ?? "none")")
+        print("control: 0x\(String(format: "%04x", info.controlFlags))")
+        guard let dacl = info.dacl else {
+            print("dacl: null")
+            return
+        }
+        print("dacl:")
+        for ace in dacl {
+            print("  type=\(ace.type) flags=0x\(String(format: "%02x", ace.flags)) mask=0x\(String(format: "%08x", ace.accessMask)) sid=\(ace.trusteeSID ?? "none")")
+        }
     }
 }
 

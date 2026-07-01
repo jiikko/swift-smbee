@@ -82,6 +82,34 @@ public struct SMBVolumeInfo: Equatable, Sendable {
     }
 }
 
+public struct SMBSecurityInfo: Equatable, Sendable {
+    public let ownerSID: String?
+    public let groupSID: String?
+    public let dacl: [SMBAccessControlEntry]?
+    public let controlFlags: UInt16
+
+    public init(ownerSID: String?, groupSID: String?, dacl: [SMBAccessControlEntry]?, controlFlags: UInt16) {
+        self.ownerSID = ownerSID
+        self.groupSID = groupSID
+        self.dacl = dacl
+        self.controlFlags = controlFlags
+    }
+}
+
+public struct SMBAccessControlEntry: Equatable, Sendable {
+    public let type: UInt8
+    public let flags: UInt8
+    public let accessMask: UInt32
+    public let trusteeSID: String?
+
+    public init(type: UInt8, flags: UInt8, accessMask: UInt32, trusteeSID: String?) {
+        self.type = type
+        self.flags = flags
+        self.accessMask = accessMask
+        self.trusteeSID = trusteeSID
+    }
+}
+
 public enum SMBFileAttributes {
     public static let readOnly: UInt32 = 0x0000_0001
     public static let hidden: UInt32 = 0x0000_0002
@@ -330,6 +358,19 @@ public actor SMBClientSession {
             let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
             try? await session.close(treeId: treeId, fileId: fileId)
             return stat
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func securityInfo(path: String) async throws -> SMBSecurityInfo {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .querySecurity(path: path))
+        do {
+            let info = try await session.querySecurityInfo(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return info
         } catch {
             try? await session.close(treeId: treeId, fileId: fileId)
             throw error
@@ -738,6 +779,29 @@ public enum SMBClient {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func securityInfo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws -> SMBSecurityInfo {
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "QUERY_SECURITY") { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .querySecurity(path: path))
+            do {
+                let info = try await session.querySecurityInfo(treeId: treeId, fileId: fileId)
+                try? await session.close(treeId: treeId, fileId: fileId)
+                return info
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
+        }
+    }
+
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func volumeInfo(
         host: String,
         port: UInt16 = 445,
@@ -789,6 +853,26 @@ public enum SMBClient {
             share: share,
             path: path,
             credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
+    public static func securityInfo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        credentialProvider: SMBCredentialProvider,
+        timeout: Duration? = nil,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> SMBSecurityInfo {
+        try await securityInfo(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: try await credentialProvider(),
+            timeout: timeout,
             makeTransport: makeTransport
         )
     }
@@ -1924,6 +2008,24 @@ actor SMBSession {
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_INFO")
         return try SMB2QueryInfo.decodeNetworkOpenInformation(response)
+    }
+
+    func querySecurityInfo(treeId: UInt32, fileId: [UInt8]) async throws -> SMBSecurityInfo {
+        let packet = try SMB2QueryInfo.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            infoType: SMB2QueryInfo.infoTypeSecurity,
+            fileInfoClass: 0,
+            outputBufferLength: 65_536,
+            additionalInformation: SMB2QueryInfo.securityOwner | SMB2QueryInfo.securityGroup | SMB2QueryInfo.securityDACL
+        )
+        debugDump("QUERY_INFO security request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_INFO security response")
+        let header = try SMB2Header.decode(response)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_INFO")
+        return try SMB2QueryInfo.decodeSecurityInfo(response)
     }
 
     func volumeInfo(treeId: UInt32, fileId: [UInt8]) async throws -> SMBVolumeInfo {

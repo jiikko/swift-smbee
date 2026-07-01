@@ -41,6 +41,10 @@ public enum SMBCLIOutput {
         try encoder.encode(VolumeInfoJSON(volumeInfo))
     }
 
+    public static func jsonData(for securityInfo: SMBSecurityInfo) throws -> Data {
+        try encoder.encode(SecurityInfoJSON(securityInfo))
+    }
+
     public static func jsonData(for shares: [SMBShareInfo]) throws -> Data {
         try encoder.encode(shares.map(ShareInfoJSON.init))
     }
@@ -59,6 +63,10 @@ public enum SMBCLIOutput {
 
     public static func jsonString(for volumeInfo: SMBVolumeInfo) throws -> String {
         try string(from: jsonData(for: volumeInfo))
+    }
+
+    public static func jsonString(for securityInfo: SMBSecurityInfo) throws -> String {
+        try string(from: jsonData(for: securityInfo))
     }
 
     public static func jsonString(for shares: [SMBShareInfo]) throws -> String {
@@ -167,6 +175,34 @@ private struct VolumeInfoJSON: Encodable {
         maxComponentLength = info.maxComponentLength
         filesystemAttributes = SMBCLIOutput.hex(info.filesystemAttributes, width: 8)
         volumeSerialNumber = info.volumeSerialNumber
+    }
+}
+
+private struct SecurityInfoJSON: Encodable {
+    var ownerSID: String?
+    var groupSID: String?
+    var dacl: [AccessControlEntryJSON]?
+    var controlFlags: String
+
+    init(_ info: SMBSecurityInfo) {
+        ownerSID = info.ownerSID
+        groupSID = info.groupSID
+        dacl = info.dacl?.map(AccessControlEntryJSON.init)
+        controlFlags = SMBCLIOutput.hex(info.controlFlags, width: 4)
+    }
+}
+
+private struct AccessControlEntryJSON: Encodable {
+    var type: UInt8
+    var flags: String
+    var accessMask: String
+    var trusteeSID: String?
+
+    init(_ ace: SMBAccessControlEntry) {
+        type = ace.type
+        flags = SMBCLIOutput.hex(ace.flags, width: 2)
+        accessMask = SMBCLIOutput.hex(ace.accessMask, width: 8)
+        trusteeSID = ace.trusteeSID
     }
 }
 

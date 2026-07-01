@@ -92,6 +92,16 @@ final class SMBeeE2ETests: XCTestCase {
         XCTAssertEqual(stat.size, 21)
         XCTAssertFalse(stat.isDirectory)
 
+        let securityInfo = try await SMBee.securityInfo(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: "known.txt"
+        )
+        XCTAssertNotNil(securityInfo.ownerSID)
+        XCTAssertGreaterThan(securityInfo.dacl?.count ?? 0, 0)
+
         let volumeInfo = try await SMBee.volumeInfo(
             host: host,
             port: port,

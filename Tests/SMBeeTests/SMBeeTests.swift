@@ -2350,6 +2350,25 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(request[104], 0)
     }
 
+    func testQueryInfoRequestCanSetAdditionalInformation() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2QueryInfo.encodeRequest(
+            messageId: 12,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            infoType: SMB2QueryInfo.infoTypeSecurity,
+            fileInfoClass: 0,
+            additionalInformation: SMB2QueryInfo.securityOwner | SMB2QueryInfo.securityGroup | SMB2QueryInfo.securityDACL
+        )
+
+        XCTAssertEqual(request[66], 0x03)
+        XCTAssertEqual(request[67], 0)
+        XCTAssertEqual(readUInt32LE(request, at: 80), 0x0000_0007)
+        XCTAssertEqual(readUInt32LE(request, at: 84), 0)
+        XCTAssertEqual(Array(request[88..<104]), fileId)
+    }
+
     func testQueryInfoResponsePreservesFileAttributes() throws {
         let response = try smb2QueryInfoResponse(size: 7, messageId: 12, treeId: 0x3344, attributes: 0x82)
 
@@ -2424,6 +2443,71 @@ final class SMBeeTests: XCTestCase {
 
         XCTAssertEqual(info.volumeSerialNumber, 0x1234_abcd)
         XCTAssertEqual(info.volumeLabel, "DATA")
+    }
+
+    func testSecurityDescriptorDecodesOwnerGroupAndDACLFromFixture() throws {
+        var payload = Array(repeating: UInt8(0), count: 20)
+        let ownerSIDOffset = payload.count
+        payload.append(contentsOf: sidBytes(authority: 5, subAuthorities: [32, 544]))
+        let groupSIDOffset = payload.count
+        payload.append(contentsOf: sidBytes(authority: 5, subAuthorities: [32, 545]))
+        let daclOffset = payload.count
+        let everyoneSID = sidBytes(authority: 1, subAuthorities: [0])
+        let userSID = sidBytes(authority: 5, subAuthorities: [21, 1000, 1001, 1002])
+        var acl = Array(repeating: UInt8(0), count: 8)
+        acl[0] = 2
+        writeUInt16LE(UInt16(8 + 8 + everyoneSID.count + 8 + userSID.count), to: &acl, at: 2)
+        writeUInt16LE(2, to: &acl, at: 4)
+        acl.append(contentsOf: aceBytes(type: 0, flags: 0, accessMask: 0x001f_01ff, sid: everyoneSID))
+        acl.append(contentsOf: aceBytes(type: 1, flags: 0x10, accessMask: 0x0001_0000, sid: userSID))
+        payload.append(contentsOf: acl)
+
+        payload[0] = 1
+        writeUInt16LE(0x8004, to: &payload, at: 2)
+        writeUInt32LE(UInt32(ownerSIDOffset), to: &payload, at: 4)
+        writeUInt32LE(UInt32(groupSIDOffset), to: &payload, at: 8)
+        writeUInt32LE(UInt32(daclOffset), to: &payload, at: 16)
+
+        let info = try SMB2QueryInfo.decodeSecurityInfo(smb2QueryInfoResponse(payload: payload))
+
+        XCTAssertEqual(info.ownerSID, "S-1-5-32-544")
+        XCTAssertEqual(info.groupSID, "S-1-5-32-545")
+        XCTAssertEqual(info.controlFlags, 0x8004)
+        XCTAssertEqual(info.dacl?.count, 2)
+        XCTAssertEqual(info.dacl?[0], SMBAccessControlEntry(type: 0, flags: 0, accessMask: 0x001f_01ff, trusteeSID: "S-1-1-0"))
+        XCTAssertEqual(info.dacl?[1], SMBAccessControlEntry(type: 1, flags: 0x10, accessMask: 0x0001_0000, trusteeSID: "S-1-5-21-1000-1001-1002"))
+    }
+
+    func testSecurityDescriptorRejectsTruncatedSIDOffset() throws {
+        var payload = Array(repeating: UInt8(0), count: 20)
+        payload[0] = 1
+        writeUInt32LE(128, to: &payload, at: 4)
+
+        XCTAssertThrowsError(try SMB2QueryInfo.decodeSecurityInfo(smb2QueryInfoResponse(payload: payload))) { error in
+            XCTAssertEqual(error as? SMBCodecError, .truncated)
+        }
+    }
+
+    func testSecurityDescriptorSkipsUnknownAceBySize() throws {
+        var payload = Array(repeating: UInt8(0), count: 20)
+        let daclOffset = payload.count
+        var acl = Array(repeating: UInt8(0), count: 8)
+        acl[0] = 2
+        writeUInt16LE(16, to: &acl, at: 2)
+        writeUInt16LE(1, to: &acl, at: 4)
+        acl.append(0x05)
+        acl.append(0x11)
+        acl.append(8)
+        acl.append(0)
+        acl.append(contentsOf: Array(repeating: UInt8(0), count: 4))
+        writeUInt32LE(0x0002_0000, to: &acl, at: 12)
+        payload.append(contentsOf: acl)
+        payload[0] = 1
+        writeUInt32LE(UInt32(daclOffset), to: &payload, at: 16)
+
+        let info = try SMB2QueryInfo.decodeSecurityInfo(smb2QueryInfoResponse(payload: payload))
+
+        XCTAssertEqual(info.dacl, [SMBAccessControlEntry(type: 0x05, flags: 0x11, accessMask: 0x0002_0000, trusteeSID: nil)])
     }
 
     func testTreeConnectResponseDecodesSharePolicy() throws {
@@ -3821,6 +3905,33 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
         response.append(contentsOf: payload)
         return response
+    }
+
+    private func sidBytes(authority: UInt64, subAuthorities: [UInt32]) -> [UInt8] {
+        var bytes: [UInt8] = [1, UInt8(subAuthorities.count)]
+        for shift in stride(from: 40, through: 0, by: -8) {
+            bytes.append(UInt8((authority >> UInt64(shift)) & 0xff))
+        }
+        for subAuthority in subAuthorities {
+            bytes.append(UInt8(subAuthority & 0xff))
+            bytes.append(UInt8((subAuthority >> 8) & 0xff))
+            bytes.append(UInt8((subAuthority >> 16) & 0xff))
+            bytes.append(UInt8((subAuthority >> 24) & 0xff))
+        }
+        return bytes
+    }
+
+    private func aceBytes(type: UInt8, flags: UInt8, accessMask: UInt32, sid: [UInt8]) -> [UInt8] {
+        var bytes: [UInt8] = [type, flags]
+        let size = UInt16(8 + sid.count)
+        bytes.append(UInt8(size & 0xff))
+        bytes.append(UInt8((size >> 8) & 0xff))
+        bytes.append(UInt8(accessMask & 0xff))
+        bytes.append(UInt8((accessMask >> 8) & 0xff))
+        bytes.append(UInt8((accessMask >> 16) & 0xff))
+        bytes.append(UInt8((accessMask >> 24) & 0xff))
+        bytes.append(contentsOf: sid)
+        return bytes
     }
 
     private func smb2TreeConnectResponse(

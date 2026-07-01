@@ -233,6 +233,15 @@ struct SMB2CreateRequest {
         )
     }
 
+    static func querySecurity(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0002_0000,
+            createDisposition: 0x0000_0001,
+            createOptions: 0
+        )
+    }
+
     static func namedPipe(path: String) -> SMB2CreateRequest {
         SMB2CreateRequest(
             path: path,
@@ -246,10 +255,14 @@ struct SMB2CreateRequest {
 enum SMB2QueryInfo {
     static let infoTypeFile: UInt8 = 0x01
     static let infoTypeFilesystem: UInt8 = 0x02
+    static let infoTypeSecurity: UInt8 = 0x03
     static let fileNetworkOpenInformation: UInt8 = 34
     static let fileFsVolumeInformation: UInt8 = 1
     static let fileFsAttributeInformation: UInt8 = 5
     static let fileFsFullSizeInformation: UInt8 = 7
+    static let securityOwner: UInt32 = 0x0000_0001
+    static let securityGroup: UInt32 = 0x0000_0002
+    static let securityDACL: UInt32 = 0x0000_0004
 
     private static let fixedPartSize = 40
     private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
@@ -261,7 +274,8 @@ enum SMB2QueryInfo {
         fileId: [UInt8],
         infoType: UInt8 = infoTypeFile,
         fileInfoClass: UInt8 = fileNetworkOpenInformation,
-        outputBufferLength: UInt32 = 65_536
+        outputBufferLength: UInt32 = 65_536,
+        additionalInformation: UInt32 = 0
     ) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
         let header = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
@@ -274,7 +288,7 @@ enum SMB2QueryInfo {
         writer.writeUInt16LE(UInt16(bufferOffset))
         writer.writeUInt16LE(0)
         writer.writeUInt32LE(0)
-        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(additionalInformation)
         writer.writeUInt32LE(0)
         writer.writeBytes(fileId)
         // MS-SMB2 QUERY_INFO has a variable Buffer[] field; Samba accepts a one byte pad when InputBufferLength is 0.
@@ -342,6 +356,27 @@ enum SMB2QueryInfo {
         )
     }
 
+    static func decodeSecurityInfo(_ bytes: [UInt8]) throws -> SMBSecurityInfo {
+        try decodeSecurityDescriptor(decodeOutputBuffer(bytes))
+    }
+
+    static func decodeSecurityDescriptor(_ data: [UInt8]) throws -> SMBSecurityInfo {
+        guard data.count >= 20 else { throw SMBCodecError.truncated }
+        guard data[0] == 1 else {
+            throw SMBCodecError.invalidValue("unsupported SECURITY_DESCRIPTOR revision")
+        }
+        let control = readUInt16LE(data, at: 2)
+        let ownerOffset = Int(readUInt32LE(data, at: 4))
+        let groupOffset = Int(readUInt32LE(data, at: 8))
+        let daclOffset = Int(readUInt32LE(data, at: 16))
+        return SMBSecurityInfo(
+            ownerSID: ownerOffset == 0 ? nil : try decodeSID(data, at: ownerOffset, limit: data.count),
+            groupSID: groupOffset == 0 ? nil : try decodeSID(data, at: groupOffset, limit: data.count),
+            dacl: daclOffset == 0 ? nil : try decodeACL(data, at: daclOffset),
+            controlFlags: control
+        )
+    }
+
     private static func decodeOutputBuffer(_ bytes: [UInt8]) throws -> [UInt8] {
         var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
         guard try reader.readUInt16LE() == 9 else {
@@ -351,6 +386,56 @@ enum SMB2QueryInfo {
         let length = Int(try reader.readUInt32LE())
         guard offset + length <= bytes.count else { throw SMBCodecError.truncated }
         return Array(bytes[offset..<offset + length])
+    }
+
+    private static func decodeACL(_ data: [UInt8], at offset: Int) throws -> [SMBAccessControlEntry] {
+        guard offset >= 0, offset + 8 <= data.count else { throw SMBCodecError.truncated }
+        let aclSize = Int(readUInt16LE(data, at: offset + 2))
+        let aceCount = Int(readUInt16LE(data, at: offset + 4))
+        guard aclSize >= 8, offset + aclSize <= data.count else { throw SMBCodecError.truncated }
+        let aclEnd = offset + aclSize
+        var cursor = offset + 8
+        var entries: [SMBAccessControlEntry] = []
+        entries.reserveCapacity(aceCount)
+        for _ in 0..<aceCount {
+            guard cursor + 4 <= aclEnd else { throw SMBCodecError.truncated }
+            let type = data[cursor]
+            let flags = data[cursor + 1]
+            let aceSize = Int(readUInt16LE(data, at: cursor + 2))
+            guard aceSize >= 4, cursor + aceSize <= aclEnd else { throw SMBCodecError.truncated }
+            let aceEnd = cursor + aceSize
+            let accessMask = aceSize >= 8 ? readUInt32LE(data, at: cursor + 4) : 0
+            let trusteeSID: String?
+            if (type == 0 || type == 1), cursor + 8 < aceEnd {
+                trusteeSID = try decodeSID(data, at: cursor + 8, limit: aceEnd)
+            } else {
+                // ⓥ Object/callback ACE layouts can carry object GUID fields before a SID; keep
+                // the mask when present and skip by AceSize instead of guessing the trustee offset.
+                trusteeSID = nil
+            }
+            entries.append(SMBAccessControlEntry(type: type, flags: flags, accessMask: accessMask, trusteeSID: trusteeSID))
+            cursor = aceEnd
+        }
+        return entries
+    }
+
+    private static func decodeSID(_ data: [UInt8], at offset: Int, limit: Int) throws -> String {
+        guard offset >= 0, offset + 8 <= limit, limit <= data.count else { throw SMBCodecError.truncated }
+        guard data[offset] == 1 else {
+            throw SMBCodecError.invalidValue("unsupported SID revision")
+        }
+        let subAuthorityCount = Int(data[offset + 1])
+        let sidLength = 8 + subAuthorityCount * 4
+        guard offset + sidLength <= limit else { throw SMBCodecError.truncated }
+        var authority: UInt64 = 0
+        for byte in data[(offset + 2)..<(offset + 8)] {
+            authority = (authority << 8) | UInt64(byte)
+        }
+        var parts = ["S", "1", "\(authority)"]
+        for index in 0..<subAuthorityCount {
+            parts.append("\(readUInt32LE(data, at: offset + 8 + index * 4))")
+        }
+        return parts.joined(separator: "-")
     }
 
     private static func utf16LEString(_ bytes: [UInt8]) throws -> String {
@@ -788,6 +873,10 @@ private func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
         | (UInt32(bytes[offset + 1]) << 8)
         | (UInt32(bytes[offset + 2]) << 16)
         | (UInt32(bytes[offset + 3]) << 24)
+}
+
+private func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {
+    UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
 }
 
 private func readUInt64LE(_ bytes: [UInt8], at offset: Int) -> UInt64 {

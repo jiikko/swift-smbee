@@ -331,6 +331,16 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - CLI では `smbcli watch smb://...` 相当。MVP の copy/read/write には不要なので後回し。
 - [ ] ACL / owner / SID metadata
   - `QUERY_SECURITY` / `SET_SECURITY`。MVP では扱わないが、管理系 smbclient としては必要。
+  - 2026-07-01 (codex-drive): **READ (QUERY_SECURITY) を実装**。QUERY_INFO に
+    `additionalInformation: UInt32` を追加 (既存 stat/df wire は default 0 不変)。InfoType=0x03 で
+    AdditionalInformation=OWNER|GROUP|DACL(0x1|0x2|0x4) を送り、self-relative SECURITY_DESCRIPTOR /
+    SID (6-byte BE authority → "S-1-..") / ACL / ACE を境界検証付きで parse。公開型
+    `SMBSecurityInfo` (ownerSID?/groupSID?/dacl?/controlFlags) + `SMBAccessControlEntry`
+    (type/flags/accessMask/trusteeSID?)。READ_CONTROL 付き `.querySecurity(path:)` open。
+    `SMBClientSession.securityInfo` / `SMBee.securityInfo` + `smbcli acl` (--json)。未知/OBJECT ACE は
+    mask だけ保持し AceSize でスキップ。fixture unit + 実 Samba E2E (ownerSID != nil / DACL ACE>=1) green。
+  - **残 (defer)**: `SET_SECURITY` (書き込み) は自アクセスをロックアウトしうる破壊操作 + SD 構築が大きいため
+    未実装。SACL は特権要求のため対象外 (AdditionalInformation に SACL bit を立てていない)。
 - [ ] locking / durable handle / lease / oplock の扱い
   - concurrent clients や大ファイル操作の堅牢性向け。最初は明示的に unsupported としてエラーを設計する。
 - [ ] multi-share / multi-tree session reuse

@@ -17,6 +17,7 @@ public enum SMBError: Error, Equatable, Sendable {
     case connectionLost(operation: String)
     case transport(String)
     case protocolError(String)
+    case invalidRecursion(String)
 }
 
 enum SMBErrorMapper {

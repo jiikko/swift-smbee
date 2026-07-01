@@ -18,6 +18,8 @@ public struct SMBShareName: Equatable, Sendable {
 }
 
 public struct SMBPath: Equatable, Sendable {
+    static let maxRecursionDepth = 64
+
     public var rawValue: String
 
     public init(_ value: String) throws {
@@ -49,5 +51,26 @@ public struct SMBPath: Equatable, Sendable {
         guard !normalizedChild.isEmpty else { return normalizedParent }
         if normalizedParent.isEmpty { return normalizedChild }
         return "\(normalizedParent)\\\(normalizedChild)"
+    }
+
+    static func validateDirectoryCopyTarget(fromPath: String, toPath: String) throws {
+        let source = try normalize(fromPath)
+        let destination = try normalize(toPath)
+        guard !source.isEmpty else {
+            throw SMBError.invalidRecursion("destination is inside source directory")
+        }
+        let foldedSource = source.lowercased()
+        let foldedDestination = destination.lowercased()
+        // ⓥ SMB path matching is case-insensitive. Unicode normalization is intentionally not applied.
+        guard foldedDestination != foldedSource,
+              !foldedDestination.hasPrefix("\(foldedSource)\\") else {
+            throw SMBError.invalidRecursion("destination is inside source directory")
+        }
+    }
+
+    static func validateRecursionDepth(_ depth: Int) throws {
+        guard depth <= maxRecursionDepth else {
+            throw SMBError.invalidRecursion("recursion depth exceeded \(maxRecursionDepth)")
+        }
     }
 }

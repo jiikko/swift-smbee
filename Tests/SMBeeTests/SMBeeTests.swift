@@ -665,6 +665,32 @@ final class SMBeeTests: XCTestCase {
         XCTAssertThrowsError(try SMBPath.normalize("dir/../child"))
     }
 
+    func testSMBPathRejectsRecursiveDirectoryCopyTargets() throws {
+        XCTAssertThrowsError(try SMBPath.validateDirectoryCopyTarget(fromPath: "a", toPath: "a")) { error in
+            XCTAssertEqual(error as? SMBError, .invalidRecursion("destination is inside source directory"))
+        }
+        XCTAssertThrowsError(try SMBPath.validateDirectoryCopyTarget(fromPath: "\\a", toPath: "/a/sub")) { error in
+            XCTAssertEqual(error as? SMBError, .invalidRecursion("destination is inside source directory"))
+        }
+        XCTAssertThrowsError(try SMBPath.validateDirectoryCopyTarget(fromPath: "A/Mixed", toPath: "a/mixed/Child")) { error in
+            XCTAssertEqual(error as? SMBError, .invalidRecursion("destination is inside source directory"))
+        }
+    }
+
+    func testSMBPathAllowsNonRecursiveDirectoryCopyTargets() throws {
+        XCTAssertNoThrow(try SMBPath.validateDirectoryCopyTarget(fromPath: "a\\sub", toPath: "a"))
+        XCTAssertNoThrow(try SMBPath.validateDirectoryCopyTarget(fromPath: "a", toPath: "ab"))
+        XCTAssertNoThrow(try SMBPath.validateDirectoryCopyTarget(fromPath: "a", toPath: "b\\a"))
+    }
+
+    func testSMBPathRecursionDepthCap() throws {
+        XCTAssertNoThrow(try SMBPath.validateRecursionDepth(0))
+        XCTAssertNoThrow(try SMBPath.validateRecursionDepth(SMBPath.maxRecursionDepth))
+        XCTAssertThrowsError(try SMBPath.validateRecursionDepth(SMBPath.maxRecursionDepth + 1)) { error in
+            XCTAssertEqual(error as? SMBError, .invalidRecursion("recursion depth exceeded 64"))
+        }
+    }
+
     func testSMBShareNameRejectsPathSeparators() {
         XCTAssertThrowsError(try SMBShareName(""))
         XCTAssertThrowsError(try SMBShareName("a/b"))

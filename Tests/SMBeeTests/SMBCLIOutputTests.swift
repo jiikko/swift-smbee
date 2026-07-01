@@ -120,6 +120,7 @@ final class SMBCLIOutputTests: XCTestCase {
         XCTAssertEqual(SMBCLIExitCode.code(for: .networkNameDeleted(status: 0, operation: "TREE_CONNECT")), 5)
         XCTAssertEqual(SMBCLIExitCode.code(for: .unsupported(status: 0, operation: "NEGOTIATE")), 1)
         XCTAssertEqual(SMBCLIExitCode.code(for: .protocolError("bad packet")), 1)
+        XCTAssertEqual(SMBCLIExitCode.code(for: .invalidRecursion("destination is inside source directory")), 1)
     }
 
     private func jsonObject(_ data: Data) throws -> [String: Any] {

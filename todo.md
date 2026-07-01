@@ -240,6 +240,14 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - local download は temp file → move/replace で単一 file の atomicity を確保済み。directory download /
     upload / remote copy は directory 単位の atomicity は無いので、resume / verify / cleanup policy を
     別タスクとして設計する。
+  - 2026-07-01 (codex-drive): **自己再帰防止 + 最大 depth cap を実装**。
+    `SMBError.invalidRecursion(String)` を追加。`SMBPath.validateDirectoryCopyTarget`
+    (toPath が fromPath と同一/子孫なら reject、case-insensitive、`source\` 境界で /a vs /ab 誤検出なし) を
+    copyDirectory 入口で、`validateRecursionDepth`(`maxRecursionDepth=64`)を
+    copyDirectory/deleteRecursively/downloadDirectory/uploadDirectory の再帰に配線。exit code は 1 に分類。
+    Linux 138 / macOS 141 unit green。
+    **残 (設計判断ゆえ本タスクでは未着手)**: failure 中断時の partial tree の rollback/skip policy、
+    同名衝突の overwrite policy の option 化、directory 単位 atomicity、resume/verify/cleanup。
 - [x] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 2026-06-30: `SMBee.withDirectoryStream` / `SMBClient.withDirectoryStream` を追加。`SMBSession`
     は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で

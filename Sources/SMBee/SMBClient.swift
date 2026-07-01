@@ -434,6 +434,7 @@ public actor SMBClientSession {
 
     public func copyDirectory(fromPath: String, toPath: String, overwrite: Bool = false) async throws {
         try ensureOpen()
+        try SMBPath.validateDirectoryCopyTarget(fromPath: fromPath, toPath: toPath)
         try await session.copyDirectory(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
     }
 
@@ -1013,6 +1014,34 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
+        try await downloadDirectoryRecursive(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localDirectory: localDirectory,
+            overwrite: overwrite,
+            credential: credential,
+            timeout: timeout,
+            makeTransport: makeTransport,
+            depth: 0
+        )
+    }
+
+    // swiftlint:disable:next function_parameter_count
+    private static func downloadDirectoryRecursive(
+        host: String,
+        port: UInt16,
+        share: String,
+        path: String,
+        localDirectory: URL,
+        overwrite: Bool,
+        credential: SMBCredential,
+        timeout: Duration?,
+        makeTransport: (@Sendable () -> SMBTransport)?,
+        depth: Int
+    ) async throws {
+        try SMBPath.validateRecursionDepth(depth)
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: localDirectory, withIntermediateDirectories: true)
         let entries = try await list(
@@ -1030,7 +1059,7 @@ public enum SMBClient {
             let remoteChild = joinSMBPath(path, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
             if entry.isDirectory {
-                try await downloadDirectory(
+                try await downloadDirectoryRecursive(
                     host: host,
                     port: port,
                     share: share,
@@ -1039,7 +1068,8 @@ public enum SMBClient {
                     overwrite: overwrite,
                     credential: credential,
                     timeout: timeout,
-                    makeTransport: makeTransport
+                    makeTransport: makeTransport,
+                    depth: depth + 1
                 )
             } else {
                 try await download(
@@ -1240,8 +1270,36 @@ public enum SMBClient {
         overwrite: Bool = true,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
     ) async throws {
+        try await uploadDirectoryRecursive(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localDirectory: localDirectory,
+            overwrite: overwrite,
+            credential: credential,
+            timeout: timeout,
+            makeTransport: makeTransport,
+            depth: 0
+        )
+    }
+
+    // swiftlint:disable:next function_parameter_count
+    private static func uploadDirectoryRecursive(
+        host: String,
+        port: UInt16,
+        share: String,
+        path: String,
+        localDirectory: URL,
+        overwrite: Bool,
+        credential: SMBCredential,
+        timeout: Duration?,
+        makeTransport: (@Sendable () -> SMBTransport)?,
+        depth: Int
+    ) async throws {
+        try SMBPath.validateRecursionDepth(depth)
         if !path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/")).isEmpty {
             try await createDirectoryIfNeeded(
                 host: host,
@@ -1264,7 +1322,7 @@ public enum SMBClient {
             let resourceValues = try localChild.resourceValues(forKeys: [.isDirectoryKey])
             let remoteChild = joinSMBPath(path, localChild.lastPathComponent)
             if resourceValues.isDirectory == true {
-                try await uploadDirectory(
+                try await uploadDirectoryRecursive(
                     host: host,
                     port: port,
                     share: share,
@@ -1273,7 +1331,8 @@ public enum SMBClient {
                     overwrite: overwrite,
                     credential: credential,
                     timeout: timeout,
-                    makeTransport: makeTransport
+                    makeTransport: makeTransport,
+                    depth: depth + 1
                 )
             } else {
                 try await upload(
@@ -1418,6 +1477,7 @@ public enum SMBClient {
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
+            try SMBPath.validateDirectoryCopyTarget(fromPath: fromPath, toPath: toPath)
             try await session.copyDirectory(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
         }
     }
@@ -2127,8 +2187,10 @@ actor SMBSession {
         return chunks
     }
 
-    func copyDirectory(treeId: UInt32, fromPath: String, toPath: String, overwrite: Bool) async throws {
+    func copyDirectory(treeId: UInt32, fromPath: String, toPath: String, overwrite: Bool, depth: Int = 0) async throws {
         try Task.checkCancellation()
+        try SMBPath.validateRecursionDepth(depth)
+        try SMBPath.validateDirectoryCopyTarget(fromPath: fromPath, toPath: toPath)
         let sourceFileId = try await create(treeId: treeId, path: fromPath, directory: true)
         do {
             let destinationFileId = try await create(treeId: treeId, request: .makeDirectory(path: toPath))
@@ -2146,7 +2208,13 @@ actor SMBSession {
                 let sourceChild = self.joinSMBPath(fromPath, entry.name)
                 let destinationChild = self.joinSMBPath(toPath, entry.name)
                 if entry.isDirectory && !entry.isReparsePoint {
-                    try await self.copyDirectory(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+                    try await self.copyDirectory(
+                        treeId: treeId,
+                        fromPath: sourceChild,
+                        toPath: destinationChild,
+                        overwrite: overwrite,
+                        depth: depth + 1
+                    )
                 } else {
                     try await self.copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
                 }
@@ -2214,15 +2282,21 @@ actor SMBSession {
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "FLUSH")
     }
 
-    func deleteRecursively(treeId: UInt32, path: String, directory: Bool) async throws {
+    func deleteRecursively(treeId: UInt32, path: String, directory: Bool, depth: Int = 0) async throws {
         try Task.checkCancellation()
+        try SMBPath.validateRecursionDepth(depth)
         if directory {
             let fileId = try await create(treeId: treeId, path: path, directory: true)
             do {
                 try await queryDirectory(treeId: treeId, fileId: fileId) { entry in
                     try Task.checkCancellation()
                     guard !entry.isReparsePoint else { return }
-                    try await self.deleteRecursively(treeId: treeId, path: self.joinSMBPath(path, entry.name), directory: entry.isDirectory)
+                    try await self.deleteRecursively(
+                        treeId: treeId,
+                        path: self.joinSMBPath(path, entry.name),
+                        directory: entry.isDirectory,
+                        depth: depth + 1
+                    )
                 }
                 try? await close(treeId: treeId, fileId: fileId)
             } catch {

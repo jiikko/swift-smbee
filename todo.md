@@ -435,11 +435,19 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     JSON は sortedKeys / hex 文字列 / ISO8601、human 出力は不変。SMBError → distinct exit code
     (0/1/2/3/4/5) を exhaustive switch でマッピングし docs/smbcli-exit-codes.md に記載。unit +
     実 Samba live check 済み。**残: interactive password prompt (TTY 依存) のみ**。
-- [ ] CLI batch / wildcard ergonomics
+- [x] CLI batch / wildcard ergonomics
   - `smbclient` 互換の対話 shell までは MVP 外だが、運用用途では wildcard (`*.log`) / glob、
     `mget`/`mput` 的な複数 path、`--include`/`--exclude`、dry-run、確認 prompt が欲しくなる。
   - shell 側 glob と SMB 側 pattern matching の責務を分け、URL percent decode / path validation と
     矛盾しない CLI surface を設計する。
+  - 2026-07-01 (codex-drive): **`smbcli mget` / `mput` を実装**。設計 = **glob は client-side**
+    (SMB path に wildcard を埋めず、remote/local dir を列挙 → `fnmatch(3)` で filter → 各ファイル転送。
+    既存の URL/path validation が wildcard を拒否する方針と矛盾させない)。単一 dir 直下の非ディレクトリのみ、
+    `--exclude` (repeatable) / `--dry-run` / `--no-overwrite`。0 match は exit 0 + stderr 警告。
+    glob helper (`globMatches`/`batchGlobEntries`) を切り出して unit test。転送は既に E2E 実証済みの
+    list/download/upload を合成。Linux 160 / macOS 163 unit green (test target が smbcli を import)。
+    残 (defer): recursive (`-r`)、`--create-dirs`、個別ファイル progress、対話 shell、確認 prompt
+    (mget/mput は非破壊なので --dry-run で代替)。
 - [ ] compatibility matrix: macOS SMBX / Samba / Windows Server / NAS (Synology/QNAP 等)
   - dialect/signing/encryption/quirk を記録し、手動 smoke 手順を docs 化する。
   - 2026-07-01 現状: Samba は 3.0.2 encrypted-required / 3.1.1 signing-required /

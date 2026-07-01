@@ -14,7 +14,7 @@ struct SMBCLI: AsyncParsableCommand {
         version: SMBee.version,
         subcommands: [
             Probe.self, Shares.self, List.self, Stat.self, ACL.self, DiskFree.self, Cat.self, Get.self,
-            MakeDirectory.self, Put.self, Copy.self, Move.self, Remove.self, Dfs.self
+            MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Dfs.self
         ]
     )
 }
@@ -154,7 +154,7 @@ struct List: AsyncParsableCommand {
     }
 }
 
-private final class DirectoryEntryCollector: @unchecked Sendable {
+final class DirectoryEntryCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [SMBDirectoryEntry] = []
 
@@ -814,11 +814,11 @@ struct DebugOptions: ParsableArguments {
     }
 }
 
-private func makeReadEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {
+func makeReadEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {
     try makeEndpointAndCredential(url: url, auth: auth)
 }
 
-private func makeEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {
+func makeEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {
     let endpoint = try SMBURLParser.parseReadURL(url)
     return (endpoint, try makeCredential(username: endpoint.username, password: endpoint.password, auth: auth))
 }
@@ -934,7 +934,7 @@ private func formatByteCount(_ bytes: UInt64) -> String {
     return String(format: "%.1f %@", value, units[unitIndex])
 }
 
-private func writeStandardError(_ string: String) {
+func writeStandardError(_ string: String) {
     FileHandle.standardError.write(Data(string.utf8))
 }
 

@@ -1,8 +1,29 @@
 # 005 auth: macOS Finder相当のSMB認証をobaket/SMBeeで実現できるか調査する
 
-状態: **open**
+状態: **open**（調査課題。下記の一部前提は 2026-07-01 に実装で前進）
 起票: 2026-06-30
 関連: `Sources/SMBee/NTLM.swift` / `Sources/SMBee/SMBClient.swift` / `Sources/smbcli/SMBCLI.swift` / `issues/001-bug-macos-ntlm-logon-failure.md`
+
+## 進捗 (2026-07-01)
+
+SMBee 側で本 issue に関連する auth 基盤を実装した（commit c8172c3、[todo.md](../todo.md) の authentication options 参照）。
+
+- **guest / anonymous NTLM** を実装（`SMBCredential.anonymous`、CLL `--anonymous`/`--guest`、
+  NTLM anonymous Type3、signing 不可時の unsigned フォールバック）。実 Samba guest で ls/cat/stat 成功。
+  → 「現状の仮説」の **3. guest / local account fallback** はクライアント側で検証可能になった。
+- **password provider callback**（`SMBCredentialProvider` = lazy closure）を `connect` に追加。
+  → Keychain 等から遅延取得した credential を SMBee に渡す配線点ができた（Keychain lookup 自体は下記のとおり consumer 責務）。
+
+本 issue の残りは **SMBee ライブラリ core の外**にある macOS システム依存部分に絞られる:
+
+- **Keychain 連携**: macOS `Security.framework` 依存。SMBee は cross-platform（Linux ビルド維持）で
+  credential-agnostic を保つ方針のため、Keychain lookup は **consumer (obaket / smbcli) 側**で行い、
+  結果を `SMBCredentialProvider` で SMBee に渡す。SMBee core には入れない。
+- **Kerberos / GSS / SPNEGO(Kerberos mech)**: MVP scope 外。SMBee の NTLM 経路は壊さない（「やらないこと」参照）。
+- **macOS mount delegation / NetFS SSO**: obaket 側の統合方針の問題。
+
+→ 従って本 issue は「SMBee で実装する課題」ではなく「**obaket がどの方式を採用するかの意思決定 + macOS 依存部分**」の
+調査として残る。SMBee が提供する土台（password / ntHash / provider / anonymous）は出揃った。
 
 ## 背景
 

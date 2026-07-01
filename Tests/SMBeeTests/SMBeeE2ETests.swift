@@ -65,6 +65,23 @@ final class SMBeeE2ETests: XCTestCase {
         XCTAssertTrue(entries.contains { $0.name == "known.txt" && !$0.isDirectory })
 
         let credential = SMBCredential(username: username, password: password)
+        let session = try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        let sessionEntries = try await session.list()
+        await session.close()
+        XCTAssertTrue(sessionEntries.contains { $0.name == "known.txt" && !$0.isDirectory })
+
+        let streamedEntryNames = DirectoryNameAccumulator()
+        try await SMBee.withDirectoryStream(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share
+        ) { entry in
+            await streamedEntryNames.record(entry.name)
+        }
+        let streamContainsKnownFile = await streamedEntryNames.contains("known.txt")
+        XCTAssertTrue(streamContainsKnownFile)
+
         let stat = try await SMBee.stat(
             host: host,
             port: port,
@@ -83,6 +100,16 @@ final class SMBeeE2ETests: XCTestCase {
             path: "known.txt"
         )
         XCTAssertEqual(String(decoding: data, as: UTF8.self), "hello from SMBee E2E\n")
+
+        let rangeData = try await SMBee.read(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: "known.txt",
+            range: SMBReadRange(offset: 6, length: 4)
+        )
+        XCTAssertEqual(String(decoding: rangeData, as: UTF8.self), "from")
     }
 
     func testShareDiscoveryListsPublicShare() async throws {
@@ -145,6 +172,17 @@ final class SMBeeE2ETests: XCTestCase {
         try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: original, data: payload)
         let data = try await SMBee.read(host: host, port: port, credential: credential, share: share, path: original)
         XCTAssertEqual(data, payload)
+        let updatedModifiedTime = Date(timeIntervalSince1970: 1_704_067_200)
+        try await SMBee.updateMetadata(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: original,
+            update: SMBFileMetadataUpdate(modifiedTime: updatedModifiedTime)
+        )
+        let updatedStat = try await SMBee.stat(host: host, port: port, credential: credential, share: share, path: original)
+        XCTAssertEqual(updatedStat.modifiedTime?.timeIntervalSince1970 ?? 0, updatedModifiedTime.timeIntervalSince1970, accuracy: 2)
         try await SMBee.copy(
             host: host,
             port: port,
@@ -323,5 +361,17 @@ private actor LargeReadAccumulator {
 
     func record(byteCount: Int) {
         self.byteCount += UInt64(byteCount)
+    }
+}
+
+private actor DirectoryNameAccumulator {
+    private var names: [String] = []
+
+    func record(_ name: String) {
+        names.append(name)
+    }
+
+    func contains(_ name: String) -> Bool {
+        names.contains(name)
     }
 }

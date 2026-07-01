@@ -42,7 +42,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        swift_version: ["6.0", "6.2"]
+        # swift-tools-version は 6.2 (swift-asn1 1.7.x が Swift 6.1+ を要求)。
+        # Swift 6.0 Linux は concurrency runtime の flaky hang があり除外 (issue 007)。
+        swift_version: ["6.2"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Swift
@@ -55,10 +57,8 @@ jobs:
         run: swift build
       - name: Unit tests on Linux
         timeout-minutes: 10
-        # Samba-backed tests run in the E2E workflows. Match macOS here so the
-        # generic Linux job stays on deterministic unit/vector coverage; Swift
-        # 6.0 Linux can stall after compiling when skipped async E2E XCTest
-        # cases are still part of the selected test plan.
+        # Samba-backed tests run in the E2E workflows. Keep the generic Linux
+        # job on deterministic unit/vector coverage.
         run: swift test --skip SMBeeE2ETests
 
   performance-regression:

@@ -1,6 +1,6 @@
 # 007 ci: Swift 6.0 Linux unit test が stuck する
 
-状態: **open**
+状態: **done** (2026-07-01 恒久対処: Swift 6.0 を CI matrix から除外)
 起票: 2026-07-01
 関連: `.github/workflows/test.yml` / `Tests/SMBeeTests/SMBeeE2ETests.swift`
 GitHub Actions: https://github.com/jiikko/swift-smbee/actions/runs/28486174498/job/84433018363
@@ -129,6 +129,25 @@ container run --rm --cpus 2 -v "$PWD:/work" -w /work swift:6.0-noble bash -c '
    決定論的な continuation 同期に書き換えて runtime 依存を外す。
 3. 6.0 test step を `continue-on-error: true` で non-blocking 化 (signal は残す)。
 
+## 恒久対処 (2026-07-01 実施)
+
+案 1 を採用。あわせて Swift バージョン整合も解消した (swift-asn1 downgrade 問題)。
+
+- `Package.swift`: `swift-tools-version` を 6.0 → **6.2** に引き上げ。
+  - 背景: `swift-crypto` の推移依存 `swift-asn1` は **1.7.0 以降が Swift 6.1+ を要求**
+    (1.6.0 の tools-version は 6.0)。Swift 6.0 toolchain で resolve すると asn1 が
+    1.6.0 へ **自動 downgrade** され、committed の `Package.resolved` (asn1 1.7.1 /
+    crypto 3.15.1) と乖離・dirty 化していた。tools-version を 6.2 にすることで 6.0
+    での resolve 経路自体を塞ぎ、単一 `Package.resolved` (asn1 1.7.1) で整合する。
+  - `swift-smbee` を参照する consumer は my-products 内に現状ゼロ (影響なし)。
+- `.github/workflows/test.yml`: Linux matrix を `["6.0", "6.2"]` → **`["6.2"]`**。
+  6.0 Linux の flaky hash を CI から排除。
+- `Package.resolved`: 変更なし (HEAD は元々 asn1 1.7.1 で正しかった。1.6.0 への
+  downgrade は 6.0 での resolve 時にのみ作業ツリーで発生する transient な副作用)。
+
+再現 script (下記) は Swift 6.0 toolchain 依存の記録として残すが、CI からは 6.0 が
+消えたため本 stall は再発しない。
+
 ## 完了条件
 
 - [x] CI の stuck を回避する暫定対応を入れる。
@@ -137,4 +156,4 @@ container run --rm --cpus 2 -v "$PWD:/work" -w /work swift:6.0-noble bash -c '
 - [x] 最小再現条件を記録する (`--cpus 2` + `swift:6.0-noble`, 上記)。
 - [x] toolchain 問題か repo 側か切り分ける (**toolchain: 6.0 Linux concurrency runtime の flaky hang**。
       主犯 test = `testConcurrentReadChunksSerializeWireTransactions`)。
-- [ ] 恒久対処 (上記 1-3 のいずれか) を決めて適用する。
+- [x] 恒久対処: 案 1 採用 (Swift 6.0 を CI から除外 + tools-version 6.2 化)。

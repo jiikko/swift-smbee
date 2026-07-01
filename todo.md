@@ -312,12 +312,14 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     で抑えているが、CreditCharge / CreditRequest / CreditResponse を管理していない。大きな IO や
     multi-credit server での挙動を MS-SMB2 と実 packet で確認し、必要なら messageId/credit allocator を
     `SMBWireTransactionGate` の後継として設計する。
-- [ ] session lifecycle: TREE_DISCONNECT / LOGOFF
+- [x] session lifecycle: TREE_DISCONNECT / LOGOFF
   - 2026-06-30 実装レビュー追加: close は TCP close のみで、TREE_DISCONNECT / LOGOFF を送らない。
     persistent session API の `close()` で graceful teardown するか、best-effort に留めるかを決める。
   - 2026-06-30: `SMBClientSession.close()` は best-effort で TREE_DISCONNECT → LOGOFF を送ってから
-    transport close するよう修正し、二重 close で再送しない unit test を追加。残: ワンショット API の
-    teardown 方針を決める。
+    transport close するよう修正し、二重 close で再送しない unit test を追加。
+  - 2026-07-01 (commit eec6b34): ワンショット静的 API (`withSession` 成功経路) も bare closeTransport
+    から best-effort disconnect (TREE_DISCONNECT → LOGOFF → close) に統一。error 経路は session が
+    suspect なので bare close 維持。実 Samba で one-shot ls の teardown 送出を確認。
 - [ ] timeout / progress / cancellation API の整備
   - read/write loop は cancellation 済み。公開 API と CLI に progress callback / transfer rate / timeout を足す。
   - 2026-06-30 実装レビュー追記: POSIX transport は blocking `connect` / `recv` / `send` を
@@ -334,6 +336,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: `smbcli probe/ls/stat/cat/get/mkdir/put/mv/cp/rm` に `--debug` と
     `--trace-wire` を追加。`--trace-wire` は `--debug` を暗黙に有効化し、既存の env gate
     (`SMBEE_DEBUG` / `SMBEE_TRACE_WIRE`) に接続する。
+  - 2026-07-01 (commit 62e0e48): `--json` (probe/ls/stat/shares) と exit code 表を実装。
+    JSON は sortedKeys / hex 文字列 / ISO8601、human 出力は不変。SMBError → distinct exit code
+    (0/1/2/3/4/5) を exhaustive switch でマッピングし docs/smbcli-exit-codes.md に記載。unit +
+    実 Samba live check 済み。**残: interactive password prompt (TTY 依存) のみ**。
 - [ ] compatibility matrix: macOS SMBX / Samba / Windows Server / NAS (Synology/QNAP 等)
   - dialect/signing/encryption/quirk を記録し、手動 smoke 手順を docs 化する。
 - [ ] NetBIOS name / port 139 / hostname discovery は原則 scope 外だが、必要になったら separate transport として検討

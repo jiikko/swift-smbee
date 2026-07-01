@@ -7,7 +7,6 @@ import Glibc
 import Darwin
 #endif
 
-@main
 struct SMBCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "smbcli",
@@ -20,6 +19,46 @@ struct SMBCLI: AsyncParsableCommand {
     )
 }
 
+@main
+enum SMBCLIMain {
+    static func main() async {
+        do {
+            var command = try await SMBCLI.asyncParseAsRoot()
+            if var asyncCommand = command as? AsyncParsableCommand {
+                try await asyncCommand.run()
+            } else {
+                try command.run()
+            }
+        } catch {
+            exit(with: error)
+        }
+    }
+
+    private static func exit(with error: Error) -> Never {
+        let parserExitCode = SMBCLI.exitCode(for: error)
+        if parserExitCode.isSuccess {
+            SMBCLI.exit(withError: error)
+        }
+        if parserExitCode == .validationFailure {
+            printError(error)
+            Foundation.exit(SMBCLIExitCode.usage)
+        }
+        if let smbError = error as? SMBError {
+            printError(smbError)
+            Foundation.exit(SMBCLIExitCode.code(for: smbError))
+        }
+        printError(error)
+        Foundation.exit(SMBCLIExitCode.other)
+    }
+
+    private static func printError(_ error: Error) {
+        let stderr = FileHandle.standardError
+        if let data = "Error: \(error)\n".data(using: .utf8) {
+            stderr.write(data)
+        }
+    }
+}
+
 /// `smbcli probe smb://host[:445]` — NEGOTIATE して交渉結果
 /// (dialect / signing / encryption) を表示する。最初のマイルストーン。
 struct Probe: AsyncParsableCommand {
@@ -30,6 +69,9 @@ struct Probe: AsyncParsableCommand {
     @Argument(help: "smb://host[:445]")
     var url: String
 
+    @Flag(help: "Print JSON output")
+    var json = false
+
     @OptionGroup
     var debug: DebugOptions
 
@@ -37,6 +79,10 @@ struct Probe: AsyncParsableCommand {
         debug.apply()
         let endpoint = try SMBURLParser.parseServerURL(url)
         let result = try await SMBProbe.probe(host: endpoint.host, port: endpoint.port)
+        if json {
+            print(try SMBCLIOutput.jsonString(for: result))
+            return
+        }
         print("dialect: \(formatHex(result.dialect, width: 4))")
         print("signingRequired: \(result.signingRequired)")
         print("signing: \(formatOptionalHex(result.signingAlgorithm, width: 4))")
@@ -70,9 +116,13 @@ struct List: AsyncParsableCommand {
     @OptionGroup
     var debug: DebugOptions
 
+    @Flag(help: "Print JSON output")
+    var json = false
+
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        let collector = DirectoryEntryCollector()
         try await SMBee.withDirectoryStream(
             host: endpoint.host,
             port: endpoint.port,
@@ -80,9 +130,33 @@ struct List: AsyncParsableCommand {
             share: endpoint.share,
             path: endpoint.path
         ) { entry in
+            if json {
+                collector.append(entry)
+                return
+            }
             let kind = entry.isDirectory ? "d" : "-"
             print("\(kind) \(entry.fileSize) \(entry.name)")
         }
+        if json {
+            print(try SMBCLIOutput.jsonString(for: collector.entries))
+        }
+    }
+}
+
+private final class DirectoryEntryCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBDirectoryEntry] = []
+
+    var entries: [SMBDirectoryEntry] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ entry: SMBDirectoryEntry) {
+        lock.lock()
+        storage.append(entry)
+        lock.unlock()
     }
 }
 
@@ -98,6 +172,9 @@ struct Shares: AsyncParsableCommand {
     @OptionGroup
     var debug: DebugOptions
 
+    @Flag(help: "Print JSON output")
+    var json = false
+
     func run() async throws {
         debug.apply()
         let endpoint = try SMBURLParser.parseServerURL(url)
@@ -110,6 +187,10 @@ struct Shares: AsyncParsableCommand {
             port: endpoint.port,
             credential: credential
         )
+        if json {
+            print(try SMBCLIOutput.jsonString(for: shares))
+            return
+        }
         for share in shares {
             print(share.name)
         }
@@ -129,6 +210,9 @@ struct Stat: AsyncParsableCommand {
     @OptionGroup
     var debug: DebugOptions
 
+    @Flag(help: "Print JSON output")
+    var json = false
+
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
@@ -139,6 +223,10 @@ struct Stat: AsyncParsableCommand {
             share: endpoint.share,
             path: endpoint.path
         )
+        if json {
+            print(try SMBCLIOutput.jsonString(for: stat))
+            return
+        }
         print("size: \(stat.size)")
         print("type: \(stat.isDirectory ? "directory" : "file")")
         print("attributes: 0x\(String(format: "%08x", stat.attributes))")

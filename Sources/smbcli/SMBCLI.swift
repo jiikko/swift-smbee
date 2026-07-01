@@ -55,6 +55,13 @@ enum SMBCLIMain {
     }
 
     private static func printError(_ error: Error) {
+        if case let SMBError.recursiveOperationIncomplete(failures) = error {
+            writeStandardError("Error: recursive operation incomplete\n")
+            for failure in failures {
+                writeStandardError("\(failure.path): \(failure.message)\n")
+            }
+            return
+        }
         let stderr = FileHandle.standardError
         if let data = "Error: \(error)\n".data(using: .utf8) {
             stderr.write(data)
@@ -581,6 +588,15 @@ struct Get: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively download a directory")
     var recursive = false
 
+    @Flag(help: "Continue recursive transfers after item failures")
+    var continueOnError = false
+
+    @Flag(help: "Skip recursive items whose destination already exists")
+    var skipExisting = false
+
+    @Flag(help: "Show planned recursive actions without modifying destinations")
+    var dryRun = false
+
     @Flag(help: "Show transfer progress")
     var progress = false
 
@@ -606,8 +622,11 @@ struct Get: AsyncParsableCommand {
                 path: endpoint.path,
                 localDirectory: URL(fileURLWithPath: destination),
                 overwrite: !noOverwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                dryRun: dryRun,
                 timeout: transport.duration
-            )
+            ) { action in writeRecursiveAction(action) }
             return
         }
         let progressWriter = progress ? TransferProgressWriter() : nil
@@ -676,6 +695,15 @@ struct Put: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively upload a directory")
     var recursive = false
 
+    @Flag(help: "Continue recursive transfers after item failures")
+    var continueOnError = false
+
+    @Flag(help: "Skip recursive items whose destination already exists")
+    var skipExisting = false
+
+    @Flag(help: "Show planned recursive actions without modifying destinations")
+    var dryRun = false
+
     @Flag(help: "Show transfer progress")
     var progress = false
 
@@ -701,8 +729,11 @@ struct Put: AsyncParsableCommand {
                 path: endpoint.path,
                 localDirectory: URL(fileURLWithPath: source),
                 overwrite: !noOverwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                dryRun: dryRun,
                 timeout: transport.duration
-            )
+            ) { action in writeRecursiveAction(action) }
             return
         }
         if progress {
@@ -789,6 +820,15 @@ struct Copy: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively copy a directory")
     var recursive = false
 
+    @Flag(help: "Continue recursive copies after item failures")
+    var continueOnError = false
+
+    @Flag(help: "Skip recursive items whose destination already exists")
+    var skipExisting = false
+
+    @Flag(help: "Show planned recursive actions without modifying destinations")
+    var dryRun = false
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -812,8 +852,11 @@ struct Copy: AsyncParsableCommand {
                 fromPath: from.path,
                 toPath: to.path,
                 overwrite: replace,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                dryRun: dryRun,
                 timeout: transport.duration
-            )
+            ) { action in writeRecursiveAction(action) }
             return
         }
         try await SMBee.copy(
@@ -841,6 +884,12 @@ struct Remove: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively delete a non-empty directory")
     var recursive = false
 
+    @Flag(help: "Continue recursive deletes after item failures")
+    var continueOnError = false
+
+    @Flag(help: "Show planned recursive actions without modifying destinations")
+    var dryRun = false
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -861,8 +910,10 @@ struct Remove: AsyncParsableCommand {
             path: endpoint.path,
             directory: directory || recursive,
             recursive: recursive,
+            continueOnError: continueOnError,
+            dryRun: dryRun,
             timeout: transport.duration
-        )
+        ) { action in writeRecursiveAction(action) }
     }
 }
 
@@ -1075,6 +1126,10 @@ private func formatByteCount(_ bytes: UInt64) -> String {
 
 func writeStandardError(_ string: String) {
     FileHandle.standardError.write(Data(string.utf8))
+}
+
+func writeRecursiveAction(_ action: SMBRecursiveAction) {
+    FileHandle.standardOutput.write(Data("\(action.kind.rawValue) \(action.path)\n".utf8))
 }
 
 func parseRange(_ value: String) throws -> SMBReadRange {

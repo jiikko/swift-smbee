@@ -13,6 +13,23 @@ import Darwin
 import Network
 #endif
 
+private final class RecursiveActionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBRecursiveAction] = []
+
+    func append(_ action: SMBRecursiveAction) {
+        lock.lock()
+        storage.append(action)
+        lock.unlock()
+    }
+
+    var actions: [SMBRecursiveAction] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
 private struct SMBTestTimeoutError: Error, CustomStringConvertible {
     let label: String
     let seconds: Double
@@ -3801,6 +3818,190 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt32LE(requests[7], at: 68), SMB2Ioctl.fsctlSrvRequestResumeKey)
         XCTAssertEqual(Array(requests[9][112..<requests[9].count]), Array("data".utf8))
         XCTAssertEqual(readUInt32LE(requests[15], at: 100), 0x0000_0002)
+    }
+
+    func testSessionCopyDirectoryContinueOnErrorAggregatesAndContinues() async throws {
+        let sourceRootId = hexBytes("00000000000000000000000000000011")
+        let destinationRootId = hexBytes("00000000000000000000000000000012")
+        let failedSourceId = hexBytes("00000000000000000000000000000013")
+        let okSourceId = hexBytes("00000000000000000000000000000014")
+        let okDestinationId = hexBytes("00000000000000000000000000000015")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceRootId, messageId: 0, treeId: 0x3344),
+            try smb2CreateResponse(fileId: destinationRootId, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [makeDirectoryEntry(name: "bad.txt", isDirectory: false, fileSize: 0, nextOffset: 0)],
+                messageId: 3,
+                treeId: 0x3344
+            ),
+            try smb2CreateResponse(fileId: failedSourceId, messageId: 4, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 0, messageId: 5, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.accessDenied, command: SMB2Commands.create, messageId: 6, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [makeDirectoryEntry(name: "ok.txt", isDirectory: false, fileSize: 0, nextOffset: 0)],
+                messageId: 8,
+                treeId: 0x3344
+            ),
+            try smb2CreateResponse(fileId: okSourceId, messageId: 9, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 0, messageId: 10, treeId: 0x3344),
+            try smb2CreateResponse(fileId: okDestinationId, messageId: 11, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 12, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 13, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 14, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 15, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 16, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        do {
+            try await session.copyDirectory(
+                treeId: 0x3344,
+                fromPath: "src",
+                toPath: "dst",
+                overwrite: false,
+                continueOnError: true
+            )
+            XCTFail("expected recursiveOperationIncomplete")
+        } catch let SMBError.recursiveOperationIncomplete(failures) {
+            XCTAssertEqual(failures.count, 1)
+            XCTAssertEqual(failures[0].path, "src\\bad.txt")
+            let requests = try unframed(transport.outbound)
+            XCTAssertEqual(requests.count, 17)
+            XCTAssertEqual(try SMB2Header.decode(requests[9]).command, SMB2Commands.create)
+        } catch {
+            XCTFail("expected recursiveOperationIncomplete, got \(error)")
+        }
+    }
+
+    func testSessionCopyDirectoryDefaultAbortsOnFirstEntryFailure() async throws {
+        let sourceRootId = hexBytes("00000000000000000000000000000021")
+        let destinationRootId = hexBytes("00000000000000000000000000000022")
+        let failedSourceId = hexBytes("00000000000000000000000000000023")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceRootId, messageId: 0, treeId: 0x3344),
+            try smb2CreateResponse(fileId: destinationRootId, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [makeDirectoryEntry(name: "bad.txt", isDirectory: false, fileSize: 0, nextOffset: 0)],
+                messageId: 3,
+                treeId: 0x3344
+            ),
+            try smb2CreateResponse(fileId: failedSourceId, messageId: 4, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 0, messageId: 5, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.accessDenied, command: SMB2Commands.create, messageId: 6, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 8, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        do {
+            try await session.copyDirectory(treeId: 0x3344, fromPath: "src", toPath: "dst", overwrite: false)
+            XCTFail("expected accessDenied")
+        } catch SMBError.accessDenied {
+            let requests = try unframed(transport.outbound)
+            XCTAssertEqual(requests.count, 9)
+        } catch {
+            XCTFail("expected accessDenied, got \(error)")
+        }
+    }
+
+    func testSessionCopyDirectorySkipExistingSkipsCollidingFile() async throws {
+        let sourceRootId = hexBytes("00000000000000000000000000000031")
+        let destinationRootId = hexBytes("00000000000000000000000000000032")
+        let sourceFileId = hexBytes("00000000000000000000000000000033")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceRootId, messageId: 0, treeId: 0x3344),
+            try smb2CreateResponse(fileId: destinationRootId, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [makeDirectoryEntry(name: "exists.txt", isDirectory: false, fileSize: 0, nextOffset: 0)],
+                messageId: 3,
+                treeId: 0x3344
+            ),
+            try smb2CreateResponse(fileId: sourceFileId, messageId: 4, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 0, messageId: 5, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.objectNameCollision, command: SMB2Commands.create, messageId: 6, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 8, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 9, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        try await session.copyDirectory(
+            treeId: 0x3344,
+            fromPath: "src",
+            toPath: "dst",
+            overwrite: false,
+            skipExisting: true
+        )
+    }
+
+    func testSessionCopyDirectoryDryRunDoesNotSendDestinationMutations() async throws {
+        let sourceRootId = hexBytes("00000000000000000000000000000041")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceRootId, messageId: 0, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [makeDirectoryEntry(name: "a.txt", isDirectory: false, fileSize: 0, nextOffset: 0)],
+                messageId: 1,
+                treeId: 0x3344
+            ),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let recorder = RecursiveActionRecorder()
+
+        try await session.copyDirectory(
+            treeId: 0x3344,
+            fromPath: "src",
+            toPath: "dst",
+            overwrite: false,
+            dryRun: true
+        ) { action in
+            recorder.append(action)
+        }
+
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .mkdir, path: "dst"),
+            SMBRecursiveAction(kind: .copy, path: "dst\\a.txt"),
+        ])
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.close,
+        ])
     }
 
     func testWriteRequestUsesOffsetLengthFileIdAndDataBuffer() throws {

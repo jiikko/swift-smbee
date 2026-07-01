@@ -18,7 +18,7 @@ public enum SMBCLIExitCode {
             connection
         case .sharingViolation, .nameCollision, .directoryNotEmpty, .fileIsADirectory,
              .notADirectory, .diskFull, .objectNameInvalid, .endOfFile, .unsupported,
-             .protocolError, .invalidRecursion:
+             .protocolError, .invalidRecursion, .recursiveOperationIncomplete:
             other
         }
     }

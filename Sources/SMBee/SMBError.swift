@@ -18,6 +18,7 @@ public enum SMBError: Error, Equatable, Sendable {
     case transport(String)
     case protocolError(String)
     case invalidRecursion(String)
+    case recursiveOperationIncomplete(failures: [SMBRecursiveFailure])
 }
 
 enum SMBErrorMapper {

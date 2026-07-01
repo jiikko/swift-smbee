@@ -8,6 +8,17 @@ COVERAGE_REPORT="${COVERAGE_REPORT:-.build/code-coverage-report.txt}"
 IGNORE_FILENAME_REGEX="${IGNORE_FILENAME_REGEX:-(/Tests/|/.build/)}"
 LLVM_COV="${LLVM_COV:-llvm-cov}"
 
+if ! command -v "$LLVM_COV" >/dev/null 2>&1; then
+  swift_bin=$(command -v swift)
+  toolchain_llvm_cov="$(dirname "$swift_bin")/llvm-cov"
+  if [[ -x "$toolchain_llvm_cov" ]]; then
+    LLVM_COV="$toolchain_llvm_cov"
+  else
+    echo "CODE_COVERAGE_ERROR llvm-cov not found in PATH or Swift toolchain" >&2
+    exit 1
+  fi
+fi
+
 mkdir -p "$(dirname "$COVERAGE_JSON")"
 
 # Keep E2E/Samba-backed tests in their dedicated workflows. Coverage should measure
@@ -43,6 +54,7 @@ if [[ -z "$test_binary" || ! -f "$test_binary" ]]; then
   exit 1
 fi
 
+echo "CODE_COVERAGE_INFO llvm_cov=$LLVM_COV"
 echo "CODE_COVERAGE_INFO profdata=$profdata"
 echo "CODE_COVERAGE_INFO test_binary=$test_binary"
 

@@ -370,6 +370,69 @@ final class SMBeeE2ETests: XCTestCase {
         let total = await accumulator.total
         XCTAssertEqual(total, stat.size)
     }
+
+    func testChangeNotifyReceivesFileCreation() async throws {
+        guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
+        let portString = environment["SMBEE_E2E_PORT"] ?? "445"
+        guard let port = UInt16(portString) else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16, got \(portString)")
+            return
+        }
+        let username = environment["SMBEE_E2E_USERNAME"] ?? "smbee"
+        let password = environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
+        let share = environment["SMBEE_E2E_SHARE"] ?? "public"
+        let credential = SMBCredential(username: username, password: password)
+        let directory = "smbee-e2e-watch-\(UUID().uuidString)"
+        let watchedFile = "created.txt"
+
+        try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: directory)
+
+        let accumulator = DirectoryNameAccumulator()
+        let watcher = Task {
+            try await SMBee.withChangeNotifications(
+                host: host,
+                port: port,
+                credential: credential,
+                share: share,
+                path: directory
+            ) { event in
+                if case .changes(let changes) = event {
+                    for change in changes {
+                        await accumulator.record(change.name)
+                    }
+                }
+            }
+        }
+
+        // Let the watcher subscribe (CHANGE_NOTIFY must be registered before the create).
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        try await SMBee.upload(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: "\(directory)\\\(watchedFile)",
+            data: Array("watch me\n".utf8)
+        )
+
+        // Bounded wait for the ADDED notification (do not block indefinitely).
+        var observed = false
+        for _ in 0..<40 {
+            if await accumulator.contains(watchedFile) {
+                observed = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        watcher.cancel()
+
+        XCTAssertTrue(observed, "expected a CHANGE_NOTIFY notification for \(watchedFile)")
+    }
 }
 
 private actor LargeReadAccumulator {

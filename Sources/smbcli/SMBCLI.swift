@@ -1,4 +1,5 @@
 import ArgumentParser
+import Dispatch
 import Foundation
 import SMBee
 #if os(Linux)
@@ -6,6 +7,7 @@ import Glibc
 #else
 import Darwin
 #endif
+// swiftlint:disable file_length
 
 struct SMBCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -14,7 +16,7 @@ struct SMBCLI: AsyncParsableCommand {
         version: SMBee.version,
         subcommands: [
             Probe.self, Shares.self, List.self, Stat.self, ACL.self, DiskFree.self, Cat.self, Get.self,
-            MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Dfs.self
+            MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Watch.self, Dfs.self
         ]
     )
 }
@@ -171,6 +173,77 @@ final class DirectoryEntryCollector: @unchecked Sendable {
     }
 }
 
+struct Watch: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "watch", abstract: "Watch an SMB directory for changes")
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var url: String
+
+    @Flag(help: "Watch the full subtree")
+    var recursive = false
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    func run() async throws {
+        debug.apply()
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        let task = Task {
+            try await SMBee.withChangeNotifications(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                watchTree: recursive,
+                timeout: transport.duration
+            ) { event in
+                switch event {
+                case .overflow:
+                    print("overflow: rescan needed")
+                case .changes(let changes):
+                    for change in changes {
+                        print("\(formatChangeAction(change.action)) \(change.name)")
+                    }
+                }
+            }
+        }
+        let sigint = makeSIGINTSource {
+            task.cancel()
+        }
+        sigint.resume()
+        do {
+            try await task.value
+        } catch is CancellationError {
+        }
+        sigint.cancel()
+    }
+
+    private func formatChangeAction(_ action: SMBFileChangeAction) -> String {
+        switch action {
+        case .added: return "added"
+        case .removed: return "removed"
+        case .modified: return "modified"
+        case .renamedOldName: return "renamed-old"
+        case .renamedNewName: return "renamed-new"
+        case .other(let raw): return "other(\(raw))"
+        }
+    }
+
+    private func makeSIGINTSource(_ handler: @escaping @Sendable () -> Void) -> DispatchSourceSignal {
+        signal(SIGINT, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        source.setEventHandler(handler: handler)
+        return source
+    }
+}
+
 struct Shares: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "shares", abstract: "List SMB shares on a server")
 
@@ -255,7 +328,6 @@ struct Dfs: AsyncParsableCommand {
         return "\\\\\(endpoint.host)\\\(suffix)"
     }
 }
-
 
 struct Stat: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "stat", abstract: "Stat an SMB path")

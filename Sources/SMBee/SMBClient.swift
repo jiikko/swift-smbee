@@ -420,6 +420,29 @@ public actor SMBClientSession {
         }
     }
 
+    public func withChangeNotifications(
+        path: String = "",
+        filter: SMBChangeNotifyFilter = .default,
+        watchTree: Bool = false,
+        onChange: @escaping @Sendable (SMBChangeNotifyEvent) async throws -> Void
+    ) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .changeNotify(path: path))
+        do {
+            try await session.changeNotify(
+                treeId: treeId,
+                fileId: fileId,
+                filter: filter,
+                watchTree: watchTree,
+                onChange: onChange
+            )
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     public func stat(path: String) async throws -> SMBFileStat {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, path: path, directory: false)
@@ -897,6 +920,55 @@ public enum SMBClient {
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
             onEntry: onEntry
+        )
+    }
+
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall watch deadline.
+    public static func withChangeNotifications(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String = "",
+        filter: SMBChangeNotifyFilter = .default,
+        watchTree: Bool = false,
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onChange: @escaping @Sendable (SMBChangeNotifyEvent) async throws -> Void
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "CHANGE_NOTIFY") { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .changeNotify(path: path))
+            do {
+                try await session.changeNotify(treeId: treeId, fileId: fileId, filter: filter, watchTree: watchTree, onChange: onChange)
+                try? await session.close(treeId: treeId, fileId: fileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
+        }
+    }
+
+    public static func withChangeNotifications(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String = "",
+        filter: SMBChangeNotifyFilter = .default,
+        watchTree: Bool = false,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
+        onChange: @escaping @Sendable (SMBChangeNotifyEvent) async throws -> Void
+    ) async throws {
+        try await withChangeNotifications(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            filter: filter,
+            watchTree: watchTree,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport,
+            onChange: onChange
         )
     }
 
@@ -2178,6 +2250,45 @@ actor SMBSession {
         return try SMB2QueryDirectory.decodeResponse(response)
     }
 
+    func changeNotify(
+        treeId: UInt32,
+        fileId: [UInt8],
+        filter: SMBChangeNotifyFilter,
+        watchTree: Bool,
+        onChange: @escaping @Sendable (SMBChangeNotifyEvent) async throws -> Void
+    ) async throws {
+        while true {
+            try Task.checkCancellation()
+            let event = try await changeNotifyOnce(treeId: treeId, fileId: fileId, filter: filter, watchTree: watchTree)
+            try Task.checkCancellation()
+            try await onChange(event)
+        }
+    }
+
+    private func changeNotifyOnce(
+        treeId: UInt32,
+        fileId: [UInt8],
+        filter: SMBChangeNotifyFilter,
+        watchTree: Bool
+    ) async throws -> SMBChangeNotifyEvent {
+        let packet = try SMB2ChangeNotify.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            completionFilter: filter,
+            watchTree: watchTree
+        )
+        debugDump("CHANGE_NOTIFY request", packet)
+        let response = try await signedLongPollWireTransaction(packet: packet, responseLabel: "CHANGE_NOTIFY response")
+        let header = try SMB2Header.decode(response)
+        if header.status == SMB2Status.notifyEnumDir {
+            return .overflow
+        }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "CHANGE_NOTIFY")
+        return .changes(try SMB2ChangeNotify.decodeResponse(response))
+    }
+
     func queryInfo(treeId: UInt32, fileId: [UInt8]) async throws -> SMBFileStat {
         let packet = try SMB2QueryInfo.encodeRequest(
             messageId: nextMessageId(),
@@ -2727,6 +2838,23 @@ actor SMBSession {
         return response
     }
 
+    private func signedLongPollWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
+        await wireTransactionGate.enter()
+        defer { wireTransactionGate.leave() }
+        let response = try await withTaskCancellationHandler {
+            try await sendSigned(packet)
+            return try await receiveLongPoll(label: responseLabel)
+        } onCancel: {
+            Task {
+                await self.closeTransport()
+            }
+        }
+        if verifySignature {
+            try verifySigned(response)
+        }
+        return response
+    }
+
     private func sendUnsigned(_ packet: [UInt8]) async throws {
         try Task.checkCancellation()
         try await transport.send(DirectTCPFraming.frame(packet))
@@ -2825,6 +2953,17 @@ actor SMBSession {
             debugLine("\(label) ignored interim STATUS_PENDING async response")
         }
         throw SMBCodecError.invalidValue("too many interim SMB2 STATUS_PENDING responses")
+    }
+
+    private func receiveLongPoll(label: String) async throws -> [UInt8] {
+        while true {
+            try Task.checkCancellation()
+            let packet = try await receiveDecryptedFrame(label: label)
+            guard try SMB2AsyncInterim.shouldDiscard(packet) else {
+                return packet
+            }
+            debugLine("\(label) ignored interim STATUS_PENDING async response")
+        }
     }
 
     private func receiveDecryptedFrame(label: String) async throws -> [UInt8] {
@@ -2941,6 +3080,7 @@ actor SMBSession {
 enum SMB2Status {
     static let success: UInt32 = 0x0000_0000
     static let pending: UInt32 = 0x0000_0103
+    static let notifyEnumDir: UInt32 = 0x0000_010c
     static let bufferOverflow: UInt32 = 0x8000_0005
     static let noMoreFiles: UInt32 = 0x8000_0006
     static let invalidParameter: UInt32 = 0xc000_000d

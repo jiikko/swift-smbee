@@ -138,6 +138,53 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall watch deadline.
+    public static func withChangeNotifications(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String = "",
+        filter: SMBChangeNotifyFilter = .default,
+        watchTree: Bool = false,
+        timeout: Duration? = nil,
+        onChange: @escaping @Sendable (SMBChangeNotifyEvent) async throws -> Void
+    ) async throws {
+        try await SMBClient.withChangeNotifications(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            filter: filter,
+            watchTree: watchTree,
+            credential: credential,
+            timeout: timeout,
+            onChange: onChange
+        )
+    }
+
+    public static func withChangeNotifications(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String = "",
+        filter: SMBChangeNotifyFilter = .default,
+        watchTree: Bool = false,
+        onChange: @escaping @Sendable (SMBChangeNotifyEvent) async throws -> Void
+    ) async throws {
+        try await SMBClient.withChangeNotifications(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            filter: filter,
+            watchTree: watchTree,
+            credentialProvider: credentialProvider,
+            onChange: onChange
+        )
+    }
+
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func stat(
         host: String,

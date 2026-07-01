@@ -389,6 +389,23 @@ private final class TestDirectoryEntryCollector: @unchecked Sendable {
     }
 }
 
+private final class ChangeNotifyCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBChangeNotifyEvent] = []
+
+    var events: [SMBChangeNotifyEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ event: SMBChangeNotifyEvent) {
+        lock.lock()
+        storage.append(event)
+        lock.unlock()
+    }
+}
+
 private final class LockedCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var storage = 0
@@ -2429,6 +2446,94 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(request[67], 0x00)
     }
 
+    func testChangeNotifyRequestShape() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2ChangeNotify.encodeRequest(
+            messageId: 12,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            completionFilter: [.fileName, .dirName, .lastWrite],
+            watchTree: true,
+            outputBufferLength: 4096
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.changeNotify)
+        XCTAssertEqual(header.messageId, 12)
+        XCTAssertEqual(header.treeId, 0x5566_7788)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(request.count, 96)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 32)
+        XCTAssertEqual(readUInt16LE(request, at: 66), 0x0001)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 4096)
+        XCTAssertEqual(Array(request[72..<88]), fileId)
+        XCTAssertEqual(readUInt32LE(request, at: 88), 0x0000_0013)
+        XCTAssertEqual(readUInt32LE(request, at: 92), 0)
+    }
+
+    func testChangeNotifyResponseDecodesFileNotifyInformationEntries() throws {
+        let response = try smb2ChangeNotifyResponse(
+            entries: [
+                makeFileNotifyEntry(action: 1, name: "new.txt", nextOffset: 32),
+                makeFileNotifyEntry(action: 2, name: "old.txt", nextOffset: 0),
+            ],
+            messageId: 12,
+            treeId: 0x3344
+        )
+
+        let changes = try SMB2ChangeNotify.decodeResponse(response)
+
+        XCTAssertEqual(changes, [
+            SMBFileChange(action: .added, name: "new.txt"),
+            SMBFileChange(action: .removed, name: "old.txt"),
+        ])
+    }
+
+    func testChangeNotifyResponseRejectsTruncatedFileNotifyInformation() throws {
+        var response = try smb2ChangeNotifyResponse(
+            entries: [makeFileNotifyEntry(action: 3, name: "bad.txt", nextOffset: 0)],
+            messageId: 12,
+            treeId: 0x3344
+        )
+        writeUInt32LE(10_000, to: &response, at: 80)
+
+        XCTAssertThrowsError(try SMB2ChangeNotify.decodeResponse(response)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .truncated)
+        }
+    }
+
+    func testChangeNotifyOverflowStatusMapsToOverflowEvent() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2StatusResponse(status: SMB2Status.notifyEnumDir, command: SMB2Commands.changeNotify, messageId: 0, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let collector = ChangeNotifyCollector()
+        let task = Task {
+            try await session.changeNotify(treeId: 0x3344, fileId: fileId, filter: .default, watchTree: false) { event in
+                collector.append(event)
+                throw CancellationError()
+            }
+        }
+        do {
+            try await awaitWithTimeout("CHANGE_NOTIFY overflow") {
+                try await task.value
+            }
+        } catch is CancellationError {
+        }
+
+        XCTAssertEqual(collector.events, [.overflow])
+    }
+
     func testSessionQueryDirectoryStreamsPagesUntilNoMoreFiles() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([
@@ -4250,6 +4355,19 @@ final class SMBeeTests: XCTestCase {
         return bytes
     }
 
+    private func makeFileNotifyEntry(action: UInt32, name: String, nextOffset: UInt32) -> [UInt8] {
+        let nameBytes = NTLM.utf16le(name)
+        var bytes = Array(repeating: UInt8(0), count: 12 + nameBytes.count)
+        writeUInt32LE(nextOffset, to: &bytes, at: 0)
+        writeUInt32LE(action, to: &bytes, at: 4)
+        writeUInt32LE(UInt32(nameBytes.count), to: &bytes, at: 8)
+        bytes.replaceSubrange(12..<12 + nameBytes.count, with: nameBytes)
+        if Int(nextOffset) > bytes.count {
+            bytes.append(contentsOf: Array(repeating: 0, count: Int(nextOffset) - bytes.count))
+        }
+        return bytes
+    }
+
     private func hex(_ bytes: [UInt8]) -> String {
         bytes.map { String(format: "%02x", $0) }.joined()
     }
@@ -4565,6 +4683,17 @@ final class SMBeeTests: XCTestCase {
     private func smb2QueryDirectoryResponse(entries: [[UInt8]], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
         let payload = entries.flatMap { $0 }
         var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: messageId, treeId: treeId).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 66)
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+        return response
+    }
+
+    private func smb2ChangeNotifyResponse(entries: [[UInt8]], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+        let payload = entries.flatMap { $0 }
+        var response = try SMB2Header(command: SMB2Commands.changeNotify, messageId: messageId, treeId: treeId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
         writeUInt16LE(9, to: &response, at: 64)
         writeUInt16LE(72, to: &response, at: 66)

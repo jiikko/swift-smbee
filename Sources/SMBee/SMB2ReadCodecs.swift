@@ -1,4 +1,5 @@
 import Foundation
+// swiftlint:disable file_length
 
 enum SMB2Commands {
     static let sessionSetup: UInt16 = 1
@@ -12,9 +13,64 @@ enum SMB2Commands {
     static let write: UInt16 = 9
     static let ioctl: UInt16 = 11
     static let cancel: UInt16 = 12
+    static let changeNotify: UInt16 = 15
     static let setInfo: UInt16 = 17
     static let queryInfo: UInt16 = 16
     static let queryDirectory: UInt16 = 14
+}
+
+public struct SMBFileChange: Equatable, Sendable {
+    public let action: SMBFileChangeAction
+    public let name: String
+
+    public init(action: SMBFileChangeAction, name: String) {
+        self.action = action
+        self.name = name
+    }
+}
+
+public enum SMBFileChangeAction: Equatable, Sendable {
+    case added
+    case removed
+    case modified
+    case renamedOldName
+    case renamedNewName
+    case other(UInt32)
+
+    init(rawValue: UInt32) {
+        switch rawValue {
+        case 1: self = .added
+        case 2: self = .removed
+        case 3: self = .modified
+        case 4: self = .renamedOldName
+        case 5: self = .renamedNewName
+        default: self = .other(rawValue)
+        }
+    }
+}
+
+public struct SMBChangeNotifyFilter: OptionSet, Sendable {
+    public let rawValue: UInt32
+
+    public init(rawValue: UInt32) {
+        self.rawValue = rawValue
+    }
+
+    public static let fileName = SMBChangeNotifyFilter(rawValue: 0x0000_0001)
+    public static let dirName = SMBChangeNotifyFilter(rawValue: 0x0000_0002)
+    public static let attributes = SMBChangeNotifyFilter(rawValue: 0x0000_0004)
+    public static let size = SMBChangeNotifyFilter(rawValue: 0x0000_0008)
+    public static let lastWrite = SMBChangeNotifyFilter(rawValue: 0x0000_0010)
+    public static let lastAccess = SMBChangeNotifyFilter(rawValue: 0x0000_0020)
+    public static let creation = SMBChangeNotifyFilter(rawValue: 0x0000_0040)
+    public static let ea = SMBChangeNotifyFilter(rawValue: 0x0000_0080)
+    public static let security = SMBChangeNotifyFilter(rawValue: 0x0000_0100)
+    public static let `default`: SMBChangeNotifyFilter = [.fileName, .dirName, .attributes, .lastWrite]
+}
+
+public enum SMBChangeNotifyEvent: Equatable, Sendable {
+    case changes([SMBFileChange])
+    case overflow
 }
 
 enum SMB2Logoff {
@@ -185,6 +241,15 @@ struct SMB2CreateRequest {
             desiredAccess: directory ? 0x0000_0089 : 0x0000_0081,
             createDisposition: 0x0000_0001,
             createOptions: directory ? 0x0000_0001 : 0x0000_0040
+        )
+    }
+
+    static func changeNotify(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0001,
+            createDisposition: 0x0000_0001,
+            createOptions: 0x0000_0001
         )
     }
 
@@ -845,6 +910,67 @@ enum SMB2QueryDirectory {
 
     private static func readUInt64LE(_ bytes: [UInt8], at offset: Int) -> UInt64 {
         UInt64(readUInt32LE(bytes, at: offset)) | (UInt64(readUInt32LE(bytes, at: offset + 4)) << 32)
+    }
+}
+
+enum SMB2ChangeNotify {
+    static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        completionFilter: SMBChangeNotifyFilter = .default,
+        watchTree: Bool = false,
+        outputBufferLength: UInt32 = 65_536
+    ) throws -> [UInt8] {
+        guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        let header = try SMB2Header(
+            command: SMB2Commands.changeNotify,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(32)
+        writer.writeUInt16LE(watchTree ? 0x0001 : 0x0000)
+        writer.writeUInt32LE(outputBufferLength)
+        writer.writeBytes(fileId)
+        writer.writeUInt32LE(completionFilter.rawValue)
+        writer.writeUInt32LE(0)
+        return writer.bytes
+    }
+
+    static func decodeResponse(_ bytes: [UInt8]) throws -> [SMBFileChange] {
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 9 else {
+            throw SMBCodecError.invalidValue("invalid CHANGE_NOTIFY response structure size")
+        }
+        let offset = Int(try reader.readUInt16LE())
+        let length = Int(try reader.readUInt32LE())
+        guard offset >= SMB2Header.encodedSize, offset + length <= bytes.count else {
+            throw SMBCodecError.truncated
+        }
+        return try decodeFileNotifyInformation(Array(bytes[offset..<offset + length]))
+    }
+
+    static func decodeFileNotifyInformation(_ data: [UInt8]) throws -> [SMBFileChange] {
+        var changes: [SMBFileChange] = []
+        var entryOffset = 0
+        while entryOffset < data.count {
+            guard entryOffset + 12 <= data.count else { throw SMBCodecError.truncated }
+            let next = Int(readUInt32LE(data, at: entryOffset))
+            let action = readUInt32LE(data, at: entryOffset + 4)
+            let nameLength = Int(readUInt32LE(data, at: entryOffset + 8))
+            let nameOffset = entryOffset + 12
+            guard nameOffset + nameLength <= data.count else { throw SMBCodecError.truncated }
+            let nameBytes = Array(data[nameOffset..<nameOffset + nameLength])
+            changes.append(SMBFileChange(action: SMBFileChangeAction(rawValue: action), name: decodeUTF16LE(nameBytes)))
+            if next == 0 { break }
+            guard next >= 12, entryOffset + next <= data.count else { throw SMBCodecError.truncated }
+            entryOffset += next
+        }
+        return changes
     }
 }
 

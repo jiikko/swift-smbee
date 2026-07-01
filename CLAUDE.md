@@ -28,6 +28,19 @@ SAMBA_CONFIG=test/e2e/smb/smb311-encrypted-required.conf bin/e2e/container-samba
 profile の使い分け・SMB 3.1.1 だけ確認する起動例・wire trace は [docs/testing.md](docs/testing.md)
 「ローカル実行 — Apple container / macOS」が正本。
 
+### 変更したら「その箇所をどうカバーするか」を必ず検討する
+
+コードを変更したら、**変更した箇所の退行を捕まえるテストを追加できないか**を毎回検討する。
+機能追加・バグ修正だけで終わらせず、次のどれでカバーするか（または「不要」の理由）を明示する:
+
+- **unit / regression test**: 変更したロジック・codec・境界の退行を synthetic に固定する
+  （例: perf 契約は `SMBeePerformanceRegressionTests`、wire は fixture）。
+- **E2E test**: 実サーバでしか出ない挙動（negotiate 結果・署名/暗号・実 status）は
+  `Tests/SMBeeTests/SMBeeE2ETests.swift` に足し、`bin/e2e/container-samba.sh` で回す。
+- 該当 profile が無ければ `test/e2e/smb/*.conf` を足すことも検討する。
+
+「テストで守れない変更」だと判断したら、その理由を PR / commit に一行残す。
+
 ### smoke が要る変更 / 要らない変更
 
 - **要る**: CREATE/READ/WRITE/QUERY_*/SET_INFO 等の codec、署名（CMAC/GMAC）、暗号（CCM/GCM）、

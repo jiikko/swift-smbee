@@ -257,6 +257,13 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30 実装レビュー追記: `SMBCredential` は source compatibility のため `password: String`
     を保持しており、NT hash credential では空文字を入れている。将来は `password` 露出を避ける
     credential enum / provider callback へ移行し、deprecation plan を用意する。
+  - 2026-07-01 (commit c8172c3): **password provider callback** と **guest/anonymous** を実装。
+    `SMBCredentialProvider` (lazy closure) を persistent `connect` に、`SMBCredential.anonymous` /
+    CLI `--anonymous`/`--guest` を追加。NTLM anonymous Type3 + signing 不可時の unsigned フォールバック。
+    実 Samba guest E2E で anonymous ls/cat/stat 成功 (test/e2e/smb/guest.conf)。
+    **残 (本ライブラリ core 対象外): keychain 連携 = macOS Security.framework 依存で consumer 側
+    (obaket/smbcli) の関心。Kerberos/GSS = MVP scope 外 ([`issues/005`](issues/005-auth-macos-finder-equivalent-smb-auth.md))。**
+    ライブラリは credential-agnostic (password/ntHash/provider/anonymous) を維持する方針。
 - [ ] path handling: SMB パス正規化・`.`/`..`・区切り文字・URL percent decoding/encoding の仕様化
   - 2026-06-30: CLI URL parser で share/path component と userinfo の percent decode を実装。
     path component の `.` / `..` と decoded separator (`/` / `\`) は拒否し、URL `/` のみを

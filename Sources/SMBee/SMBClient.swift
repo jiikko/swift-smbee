@@ -453,6 +453,23 @@ public enum SMBClient {
         credential: SMBCredential,
         makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
     ) async throws -> SMBClientSession {
+        try await connect(
+            host: host,
+            port: port,
+            share: share,
+            credentialProvider: { credential },
+            makeTransport: makeTransport
+        )
+    }
+
+    public static func connect(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> SMBClientSession {
+        let credential = try await credentialProvider()
         let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
         do {
             try await session.connect()
@@ -1144,7 +1161,7 @@ actor SMBSession {
             negotiateMessage: type1Message,
             challengeMessage: challengeMessage
         )
-        let mechListMIC = NTLM.makeMechListMIC(exportedSessionKey: authenticate.exportedSessionKey)
+        let mechListMIC = credential.isAnonymous ? nil : NTLM.makeMechListMIC(exportedSessionKey: authenticate.exportedSessionKey)
         let authBlob = SPNEGO.wrapNegTokenResp(authenticate.message, mechListMIC: mechListMIC)
         let authPacket = try SMB2SessionSetup.encodeRequest(
             messageId: nextMessageId(),
@@ -1162,6 +1179,13 @@ actor SMBSession {
         let authHeader = try SMB2Header.decode(authResponse)
         try SMBErrorMapper.throwIfFailure(status: authHeader.status, operation: "SESSION_SETUP")
         sessionId = authHeader.sessionId
+        if credential.isAnonymous {
+            // ⓥ Anonymous NTLM does not provide session key material, so SMB signing/encryption keys
+            // cannot be derived here. If a server requires signing/encryption for guest access, the
+            // later signed or encrypted operation is expected to fail until guest E2E coverage defines
+            // a server-specific fallback.
+            return
+        }
         if result.dialect == SMBNegotiateConstants.dialect311 {
             let preauthHash = SMBCrypto.smb311PreauthIntegrityHash(preauthMessages)
             signingKey = SMBCrypto.smb311SigningKey(sessionKey: authenticate.exportedSessionKey, preauthIntegrityHash: preauthHash)
@@ -1707,7 +1731,13 @@ actor SMBSession {
             try await sendEncrypted(packet)
             return
         }
-        guard let signingKey else { throw SMBCodecError.invalidValue("missing SMB signing key") }
+        // No signing key means an anonymous/guest session (NTLM anonymous yields no session key
+        // material). Such sessions cannot sign; the server granted access without requiring signing
+        // (signingRequired was false at NEGOTIATE), so send the packet unsigned.
+        guard let signingKey else {
+            try await sendUnsigned(packet)
+            return
+        }
         var signed = packet
         signed[16] |= UInt8(SMB2Flags.signed & 0xff)
         for index in 48..<64 { signed[index] = 0 }

@@ -19,6 +19,15 @@ public enum SMBee {
         try await SMBClient.connect(host: host, port: port, share: share, credential: credential)
     }
 
+    public static func connect(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String
+    ) async throws -> SMBClientSession {
+        try await SMBClient.connect(host: host, port: port, share: share, credentialProvider: credentialProvider)
+    }
+
     public static func listShares(
         host: String,
         port: UInt16 = 445,

@@ -245,6 +245,23 @@ private final class TestDirectoryEntryCollector: @unchecked Sendable {
     }
 }
 
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func increment() {
+        lock.lock()
+        storage += 1
+        lock.unlock()
+    }
+}
+
 final class SMBeeTests: XCTestCase {
     func testVersionIsNotEmpty() {
         XCTAssertFalse(SMBee.version.isEmpty)
@@ -429,6 +446,34 @@ final class SMBeeTests: XCTestCase {
         } catch {
             XCTFail("expected logonFailure, got \(error)")
         }
+    }
+
+    func testCredentialProviderIsResolvedOnceWhenConnectingPersistentSession() async throws {
+        let inbound = try framed([
+            negotiateResponse(messageId: 0),
+            sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let providerCalls = LockedCounter()
+
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credentialProvider: {
+                providerCalls.increment()
+                return SMBCredential(username: "provider-user", password: "provider-pass", domain: "provider-domain")
+            },
+            makeTransport: { transport }
+        )
+        await session.close()
+
+        XCTAssertEqual(providerCalls.value, 1)
+        let requests = try unframed(transport.outbound)
+        XCTAssertGreaterThanOrEqual(requests.count, 3)
+        let type1 = try SPNEGO.unwrapNTLMToken(Array(requests[1][88..<requests[1].count]))
+        XCTAssertEqual(String(decoding: readSecurityBuffer(type1, at: 16), as: UTF8.self), "PROVIDER-DOMAIN")
     }
 
     func testSMB2HeaderRoundTrip() throws {
@@ -991,6 +1036,16 @@ final class SMBeeTests: XCTestCase {
         XCTAssertThrowsError(try SMBCredential(username: "User", ntHash: [0], domain: "Domain"))
     }
 
+    func testAnonymousCredentialHasEmptyIdentityAndNoSecretMaterial() {
+        let credential = SMBCredential.anonymous
+
+        XCTAssertTrue(credential.isAnonymous)
+        XCTAssertEqual(credential.username, "")
+        XCTAssertEqual(credential.password, "")
+        XCTAssertNil(credential.ntHash)
+        XCTAssertEqual(credential.domain, "")
+    }
+
     func testMSNLMPSection424NTLMv2SessionKeyExchangeRegressionVector() throws {
         // Regression vector for this implementation's fixed inputs. This is not the
         // literal MS-NLMP 4.2.4 published vector: timestamp and client challenge differ.
@@ -1024,6 +1079,34 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(authenticate.message, at: 52), 16)
         XCTAssertEqual(hex(readSecurityBuffer(authenticate.message, at: 52)), "531734fe4e46f82f46a28fadaaaf0e49")
         XCTAssertEqual(authenticate.exportedSessionKey, hexBytes("55555555555555555555555555555555"))
+    }
+
+    func testAnonymousNTLMType3UsesAnonymousFlagAndEmptyIdentityResponses() throws {
+        let challenge = NTLMChallenge(
+            targetName: NTLM.utf16le("Server"),
+            flags: NTLM.negotiateFlags,
+            serverChallenge: hexBytes("0123456789abcdef"),
+            targetInfo: hexBytes("02000c0044004f004d00410049004e0000000000")
+        )
+
+        let authenticate = try NTLM.makeType3(credential: .anonymous, challenge: challenge)
+        let message = authenticate.message
+
+        XCTAssertEqual(Array(message[0..<8]), Array("NTLMSSP\0".utf8))
+        XCTAssertEqual(readUInt32LE(message, at: 8), 3)
+        XCTAssertEqual(readSecurityBuffer(message, at: 12), [0x00])
+        XCTAssertEqual(readSecurityBuffer(message, at: 20), [])
+        XCTAssertEqual(readSecurityBuffer(message, at: 28), [])
+        XCTAssertEqual(readSecurityBuffer(message, at: 36), [])
+        XCTAssertEqual(readSecurityBuffer(message, at: 44), [])
+        XCTAssertEqual(readSecurityBuffer(message, at: 52), [])
+        XCTAssertEqual(readUInt32LE(message, at: 60) & NTLM.negotiateAnonymous, NTLM.negotiateAnonymous)
+        XCTAssertEqual(readUInt32LE(message, at: 60) & NTLM.negotiateKeyExchange, 0)
+        XCTAssertEqual(readUInt32LE(message, at: 60) & NTLM.negotiateSign, 0)
+        XCTAssertEqual(readUInt32LE(message, at: 60) & NTLM.negotiateSeal, 0)
+        XCTAssertEqual(message.count, 73)
+        XCTAssertEqual(authenticate.sessionBaseKey, [])
+        XCTAssertEqual(authenticate.exportedSessionKey, [])
     }
 
     func testNTLMMICUsesExportedSessionKeyAndZeroedMICField() throws {
@@ -3177,6 +3260,23 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(1_048_576, to: &response, at: 100)
         writeUInt16LE(UInt16(response.count), to: &response, at: 116)
         writeUInt16LE(0, to: &response, at: 118)
+        return response
+    }
+
+    private func sessionSetupChallengeResponse(messageId: UInt64, sessionId: UInt64) throws -> [UInt8] {
+        let targetInfo = hexBytes("070008000090d336b734c30100000000")
+        let blob = SPNEGO.wrapNegTokenResp(makeNTLMChallengeMessage(targetInfo: targetInfo))
+        var response = try SMB2Header(
+            status: SMB2Status.moreProcessingRequired,
+            command: SMB2Commands.sessionSetup,
+            messageId: messageId,
+            sessionId: sessionId
+        ).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 68)
+        writeUInt16LE(UInt16(blob.count), to: &response, at: 70)
+        response.append(contentsOf: blob)
         return response
     }
 

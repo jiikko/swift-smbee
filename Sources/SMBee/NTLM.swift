@@ -5,12 +5,14 @@ public struct SMBCredential: Sendable {
     public var password: String
     public var ntHash: [UInt8]?
     public var domain: String
+    public var isAnonymous: Bool
 
     public init(username: String, password: String, domain: String = "") {
         self.username = username
         self.password = password
         self.ntHash = nil
         self.domain = domain
+        self.isAnonymous = false
     }
 
     public init(username: String, ntHash: [UInt8], domain: String = "") throws {
@@ -21,8 +23,23 @@ public struct SMBCredential: Sendable {
         self.password = ""
         self.ntHash = ntHash
         self.domain = domain
+        self.isAnonymous = false
+    }
+
+    public static var anonymous: SMBCredential {
+        SMBCredential(username: "", password: "", domain: "", isAnonymous: true)
+    }
+
+    private init(username: String, password: String, domain: String, isAnonymous: Bool) {
+        self.username = username
+        self.password = password
+        self.ntHash = nil
+        self.domain = domain
+        self.isAnonymous = isAnonymous
     }
 }
+
+public typealias SMBCredentialProvider = @Sendable () async throws -> SMBCredential
 
 struct NTLMChallenge {
     var targetName: [UInt8]
@@ -39,6 +56,7 @@ enum NTLM {
     static let negotiateSeal: UInt32 = 0x0000_0020
     static let negotiateNTLM: UInt32 = 0x0000_0200
     static let negotiateAlwaysSign: UInt32 = 0x0000_8000
+    static let negotiateAnonymous: UInt32 = 0x0000_0800
     static let negotiateExtendedSessionSecurity: UInt32 = 0x0008_0000
     static let negotiateTargetInfo: UInt32 = 0x0080_0000
     static let negotiateVersion: UInt32 = 0x0200_0000
@@ -100,6 +118,9 @@ enum NTLM {
         clientChallenge: [UInt8] = randomBytes(count: 8),
         exportedSessionKey: [UInt8] = randomBytes(count: 16)
     ) throws -> (message: [UInt8], sessionBaseKey: [UInt8], exportedSessionKey: [UInt8]) {
+        if credential.isAnonymous {
+            return makeAnonymousType3(challenge: challenge)
+        }
         guard clientChallenge.count == 8 else {
             throw SMBCodecError.invalidValue("NTLMv2 client challenge must be 8 bytes")
         }
@@ -188,6 +209,55 @@ enum NTLM {
             message.replaceSubrange(72..<88, with: mic)
         }
         return (message, sessionBaseKey, exportedSessionKey)
+    }
+
+    private static func makeAnonymousType3(
+        challenge: NTLMChallenge
+    ) -> (message: [UInt8], sessionBaseKey: [UInt8], exportedSessionKey: [UInt8]) {
+        let lmChallengeResponse: [UInt8] = [0x00]
+        let ntChallengeResponse: [UInt8] = []
+        let domainBytes: [UInt8] = []
+        let userBytes: [UInt8] = []
+        let workstationBytes: [UInt8] = []
+        let sessionKey: [UInt8] = []
+        // ⓥ MS-NLMP anonymous authenticate has no session key material. Keep sign/seal/key-exchange
+        // off even if the server challenge advertises them; real Samba guest E2E should confirm
+        // whether any server expects extra negotiated bits preserved here.
+        let flags = ((negotiateFlags & challenge.flags) | negotiateAnonymous)
+            & ~negotiateSign
+            & ~negotiateSeal
+            & ~negotiateKeyExchange
+            & ~negotiateAlwaysSign
+
+        let fixedSize = 72
+        var payloadOffset = UInt32(fixedSize)
+        var payload: [UInt8] = []
+        func appendPayload(_ bytes: [UInt8]) -> (Int, UInt32) {
+            let result = (bytes.count, payloadOffset)
+            payload += bytes
+            payloadOffset += UInt32(bytes.count)
+            return result
+        }
+        let lm = appendPayload(lmChallengeResponse)
+        let nt = appendPayload(ntChallengeResponse)
+        let domain = appendPayload(domainBytes)
+        let user = appendPayload(userBytes)
+        let workstation = appendPayload(workstationBytes)
+        let key = appendPayload(sessionKey)
+
+        var writer = SMBByteWriter()
+        writer.writeBytes(signature)
+        writer.writeUInt32LE(3)
+        writeSecurityBuffer(&writer, length: lm.0, offset: lm.1)
+        writeSecurityBuffer(&writer, length: nt.0, offset: nt.1)
+        writeSecurityBuffer(&writer, length: domain.0, offset: domain.1)
+        writeSecurityBuffer(&writer, length: user.0, offset: user.1)
+        writeSecurityBuffer(&writer, length: workstation.0, offset: workstation.1)
+        writeSecurityBuffer(&writer, length: key.0, offset: key.1)
+        writer.writeUInt32LE(flags)
+        writer.writeBytes([0x06, 0x01, 0xb1, 0x1d, 0, 0, 0, 0x0f])
+        writer.writeBytes(payload)
+        return (writer.bytes, [], [])
     }
 
     static func ntowfv2(password: String, username: String, domain: String) -> [UInt8] {

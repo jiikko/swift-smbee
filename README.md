@@ -4,13 +4,14 @@ A pure-Swift SMB2/3 client.
 
 SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing は本ライブラリで
 **自作**し、AES-GCM / HMAC / SHA などの暗号プリミティブの計算は
-[swift-crypto](https://github.com/apple/swift-crypto) に委ねる
+[swift-crypto](https://github.com/apple/swift-crypto) と in-repo pure-Swift 実装に委ねる
 （`libsmb2` のような vendored C 依存は持たない）。
 
 ## スコープ (MVP)
 
 - 対象サーバ: **macOS の SMB サーバ (SMBX / ファイル共有)**
-- dialect: **SMB 3.1.1**（signing = AES-GMAC / encryption = AES-GCM が交渉できた場合）
+- dialect: **SMB 3.0.2 / SMB 3.1.1**（サーバとの NEGOTIATE 結果に従う。macOS SMBX は現状 3.0.2 上限、Samba では 3.1.1 profile も検証）
+- signing / encryption: negotiated dialect に応じて AES-CMAC / AES-CCM（3.0.x）または AES-GMAC / AES-GCM（3.1.1）
 - 認証: **NTLMv2**（Kerberos は対象外）
 - まず CLI (`smbcli`) で動かし、後段で GUI から利用する
 

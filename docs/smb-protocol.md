@@ -32,7 +32,7 @@ Specifications**。周辺の暗号・交渉メカニズムの一部だけが IET
 | RFC 2104 | HMAC | HMAC-MD5（NTLMv2）/ HMAC-SHA256（KDF） |
 | NIST SP 800-108 | KDF（counter mode） | SMB 3.x の鍵導出 |
 | NIST SP 800-38D | GCM / GMAC | 3.1.1 の encryption(GCM)・signing(GMAC) |
-| RFC 4493 / RFC 3610 / NIST SP 800-38C | AES-CMAC / AES-CCM | 3.0.2 の signing(CMAC)・encryption(CCM)。swift-crypto に無いため Phase 2 で pure-Swift 実装 |
+| RFC 4493 / RFC 3610 / NIST SP 800-38C | AES-CMAC / AES-CCM | 3.0.2 の signing(CMAC)・encryption(CCM)。in-repo pure-Swift 実装で扱う |
 | RFC 1001 / 1002 | NetBIOS | direct TCP 445 の 4 byte length header はこれ由来（445 では name service は使わない） |
 
 ## MVP スコープ（SMBee）
@@ -43,8 +43,7 @@ Specifications**。周辺の暗号・交渉メカニズムの一部だけが IET
 - **auth**: **NTLMv2**（SPNEGO 包装）。**Kerberos は対象外**。
 - **signing / encryption**: negotiated dialect 依存。
   - **3.1.1**: AES-128-GMAC / AES-128-GCM（swift-crypto）。
-  - **3.0.2**: AES-CMAC / AES-128-CCM。swift-crypto に無いため Phase 2 で pure-Swift 実装
-    または pure-Swift cross-platform lib（例: CryptoSwift, MIT）を踏襲する。Linux ビルド維持が条件。
+  - **3.0.2**: AES-CMAC / AES-128-CCM（in-repo pure-Swift 実装）。Linux ビルド維持が条件。
 - **対象サーバ**: **macOS の SMB サーバ（SMBX、実上限 3.0.2）**。Samba は E2E / 互換確認対象。
 
 ## 接続ライフサイクルと実装する command

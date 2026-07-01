@@ -54,7 +54,7 @@ protocol SMBTransport            // TCP 445 上の双方向バイトストリー
 | `SMBTransport`（protocol）+ 実装 | TCP バイトストリーム。platform 差はここだけ |
 | `Protocol/` | SMB2 header / command codec / framing |
 | `Auth/` | NTLMv2 / SPNEGO |
-| `Crypto/` | preauth / KDF / signing / encryption。3.1.1 は GMAC/GCM を swift-crypto で扱う。3.0.2 は CMAC/CCM が必要だが swift-crypto に無いため、Phase 2 で pure-Swift 実装または pure-Swift cross-platform lib を踏襲する |
+| `Crypto/` | preauth / KDF / signing / encryption。3.1.1 は GMAC/GCM を swift-crypto で扱う。3.0.2 は in-repo pure-Swift AES-CMAC/AES-CCM で扱う |
 | `Session/` | `SMBSession`（actor）: 接続シーケンス・直列化・再接続・cancellation |
 | `API/` | 公開 API（list/stat/read/write/mkdir/rename/delete）。型は path/offset/length/attrs |
 | `smbcli` | CLI（probe/ls/stat/cat/put/...） |
@@ -68,5 +68,4 @@ SMBee を薄くラップする）。
   3.1.1 は喋らない。
 - Samba 等の 3.1.1 対応サーバでは **0x0311 (SMB 3.1.1)** も対象。
 - 3.1.1 は AES-GMAC / AES-GCM を swift-crypto で扱う。3.0.2 は AES-CMAC / AES-128-CCM が必要で、
-  Phase 2 で pure-Swift 実装（RFC4493 / RFC3610 / SP800-38C）または pure-Swift cross-platform lib を検討する。
-  CommonCrypto は Linux 非対応なので使わない。
+  in-repo pure-Swift 実装（RFC4493 / RFC3610 / SP800-38C）で扱う。CommonCrypto は Linux 非対応なので使わない。

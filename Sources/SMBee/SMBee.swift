@@ -3,8 +3,8 @@ import Foundation
 /// SMBee 🐝 — a pure-Swift SMB2/3 client.
 ///
 /// SMB protocol / framing / NTLMv2 flow / SMB3 crypto framing は本ライブラリで
-/// 自作し、AES-GCM / HMAC / SHA の計算は swift-crypto に委ねる。
-/// MVP の対象サーバは macOS の SMB サーバ (SMBX)、dialect は SMB 3.0.2 / 3.1.1。
+/// 自作し、暗号プリミティブの計算は swift-crypto と in-repo pure-Swift 実装に委ねる。
+/// MVP の対象サーバは macOS の SMB サーバ (SMBX、実上限 SMB 3.0.2)。Samba では SMB 3.1.1 も互換確認対象。
 public enum SMBee {
     /// ライブラリのバージョン (暫定)。
     public static let version = "0.0.1"

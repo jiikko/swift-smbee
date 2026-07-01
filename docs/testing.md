@@ -54,16 +54,15 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 - **signing/cipher の交渉差**: macOS SMBX は macOS 26.5.1 でも negotiated dialect が
   **0x0302 (SMB 3.0.2)** で上限。SMB 3.0.2 は 3.1.1 negotiate contexts を返さず、
   signing/encryption は CMAC/CCM 系になる。
-- 当面の E2E は Samba を **SMB3_02 上限 + signing required** に固定し、実 macOS の probe-only
-  挙動をミラーする。3.0.2 用 AES-CMAC / AES-128-CCM は swift-crypto に無いため Phase 2 で
-  pure-Swift 実装または pure-Swift cross-platform lib を検討する。
-- Samba の **SMB 3.1.1 + AES-128-GMAC + AES-128-GCM** 交渉は別途 probe で確認する。Samba 3.1.1
-  response parser が `truncated` になる既知課題があり、macOS 実上限が 3.0.2 のため優先度は低い。
+- PR 必須 E2E は Samba を **SMB3_02 上限 + signing required + encryption required** に固定し、実 macOS の
+  3.0.2 上限をミラーする。3.0.2 用 AES-CMAC / AES-128-CCM は in-repo pure-Swift 実装で扱う。
+- Samba の **SMB 3.1.1 + AES-128-GMAC + AES-128-GCM** は `.github/workflows/samba-compat.yml` の
+  互換 matrix で確認する。3.1.1 は Samba 互換対象であり、macOS SMBX の前提 dialect ではない。
 - したがって E2E（Samba）green ≠ macOS SMBX 動作保証。**macOS SMBX への手動 smoke（Tier 3）を併用**する。
 
 ### CI 実行 — Docker / Linux runner
 
-- CI は **`ubuntu-latest` + Docker で Samba を起動**して E2E（`.github/workflows/e2e.yml`）。
+- CI は **`ubuntu-latest` + Docker で Samba を起動**して E2E（`.github/workflows/e2e.yml`、Swift 6.0 / 6.2 matrix）。
   ローカルは Apple container、CI は Docker、と起動手段を分ける。
 - **前提（再掲）**: Linux で動かす以上、SMBee が Linux ビルド可能であること（上の transport 制約）。
 - E2E テストは env gate（`SMBEE_E2E=1` + 接続情報 env）。未満足ならローカルの通常 `swift test` では skip。
@@ -71,7 +70,7 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   `test/e2e/smb/smb302-encrypted-required.conf` を使い、macOS SMBX mirror として
   SMB 3.0.2 + signing mandatory + encryption required を維持する。
 - `.github/workflows/samba-compat.yml` は重い互換性 matrix。`workflow_dispatch` と週次 schedule で、
-  distro-provided Samba と `test/e2e/smb/*.conf` profile の代表組み合わせを回す。
+  distro-provided Samba、Swift 6.0 / 6.2、`test/e2e/smb/*.conf` profile の代表組み合わせを回す。
 
 ### ローカル実行 — Apple container / macOS
 

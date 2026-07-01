@@ -221,7 +221,13 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: remote directory → remote directory copy (`SMBee.copyDirectory`, `SMBClientSession.copyDirectory`,
     `smbcli cp -r`) を追加。既存 READ/WRITE + QUERY_DIRECTORY の client-side recursive copy で実装し、
     unit と Samba E2E smoke に assertion 追加。
-  - 残: server-side copy (`FSCTL_SRV_COPYCHUNK`) の対応可否実測。
+  - 2026-07-01 (commit f502d96): server-side copy (`FSCTL_SRV_COPYCHUNK`) 実装 + 対応可否実測。
+    `copyFile` が resume key → copychunk_write (chunk limit 交渉付き) を先に試し、非対応時は
+    client-side READ/WRITE に透過フォールバック。**実測**: 当 Samba container の FS は copychunk
+    offload 非対応で `STATUS_INVALID_DEVICE_REQUEST` (StructureSize=9 error response) を返すため
+    fallback で動作 (300KB cp round-trip 一致)。offload 対応サーバでは server-side path を使う。
+    デバッグで 3 バグ修正 (resume key buffer size / IOCTL error-format 許容 / fallback 配線)。
+    error-format fallback の unit regression test 追加。
   - 2026-06-30 実装レビュー追記: recursive copy/delete/download は directory page を配列集約してから
     再帰している箇所がある。大規模 tree 向けに streaming traversal 化し、source が destination
     配下にある場合の自己再帰防止、最大 depth、同名衝突時の partial rollback 方針を決める。

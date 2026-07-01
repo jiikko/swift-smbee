@@ -16,14 +16,25 @@ jobs:
   build-test:
     # public repo なので macOS runner は無料 (.claude/rules gha-runner)。
     # Network.framework / CryptoKit-backed swift-crypto に依存するため macOS で回す。
-    # macos-26 (Swift 6.3 系) を使う: macos-15 (Swift 6.0 系) では SwiftLint の
-    # build-tool plugin が "prebuild command cannot use executables built from source"
-    # で失敗する。新しい toolchain なら plugin が通る (ローカル macOS 26 で確認済)。
+    # macOS runner は内蔵Swiftを使うため、.swift-version は厳密pinではなく最低要求versionとして検証する。
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - name: Swift version
-        run: swift --version
+      - name: Verify Swift version compatibility
+        run: |
+          required="$(tr -d '[:space:]' < .swift-version)"
+          actual="$(swift --version | sed -n 's/^Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+          swift --version
+          if [ -z "$actual" ]; then
+            echo "Could not parse swift --version output" >&2
+            exit 1
+          fi
+          lowest="$(printf '%s\n%s\n' "$required" "$actual" | sort -V | head -n 1)"
+          if [ "$lowest" != "$required" ]; then
+            echo "Swift ${actual} is older than required .swift-version ${required}" >&2
+            exit 1
+          fi
+          echo "Swift ${actual} satisfies .swift-version ${required}"
       # swift build は SwiftLintBuildToolPlugin も実行する (lint は brew でなく plugin)。
       - name: Build
         run: swift build

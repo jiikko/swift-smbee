@@ -61,6 +61,26 @@ jobs:
         # job on deterministic unit/vector coverage.
         run: swift test --skip SMBeeE2ETests
 
+  test-discovery:
+    name: test-discovery / Swift 6.2
+    # `swift test --list-tests` が新規 XCTest ファイル / class / method を拾えているかを確認する。
+    # 実行結果ではなく discovery coverage の smoke。source 側の `func test...` 数を下限として使い、
+    # Linux SwiftPM/XCTest 上の登録漏れを早めに検出する。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+      - name: Swift version
+        run: swift --version
+      - name: Check Swift test discovery
+        timeout-minutes: 10
+        env:
+          MIN_DISCOVERED_TESTS: "20"
+        run: bash scripts/check-test-discovery.sh
+
   performance-regression:
     runs-on: ubuntu-latest
     steps:

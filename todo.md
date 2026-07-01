@@ -36,12 +36,12 @@
   (SMBTransportError.connectionClosed/.socketFailure) 時に idempotent 操作 (probe/ls/stat/cat) のみ
   新 transport で最大 1 回再接続+やり直し。mutation は再試行せず SMBError.connectionLost。
   非接続喪失エラー・CancellationError は即 rethrow。
-- 🧊 E (defer 維持・2026-07-01 再確認): 3.1.1 GMAC/GCM 経路。Apple container + Samba
-  profile でローカル probe 検証可能。NEGOTIATE contexts / unpadded final context parser /
-  preauth integrity SHA-512 running hash / SP800-108 KDF (preauth-hash context) /
-  AES-GCM TRANSFORM_HEADER fixture / session への 3.1.1 KDF + GCM 暗号配線は実装済み。
-  残: 3.1.1 authenticated full E2E（GMAC signing-only response verify / GCM encrypted session）の
-  実サーバ検証と修正。
+- 🟡 E (2026-07-01 更新): 3.1.1 経路。**GMAC signing-only は実 Samba E2E green で完了**
+  (smb311-signing-required。KDF label null + preauth transcript の 2 バグを修正。commit e3468c9)。
+  **残: GCM encrypted session** — smb311-encrypted-required E2E は key 修正後も authenticated
+  encrypted op でサーバが connection を切る (`connectionLost`/`connectionClosed`)。key は
+  正しくなったので次は GCM TRANSFORM_HEADER の nonce/AAD/tag レイアウトを wire trace で
+  検証する段。Apple container + `smb311-encrypted-required` profile で再現可能。
 - ✅ 公開 read streaming API (2026-06-30): `SMBee.withReadStream(... onChunk:)` (scoped callback)。
   SMBSession.readChunks primitive に集約し既存 `[UInt8]` 一括 read は互換維持。chunk yield 後は透過 retry
   せず connectionLost に昇格。`smbcli cat` も streaming 化 (大ファイルを全量 lift しない)。実機 macOS で
@@ -117,7 +117,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [ ] **SMB 3.1.1 crypto framing**:
   - [x] preauth integrity: NEGOTIATE+SESSION_SETUP の SHA-512 running transcript
   - [x] SP800-108 counter KDF（HMAC-SHA256）で signing/encryption/application key 導出（label/context ⓥ）
-  - [ ] signing = AES-GMAC を packet に適用 / 検証
+  - [x] signing = AES-GMAC を packet に適用 / 検証
     - 2026-06-30: primitive と KDF は実装済み。GMAC 署名 packet の nonce/signature field レイアウトは
       実 packet fixture か 3.1.1 サーバで確認してから配線する。
     - 2026-06-30 実装レビュー追記: `sendSigned` は GMAC signing 単体を未配線、`verifySigned` は
@@ -136,6 +136,12 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
       GMAC signing-only 経路は unit green だが実 Samba 3.1.1 では通らない = 循環テスト型の
       未検出バグ。真因候補: 3.1.1 signing key 導出 / GMAC nonce レイアウト / response の
       signature field zeroing / verify 側 AAD。**要デバッグ (未着手)**。
+    - 2026-07-01 **解決**: wire trace で TREE_CONNECT response = STATUS_ACCESS_DENIED =
+      サーバが署名を拒否 = signing key 誤りと特定。真因 2 点: (1) 3.1.1 KDF label
+      (SMBSigningKey ほか 4 種) が終端 null を欠き 3.0.x と非対称に 1 null で導出していた
+      (MS-SMB2 §3.1.4.2)。(2) preauth hash に最終 SESSION_SETUP success 応答まで畳み込んで
+      いた (key 導出は最終 request まで; §3.2.5.3.1)。両修正で **smb311-signing-required
+      E2E green** (実 Samba)。KDF unit vector を実サーバ検証済み正値へ更新。commit e3468c9。
   - [x] encryption = TRANSFORM_HEADER + AES-GCM（nonce/AAD/tag レイアウト ⓥ）
     - 2026-06-30: 12-byte nonce + 16-byte TRANSFORM_HEADER nonce field padding / AAD / tag fixture を追加し、
       session の 3.1.1 暗号化・復号分岐へ配線。

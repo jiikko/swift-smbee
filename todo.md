@@ -306,12 +306,17 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `isReparsePoint` helper を追加。recursive copy/delete/download は reparse point を directory として
     辿らない安全側 policy にした。残: reparse tag 本体の取得 (`FileAttributeTagInformation` など) と
     DFS referral の扱い。
-- [ ] filesystem / volume information
+- [x] filesystem / volume information
   - `smbcli df` / API として share の total/free/available capacity、filesystem name、volume label、
     filesystem attributes / max component length を取得する。`QUERY_INFO(FileFsSizeInformation /
     FileFsAttributeInformation / FileFsVolumeInformation)` 相当。
   - upload / copy 前の空き容量チェックや GUI の容量表示で必要。server 実装差が出やすいため Samba /
     macOS SMBX / Windows で fixture または smoke を取る。
+  - 2026-07-01 (commit 4c420a0, codex-drive): QUERY_INFO を InfoType=0x02 (FILESYSTEM) で送れるよう
+    parametrize (既存 stat wire 不変)。decoder = FileFsFullSizeInformation(7) / FileFsAttributeInformation(5)
+    / FileFsVolumeInformation(1)。`SMBVolumeInfo` + `SMBee.volumeInfo` / `SMBClientSession.volumeInfo` +
+    `smbcli df` (--json)。fixture unit + 実 Samba E2E (df assertion) green。
+    残: macOS SMBX / Windows / NAS の smoke (実機必要)。
 - [ ] change notification / directory watch
   - ファイルブラウザ基盤として、ディレクトリ変更検知 (`CHANGE_NOTIFY`) の API を検討する。
     long-poll/async response、cancellation、再接続時の再購読、overflow 時の full rescan 方針が必要。
@@ -377,8 +382,12 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     - M5: smbcli に --timeout (TransportOptions) と get/put の --progress (stderr, \r live 更新) を配線。
     - 残: 全操作 deadline (per-operation withTimeout ラップ) は未対応 (今回は socket-level のみ)。
       put --progress はファイルを Data に読み込む経路 (streaming ではない) = 大ファイルでメモリ増。
-- [ ] CLI UX: `--password-stdin` / interactive password prompt / `--json` / exit code 表 / `--debug` redaction policy
+- [x] CLI UX: `--password-stdin` / interactive password prompt / `--json` / exit code 表 / `--debug` redaction policy
   - 自動化用途と人間操作の両方を想定。
+  - 2026-07-01: interactive password prompt を実装。`readPassword` の最終フォールバックとして
+    URL/`--password-stdin`/`SMB_PASSWORD` が全て無く **stdin が TTY (`isatty(STDIN_FILENO)`)** の場合のみ
+    `getpass` で echo 無効入力を促す。非TTY (パイプ/CI) では発火せず既存の ValidationError 経路を維持。
+    Linux の `stdin` グローバル concurrency 非安全を避け `STDIN_FILENO` 定数を使用。Linux/macOS build+unit green。
   - 2026-06-30 実装レビュー追記: `SMBEE_DEBUG=1` は raw SMB packet を出す。SESSION_SETUP 以降は
     security blob / encrypted payload / signing material に近い情報を含み得るため、command type ごとの
     redaction policy と `--debug` / `--trace-wire` の分離を決める。

@@ -763,7 +763,25 @@ private func readPassword(options: AuthOptions) throws -> String? {
         }
         return password.trimmingCharacters(in: CharacterSet(charactersIn: "\r\n"))
     }
-    return ProcessInfo.processInfo.environment["SMB_PASSWORD"]
+    if let envPassword = ProcessInfo.processInfo.environment["SMB_PASSWORD"] {
+        return envPassword
+    }
+    // 最終フォールバック: 対話端末でのみ echo を切ってパスワード入力を促す。
+    // 自動化 (パイプ/CI) では stdin が TTY でないため発火せず、既存の
+    // ValidationError 経路 (SMB_PASSWORD/--password-stdin 等の要求) を維持する。
+    if isatty(STDIN_FILENO) != 0 {
+        return try promptPasswordInteractively()
+    }
+    return nil
+}
+
+private func promptPasswordInteractively() throws -> String {
+    // getpass は /dev/tty から echo 無効で読み、末尾改行を含めない。
+    // Glibc/Darwin 双方で利用可能。
+    guard let raw = getpass("SMB password: ") else {
+        throw ValidationError("Failed to read password from the terminal")
+    }
+    return String(cString: raw)
 }
 
 private func parseNTHash(_ value: String) throws -> [UInt8] {

@@ -108,7 +108,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: swift-code-coverage
+          # Expiring artifact (short retention). The formatted Markdown report is also
+          # rendered inline on the job summary via $GITHUB_STEP_SUMMARY
+          # (see scripts/check-code-coverage.sh).
+          retention-days: 14
           path: |
+            .build/code-coverage.md
             .build/code-coverage.json
             .build/code-coverage-report.txt
           if-no-files-found: ignore

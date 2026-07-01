@@ -5,6 +5,7 @@ MIN_LINE_COVERAGE="${MIN_LINE_COVERAGE:-50}"
 MIN_FUNCTION_COVERAGE="${MIN_FUNCTION_COVERAGE:-0}"
 COVERAGE_JSON="${COVERAGE_JSON:-.build/code-coverage.json}"
 COVERAGE_REPORT="${COVERAGE_REPORT:-.build/code-coverage-report.txt}"
+COVERAGE_MD="${COVERAGE_MD:-.build/code-coverage.md}"
 IGNORE_FILENAME_REGEX="${IGNORE_FILENAME_REGEX:-(/Tests/|/.build/)}"
 LLVM_COV="${LLVM_COV:-llvm-cov}"
 
@@ -77,11 +78,12 @@ echo "CODE_COVERAGE_INFO test_binary=$test_binary"
   -ignore-filename-regex "$IGNORE_FILENAME_REGEX" \
   > "$COVERAGE_JSON"
 
-python3 - "$COVERAGE_JSON" "$MIN_LINE_COVERAGE" "$MIN_FUNCTION_COVERAGE" <<'PY'
+python3 - "$COVERAGE_JSON" "$MIN_LINE_COVERAGE" "$MIN_FUNCTION_COVERAGE" "$COVERAGE_MD" <<'PY'
 import json
+import os
 import sys
 
-coverage_json, min_line_raw, min_function_raw = sys.argv[1:4]
+coverage_json, min_line_raw, min_function_raw, markdown_path = sys.argv[1:5]
 min_line = float(min_line_raw)
 min_function = float(min_function_raw)
 
@@ -118,6 +120,47 @@ print(
     f"covered={covered_functions} count={counted_functions}"
 )
 print(f"CODE_COVERAGE_METRIC region_coverage_percent value={region_percent:.2f}")
+
+# Render a Markdown report for the GitHub Actions job summary + an uploadable artifact.
+def short_name(path):
+    # Strip everything up to and including the last "Sources/" so the table shows
+    # repo-relative module paths (e.g. SMBee/SMBClient.swift) instead of runner-absolute paths.
+    marker = "Sources/"
+    idx = path.rfind(marker)
+    return path[idx + len(marker):] if idx >= 0 else os.path.basename(path)
+
+status = "✅ pass" if line_percent >= min_line else "❌ below threshold"
+md = []
+md.append("## Code coverage")
+md.append("")
+md.append(f"**Line coverage: {line_percent:.2f}%** (min {min_line:.2f}%) — {status}")
+md.append("")
+md.append(f"- Lines: {covered_lines}/{counted_lines} ({line_percent:.2f}%)")
+md.append(f"- Functions: {covered_functions}/{counted_functions} ({function_percent:.2f}%)")
+md.append(f"- Regions: {region_percent:.2f}%")
+md.append("")
+md.append("| File | Lines % | Functions % | Regions % |")
+md.append("| --- | ---: | ---: | ---: |")
+files = data[0].get("files", []) or []
+for entry in sorted(files, key=lambda f: float(f.get("summary", {}).get("lines", {}).get("percent", 0.0))):
+    summary = entry.get("summary", {})
+    fl = float(summary.get("lines", {}).get("percent", 0.0))
+    ff = float(summary.get("functions", {}).get("percent", 0.0))
+    fr = float(summary.get("regions", {}).get("percent", 0.0))
+    md.append(f"| {short_name(entry.get('filename', '?'))} | {fl:.2f} | {ff:.2f} | {fr:.2f} |")
+md.append(f"| **TOTAL** | **{line_percent:.2f}** | **{function_percent:.2f}** | **{region_percent:.2f}** |")
+md_text = "\n".join(md) + "\n"
+
+with open(markdown_path, "w", encoding="utf-8") as handle:
+    handle.write(md_text)
+
+# GitHub Actions renders $GITHUB_STEP_SUMMARY as Markdown on the job details page.
+summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+if summary_path:
+    with open(summary_path, "a", encoding="utf-8") as handle:
+        handle.write(md_text)
+
+print(f"CODE_COVERAGE_INFO markdown={markdown_path}")
 
 failed = False
 if counted_lines <= 0:

@@ -23,7 +23,10 @@ jobs:
       - name: Verify Swift version compatibility
         run: |
           required="$(tr -d '[:space:]' < .swift-version)"
-          actual="$(swift --version | sed -n 's/^Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+          # macOS prints "Apple Swift version 6.3.2 ..." while Linux prints
+          # "Swift version 6.2 ...", so match "Swift version" unanchored (not ^) to
+          # handle the "Apple " prefix on macOS runners.
+          actual="$(swift --version | sed -n 's/.*Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
           swift --version
           if [ -z "$actual" ]; then
             echo "Could not parse swift --version output" >&2

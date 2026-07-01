@@ -428,7 +428,10 @@ public enum SMBClient {
                 try await session.connect()
                 let treeId = try await session.treeConnect(share: share)
                 let result = try await operation(session, treeId)
-                await session.closeTransport()
+                // Graceful teardown on success (best-effort TREE_DISCONNECT → LOGOFF → TCP close),
+                // matching listShares / the persistent SMBClientSession.close() path. Error paths
+                // below stay bare closeTransport() since the session is already suspect.
+                await session.disconnect(treeId: treeId)
                 return result
             } catch {
                 await session.closeTransport()

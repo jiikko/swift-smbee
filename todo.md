@@ -129,6 +129,13 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
       AES-GMAC signing-only を配線。unit で nonce / signature / session read path を検証。
       `smb311-signing-required` profile も authenticated API E2E 対象に変更。残: 実 Samba 3.1.1
       workflow_dispatch 初回実行結果を記録する。
+    - 2026-07-01 **実測 (Apple container + Samba `smb311-signing-required`)**: probe は成功
+      (dialect 0x0311 / signing 0x0002 GMAC 交渉 OK) だが、**authenticated 全 op が
+      `invalidValue("SMB signature verification failed")` で失敗** (TreeConnect+List /
+      Write / ShareDiscovery の 3 test。`SMBClient.swift:436` / `:479` の verify 経路)。
+      GMAC signing-only 経路は unit green だが実 Samba 3.1.1 では通らない = 循環テスト型の
+      未検出バグ。真因候補: 3.1.1 signing key 導出 / GMAC nonce レイアウト / response の
+      signature field zeroing / verify 側 AAD。**要デバッグ (未着手)**。
   - [x] encryption = TRANSFORM_HEADER + AES-GCM（nonce/AAD/tag レイアウト ⓥ）
     - 2026-06-30: 12-byte nonce + 16-byte TRANSFORM_HEADER nonce field padding / AAD / tag fixture を追加し、
       session の 3.1.1 暗号化・復号分岐へ配線。

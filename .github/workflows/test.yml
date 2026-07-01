@@ -16,14 +16,25 @@ jobs:
   build-test:
     # public repo なので macOS runner は無料 (.claude/rules gha-runner)。
     # Network.framework / CryptoKit-backed swift-crypto に依存するため macOS で回す。
-    # macos-26 (Swift 6.3 系) を使う: macos-15 (Swift 6.0 系) では SwiftLint の
-    # build-tool plugin が "prebuild command cannot use executables built from source"
-    # で失敗する。新しい toolchain なら plugin が通る (ローカル macOS 26 で確認済)。
+    # macOS runner は内蔵Swiftを使うため、.swift-version は厳密pinではなく最低要求versionとして検証する。
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
-      - name: Swift version
-        run: swift --version
+      - uses: actions/checkout@v5
+      - name: Verify Swift version compatibility
+        run: |
+          required="$(tr -d '[:space:]' < .swift-version)"
+          actual="$(swift --version | sed -n 's/^Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+          swift --version
+          if [ -z "$actual" ]; then
+            echo "Could not parse swift --version output" >&2
+            exit 1
+          fi
+          lowest="$(printf '%s\n%s\n' "$required" "$actual" | sort -V | head -n 1)"
+          if [ "$lowest" != "$required" ]; then
+            echo "Swift ${actual} is older than required .swift-version ${required}" >&2
+            exit 1
+          fi
+          echo "Swift ${actual} satisfies .swift-version ${required}"
       # swift build は SwiftLintBuildToolPlugin も実行する (lint は brew でなく plugin)。
       - name: Build
         run: swift build
@@ -40,23 +51,19 @@ jobs:
     # unit/vector テストが Linux 上でも通ることを PR 時点で明示的に確認する。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read Swift version
         id: swift-version
-        run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: ${{ steps.swift-version.outputs.version }}
+        run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Swift version
-        run: swift --version
+        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Build on Linux
-        run: swift build
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift build
       - name: Unit tests on Linux
         timeout-minutes: 10
         # Samba-backed tests run in the E2E workflows. Keep the generic Linux
         # job on deterministic unit/vector coverage.
-        run: swift test --skip SMBeeE2ETests
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift test --skip SMBeeE2ETests
 
   test-registration-coverage:
     name: test-registration-coverage / .swift-version
@@ -65,21 +72,17 @@ jobs:
     # 下限として使い、Linux SwiftPM/XCTest 上の登録漏れを早めに検出する。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read Swift version
         id: swift-version
-        run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: ${{ steps.swift-version.outputs.version }}
+        run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Swift version
-        run: swift --version
+        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Check Swift test registration coverage
         timeout-minutes: 10
         env:
           MIN_DISCOVERED_TESTS: "20"
-        run: bash scripts/check-test-discovery.sh
+        run: docker run --rm -e MIN_DISCOVERED_TESTS -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bash scripts/check-test-discovery.sh
 
   code-coverage:
     name: code-coverage / .swift-version
@@ -88,29 +91,22 @@ jobs:
     # 初期閾値は既存コードへ過剰に厳しくしない 50%。CI実績を見て段階的に引き上げる。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read Swift version
         id: swift-version
-        run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: ${{ steps.swift-version.outputs.version }}
+        run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Swift version
-        run: swift --version
+        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Check code coverage
         timeout-minutes: 15
         env:
           MIN_LINE_COVERAGE: "50"
-        run: bash scripts/check-code-coverage.sh
+        run: docker run --rm -e MIN_LINE_COVERAGE -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bash scripts/check-code-coverage.sh
       - name: Upload code coverage artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: swift-code-coverage
-          # Expiring artifact (short retention). The formatted Markdown report is also
-          # rendered inline on the job summary via $GITHUB_STEP_SUMMARY
-          # (see scripts/check-code-coverage.sh).
           retention-days: 14
           path: |
             .build/code-coverage.md
@@ -121,16 +117,12 @@ jobs:
   performance-regression:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read Swift version
         id: swift-version
-        run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: ${{ steps.swift-version.outputs.version }}
+        run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Swift version
-        run: swift --version
+        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Performance regression tests
         timeout-minutes: 10
-        run: swift test --filter SMBeePerformanceRegressionTests
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift test --filter SMBeePerformanceRegressionTests

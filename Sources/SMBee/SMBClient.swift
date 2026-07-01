@@ -380,6 +380,8 @@ private final class SMBReadAccumulator: @unchecked Sendable {
 }
 
 public actor SMBClientSession {
+    private static let localWriteChunkLimit = 64 * 1024
+
     private let session: SMBSession
     private let treeId: UInt32
     private var isClosed = false
@@ -535,6 +537,38 @@ public actor SMBClientSession {
         }
     }
 
+    public func upload(
+        path: String,
+        fileURL: URL,
+        overwrite: Bool = true,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try ensureOpen()
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let totalBytes = (attributes[.size] as? NSNumber)?.uint64Value
+        let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        let progress = SMBTransferProgressEmitter(totalBytes: totalBytes, onProgress: onProgress)
+        var bytesTransferred: UInt64 = 0
+        do {
+            try await session.write(treeId: treeId, fileId: fileId) { maxLength in
+                let length = min(maxLength, Self.localWriteChunkLimit)
+                let data = try handle.read(upToCount: length) ?? Data()
+                bytesTransferred += UInt64(data.count)
+                if !data.isEmpty {
+                    progress.emit(bytesTransferred: bytesTransferred)
+                }
+                return Array(data)
+            }
+            try await session.flush(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     public func copy(fromPath: String, toPath: String, overwrite: Bool = false) async throws {
         try ensureOpen()
         try await session.copyFile(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
@@ -596,8 +630,6 @@ public actor SMBClientSession {
 }
 
 public enum SMBClient {
-    private static let localWriteChunkLimit = 64 * 1024
-
     static func resolvedTransportFactory(
         _ makeTransport: (@Sendable () -> SMBTransport)?,
         timeout: Duration?
@@ -1435,6 +1467,49 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        fileURL: URL,
+        overwrite: Bool = true,
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
+            let clientSession = SMBClientSession(session: session, treeId: treeId)
+            try await clientSession.upload(path: path, fileURL: fileURL, overwrite: overwrite, onProgress: onProgress)
+        }
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        fileURL: URL,
+        overwrite: Bool = true,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try await upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            fileURL: fileURL,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport,
+            onProgress: onProgress
+        )
+    }
+
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -1581,23 +1656,17 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
-            let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
-            let handle = try FileHandle(forReadingFrom: localFile)
-            defer { try? handle.close() }
-            do {
-                try await session.write(treeId: treeId, fileId: fileId) { maxLength in
-                    let length = min(maxLength, localWriteChunkLimit)
-                    let data = try handle.read(upToCount: length) ?? Data()
-                    return Array(data)
-                }
-                try await session.flush(treeId: treeId, fileId: fileId)
-                try? await session.close(treeId: treeId, fileId: fileId)
-            } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
-                throw error
-            }
-        }
+        try await upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            fileURL: localFile,
+            overwrite: overwrite,
+            credential: credential,
+            timeout: timeout,
+            makeTransport: makeTransport
+        )
     }
 
     public static func upload(

@@ -479,6 +479,55 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        fileURL: URL,
+        overwrite: Bool = true,
+        timeout: Duration? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try await SMBClient.upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            fileURL: fileURL,
+            overwrite: overwrite,
+            credential: credential,
+            timeout: timeout,
+            onProgress: onProgress
+        )
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        fileURL: URL,
+        overwrite: Bool = true,
+        timeout: Duration? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try await SMBClient.upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            fileURL: fileURL,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            timeout: timeout,
+            onProgress: onProgress
+        )
+    }
+
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,

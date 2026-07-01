@@ -35,22 +35,19 @@ jobs:
         run: swift test --skip SMBeeE2ETests
 
   linux-build-test:
-    name: linux-build-test / Swift ${{ matrix.swift_version }}
+    name: linux-build-test / .swift-version
     # Linux runner で、Network.framework 依存が SMB 本体へ漏れていないことと、
     # unit/vector テストが Linux 上でも通ることを PR 時点で明示的に確認する。
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # swift-tools-version は 6.2 (swift-asn1 1.7.x が Swift 6.1+ を要求)。
-        # Swift 6.0 Linux は concurrency runtime の flaky hang があり除外 (issue 007)。
-        swift_version: ["6.2"]
     steps:
       - uses: actions/checkout@v4
+      - name: Read Swift version
+        id: swift-version
+        run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Set up Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: ${{ matrix.swift_version }}
+          swift-version: ${{ steps.swift-version.outputs.version }}
       - name: Swift version
         run: swift --version
       - name: Build on Linux
@@ -62,17 +59,20 @@ jobs:
         run: swift test --skip SMBeeE2ETests
 
   test-registration-coverage:
-    name: test-registration-coverage / Swift 6.2
+    name: test-registration-coverage / .swift-version
     # `swift test --list-tests` が新規 XCTest ファイル / class / method を拾えているかを確認する。
     # code coverage ではなく test registration coverage の smoke。source 側の `func test...` 数を
     # 下限として使い、Linux SwiftPM/XCTest 上の登録漏れを早めに検出する。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Read Swift version
+        id: swift-version
+        run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Set up Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: "6.2"
+          swift-version: ${{ steps.swift-version.outputs.version }}
       - name: Swift version
         run: swift --version
       - name: Check Swift test registration coverage
@@ -81,14 +81,49 @@ jobs:
           MIN_DISCOVERED_TESTS: "20"
         run: bash scripts/check-test-discovery.sh
 
+  code-coverage:
+    name: code-coverage / .swift-version
+    # swift test の line coverage を測る。test registration coverage とは別物:
+    # こちらは「登録されたテストが Sources をどれだけ実行したか」を見る。
+    # 初期閾値は既存コードへ過剰に厳しくしない 50%。CI実績を見て段階的に引き上げる。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read Swift version
+        id: swift-version
+        run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: ${{ steps.swift-version.outputs.version }}
+      - name: Swift version
+        run: swift --version
+      - name: Check code coverage
+        timeout-minutes: 15
+        env:
+          MIN_LINE_COVERAGE: "50"
+        run: bash scripts/check-code-coverage.sh
+      - name: Upload code coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-code-coverage
+          path: |
+            .build/code-coverage.json
+            .build/code-coverage-report.txt
+          if-no-files-found: ignore
+
   performance-regression:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Read Swift version
+        id: swift-version
+        run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Set up Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: "6.2"
+          swift-version: ${{ steps.swift-version.outputs.version }}
       - name: Swift version
         run: swift --version
       - name: Performance regression tests

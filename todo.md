@@ -100,7 +100,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     workflow_dispatch / schedule で確認できる状態にした。残: GitHub Actions 上の初回実行結果を記録する。
   - 2026-07-01: Apple container + Ubuntu 24.04 Samba + `smb311-encrypted-required` で
     `dialect: 0x0311`, `signing: 0x0002`, `cipher: 0x0002`, `preauthHash: 0x0001` を実測。
-    `.github/workflows/e2e.yml` に PR / push で走る probe matrix lane を追加。
+    `.github/workflows/e2e.yml` の API E2E matrix に PR / push で走る negotiate-scope lane を追加。
 - [x] 既知課題: Samba 3.1.1 response の parser が `truncated` になるバグを調査
   - 2026-06-30: NEGOTIATE context parser が「最後の context も 8-byte padding あり」と仮定していた
     ため、最後の context が unpadded の response で `truncated` になり得た。最終 context は padding

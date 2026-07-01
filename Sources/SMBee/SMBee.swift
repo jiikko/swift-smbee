@@ -4,7 +4,8 @@ import Foundation
 ///
 /// SMB protocol / framing / NTLMv2 flow / SMB3 crypto framing は本ライブラリで
 /// 自作し、暗号プリミティブの計算は swift-crypto と in-repo pure-Swift 実装に委ねる。
-/// MVP の対象サーバは macOS の SMB サーバ (SMBX、実上限 SMB 3.0.2)。Samba では SMB 3.1.1 も互換確認対象。
+/// 対象サーバは SMB 3.x サーバ (macOS SMBX / Windows SMB Server / Samba)。
+/// 自動 E2E は Samba、手動 smoke は実サーバで確認する。
 public enum SMBee {
     /// ライブラリのバージョン (暫定)。
     public static let version = "0.0.1"

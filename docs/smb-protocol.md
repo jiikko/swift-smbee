@@ -39,12 +39,12 @@ Specifications**。周辺の暗号・交渉メカニズムの一部だけが IET
 
 - **transport**: direct TCP、**port 445**、各 SMB2 メッセージの前に **4 byte の big-endian length**（最上位 byte は 0）。NetBIOS session service は使わない。
 - **dialect**: **SMB 3.0.2 と SMB 3.1.1 の両対応**。macOS SMBX の実上限は 3.0.2
-  （macOS 26.5.1 でも 0x0302 が上限）、Samba 等は 3.1.1 を想定。
+  （macOS 26.5.1 でも 0x0302 が上限）、Windows SMB Server / Samba 等は negotiated dialect に従う。
 - **auth**: **NTLMv2**（SPNEGO 包装）。**Kerberos は対象外**。
 - **signing / encryption**: negotiated dialect 依存。
   - **3.1.1**: AES-128-GMAC / AES-128-GCM（swift-crypto）。
   - **3.0.2**: AES-CMAC / AES-128-CCM（in-repo pure-Swift 実装）。Linux ビルド維持が条件。
-- **対象サーバ**: **macOS の SMB サーバ（SMBX、実上限 3.0.2）**。Samba は E2E / 互換確認対象。
+- **対象サーバ**: **SMB 3.x サーバ**（macOS SMBX / Windows SMB Server / Samba）。Samba は E2E / 互換確認対象、Windows 実機 smoke は未追加。
 
 ## 接続ライフサイクルと実装する command
 

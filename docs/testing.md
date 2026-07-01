@@ -48,9 +48,9 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 3. ゴールデンパスを実行して assert
 4. `container stop` / `rm` で確実に後始末（テスト失敗時も）
 
-### ⚠️ Samba と macOS SMBX の差（重要・要確認 ⓥ）
+### ⚠️ サーバ実装差（重要・要確認 ⓥ）
 
-- MVP の**対象サーバは macOS SMBX**だが、E2E は **Samba（Linux）**。両者は別実装。
+- 対象サーバには **macOS SMBX / Windows SMB Server / Samba** を含めるが、自動 E2E は **Samba（Linux）**。各実装は別物。
 - **signing/cipher の交渉差**: macOS SMBX は macOS 26.5.1 でも negotiated dialect が
   **0x0302 (SMB 3.0.2)** で上限。SMB 3.0.2 は 3.1.1 negotiate contexts を返さず、
   signing/encryption は CMAC/CCM 系になる。
@@ -58,7 +58,7 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   3.0.2 上限をミラーする。3.0.2 用 AES-CMAC / AES-128-CCM は in-repo pure-Swift 実装で扱う。
 - Samba の **SMB 3.1.1 + AES-128-GMAC + AES-128-GCM** は `.github/workflows/samba-compat.yml` の
   互換 matrix で確認する。3.1.1 は Samba 互換対象であり、macOS SMBX の前提 dialect ではない。
-- したがって E2E（Samba）green ≠ macOS SMBX 動作保証。**macOS SMBX への手動 smoke（Tier 3）を併用**する。
+- したがって E2E（Samba）green ≠ macOS SMBX / Windows SMB Server 動作保証。**実サーバへの手動 smoke（Tier 3）を併用**する。
 
 ### CI 実行 — Docker / Linux runner
 
@@ -130,10 +130,10 @@ Samba profile:
 - `smb311-signing-required`: SMB 3.1.1 / signing mandatory / encryption off。GMAC signing-only 経路の検証用。
 - `smb311-encrypted-required`: SMB 3.1.1 / signing mandatory / encryption required。GCM transform 経路の検証用。
 
-## Tier 3: 手動 smoke（実 macOS SMBX）— リリース前
+## Tier 3: 手動 smoke（実サーバ）— リリース前
 
-MVP の真の対象である **macOS のファイル共有（SMBX）**に対し `smbcli probe` + ゴールデンパスを
-手動で 1 周。Tier 2 の Samba では拾えない macOS SMBX 固有挙動（交渉値・quirk）を確認する。
+**macOS のファイル共有（SMBX）** と **Windows SMB Server** に対し `smbcli probe` + ゴールデンパスを
+手動で 1 周。Tier 2 の Samba では拾えない実サーバ固有挙動（交渉値・quirk）を確認する。
 「自発実行はビルドまで、実行はユーザー」運用に乗せる。
 
 ## まとめ
@@ -142,4 +142,4 @@ MVP の真の対象である **macOS のファイル共有（SMBX）**に対し 
 |------|------|----|----|
 | 1 unit | なし（vector/fixture） | ✅ 必須 | ロジック・framing の正しさ |
 | 2 E2E | Samba コンテナ（ローカル=Apple container / CI=Docker on Linux） | ✅（e2e.yml。足場は手動、整い次第 push/PR） | 再現可能なゴールデンパス回帰 |
-| 3 smoke | 実 macOS SMBX | 手動 | MVP 本番サーバの最終確認 |
+| 3 smoke | 実 macOS SMBX / Windows SMB Server | 手動 | 実サーバの最終確認 |

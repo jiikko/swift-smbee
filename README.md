@@ -9,8 +9,8 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 
 ## スコープ (MVP)
 
-- 対象サーバ: **macOS の SMB サーバ (SMBX / ファイル共有)**
-- dialect: **SMB 3.0.2 / SMB 3.1.1**（サーバとの NEGOTIATE 結果に従う。macOS SMBX は現状 3.0.2 上限、Samba では 3.1.1 profile も検証）
+- 対象サーバ: **SMB 3.x サーバ**（macOS SMBX / Windows SMB Server / Samba）。現時点の自動 E2E は Samba、Windows 実機 smoke は未追加。
+- dialect: **SMB 3.0.2 / SMB 3.1.1**（サーバとの NEGOTIATE 結果に従う。macOS SMBX は現状 3.0.2 上限、Samba では 3.1.1 profile も検証。Windows SMB Server は実機 smoke 未追加）
 - signing / encryption: negotiated dialect に応じて AES-CMAC / AES-CCM（3.0.x）または AES-GMAC / AES-GCM（3.1.1）
 - 認証: **NTLMv2**（Kerberos は対象外）
 - まず CLI (`smbcli`) で動かし、後段で GUI から利用する
@@ -24,7 +24,7 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 
 - [docs/smb-protocol.md](docs/smb-protocol.md) — 実装する SMB wire 仕様と一次ソース（MS-SMB2 / MS-NLMP / NIST 等）
 - [docs/architecture.md](docs/architecture.md) — 内部構成と transport 抽象（macOS=NWConnection / Linux=POSIX|NIO）
-- [docs/testing.md](docs/testing.md) — テスト戦略（unit vector / コンテナ Samba で E2E: ローカル=Apple container・CI=Docker / 実 macOS smoke）
+- [docs/testing.md](docs/testing.md) — テスト戦略（unit vector / コンテナ Samba で E2E: ローカル=Apple container・CI=Docker / 実サーバ smoke）
 - [todo.md](todo.md) — 実装 TODO（Phase 0〜5 のチェックリスト）
 
 ## 開発状況

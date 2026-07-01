@@ -13,6 +13,11 @@ SMBee のテストは 3 tier。**ⓥ = 実装/運用前に要確認**。
   TRANSFORM_HEADER round-trip / signed packet 検証 /
   **packet-level fixture**（pcap or 既存実装由来。primitive が通っても framing が正しいとは限らない）
 
+性能退行テストは wall-clock time を pass/fail 条件にしない。CI やローカル環境の負荷差で揺れやすいため、
+`InMemoryTransport` と synthetic SMB2 frame を使い、command count / streaming callback count / byte count を
+計算量 proxy として固定する。ログは `PERF_METRIC <name> actual=.. expected=..` 形式にし、時間を出す場合も
+補助情報 `PERF_INFO` に留める。
+
 ## Tier 2: E2E（コンテナ上の SMB サーバ）— 本 repo のテスト範囲の主役
 
 SMB サーバ（Samba）をコンテナで起動し、SMBee/`smbcli` でゴールデンパスを通す。

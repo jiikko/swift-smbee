@@ -60,3 +60,17 @@ jobs:
         # 6.0 Linux can stall after compiling when skipped async E2E XCTest
         # cases are still part of the selected test plan.
         run: swift test --skip SMBeeE2ETests
+
+  performance-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Swift
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.2"
+      - name: Swift version
+        run: swift --version
+      - name: Performance regression tests
+        timeout-minutes: 10
+        run: swift test --filter SMBeePerformanceRegressionTests

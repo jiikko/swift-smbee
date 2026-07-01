@@ -73,12 +73,19 @@ struct Probe: AsyncParsableCommand {
     var json = false
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     func run() async throws {
         debug.apply()
         let endpoint = try SMBURLParser.parseServerURL(url)
-        let result = try await SMBProbe.probe(host: endpoint.host, port: endpoint.port)
+        let result = try await SMBProbe.probe(
+            host: endpoint.host,
+            port: endpoint.port,
+            makeTransport: { POSIXSocketTransport(timeout: transport.duration) }
+        )
         if json {
             print(try SMBCLIOutput.jsonString(for: result))
             return
@@ -114,6 +121,9 @@ struct List: AsyncParsableCommand {
     var auth: AuthOptions
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     @Flag(help: "Print JSON output")
@@ -128,7 +138,8 @@ struct List: AsyncParsableCommand {
             port: endpoint.port,
             credential: credential,
             share: endpoint.share,
-            path: endpoint.path
+            path: endpoint.path,
+            timeout: transport.duration
         ) { entry in
             if json {
                 collector.append(entry)
@@ -170,6 +181,9 @@ struct Shares: AsyncParsableCommand {
     var auth: AuthOptions
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     @Flag(help: "Print JSON output")
@@ -182,7 +196,8 @@ struct Shares: AsyncParsableCommand {
         let shares = try await SMBee.listShares(
             host: endpoint.host,
             port: endpoint.port,
-            credential: credential
+            credential: credential,
+            timeout: transport.duration
         )
         if json {
             print(try SMBCLIOutput.jsonString(for: shares))
@@ -205,6 +220,9 @@ struct Stat: AsyncParsableCommand {
     var auth: AuthOptions
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     @Flag(help: "Print JSON output")
@@ -218,7 +236,8 @@ struct Stat: AsyncParsableCommand {
             port: endpoint.port,
             credential: credential,
             share: endpoint.share,
-            path: endpoint.path
+            path: endpoint.path,
+            timeout: transport.duration
         )
         if json {
             print(try SMBCLIOutput.jsonString(for: stat))
@@ -255,6 +274,9 @@ struct Cat: AsyncParsableCommand {
     var auth: AuthOptions
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     func run() async throws {
@@ -268,7 +290,8 @@ struct Cat: AsyncParsableCommand {
             credential: credential,
             share: endpoint.share,
             path: endpoint.path,
-            range: try range.map(parseRange)
+            range: try range.map(parseRange),
+            timeout: transport.duration
         ) { chunk in
             stdout.write(Data(chunk))
         }
@@ -290,8 +313,14 @@ struct Get: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively download a directory")
     var recursive = false
 
+    @Flag(help: "Show transfer progress")
+    var progress = false
+
     @OptionGroup
     var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
 
     @OptionGroup
     var debug: DebugOptions
@@ -300,6 +329,7 @@ struct Get: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         if recursive {
+            // ⓥ Directory transfer progress is not exposed by the facade yet.
             try await SMBee.downloadDirectory(
                 host: endpoint.host,
                 port: endpoint.port,
@@ -307,9 +337,17 @@ struct Get: AsyncParsableCommand {
                 share: endpoint.share,
                 path: endpoint.path,
                 localDirectory: URL(fileURLWithPath: destination),
-                overwrite: !noOverwrite
+                overwrite: !noOverwrite,
+                timeout: transport.duration
             )
             return
+        }
+        let progressWriter = progress ? TransferProgressWriter() : nil
+        let onProgress: (@Sendable (SMBTransferProgress) -> Void)?
+        if let progressWriter {
+            onProgress = { progress in progressWriter.emit(progress) }
+        } else {
+            onProgress = nil
         }
         try await SMBee.download(
             host: endpoint.host,
@@ -318,8 +356,11 @@ struct Get: AsyncParsableCommand {
             share: endpoint.share,
             path: endpoint.path,
             localFile: URL(fileURLWithPath: destination),
-            overwrite: !noOverwrite
+            overwrite: !noOverwrite,
+            timeout: transport.duration,
+            onProgress: onProgress
         )
+        progressWriter?.finish()
     }
 }
 
@@ -333,6 +374,9 @@ struct MakeDirectory: AsyncParsableCommand {
     var auth: AuthOptions
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     func run() async throws {
@@ -343,7 +387,8 @@ struct MakeDirectory: AsyncParsableCommand {
             port: endpoint.port,
             credential: credential,
             share: endpoint.share,
-            path: endpoint.path
+            path: endpoint.path,
+            timeout: transport.duration
         )
     }
 }
@@ -363,8 +408,14 @@ struct Put: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively upload a directory")
     var recursive = false
 
+    @Flag(help: "Show transfer progress")
+    var progress = false
+
     @OptionGroup
     var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
 
     @OptionGroup
     var debug: DebugOptions
@@ -373,6 +424,7 @@ struct Put: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: destination, auth: auth)
         if recursive {
+            // ⓥ Directory transfer progress is not exposed by the facade yet.
             try await SMBee.uploadDirectory(
                 host: endpoint.host,
                 port: endpoint.port,
@@ -380,8 +432,26 @@ struct Put: AsyncParsableCommand {
                 share: endpoint.share,
                 path: endpoint.path,
                 localDirectory: URL(fileURLWithPath: source),
-                overwrite: !noOverwrite
+                overwrite: !noOverwrite,
+                timeout: transport.duration
             )
+            return
+        }
+        if progress {
+            let progressWriter = TransferProgressWriter()
+            let data = try Data(contentsOf: URL(fileURLWithPath: source))
+            try await SMBee.upload(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                data: [UInt8](data),
+                overwrite: !noOverwrite,
+                timeout: transport.duration,
+                onProgress: { progress in progressWriter.emit(progress) }
+            )
+            progressWriter.finish()
             return
         }
         try await SMBee.upload(
@@ -391,7 +461,8 @@ struct Put: AsyncParsableCommand {
             share: endpoint.share,
             path: endpoint.path,
             localFile: URL(fileURLWithPath: source),
-            overwrite: !noOverwrite
+            overwrite: !noOverwrite,
+            timeout: transport.duration
         )
     }
 }
@@ -412,6 +483,9 @@ struct Move: AsyncParsableCommand {
     var auth: AuthOptions
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     func run() async throws {
@@ -428,7 +502,8 @@ struct Move: AsyncParsableCommand {
             share: from.share,
             fromPath: from.path,
             toPath: to.path,
-            replaceIfExists: replace
+            replaceIfExists: replace,
+            timeout: transport.duration
         )
     }
 }
@@ -452,6 +527,9 @@ struct Copy: AsyncParsableCommand {
     var auth: AuthOptions
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     func run() async throws {
@@ -469,7 +547,8 @@ struct Copy: AsyncParsableCommand {
                 share: from.share,
                 fromPath: from.path,
                 toPath: to.path,
-                overwrite: replace
+                overwrite: replace,
+                timeout: transport.duration
             )
             return
         }
@@ -480,7 +559,8 @@ struct Copy: AsyncParsableCommand {
             share: from.share,
             fromPath: from.path,
             toPath: to.path,
-            overwrite: replace
+            overwrite: replace,
+            timeout: transport.duration
         )
     }
 }
@@ -501,6 +581,9 @@ struct Remove: AsyncParsableCommand {
     var auth: AuthOptions
 
     @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
     var debug: DebugOptions
 
     func run() async throws {
@@ -513,8 +596,41 @@ struct Remove: AsyncParsableCommand {
             share: endpoint.share,
             path: endpoint.path,
             directory: directory || recursive,
-            recursive: recursive
+            recursive: recursive,
+            timeout: transport.duration
         )
+    }
+}
+
+struct TransportOptions: ParsableArguments {
+    @Option(name: .long, help: "Socket I/O timeout in seconds (connect and each recv/send)")
+    var timeout: Double?
+
+    var duration: Duration? {
+        guard let timeout else { return nil }
+        let wholeSeconds = timeout.rounded(.towardZero)
+        let fractionalSeconds = timeout - wholeSeconds
+        return .seconds(Int64(wholeSeconds)) + .nanoseconds(Int64((fractionalSeconds * 1_000_000_000).rounded()))
+    }
+}
+
+private final class TransferProgressWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didEmit = false
+
+    func emit(_ progress: SMBTransferProgress) {
+        lock.lock()
+        defer { lock.unlock() }
+        didEmit = true
+        writeStandardError("\r\(formatTransferProgress(progress))    ")
+    }
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        if didEmit {
+            writeStandardError("\n")
+        }
     }
 }
 
@@ -627,6 +743,39 @@ private func parseNTHash(_ value: String) throws -> [UInt8] {
         index = next
     }
     return bytes
+}
+
+private func formatTransferProgress(_ progress: SMBTransferProgress) -> String {
+    let transferred = formatByteCount(progress.bytesTransferred)
+    let speed = "\(formatByteCount(UInt64(max(0, progress.bytesPerSecond))))/s"
+    guard let totalBytes = progress.totalBytes else {
+        return "transferred \(transferred) at \(speed)"
+    }
+    let percent: UInt64
+    if totalBytes == 0 {
+        percent = 100
+    } else {
+        percent = min(100, progress.bytesTransferred * 100 / totalBytes)
+    }
+    return "transferred \(transferred) / \(formatByteCount(totalBytes)) (\(percent)%) at \(speed)"
+}
+
+private func formatByteCount(_ bytes: UInt64) -> String {
+    let units = ["B", "KiB", "MiB", "GiB"]
+    var value = Double(bytes)
+    var unitIndex = 0
+    while value >= 1024, unitIndex < units.count - 1 {
+        value /= 1024
+        unitIndex += 1
+    }
+    if unitIndex == 0 {
+        return "\(bytes) \(units[unitIndex])"
+    }
+    return String(format: "%.1f %@", value, units[unitIndex])
+}
+
+private func writeStandardError(_ string: String) {
+    FileHandle.standardError.write(Data(string.utf8))
 }
 
 private func parseRange(_ value: String) throws -> SMBReadRange {

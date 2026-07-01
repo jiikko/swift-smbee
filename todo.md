@@ -326,12 +326,25 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-07-01 (commit eec6b34): ワンショット静的 API (`withSession` 成功経路) も bare closeTransport
     から best-effort disconnect (TREE_DISCONNECT → LOGOFF → close) に統一。error 経路は session が
     suspect なので bare close 維持。実 Samba で one-shot ls の teardown 送出を確認。
-- [ ] timeout / progress / cancellation API の整備
+- [x] timeout / progress / cancellation API の整備
   - read/write loop は cancellation 済み。公開 API と CLI に progress callback / transfer rate / timeout を足す。
   - 2026-06-30 実装レビュー追記: POSIX transport は blocking `connect` / `recv` / `send` を
     `Task.detached` で包むため、Task cancellation だけでは OS blocking call を即中断できない。
     socket timeout / nonblocking IO / close-on-cancel の設計が必要。NWConnection も continuation 多重 resume
     防止を含めた cancellation test を追加する。
+  - 2026-07-01 実装 (M1-M5, codex-drive + Linux/macOS 両検証):
+    - M1: NWConnectionTransport の continuation 二重 resume を NWContinuationResumer で修正
+      (.ready 後の .cancelled/.failed で crash していた)。loopback NWListener で cancellation test。
+    - M2: POSIXSocketTransport に socket timeout (nonblocking connect+poll / SO_RCVTIMEO/SO_SNDTIMEO) と
+      close-on-cancel を実装。**Linux は blocking recv 中の fd を close() しても起きない**ため
+      cancel 経路で shutdown(SHUT_RDWR) して起こす。fd を NSLock 保護。
+    - M3: 公開 API (facade 19 func + SMBClient) に timeout: Duration? を配線 (socket-level, operation
+      deadline ではない)。
+    - M4: SMBTransferProgress (bytesTransferred/totalBytes?/bytesPerSecond) + onProgress を read/upload/
+      download に追加。ContinuousClock でレート算出。
+    - M5: smbcli に --timeout (TransportOptions) と get/put の --progress (stderr, \r live 更新) を配線。
+    - 残: 全操作 deadline (per-operation withTimeout ラップ) は未対応 (今回は socket-level のみ)。
+      put --progress はファイルを Data に読み込む経路 (streaming ではない) = 大ファイルでメモリ増。
 - [ ] CLI UX: `--password-stdin` / interactive password prompt / `--json` / exit code 表 / `--debug` redaction policy
   - 自動化用途と人間操作の両方を想定。
   - 2026-06-30 実装レビュー追記: `SMBEE_DEBUG=1` は raw SMB packet を出す。SESSION_SETUP 以降は

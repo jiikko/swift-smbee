@@ -92,6 +92,16 @@ final class SMBeeE2ETests: XCTestCase {
         XCTAssertEqual(stat.size, 21)
         XCTAssertFalse(stat.isDirectory)
 
+        let volumeInfo = try await SMBee.volumeInfo(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share
+        )
+        XCTAssertGreaterThan(volumeInfo.totalBytes, 0)
+        XCTAssertGreaterThanOrEqual(volumeInfo.totalBytes, volumeInfo.availableBytes)
+        XCTAssertFalse(volumeInfo.filesystemName.isEmpty)
+
         let data = try await SMBee.read(
             host: host,
             port: port,

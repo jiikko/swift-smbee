@@ -244,18 +244,33 @@ struct SMB2CreateRequest {
 }
 
 enum SMB2QueryInfo {
+    static let infoTypeFile: UInt8 = 0x01
+    static let infoTypeFilesystem: UInt8 = 0x02
+    static let fileNetworkOpenInformation: UInt8 = 34
+    static let fileFsVolumeInformation: UInt8 = 1
+    static let fileFsAttributeInformation: UInt8 = 5
+    static let fileFsFullSizeInformation: UInt8 = 7
+
     private static let fixedPartSize = 40
     private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
 
-    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8]) throws -> [UInt8] {
+    static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        infoType: UInt8 = infoTypeFile,
+        fileInfoClass: UInt8 = fileNetworkOpenInformation,
+        outputBufferLength: UInt32 = 65_536
+    ) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
         let header = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(41)
-        writer.writeUInt8(0x01)
-        writer.writeUInt8(34)
-        writer.writeUInt32LE(65_536)
+        writer.writeUInt8(infoType)
+        writer.writeUInt8(fileInfoClass)
+        writer.writeUInt32LE(outputBufferLength)
         writer.writeUInt16LE(UInt16(bufferOffset))
         writer.writeUInt16LE(0)
         writer.writeUInt32LE(0)
@@ -268,14 +283,7 @@ enum SMB2QueryInfo {
     }
 
     static func decodeNetworkOpenInformation(_ bytes: [UInt8]) throws -> SMBFileStat {
-        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
-        guard try reader.readUInt16LE() == 9 else {
-            throw SMBCodecError.invalidValue("invalid QUERY_INFO response structure size")
-        }
-        let offset = Int(try reader.readUInt16LE())
-        let length = Int(try reader.readUInt32LE())
-        guard offset + length <= bytes.count else { throw SMBCodecError.truncated }
-        let data = Array(bytes[offset..<offset + length])
+        let data = try decodeOutputBuffer(bytes)
         guard data.count >= 56 else { throw SMBCodecError.truncated }
         let creationTime = readUInt64LE(data, at: 0)
         let lastAccessTime = readUInt64LE(data, at: 16)
@@ -292,6 +300,71 @@ enum SMB2QueryInfo {
             lastAccessTime: filetimeToDate(lastAccessTime),
             changeTime: filetimeToDate(changeTime)
         )
+    }
+
+    static func decodeFullSizeInformation(_ bytes: [UInt8]) throws -> (totalBytes: UInt64, availableBytes: UInt64) {
+        let data = try decodeOutputBuffer(bytes)
+        guard data.count >= 32 else { throw SMBCodecError.truncated }
+        let totalAllocationUnits = readUInt64LE(data, at: 0)
+        let callerAvailableAllocationUnits = readUInt64LE(data, at: 8)
+        let sectorsPerAllocationUnit = UInt64(readUInt32LE(data, at: 24))
+        let bytesPerSector = UInt64(readUInt32LE(data, at: 28))
+        let bytesPerAllocationUnit = sectorsPerAllocationUnit * bytesPerSector
+        return (
+            totalBytes: totalAllocationUnits * bytesPerAllocationUnit,
+            availableBytes: callerAvailableAllocationUnits * bytesPerAllocationUnit
+        )
+    }
+
+    static func decodeAttributeInformation(_ bytes: [UInt8]) throws -> (filesystemName: String, maxComponentLength: UInt32, filesystemAttributes: UInt32) {
+        let data = try decodeOutputBuffer(bytes)
+        guard data.count >= 12 else { throw SMBCodecError.truncated }
+        let attributes = readUInt32LE(data, at: 0)
+        let maxComponentLength = readUInt32LE(data, at: 4)
+        let nameLength = Int(readUInt32LE(data, at: 8))
+        guard data.count >= 12 + nameLength else { throw SMBCodecError.truncated }
+        return (
+            filesystemName: try utf16LEString(Array(data[12..<12 + nameLength])),
+            maxComponentLength: maxComponentLength,
+            filesystemAttributes: attributes
+        )
+    }
+
+    static func decodeVolumeInformation(_ bytes: [UInt8]) throws -> (volumeLabel: String, volumeSerialNumber: UInt32) {
+        let data = try decodeOutputBuffer(bytes)
+        guard data.count >= 18 else { throw SMBCodecError.truncated }
+        let serialNumber = readUInt32LE(data, at: 8)
+        let labelLength = Int(readUInt32LE(data, at: 12))
+        guard data.count >= 18 + labelLength else { throw SMBCodecError.truncated }
+        return (
+            volumeLabel: try utf16LEString(Array(data[18..<18 + labelLength])),
+            volumeSerialNumber: serialNumber
+        )
+    }
+
+    private static func decodeOutputBuffer(_ bytes: [UInt8]) throws -> [UInt8] {
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 9 else {
+            throw SMBCodecError.invalidValue("invalid QUERY_INFO response structure size")
+        }
+        let offset = Int(try reader.readUInt16LE())
+        let length = Int(try reader.readUInt32LE())
+        guard offset + length <= bytes.count else { throw SMBCodecError.truncated }
+        return Array(bytes[offset..<offset + length])
+    }
+
+    private static func utf16LEString(_ bytes: [UInt8]) throws -> String {
+        guard bytes.count.isMultiple(of: 2) else {
+            throw SMBCodecError.invalidValue("UTF-16LE byte length must be even")
+        }
+        var codeUnits: [UInt16] = []
+        codeUnits.reserveCapacity(bytes.count / 2)
+        var index = 0
+        while index < bytes.count {
+            codeUnits.append(UInt16(bytes[index]) | (UInt16(bytes[index + 1]) << 8))
+            index += 2
+        }
+        return String(decoding: codeUnits, as: UTF16.self)
     }
 }
 

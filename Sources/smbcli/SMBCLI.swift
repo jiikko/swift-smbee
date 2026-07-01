@@ -13,7 +13,7 @@ struct SMBCLI: AsyncParsableCommand {
         abstract: "🐝 SMBee command-line client",
         version: SMBee.version,
         subcommands: [
-            Probe.self, Shares.self, List.self, Stat.self, Cat.self, Get.self,
+            Probe.self, Shares.self, List.self, Stat.self, DiskFree.self, Cat.self, Get.self,
             MakeDirectory.self, Put.self, Copy.self, Move.self, Remove.self
         ]
     )
@@ -258,6 +258,46 @@ struct Stat: AsyncParsableCommand {
         if let changeTime = stat.changeTime {
             print("chtime: \(formatDate(changeTime))")
         }
+    }
+}
+
+struct DiskFree: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "df", abstract: "Show SMB share filesystem usage")
+
+    @Argument(help: "smb://user@host[:445]/share")
+    var url: String
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    @Flag(help: "Print JSON output")
+    var json = false
+
+    func run() async throws {
+        debug.apply()
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        let info = try await SMBee.volumeInfo(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            timeout: transport.duration
+        )
+        if json {
+            print(try SMBCLIOutput.jsonString(for: info))
+            return
+        }
+        print("total: \(formatByteCount(info.totalBytes)) (\(info.totalBytes))")
+        print("used: \(formatByteCount(info.usedBytes)) (\(info.usedBytes))")
+        print("available: \(formatByteCount(info.availableBytes)) (\(info.availableBytes))")
+        print("label: \(info.volumeLabel)")
+        print("filesystem: \(info.filesystemName)")
     }
 }
 

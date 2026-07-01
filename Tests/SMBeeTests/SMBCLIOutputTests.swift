@@ -88,6 +88,29 @@ final class SMBCLIOutputTests: XCTestCase {
         XCTAssertNil(array[1]["comment"])
     }
 
+    func testVolumeInfoJSONShape() throws {
+        let info = SMBVolumeInfo(
+            totalBytes: 409_600,
+            availableBytes: 102_400,
+            filesystemName: "NTFS",
+            volumeLabel: "DATA",
+            maxComponentLength: 255,
+            filesystemAttributes: 0x0000_0003,
+            volumeSerialNumber: 0x1234_abcd
+        )
+
+        let object = try jsonObject(SMBCLIOutput.jsonData(for: info))
+
+        XCTAssertEqual(object["totalBytes"] as? Int, 409_600)
+        XCTAssertEqual(object["usedBytes"] as? Int, 307_200)
+        XCTAssertEqual(object["availableBytes"] as? Int, 102_400)
+        XCTAssertEqual(object["filesystemName"] as? String, "NTFS")
+        XCTAssertEqual(object["volumeLabel"] as? String, "DATA")
+        XCTAssertEqual(object["maxComponentLength"] as? Int, 255)
+        XCTAssertEqual(object["filesystemAttributes"] as? String, "0x00000003")
+        XCTAssertEqual(object["volumeSerialNumber"] as? Int, 0x1234_abcd)
+    }
+
     func testSMBErrorExitCodeMapping() {
         XCTAssertEqual(SMBCLIExitCode.code(for: .logonFailure(status: 0, operation: "SESSION_SETUP")), 3)
         XCTAssertEqual(SMBCLIExitCode.code(for: .accessDenied(status: 0, operation: "CREATE")), 3)

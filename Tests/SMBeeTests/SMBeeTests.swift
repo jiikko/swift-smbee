@@ -2304,6 +2304,26 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(request[104], 0)
     }
 
+    func testQueryInfoRequestCanUseFilesystemInfoClass() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2QueryInfo.encodeRequest(
+            messageId: 12,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            infoType: SMB2QueryInfo.infoTypeFilesystem,
+            fileInfoClass: SMB2QueryInfo.fileFsFullSizeInformation
+        )
+
+        XCTAssertEqual(request[66], 0x02)
+        XCTAssertEqual(request[67], 7)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 65_536)
+        XCTAssertEqual(readUInt16LE(request, at: 72), 104)
+        XCTAssertEqual(readUInt16LE(request, at: 74), 0)
+        XCTAssertEqual(Array(request[88..<104]), fileId)
+        XCTAssertEqual(request[104], 0)
+    }
+
     func testQueryInfoResponsePreservesFileAttributes() throws {
         let response = try smb2QueryInfoResponse(size: 7, messageId: 12, treeId: 0x3344, attributes: 0x82)
 
@@ -2333,6 +2353,51 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(stat.modifiedTime?.timeIntervalSince1970, 3)
         XCTAssertEqual(stat.changeTime?.timeIntervalSince1970, 4)
         XCTAssertTrue(stat.isReparsePoint)
+    }
+
+    func testFileFsFullSizeInformationDecodesByteCountsFromFixture() throws {
+        var payload = Array(repeating: UInt8(0), count: 32)
+        writeUInt64LE(100, to: &payload, at: 0)
+        writeUInt64LE(25, to: &payload, at: 8)
+        writeUInt64LE(20, to: &payload, at: 16)
+        writeUInt32LE(8, to: &payload, at: 24)
+        writeUInt32LE(512, to: &payload, at: 28)
+
+        let info = try SMB2QueryInfo.decodeFullSizeInformation(smb2QueryInfoResponse(payload: payload))
+
+        XCTAssertEqual(info.totalBytes, 409_600)
+        XCTAssertEqual(info.availableBytes, 102_400)
+    }
+
+    func testFileFsAttributeInformationDecodesUTF16NameFromFixture() throws {
+        var payload = Array(repeating: UInt8(0), count: 12)
+        let name = NTLM.utf16le("NTFS")
+        writeUInt32LE(0x0000_0003, to: &payload, at: 0)
+        writeUInt32LE(255, to: &payload, at: 4)
+        writeUInt32LE(UInt32(name.count), to: &payload, at: 8)
+        payload.append(contentsOf: name)
+
+        let info = try SMB2QueryInfo.decodeAttributeInformation(smb2QueryInfoResponse(payload: payload))
+
+        XCTAssertEqual(info.filesystemAttributes, 0x0000_0003)
+        XCTAssertEqual(info.maxComponentLength, 255)
+        XCTAssertEqual(info.filesystemName, "NTFS")
+    }
+
+    func testFileFsVolumeInformationDecodesUTF16LabelFromFixture() throws {
+        var payload = Array(repeating: UInt8(0), count: 18)
+        let label = NTLM.utf16le("DATA")
+        writeUInt64LE(116_444_736_010_000_000, to: &payload, at: 0)
+        writeUInt32LE(0x1234_abcd, to: &payload, at: 8)
+        writeUInt32LE(UInt32(label.count), to: &payload, at: 12)
+        payload[16] = 1
+        payload[17] = 0
+        payload.append(contentsOf: label)
+
+        let info = try SMB2QueryInfo.decodeVolumeInformation(smb2QueryInfoResponse(payload: payload))
+
+        XCTAssertEqual(info.volumeSerialNumber, 0x1234_abcd)
+        XCTAssertEqual(info.volumeLabel, "DATA")
     }
 
     func testTreeConnectResponseDecodesSharePolicy() throws {
@@ -3714,6 +3779,16 @@ final class SMBeeTests: XCTestCase {
         writeUInt64LE(size, to: &payload, at: 40)
         writeUInt32LE(attributes, to: &payload, at: 52)
         var response = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 66)
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+        return response
+    }
+
+    private func smb2QueryInfoResponse(payload: [UInt8]) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.queryInfo, messageId: 12, treeId: 0x3344).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
         writeUInt16LE(9, to: &response, at: 64)
         writeUInt16LE(72, to: &response, at: 66)

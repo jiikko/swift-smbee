@@ -37,6 +37,10 @@ public enum SMBCLIOutput {
         try encoder.encode(FileStatJSON(stat))
     }
 
+    public static func jsonData(for volumeInfo: SMBVolumeInfo) throws -> Data {
+        try encoder.encode(VolumeInfoJSON(volumeInfo))
+    }
+
     public static func jsonData(for shares: [SMBShareInfo]) throws -> Data {
         try encoder.encode(shares.map(ShareInfoJSON.init))
     }
@@ -51,6 +55,10 @@ public enum SMBCLIOutput {
 
     public static func jsonString(for stat: SMBFileStat) throws -> String {
         try string(from: jsonData(for: stat))
+    }
+
+    public static func jsonString(for volumeInfo: SMBVolumeInfo) throws -> String {
+        try string(from: jsonData(for: volumeInfo))
     }
 
     public static func jsonString(for shares: [SMBShareInfo]) throws -> String {
@@ -137,6 +145,28 @@ private struct FileStatJSON: Encodable {
         lastAccessTime = SMBCLIOutput.dateString(stat.lastAccessTime)
         modifiedTime = SMBCLIOutput.dateString(stat.modifiedTime)
         changeTime = SMBCLIOutput.dateString(stat.changeTime)
+    }
+}
+
+private struct VolumeInfoJSON: Encodable {
+    var totalBytes: UInt64
+    var usedBytes: UInt64
+    var availableBytes: UInt64
+    var filesystemName: String
+    var volumeLabel: String
+    var maxComponentLength: UInt32
+    var filesystemAttributes: String
+    var volumeSerialNumber: UInt32
+
+    init(_ info: SMBVolumeInfo) {
+        totalBytes = info.totalBytes
+        usedBytes = info.usedBytes
+        availableBytes = info.availableBytes
+        filesystemName = info.filesystemName
+        volumeLabel = info.volumeLabel
+        maxComponentLength = info.maxComponentLength
+        filesystemAttributes = SMBCLIOutput.hex(info.filesystemAttributes, width: 8)
+        volumeSerialNumber = info.volumeSerialNumber
     }
 }
 

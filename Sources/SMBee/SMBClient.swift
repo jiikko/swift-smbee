@@ -53,6 +53,35 @@ public struct SMBFileStat: Equatable, Sendable {
     }
 }
 
+public struct SMBVolumeInfo: Equatable, Sendable {
+    public var totalBytes: UInt64
+    public var availableBytes: UInt64
+    public var usedBytes: UInt64 { totalBytes >= availableBytes ? totalBytes - availableBytes : 0 }
+    public var filesystemName: String
+    public var volumeLabel: String
+    public var maxComponentLength: UInt32
+    public var filesystemAttributes: UInt32
+    public var volumeSerialNumber: UInt32
+
+    public init(
+        totalBytes: UInt64,
+        availableBytes: UInt64,
+        filesystemName: String,
+        volumeLabel: String,
+        maxComponentLength: UInt32,
+        filesystemAttributes: UInt32,
+        volumeSerialNumber: UInt32
+    ) {
+        self.totalBytes = totalBytes
+        self.availableBytes = availableBytes
+        self.filesystemName = filesystemName
+        self.volumeLabel = volumeLabel
+        self.maxComponentLength = maxComponentLength
+        self.filesystemAttributes = filesystemAttributes
+        self.volumeSerialNumber = volumeSerialNumber
+    }
+}
+
 public enum SMBFileAttributes {
     public static let readOnly: UInt32 = 0x0000_0001
     public static let hidden: UInt32 = 0x0000_0002
@@ -301,6 +330,19 @@ public actor SMBClientSession {
             let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
             try? await session.close(treeId: treeId, fileId: fileId)
             return stat
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func volumeInfo() async throws -> SMBVolumeInfo {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, path: "", directory: true)
+        do {
+            let info = try await session.volumeInfo(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return info
         } catch {
             try? await session.close(treeId: treeId, fileId: fileId)
             throw error
@@ -692,6 +734,44 @@ public enum SMBClient {
                 throw error
             }
         }
+    }
+
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func volumeInfo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws -> SMBVolumeInfo {
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "QUERY_INFO") { session, treeId in
+            let fileId = try await session.create(treeId: treeId, path: "", directory: true)
+            do {
+                let info = try await session.volumeInfo(treeId: treeId, fileId: fileId)
+                try? await session.close(treeId: treeId, fileId: fileId)
+                return info
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
+        }
+    }
+
+    public static func volumeInfo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> SMBVolumeInfo {
+        try await volumeInfo(
+            host: host,
+            port: port,
+            share: share,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     public static func stat(
@@ -1784,6 +1864,52 @@ actor SMBSession {
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_INFO")
         return try SMB2QueryInfo.decodeNetworkOpenInformation(response)
+    }
+
+    func volumeInfo(treeId: UInt32, fileId: [UInt8]) async throws -> SMBVolumeInfo {
+        let fullSize = try await queryFilesystemFullSizeInfo(treeId: treeId, fileId: fileId)
+        let attributes = try await queryFilesystemAttributeInfo(treeId: treeId, fileId: fileId)
+        let volume = try await queryFilesystemVolumeInfo(treeId: treeId, fileId: fileId)
+        return SMBVolumeInfo(
+            totalBytes: fullSize.totalBytes,
+            availableBytes: fullSize.availableBytes,
+            filesystemName: attributes.filesystemName,
+            volumeLabel: volume.volumeLabel,
+            maxComponentLength: attributes.maxComponentLength,
+            filesystemAttributes: attributes.filesystemAttributes,
+            volumeSerialNumber: volume.volumeSerialNumber
+        )
+    }
+
+    private func queryFilesystemFullSizeInfo(treeId: UInt32, fileId: [UInt8]) async throws -> (totalBytes: UInt64, availableBytes: UInt64) {
+        let response = try await queryFilesystemInfo(treeId: treeId, fileId: fileId, fileInfoClass: SMB2QueryInfo.fileFsFullSizeInformation)
+        return try SMB2QueryInfo.decodeFullSizeInformation(response)
+    }
+
+    private func queryFilesystemAttributeInfo(treeId: UInt32, fileId: [UInt8]) async throws -> (filesystemName: String, maxComponentLength: UInt32, filesystemAttributes: UInt32) {
+        let response = try await queryFilesystemInfo(treeId: treeId, fileId: fileId, fileInfoClass: SMB2QueryInfo.fileFsAttributeInformation)
+        return try SMB2QueryInfo.decodeAttributeInformation(response)
+    }
+
+    private func queryFilesystemVolumeInfo(treeId: UInt32, fileId: [UInt8]) async throws -> (volumeLabel: String, volumeSerialNumber: UInt32) {
+        let response = try await queryFilesystemInfo(treeId: treeId, fileId: fileId, fileInfoClass: SMB2QueryInfo.fileFsVolumeInformation)
+        return try SMB2QueryInfo.decodeVolumeInformation(response)
+    }
+
+    private func queryFilesystemInfo(treeId: UInt32, fileId: [UInt8], fileInfoClass: UInt8) async throws -> [UInt8] {
+        let packet = try SMB2QueryInfo.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            infoType: SMB2QueryInfo.infoTypeFilesystem,
+            fileInfoClass: fileInfoClass
+        )
+        debugDump("QUERY_INFO request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_INFO response")
+        let header = try SMB2Header.decode(response)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_INFO")
+        return response
     }
 
     func readChunk(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {

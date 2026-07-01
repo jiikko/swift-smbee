@@ -195,6 +195,32 @@ private final class SMBReadStreamProgress: @unchecked Sendable {
     }
 }
 
+private struct SMBTransferProgressEmitter {
+    private let totalBytes: UInt64?
+    private let onProgress: (@Sendable (SMBTransferProgress) -> Void)?
+    private let clock = ContinuousClock()
+    private let start: ContinuousClock.Instant
+
+    init(totalBytes: UInt64?, onProgress: (@Sendable (SMBTransferProgress) -> Void)?) {
+        self.totalBytes = totalBytes
+        self.onProgress = onProgress
+        self.start = clock.now
+    }
+
+    func emit(bytesTransferred: UInt64) {
+        guard let onProgress else { return }
+        let elapsed = start.duration(to: clock.now)
+        let components = elapsed.components
+        let seconds = Double(components.seconds) + (Double(components.attoseconds) / 1_000_000_000_000_000_000)
+        let bytesPerSecond = seconds > 0 ? Double(bytesTransferred) / seconds : 0
+        onProgress(SMBTransferProgress(
+            bytesTransferred: bytesTransferred,
+            totalBytes: totalBytes,
+            bytesPerSecond: bytesPerSecond
+        ))
+    }
+}
+
 private final class SMBDirectoryEntryCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [SMBDirectoryEntry] = []
@@ -281,13 +307,17 @@ public actor SMBClientSession {
         }
     }
 
-    public func read(path: String, range: SMBReadRange? = nil) async throws -> [UInt8] {
+    public func read(
+        path: String,
+        range: SMBReadRange? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws -> [UInt8] {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, path: path, directory: false)
         do {
             let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
             let (start, requested) = try readBounds(stat: stat, range: range)
-            let data = try await SMBClient.readAll(session: session, treeId: treeId, fileId: fileId, offset: start, length: requested)
+            let data = try await SMBClient.readAll(session: session, treeId: treeId, fileId: fileId, offset: start, length: requested, onProgress: onProgress)
             guard UInt64(data.count) == requested else {
                 throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
             }
@@ -302,6 +332,7 @@ public actor SMBClientSession {
     public func withReadStream(
         path: String,
         range: SMBReadRange? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         try ensureOpen()
@@ -317,6 +348,7 @@ public actor SMBClientSession {
                 offset: start,
                 length: requested,
                 progress: progress,
+                onProgress: onProgress,
                 onChunk: onChunk
             )
             try? await session.close(treeId: treeId, fileId: fileId)
@@ -335,11 +367,16 @@ public actor SMBClientSession {
         try await session.close(treeId: treeId, fileId: fileId)
     }
 
-    public func upload(path: String, data: [UInt8], overwrite: Bool = true) async throws {
+    public func upload(
+        path: String,
+        data: [UInt8],
+        overwrite: Bool = true,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
         do {
-            try await session.write(treeId: treeId, fileId: fileId, data: data)
+            try await session.write(treeId: treeId, fileId: fileId, data: data, onProgress: onProgress)
             try await session.flush(treeId: treeId, fileId: fileId)
             try? await session.close(treeId: treeId, fileId: fileId)
         } catch {
@@ -591,7 +628,8 @@ public enum SMBClient {
         range: SMBReadRange? = nil,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws -> [UInt8] {
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: false)
@@ -603,7 +641,7 @@ public enum SMBClient {
                 }
                 let available = stat.size - start
                 let requested = range.map { min($0.length, available) } ?? available
-                let data = try await readAll(session: session, treeId: treeId, fileId: fileId, offset: start, length: requested)
+                let data = try await readAll(session: session, treeId: treeId, fileId: fileId, offset: start, length: requested, onProgress: onProgress)
                 guard UInt64(data.count) == requested else {
                     throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
                 }
@@ -626,6 +664,7 @@ public enum SMBClient {
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         let progress = SMBReadStreamProgress()
@@ -639,6 +678,7 @@ public enum SMBClient {
                 }
                 let available = stat.size - start
                 let requested = range.map { min($0.length, available) } ?? available
+                let transferProgress = SMBTransferProgressEmitter(totalBytes: requested, onProgress: onProgress)
                 var cursor = start
                 var remaining = requested
                 while remaining > 0 {
@@ -655,6 +695,7 @@ public enum SMBClient {
                     try await onChunk(chunk)
                     try Task.checkCancellation()
                     progress.recordReceived(byteCount: chunk.count)
+                    transferProgress.emit(bytesTransferred: progress.received)
                     cursor = advanced.cursor
                     remaining = advanced.remaining
                 }
@@ -683,7 +724,8 @@ public enum SMBClient {
         overwrite: Bool = true,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         let fileManager = FileManager.default
         let destination = localFile.standardizedFileURL
@@ -704,7 +746,8 @@ public enum SMBClient {
                 path: path,
                 credential: credential,
                 timeout: timeout,
-                makeTransport: makeTransport
+                makeTransport: makeTransport,
+                onProgress: onProgress
             ) { chunk in
                 try handle.write(contentsOf: Data(chunk))
             }
@@ -777,10 +820,19 @@ public enum SMBClient {
         }
     }
 
-    fileprivate static func readAll(session: SMBSession, treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
+    fileprivate static func readAll(
+        session: SMBSession,
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset: UInt64,
+        length: UInt64,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws -> [UInt8] {
         let result = SMBReadAccumulator()
+        let progress = SMBTransferProgressEmitter(totalBytes: length, onProgress: onProgress)
         var cursor = offset
         var remaining = length
+        var received: UInt64 = 0
         while remaining > 0 {
             try Task.checkCancellation()
             let chunk = try await session.readChunk(treeId: treeId, fileId: fileId, offset: cursor, length: remaining)
@@ -792,6 +844,8 @@ public enum SMBClient {
             )
             try Task.checkCancellation()
             result.append(chunk)
+            received += UInt64(chunk.count)
+            progress.emit(bytesTransferred: received)
             cursor = advanced.cursor
             remaining = advanced.remaining
         }
@@ -805,8 +859,10 @@ public enum SMBClient {
         offset: UInt64,
         length: UInt64,
         progress: SMBReadStreamProgress,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
+        let transferProgress = SMBTransferProgressEmitter(totalBytes: length, onProgress: onProgress)
         var cursor = offset
         var remaining = length
         while remaining > 0 {
@@ -823,6 +879,7 @@ public enum SMBClient {
             try await onChunk(chunk)
             try Task.checkCancellation()
             progress.recordReceived(byteCount: chunk.count)
+            transferProgress.emit(bytesTransferred: progress.received)
             cursor = advanced.cursor
             remaining = advanced.remaining
         }
@@ -858,12 +915,13 @@ public enum SMBClient {
         overwrite: Bool = true,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
             do {
-                try await session.write(treeId: treeId, fileId: fileId, data: data)
+                try await session.write(treeId: treeId, fileId: fileId, data: data, onProgress: onProgress)
                 try await session.flush(treeId: treeId, fileId: fileId)
                 try? await session.close(treeId: treeId, fileId: fileId)
             } catch {
@@ -1382,14 +1440,21 @@ actor SMBSession {
         return data
     }
 
-    func write(treeId: UInt32, fileId: [UInt8], data: [UInt8]) async throws {
+    func write(
+        treeId: UInt32,
+        fileId: [UInt8],
+        data: [UInt8],
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
         let chunkSize = negotiatedWriteChunkSize()
+        let progress = SMBTransferProgressEmitter(totalBytes: UInt64(data.count), onProgress: onProgress)
         var cursor = 0
         while let range = try SMBChunkedTransfer.nextWriteRange(cursor: cursor, dataCount: data.count, chunkSize: chunkSize) {
             try Task.checkCancellation()
             let chunk = Array(data[range])
             try await writeChunk(treeId: treeId, fileId: fileId, offset: UInt64(cursor), data: chunk)
             cursor = range.upperBound
+            progress.emit(bytesTransferred: UInt64(cursor))
         }
     }
 

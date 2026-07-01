@@ -19,6 +19,23 @@ private struct SMBTestTimeoutError: Error, CustomStringConvertible {
     var description: String { "test await '\(label)' timed out after \(seconds)s (likely wire-transaction ordering deadlock)" }
 }
 
+private final class TransferProgressCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBTransferProgress] = []
+
+    var snapshots: [SMBTransferProgress] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ progress: SMBTransferProgress) {
+        lock.lock()
+        storage.append(progress)
+        lock.unlock()
+    }
+}
+
 private var streamSocketType: Int32 {
     #if os(Linux)
     Int32(SOCK_STREAM.rawValue)
@@ -2069,6 +2086,62 @@ final class SMBeeTests: XCTestCase {
             SMB2Commands.close,
         ])
         XCTAssertTrue(requests.allSatisfy { (try? SMB2Header.decode($0).treeId) == 0x3344 })
+    }
+
+    func testClientSessionReadEmitsTransferProgressPerChunk() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 5, messageId: 1, treeId: 0x3344),
+            try smb2ReadResponse(Array("hel".utf8), messageId: 2, treeId: 0x3344),
+            try smb2ReadResponse(Array("lo".utf8), messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let progress = TransferProgressCollector()
+
+        let data = try await clientSession.read(path: "file.txt", onProgress: progress.append)
+
+        XCTAssertEqual(data, Array("hello".utf8))
+        XCTAssertEqual(progress.snapshots.map(\.bytesTransferred), [3, 5])
+        XCTAssertEqual(progress.snapshots.map(\.totalBytes), [5, 5])
+        XCTAssertTrue(progress.snapshots.allSatisfy { $0.bytesPerSecond >= 0 })
+    }
+
+    func testClientSessionUploadEmitsTransferProgressPerChunk() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2WriteResponse(count: 65_536, messageId: 1, treeId: 0x3344),
+            try smb2WriteResponse(count: 1, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let progress = TransferProgressCollector()
+        let data = Array(repeating: UInt8(0x41), count: 65_537)
+
+        try await clientSession.upload(path: "file.txt", data: data, onProgress: progress.append)
+
+        XCTAssertEqual(progress.snapshots.map(\.bytesTransferred), [65_536, 65_537])
+        XCTAssertEqual(progress.snapshots.map(\.totalBytes), [65_537, 65_537])
+        XCTAssertTrue(progress.snapshots.allSatisfy { $0.bytesPerSecond >= 0 })
     }
 
     func testClientSessionCloseSendsTreeDisconnectAndLogoff() async throws {

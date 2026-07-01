@@ -118,9 +118,10 @@ public enum SMBee {
         share: String,
         path: String,
         range: SMBReadRange? = nil,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws -> [UInt8] {
-        try await SMBClient.read(host: host, port: port, share: share, path: path, range: range, credential: credential, timeout: timeout)
+        try await SMBClient.read(host: host, port: port, share: share, path: path, range: range, credential: credential, timeout: timeout, onProgress: onProgress)
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
@@ -132,6 +133,7 @@ public enum SMBee {
         path: String,
         range: SMBReadRange? = nil,
         timeout: Duration? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         try await SMBClient.withReadStream(
@@ -142,6 +144,7 @@ public enum SMBee {
             range: range,
             credential: credential,
             timeout: timeout,
+            onProgress: onProgress,
             onChunk: onChunk
         )
     }
@@ -155,7 +158,8 @@ public enum SMBee {
         path: String,
         localFile: URL,
         overwrite: Bool = true,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await SMBClient.download(
             host: host,
@@ -165,7 +169,8 @@ public enum SMBee {
             localFile: localFile,
             overwrite: overwrite,
             credential: credential,
-            timeout: timeout
+            timeout: timeout,
+            onProgress: onProgress
         )
     }
 
@@ -213,7 +218,8 @@ public enum SMBee {
         path: String,
         data: [UInt8],
         overwrite: Bool = true,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await SMBClient.upload(
             host: host,
@@ -223,7 +229,8 @@ public enum SMBee {
             data: data,
             overwrite: overwrite,
             credential: credential,
-            timeout: timeout
+            timeout: timeout,
+            onProgress: onProgress
         )
     }
 

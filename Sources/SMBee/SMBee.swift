@@ -449,6 +449,10 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
+    ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
+    ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
+    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -460,6 +464,7 @@ public enum SMBee {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        atomic: Bool = false,
         timeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
@@ -473,12 +478,17 @@ public enum SMBee {
             continueOnError: continueOnError,
             skipExisting: skipExisting,
             dryRun: dryRun,
+            atomic: atomic,
             credential: credential,
             timeout: timeout,
             onAction: onAction
         )
     }
 
+    /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
+    ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
+    ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
+    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -490,6 +500,7 @@ public enum SMBee {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        atomic: Bool = false,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.downloadDirectory(
@@ -502,6 +513,7 @@ public enum SMBee {
             continueOnError: continueOnError,
             skipExisting: skipExisting,
             dryRun: dryRun,
+            atomic: atomic,
             credentialProvider: credentialProvider,
             onAction: onAction
         )

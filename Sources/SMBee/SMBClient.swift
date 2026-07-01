@@ -1424,6 +1424,10 @@ public enum SMBClient {
         )
     }
 
+    /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
+    ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
+    ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
+    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func downloadDirectory(
         host: String,
@@ -1435,30 +1439,75 @@ public enum SMBClient {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        atomic: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
+        let targetDirectory = localDirectory.standardizedFileURL
+        let downloadDirectory: URL
+        let actionDirectory: URL?
+        let stagingDirectory: URL?
+        if atomic && !dryRun {
+            let parent = targetDirectory.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            let staging = parent.appendingPathComponent(
+                ".\(targetDirectory.lastPathComponent).smbee-\(UUID().uuidString).tmp"
+            )
+            downloadDirectory = staging
+            actionDirectory = targetDirectory
+            stagingDirectory = staging
+        } else {
+            downloadDirectory = targetDirectory
+            actionDirectory = nil
+            stagingDirectory = nil
+        }
         let failures = SMBRecursiveFailureCollector()
-        try await downloadDirectoryRecursive(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            localDirectory: localDirectory,
-            overwrite: overwrite,
-            continueOnError: continueOnError,
-            skipExisting: skipExisting,
-            dryRun: dryRun,
-            credential: credential,
-            timeout: timeout,
-            makeTransport: makeTransport,
-            failures: failures,
-            onAction: onAction,
-            depth: 0
-        )
-        try failures.throwIfNeeded()
+        do {
+            try await downloadDirectoryRecursive(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localDirectory: downloadDirectory,
+                actionDirectory: actionDirectory,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: atomic ? false : skipExisting,
+                dryRun: dryRun,
+                credential: credential,
+                timeout: timeout,
+                makeTransport: makeTransport,
+                failures: failures,
+                onAction: onAction,
+                depth: 0
+            )
+            try failures.throwIfNeeded()
+            if let stagingDirectory {
+                try replaceDownloadedDirectory(stagingDirectory, with: targetDirectory, overwrite: overwrite)
+            }
+        } catch {
+            if let stagingDirectory {
+                try? FileManager.default.removeItem(at: stagingDirectory)
+            }
+            throw error
+        }
+    }
+
+    /// Best-effort local atomicity for directory downloads: stage in a sibling directory and then
+    /// move/replace the destination. This does not make the final rename transactional across
+    /// filesystems or process crashes during replacement.
+    private static func replaceDownloadedDirectory(_ stagingDirectory: URL, with destination: URL, overwrite: Bool) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: destination.path) {
+            guard overwrite else {
+                throw SMBCodecError.invalidValue("local destination already exists")
+            }
+            _ = try fileManager.replaceItemAt(destination, withItemAt: stagingDirectory)
+        } else {
+            try fileManager.moveItem(at: stagingDirectory, to: destination)
+        }
     }
 
     // swiftlint:disable:next function_parameter_count
@@ -1468,6 +1517,7 @@ public enum SMBClient {
         share: String,
         path: String,
         localDirectory: URL,
+        actionDirectory: URL?,
         overwrite: Bool,
         continueOnError: Bool,
         skipExisting: Bool,
@@ -1481,11 +1531,12 @@ public enum SMBClient {
     ) async throws {
         try SMBPath.validateRecursionDepth(depth)
         let fileManager = FileManager.default
+        let reportedDirectory = actionDirectory ?? localDirectory
         if dryRun {
-            onAction?(SMBRecursiveAction(kind: .mkdir, path: localDirectory.path))
+            onAction?(SMBRecursiveAction(kind: .mkdir, path: reportedDirectory.path))
         } else {
             try fileManager.createDirectory(at: localDirectory, withIntermediateDirectories: true)
-            onAction?(SMBRecursiveAction(kind: .mkdir, path: localDirectory.path))
+            onAction?(SMBRecursiveAction(kind: .mkdir, path: reportedDirectory.path))
         }
         let entries = try await list(
             host: host,
@@ -1501,8 +1552,9 @@ public enum SMBClient {
             guard !entry.isReparsePoint else { continue }
             let remoteChild = joinSMBPath(path, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
+            let actionChild = reportedDirectory.appendingPathComponent(entry.name)
             if skipExisting && fileManager.fileExists(atPath: localChild.path) {
-                onAction?(SMBRecursiveAction(kind: .skip, path: localChild.path))
+                onAction?(SMBRecursiveAction(kind: .skip, path: actionChild.path))
                 continue
             }
             if entry.isDirectory {
@@ -1513,6 +1565,7 @@ public enum SMBClient {
                         share: share,
                         path: remoteChild,
                         localDirectory: localChild,
+                        actionDirectory: actionChild,
                         overwrite: overwrite,
                         continueOnError: continueOnError,
                         skipExisting: skipExisting,
@@ -1531,7 +1584,7 @@ public enum SMBClient {
             } else {
                 do {
                     if dryRun {
-                        onAction?(SMBRecursiveAction(kind: .download, path: localChild.path))
+                        onAction?(SMBRecursiveAction(kind: .download, path: actionChild.path))
                     } else {
                         try await download(
                             host: host,
@@ -1544,7 +1597,7 @@ public enum SMBClient {
                             timeout: timeout,
                             makeTransport: makeTransport
                         )
-                        onAction?(SMBRecursiveAction(kind: .download, path: localChild.path))
+                        onAction?(SMBRecursiveAction(kind: .download, path: actionChild.path))
                     }
                 } catch {
                     guard continueOnError else { throw error }
@@ -1554,6 +1607,10 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
+    ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
+    ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
+    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1564,6 +1621,7 @@ public enum SMBClient {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        atomic: Bool = false,
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -1578,6 +1636,7 @@ public enum SMBClient {
             continueOnError: continueOnError,
             skipExisting: skipExisting,
             dryRun: dryRun,
+            atomic: atomic,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
             onAction: onAction

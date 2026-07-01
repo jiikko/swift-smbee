@@ -211,7 +211,11 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: `SMBee.download` / `SMBClient.download` / `smbcli get` を追加。既存 `withReadStream` を使い、
     local temp file へ streaming 書き込み後に move/replace。`--no-overwrite` 対応。Samba E2E に round-trip
     assertion 追加。
-- [ ] copy primitive: remote→remote copy / local→remote directory upload / remote→local directory download
+- [x] copy primitive: remote→remote copy / local→remote directory upload / remote→local directory download
+  - 2026-07-02 実装確認: 下記 2026-06-30〜07-01 の記録どおり `SMBee.copy` / `copyDirectory` /
+    `uploadDirectory` / `downloadDirectory` (server-side copychunk fallback 込み) + `smbcli cp/put/get (-r)`
+    が実装済み。recursive safety (自己再帰防止 + max depth) も 2026-07-01 (issue 236 partial) で追加済み。
+    checkbox のみ未チェックだったため [x] 化。残の streaming traversal / atomicity は 236 の defer 側。
   - 2026-06-30: 同一 share 内 remote file → remote file の client-side copy API / `smbcli cp` を追加。
     既存 READ/WRITE で streaming copy し、Samba E2E に round-trip assertion 追加。
   - 2026-06-30: recursive local directory upload (`SMBee.uploadDirectory`, `smbcli put -r`) と
@@ -342,11 +346,19 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     / FileFsVolumeInformation(1)。`SMBVolumeInfo` + `SMBee.volumeInfo` / `SMBClientSession.volumeInfo` +
     `smbcli df` (--json)。fixture unit + 実 Samba E2E (df assertion) green。
     残: macOS SMBX / Windows / NAS の smoke (実機必要)。
-- [ ] change notification / directory watch
+- [x] change notification / directory watch
   - ファイルブラウザ基盤として、ディレクトリ変更検知 (`CHANGE_NOTIFY`) の API を検討する。
     long-poll/async response、cancellation、再接続時の再購読、overflow 時の full rescan 方針が必要。
   - CLI では `smbcli watch smb://...` 相当。MVP の copy/read/write には不要なので後回し。
-- [ ] ACL / owner / SID metadata
+  - 2026-07-02 (codex-drive): **SMB2 CHANGE_NOTIFY (command 15) を実装**。専用 long-poll 受信
+    (`signedLongPollWireTransaction`/`receiveLongPoll`) で STATUS_PENDING を打ち切らず実 notification まで
+    待機、cancel は M2 の transport close-on-cancel で解除、resubscribe ループ。overflow
+    (STATUS_NOTIFY_ENUM_DIR) は `.overflow` として callback へ (full-rescan は呼び出し側)。公開型
+    `SMBFileChange`/`SMBFileChangeAction`/`SMBChangeNotifyFilter`(OptionSet)/`SMBChangeNotifyEvent`。
+    `SMBClientSession.withChangeNotifications` / `SMBee.withChangeNotifications` (callback) + `smbcli watch`
+    (`-r` で watch-tree)。fixture unit + **実 Samba E2E** (dir watch → file 作成 → ADDED 通知を bounded 受信) green。
+    残: `smbcli watch` の `--json` は未実装 (human のみ)。再接続時の再購読は同一 session 前提 (自動再接続は未配線)。
+- [x] ACL / owner / SID metadata
   - `QUERY_SECURITY` / `SET_SECURITY`。MVP では扱わないが、管理系 smbclient としては必要。
   - 2026-07-01 (codex-drive): **READ (QUERY_SECURITY) を実装**。QUERY_INFO に
     `additionalInformation: UInt32` を追加 (既存 stat/df wire は default 0 不変)。InfoType=0x03 で
@@ -356,8 +368,16 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     (type/flags/accessMask/trusteeSID?)。READ_CONTROL 付き `.querySecurity(path:)` open。
     `SMBClientSession.securityInfo` / `SMBee.securityInfo` + `smbcli acl` (--json)。未知/OBJECT ACE は
     mask だけ保持し AceSize でスキップ。fixture unit + 実 Samba E2E (ownerSID != nil / DACL ACE>=1) green。
-  - **残 (defer)**: `SET_SECURITY` (書き込み) は自アクセスをロックアウトしうる破壊操作 + SD 構築が大きいため
-    未実装。SACL は特権要求のため対象外 (AdditionalInformation に SACL bit を立てていない)。
+  - 2026-07-02 (codex-drive): **SET_SECURITY (DACL write) を実装**。SET_INFO を InfoType/
+    AdditionalInformation 指定可に parametrize。self-relative SECURITY_DESCRIPTOR/SID/ACL/ACE encoder
+    (decode と round-trip)。WRITE_DAC 付き `.setSecurity(path:)` open。read-modify-write (owner/group 保持)。
+    **自ロックアウト防止 guard** (`validateWritableDACL`: 空 DACL / ACCESS_ALLOWED 皆無を reject、`force` で解除、
+    trusteeSID nil の ACE は書き戻せず reject)。`SMBClientSession.setSecurityInfo(path:dacl:force:)` /
+    `SMBee.setSecurityInfo` + `smbcli setacl`。fixture unit + **実 Samba round-trip E2E** green。
+    観測: **Samba は POSIX-ACL backing のため access mask を正規化** (要求 0x00020000 → read-back 0x00120089)。
+    write 自体は成功 (追加 SID の ACE が反映) を実測確認、round-trip は mask-exact ではない旨を doc に明記。
+  - **残 (defer)**: SACL は特権要求のため対象外 (AdditionalInformation に SACL bit を立てていない)。
+    owner/group の書き換えも今回対象外 (DACL のみ)。
 - [ ] locking / durable handle / lease / oplock の扱い
   - concurrent clients や大ファイル操作の堅牢性向け。最初は明示的に unsupported としてエラーを設計する。
 - [ ] multi-share / multi-tree session reuse

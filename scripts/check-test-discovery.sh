@@ -23,10 +23,20 @@ discovered_count=$(grep -E '(^|[[:space:]])SMBeeTests[./][A-Za-z0-9_]+[./][A-Za-
 
 # Source-side XCTest discovery lower bound. This intentionally counts only XCTest-style
 # `func test...()` methods because the package currently uses XCTest, not swift-testing.
+#
+# Test methods inside `#if ... #endif` blocks (e.g. `#if canImport(Network)` macOS-only
+# NWConnectionTransport tests) are NOT compiled on every platform, so they must be excluded
+# from the lower bound: on Linux they are compiled out and are never discovered, which would
+# otherwise produce a false "discovered < source" failure. Counting only unconditional test
+# methods yields a lower bound that always holds on every platform while still catching a
+# newly added *unconditional* test method that fails to be discovered.
 source_test_count=$(find "$TEST_ROOT" -name '*Tests.swift' -print0 \
-  | xargs -0 grep -hE '^[[:space:]]*(public[[:space:]]+|internal[[:space:]]+|private[[:space:]]+)?func[[:space:]]+test[A-Za-z0-9_]*[[:space:]]*\(' \
-  | wc -l \
-  | tr -d '[:space:]')
+  | xargs -0 cat \
+  | awk '
+      /^[[:space:]]*#[[:space:]]*if/    { depth++; next }
+      /^[[:space:]]*#[[:space:]]*endif/ { if (depth > 0) depth--; next }
+      depth == 0 && /^[[:space:]]*(public[[:space:]]+|internal[[:space:]]+|private[[:space:]]+)?func[[:space:]]+test[A-Za-z0-9_]*[[:space:]]*\(/ { count++ }
+      END { print count + 0 }')
 
 # Every XCTestCase class in a *Tests.swift file should appear at least once in --list-tests.
 # This catches newly added files/classes that compile but are not discovered by SwiftPM/XCTest.

@@ -27,8 +27,13 @@ echo "CODE_COVERAGE_INFO command=swift test --enable-code-coverage --skip SMBeeE
 swift test --enable-code-coverage --skip SMBeeE2ETests
 
 profdata=""
+# NOTE: `swift test --show-codecov-path` on recent SwiftPM prints the path to the exported
+# coverage JSON (e.g. .build/.../codecov/<Package>.json), NOT the llvm `default.profdata`.
+# Passing that JSON to `llvm-cov -instr-profile` fails with "invalid instrumentation profile
+# data (bad magic)". Only trust the reported path when it is actually a *.profdata file;
+# otherwise fall back to locating default.profdata directly.
 if codecov_path=$(swift test --show-codecov-path 2>/dev/null | tail -n 1 | tr -d '[:space:]'); then
-  if [[ -n "$codecov_path" && -f "$codecov_path" ]]; then
+  if [[ -n "$codecov_path" && "$codecov_path" == *.profdata && -f "$codecov_path" ]]; then
     profdata="$codecov_path"
   fi
 fi
@@ -63,8 +68,11 @@ echo "CODE_COVERAGE_INFO test_binary=$test_binary"
   -ignore-filename-regex "$IGNORE_FILENAME_REGEX" \
   | tee "$COVERAGE_REPORT"
 
+# `llvm-cov export` emits JSON via `-format=text` (the confusingly-named default). The value
+# `json` is NOT a valid `-format` option ("Cannot find option named 'json'") on the toolchain's
+# llvm-cov, so use `text` which produces the JSON payload the python parser below expects.
 "$LLVM_COV" export "$test_binary" \
-  -format=json \
+  -format=text \
   -instr-profile "$profdata" \
   -ignore-filename-regex "$IGNORE_FILENAME_REGEX" \
   > "$COVERAGE_JSON"

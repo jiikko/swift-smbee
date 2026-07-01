@@ -808,6 +808,8 @@ enum SMB2QueryDirectory {
         var entryOffset = 0
         while entryOffset + 104 <= data.count {
             let next = Int(readUInt32LE(data, at: entryOffset))
+            let creationTime = readUInt64LE(data, at: entryOffset + 8)
+            let lastWriteTime = readUInt64LE(data, at: entryOffset + 24)
             let attributes = readUInt32LE(data, at: entryOffset + 56)
             let endOfFile = readUInt64LE(data, at: entryOffset + 40)
             let nameLength = Int(readUInt32LE(data, at: entryOffset + 60))
@@ -822,7 +824,9 @@ enum SMB2QueryDirectory {
                     fileSize: endOfFile,
                     isDirectory: (attributes & 0x10) != 0,
                     attributes: attributes,
-                    fileId: fileId
+                    fileId: fileId,
+                    modifiedTime: filetimeToDate(lastWriteTime),
+                    creationTime: filetimeToDate(creationTime)
                 ))
             }
             if next == 0 { break }

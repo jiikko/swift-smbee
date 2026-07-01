@@ -1426,7 +1426,23 @@ actor SMBSession {
         )
         debugDump("IOCTL FSCTL_PIPE_TRANSCEIVE request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "IOCTL FSCTL_PIPE_TRANSCEIVE response")
-        return try SMB2Ioctl.decodeResponse(response)
+        let decoded = try SMB2Ioctl.decodeResponseWithStatus(
+            response,
+            allowedStatuses: [SMB2Status.success, SMB2Status.bufferOverflow]
+        )
+        guard decoded.status == SMB2Status.success || decoded.status == SMB2Status.bufferOverflow else {
+            throw SMBErrorMapper.map(status: decoded.status, operation: "IOCTL")
+        }
+        var output = decoded.output
+        while !(try DCERPC.responseHasLastFragment(output)) {
+            try Task.checkCancellation()
+            let chunk = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: UInt64(negotiatedReadChunkSize()))
+            guard !chunk.isEmpty else {
+                throw SMBCodecError.invalidValue("short DCE/RPC pipe response")
+            }
+            output.append(contentsOf: chunk)
+        }
+        return output
     }
 
     func flush(treeId: UInt32, fileId: [UInt8]) async throws {
@@ -1774,6 +1790,7 @@ actor SMBSession {
 enum SMB2Status {
     static let success: UInt32 = 0x0000_0000
     static let pending: UInt32 = 0x0000_0103
+    static let bufferOverflow: UInt32 = 0x8000_0005
     static let noMoreFiles: UInt32 = 0x8000_0006
     static let endOfFile: UInt32 = 0xc000_0011
     static let moreProcessingRequired: UInt32 = 0xc000_0016

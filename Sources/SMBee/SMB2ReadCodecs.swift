@@ -420,8 +420,15 @@ enum SMB2Ioctl {
     }
 
     static func decodeResponse(_ bytes: [UInt8]) throws -> [UInt8] {
+        let response = try decodeResponseWithStatus(bytes, allowedStatuses: [SMB2Status.success])
+        return response.output
+    }
+
+    static func decodeResponseWithStatus(_ bytes: [UInt8], allowedStatuses: Set<UInt32>) throws -> SMB2IoctlResponse {
         let header = try SMB2Header.decode(bytes)
-        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "IOCTL")
+        if !allowedStatuses.contains(header.status) {
+            try SMBErrorMapper.throwIfFailure(status: header.status, operation: "IOCTL")
+        }
         var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
         guard try reader.readUInt16LE() == 49 else {
             throw SMBCodecError.invalidValue("invalid IOCTL response structure size")
@@ -435,8 +442,13 @@ enum SMB2Ioctl {
         let outputCount = Int(try reader.readUInt32LE())
         try reader.skip(count: 8)
         guard outputOffset + outputCount <= bytes.count else { throw SMBCodecError.truncated }
-        return Array(bytes[outputOffset..<outputOffset + outputCount])
+        return SMB2IoctlResponse(status: header.status, output: Array(bytes[outputOffset..<outputOffset + outputCount]))
     }
+}
+
+struct SMB2IoctlResponse {
+    var status: UInt32
+    var output: [UInt8]
 }
 
 enum SMB2SetInfo {

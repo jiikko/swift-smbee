@@ -6,6 +6,8 @@ enum DCERPC {
     static let pduTypeBind: UInt8 = 11
     static let pduTypeBindAck: UInt8 = 12
     static let pduTypeFault: UInt8 = 3
+    static let pfcFirstFrag: UInt8 = 0x01
+    static let pfcLastFrag: UInt8 = 0x02
     static let firstFragLastFrag: UInt8 = 0x03
     static let dataRepresentation: [UInt8] = [0x10, 0x00, 0x00, 0x00]
     static let ndrTransferSyntax = UUID(uuidString: "8a885d04-1ceb-11c9-9fe8-08002b104860")!
@@ -59,20 +61,44 @@ enum DCERPC {
     }
 
     static func decodeResponseStub(_ bytes: [UInt8]) throws -> [UInt8] {
-        let header = try decodeHeader(bytes)
-        if header.type == pduTypeFault {
-            guard bytes.count >= 24 else { throw SMBCodecError.truncated }
-            throw SMBCodecError.invalidValue("DCE/RPC fault status 0x\(String(format: "%08x", readUInt32LE(bytes, at: 20)))")
+        var cursor = 0
+        var stub: [UInt8] = []
+        while true {
+            let header = try decodeHeader(Array(bytes[cursor...]))
+            guard header.fragLength >= 16 else { throw SMBCodecError.truncated }
+            let fragmentEnd = cursor + Int(header.fragLength)
+            if header.type == pduTypeFault {
+                guard fragmentEnd >= cursor + 24 else { throw SMBCodecError.truncated }
+                throw SMBCodecError.invalidValue("DCE/RPC fault status 0x\(String(format: "%08x", readUInt32LE(bytes, at: cursor + 20)))")
+            }
+            guard header.type == pduTypeResponse else {
+                throw SMBCodecError.invalidValue("expected DCE/RPC response, got pdu type \(header.type)")
+            }
+            guard fragmentEnd >= cursor + 24 else { throw SMBCodecError.truncated }
+            let allocHint = Int(readUInt32LE(bytes, at: cursor + 16))
+            let stubOffset = cursor + 24
+            let stubLength = min(allocHint, fragmentEnd - stubOffset)
+            guard stubLength >= 0, stubOffset + stubLength <= bytes.count else { throw SMBCodecError.truncated }
+            stub.append(contentsOf: bytes[stubOffset..<stubOffset + stubLength])
+            if (header.flags & pfcLastFrag) != 0 {
+                return stub
+            }
+            cursor = fragmentEnd
         }
-        guard header.type == pduTypeResponse else {
-            throw SMBCodecError.invalidValue("expected DCE/RPC response, got pdu type \(header.type)")
+    }
+
+    static func responseHasLastFragment(_ bytes: [UInt8]) throws -> Bool {
+        guard !bytes.isEmpty else { throw SMBCodecError.truncated }
+        var cursor = 0
+        while true {
+            guard cursor < bytes.count else { return false }
+            let header = try decodeHeader(Array(bytes[cursor...]))
+            guard header.fragLength >= 16 else { throw SMBCodecError.truncated }
+            if (header.flags & pfcLastFrag) != 0 {
+                return true
+            }
+            cursor += Int(header.fragLength)
         }
-        guard bytes.count >= 24 else { throw SMBCodecError.truncated }
-        let allocHint = Int(readUInt32LE(bytes, at: 16))
-        let stubOffset = 24
-        let stubLength = min(allocHint, Int(header.fragLength) - stubOffset)
-        guard stubLength >= 0, stubOffset + stubLength <= bytes.count else { throw SMBCodecError.truncated }
-        return Array(bytes[stubOffset..<stubOffset + stubLength])
     }
 
     private static func encodeHeader(type: UInt8, callId: UInt32, body: [UInt8]) -> [UInt8] {
@@ -89,12 +115,19 @@ enum DCERPC {
         return writer.bytes
     }
 
-    private static func decodeHeader(_ bytes: [UInt8]) throws -> (type: UInt8, fragLength: UInt16, callId: UInt32) {
+    private struct PDUHeader {
+        var type: UInt8
+        var flags: UInt8
+        var fragLength: UInt16
+        var callId: UInt32
+    }
+
+    private static func decodeHeader(_ bytes: [UInt8]) throws -> PDUHeader {
         guard bytes.count >= 16 else { throw SMBCodecError.truncated }
         guard bytes[0] == 5 else { throw SMBCodecError.invalidValue("unsupported DCE/RPC version") }
         let fragLength = readUInt16LE(bytes, at: 8)
         guard Int(fragLength) <= bytes.count else { throw SMBCodecError.truncated }
-        return (bytes[2], fragLength, readUInt32LE(bytes, at: 12))
+        return PDUHeader(type: bytes[2], flags: bytes[3], fragLength: fragLength, callId: readUInt32LE(bytes, at: 12))
     }
 
     private static func encodeSyntax(uuid: UUID, version: UInt32) -> [UInt8] {

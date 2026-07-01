@@ -560,6 +560,21 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try DCERPC.decodeResponseStub(response), [0xaa, 0xbb, 0xcc, 0xdd])
     }
 
+    func testDCERPCResponseStubReassemblesMultipleFragments() throws {
+        let stub = makeShareEnumStub([
+            ("public", 0, "Public share"),
+            ("IPC$", 0x8000_0000, "Remote IPC"),
+            ("media", 0, "Media share"),
+        ])
+        let split = stub.count / 2
+        let response = try dcerpcResponsePDU(stub: Array(stub[..<split]), flags: DCERPC.pfcFirstFrag)
+            + dcerpcResponsePDU(stub: Array(stub[split...]), flags: DCERPC.pfcLastFrag)
+
+        let shares = try SRVSVC.decodeNetrShareEnumResponse(try DCERPC.decodeResponseStub(response))
+
+        XCTAssertEqual(shares.map(\.name), ["public", "IPC$", "media"])
+    }
+
     func testSRVSVCNetrShareEnumRequestUsesLevel1() {
         let request = SRVSVC.encodeNetrShareEnumRequest()
 
@@ -639,6 +654,39 @@ final class SMBeeTests: XCTestCase {
         response.append(contentsOf: output)
 
         XCTAssertEqual(try SMB2Ioctl.decodeResponse(response), output)
+    }
+
+    func testPipeTransceiveContinuesAfterBufferOverflowUntilLastDCEFragment() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let stub = makeShareEnumStub([
+            ("public", 0, "Public share"),
+            ("IPC$", 0x8000_0000, "Remote IPC"),
+            ("media", 0, "Media share"),
+        ])
+        let split = stub.count / 2
+        let firstFragment = try dcerpcResponsePDU(stub: Array(stub[..<split]), flags: DCERPC.pfcFirstFrag)
+        let lastFragment = try dcerpcResponsePDU(stub: Array(stub[split...]), flags: DCERPC.pfcLastFrag)
+        let inbound = try framed([
+            try smb2IoctlResponse(output: firstFragment, status: SMB2Status.bufferOverflow, messageId: 0, treeId: 0x3344, fileId: fileId),
+            try smb2ReadResponse(lastFragment, messageId: 1, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let response = try await session.pipeTransceive(treeId: 0x3344, fileId: fileId, input: [0xaa], maxOutputResponse: 16)
+        let shares = try SRVSVC.decodeNetrShareEnumResponse(try DCERPC.decodeResponseStub(response))
+
+        XCTAssertEqual(shares.map(\.name), ["public", "IPC$", "media"])
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(try SMB2Header.decode(requests[0]).command, SMB2Commands.ioctl)
+        XCTAssertEqual(try SMB2Header.decode(requests[1]).command, SMB2Commands.read)
     }
 
     func testSMB311GMACSignatureZeroesHeaderSignatureField() throws {
@@ -2703,6 +2751,23 @@ final class SMBeeTests: XCTestCase {
         try SMB2Header(status: status, command: command, messageId: messageId, treeId: treeId).encode()
     }
 
+    private func smb2IoctlResponse(output: [UInt8], status: UInt32, messageId: UInt64, treeId: UInt32, fileId: [UInt8]) throws -> [UInt8] {
+        var response = try SMB2Header(
+            status: status,
+            command: SMB2Commands.ioctl,
+            messageId: messageId,
+            treeId: treeId
+        ).encode()
+        response.append(contentsOf: Array(repeating: 0, count: 56))
+        writeUInt16LE(49, to: &response, at: 64)
+        writeUInt32LE(SMB2Ioctl.fsctlPipeTransceive, to: &response, at: 68)
+        response.replaceSubrange(72..<88, with: fileId)
+        writeUInt32LE(120, to: &response, at: 96)
+        writeUInt32LE(UInt32(output.count), to: &response, at: 100)
+        response.append(contentsOf: output)
+        return response
+    }
+
     private func waitForOutboundFrameCount(_ expectedCount: Int, transport: ControlledReceiveTransport) async throws {
         for _ in 0..<100 {
             if try unframed(transport.outbound).count >= expectedCount {
@@ -2729,6 +2794,44 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
         response.append(contentsOf: payload)
         return response
+    }
+
+    private func dcerpcResponsePDU(stub: [UInt8], flags: UInt8, callId: UInt32 = 2) throws -> [UInt8] {
+        var response: [UInt8] = [
+            0x05, 0x00, DCERPC.pduTypeResponse, flags,
+            0x10, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            UInt8(callId & 0xff), UInt8((callId >> 8) & 0xff), UInt8((callId >> 16) & 0xff), UInt8((callId >> 24) & 0xff),
+        ]
+        appendUInt32LE(UInt32(stub.count), to: &response)
+        appendUInt16LE(0, to: &response)
+        appendUInt16LE(0, to: &response)
+        response.append(contentsOf: stub)
+        writeUInt16LE(UInt16(response.count), to: &response, at: 8)
+        return response
+    }
+
+    private func makeShareEnumStub(_ entries: [(name: String, type: UInt32, comment: String)]) -> [UInt8] {
+        var stub: [UInt8] = []
+        appendUInt32LE(1, to: &stub)
+        appendUInt32LE(1, to: &stub)
+        appendUInt32LE(0x0002_0000, to: &stub)
+        appendUInt32LE(UInt32(entries.count), to: &stub)
+        appendUInt32LE(0x0002_0001, to: &stub)
+        appendUInt32LE(UInt32(entries.count), to: &stub)
+        for (index, entry) in entries.enumerated() {
+            appendUInt32LE(0x0002_0010 + UInt32(index * 2), to: &stub)
+            appendUInt32LE(entry.type, to: &stub)
+            appendUInt32LE(0x0002_0011 + UInt32(index * 2), to: &stub)
+        }
+        for entry in entries {
+            appendNDRString(entry.name, to: &stub)
+            appendNDRString(entry.comment, to: &stub)
+        }
+        appendUInt32LE(UInt32(entries.count), to: &stub)
+        appendUInt32LE(0, to: &stub)
+        appendUInt32LE(0, to: &stub)
+        return stub
     }
 
     private func smb2WriteResponse(count: Int, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {

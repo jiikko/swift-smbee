@@ -1,5 +1,8 @@
 # SMBee 🐝
 
+[![Test](https://github.com/jiikko/swift-smbee/actions/workflows/test.yml/badge.svg)](https://github.com/jiikko/swift-smbee/actions/workflows/test.yml)
+[![E2E](https://github.com/jiikko/swift-smbee/actions/workflows/e2e.yml/badge.svg)](https://github.com/jiikko/swift-smbee/actions/workflows/e2e.yml)
+
 A pure-Swift SMB2/3 client.
 
 SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing は本ライブラリで

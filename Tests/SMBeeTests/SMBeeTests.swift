@@ -2491,6 +2491,43 @@ final class SMBeeTests: XCTestCase {
         XCTAssertTrue(entry.isReparsePoint)
     }
 
+    func testQueryDirectoryResponseDecodesTimestamps() throws {
+        var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: 11).encode()
+        let payload = makeDirectoryEntry(
+            name: "dated.txt",
+            isDirectory: false,
+            fileSize: 7,
+            nextOffset: 0,
+            creationTime: 116_444_736_010_000_000,
+            lastWriteTime: 116_444_736_020_000_000
+        )
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 66)
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+
+        let entry = try XCTUnwrap(SMB2QueryDirectory.decodeResponse(response).first)
+
+        XCTAssertEqual(entry.creationTime, Date(timeIntervalSince1970: 1))
+        XCTAssertEqual(entry.modifiedTime, Date(timeIntervalSince1970: 2))
+    }
+
+    func testQueryDirectoryResponseTreatsZeroTimestampsAsNil() throws {
+        var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: 11).encode()
+        let payload = makeDirectoryEntry(name: "undated.txt", isDirectory: false, fileSize: 7, nextOffset: 0)
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
+        writeUInt16LE(9, to: &response, at: 64)
+        writeUInt16LE(72, to: &response, at: 66)
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+
+        let entry = try XCTUnwrap(SMB2QueryDirectory.decodeResponse(response).first)
+
+        XCTAssertNil(entry.creationTime)
+        XCTAssertNil(entry.modifiedTime)
+    }
+
     func testQueryDirectoryResponseRejectsInvalidNextEntryOffset() throws {
         var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: 11).encode()
         let payload = makeDirectoryEntry(name: "child", isDirectory: true, nextOffset: 1)
@@ -3952,11 +3989,15 @@ final class SMBeeTests: XCTestCase {
         fileSize: UInt64 = 0,
         nextOffset: UInt32,
         attributes: UInt32? = nil,
-        fileId: UInt64 = 0
+        fileId: UInt64 = 0,
+        creationTime: UInt64 = 0,
+        lastWriteTime: UInt64 = 0
     ) -> [UInt8] {
         let nameBytes = NTLM.utf16le(name)
         var bytes = Array(repeating: UInt8(0), count: 104 + nameBytes.count)
         writeUInt32LE(nextOffset, to: &bytes, at: 0)
+        writeUInt64LE(creationTime, to: &bytes, at: 8)
+        writeUInt64LE(lastWriteTime, to: &bytes, at: 24)
         writeUInt64LE(fileSize, to: &bytes, at: 40)
         writeUInt32LE(attributes ?? (isDirectory ? 0x10 : 0x80), to: &bytes, at: 56)
         writeUInt32LE(UInt32(nameBytes.count), to: &bytes, at: 60)

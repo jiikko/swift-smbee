@@ -7,17 +7,29 @@ public struct SMBDirectoryEntry: Equatable, Sendable {
     public var isDirectory: Bool
     public var attributes: UInt32
     public var fileId: UInt64?
+    public var modifiedTime: Date?
+    public var creationTime: Date?
 
     public var isReparsePoint: Bool {
         (attributes & SMBFileAttributes.reparsePoint) != 0
     }
 
-    public init(name: String, fileSize: UInt64, isDirectory: Bool, attributes: UInt32 = 0, fileId: UInt64? = nil) {
+    public init(
+        name: String,
+        fileSize: UInt64,
+        isDirectory: Bool,
+        attributes: UInt32 = 0,
+        fileId: UInt64? = nil,
+        modifiedTime: Date? = nil,
+        creationTime: Date? = nil
+    ) {
         self.name = name
         self.fileSize = fileSize
         self.isDirectory = isDirectory
         self.attributes = attributes
         self.fileId = fileId
+        self.modifiedTime = modifiedTime
+        self.creationTime = creationTime
     }
 }
 

@@ -20,34 +20,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Swift 6.0 は除外: package の swift-tools-version が 6.2 (swift-asn1 1.7.x が
+        # Swift 6.1+ を要求) のため 6.0 toolchain では build できない。test.yml / e2e.yml と同様。
         include:
           - samba_base: ubuntu:24.04
             profile: smb302-encrypted-required
-            swift_version: "6.0"
-          - samba_base: ubuntu:24.04
-            profile: smb302-encrypted-required
             swift_version: "6.2"
-          - samba_base: ubuntu:24.04
-            profile: smb311-signing-required
-            swift_version: "6.0"
           - samba_base: ubuntu:24.04
             profile: smb311-signing-required
             swift_version: "6.2"
           - samba_base: ubuntu:24.04
             profile: smb311-encrypted-required
-            swift_version: "6.0"
-          - samba_base: ubuntu:24.04
-            profile: smb311-encrypted-required
             swift_version: "6.2"
           - samba_base: ubuntu:22.04
             profile: smb302-encrypted-required
-            swift_version: "6.0"
-          - samba_base: ubuntu:22.04
-            profile: smb302-encrypted-required
             swift_version: "6.2"
-          - samba_base: debian:12
-            profile: smb302-encrypted-required
-            swift_version: "6.0"
           - samba_base: debian:12
             profile: smb302-encrypted-required
             swift_version: "6.2"

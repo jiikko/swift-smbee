@@ -21,11 +21,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Swift 6.0 は除外: package の swift-tools-version が 6.2 (swift-asn1 1.7.x が
+        # Swift 6.1+ を要求) のため 6.0 toolchain では build できない
+        # ("using Swift tools version 6.2.0 but the installed version is 6.0.3")。
+        # test.yml と同様に 6.2 のみ。
         include:
-          - swift_version: "6.0"
-            profile: smb302-encrypted-required
-            scope: full
-            test_filter: SMBeeE2ETests
           - swift_version: "6.2"
             profile: smb302-encrypted-required
             scope: full
@@ -34,10 +34,6 @@ jobs:
           # signing-only currently needs server packet verification work, and
           # encrypted sessions need the remaining GCM path fixes. Keep this
           # lane in the main API E2E matrix as the negotiated-handshake check.
-          - swift_version: "6.0"
-            profile: smb311-encrypted-required
-            scope: negotiate
-            test_filter: SMBeeE2ETests.testProbeNegotiatesExpectedProfile
           - swift_version: "6.2"
             profile: smb311-encrypted-required
             scope: negotiate
@@ -89,7 +85,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        swift_version: ["6.0", "6.2"]
+        # Swift 6.0 は除外: swift-tools-version 6.2 のため 6.0 では build 不可 (上記 e2e-api 参照)。
+        swift_version: ["6.2"]
     env:
       SAMBA_CONTAINER: smbee-samba-cli
       SAMBA_BASE_IMAGE: ubuntu:24.04

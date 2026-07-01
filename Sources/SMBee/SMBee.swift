@@ -10,48 +10,58 @@ public enum SMBee {
     /// ライブラリのバージョン (暫定)。
     public static let version = "0.0.1"
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
-        share: String
+        share: String,
+        timeout: Duration? = nil
     ) async throws -> SMBClientSession {
-        try await SMBClient.connect(host: host, port: port, share: share, credential: credential)
+        try await SMBClient.connect(host: host, port: port, share: share, credential: credential, timeout: timeout)
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         credentialProvider: SMBCredentialProvider,
-        share: String
+        share: String,
+        timeout: Duration? = nil
     ) async throws -> SMBClientSession {
-        try await SMBClient.connect(host: host, port: port, share: share, credentialProvider: credentialProvider)
+        try await SMBClient.connect(host: host, port: port, share: share, credentialProvider: credentialProvider, timeout: timeout)
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func listShares(
         host: String,
         port: UInt16 = 445,
-        credential: SMBCredential
+        credential: SMBCredential,
+        timeout: Duration? = nil
     ) async throws -> [SMBShareInfo] {
-        try await SMBClient.listShares(host: host, port: port, credential: credential)
+        try await SMBClient.listShares(host: host, port: port, credential: credential, timeout: timeout)
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func list(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         share: String,
-        path: String = ""
+        path: String = "",
+        timeout: Duration? = nil
     ) async throws -> [SMBDirectoryEntry] {
-        try await SMBClient.list(host: host, port: port, share: share, path: path, credential: credential)
+        try await SMBClient.list(host: host, port: port, share: share, path: path, credential: credential, timeout: timeout)
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func withDirectoryStream(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         share: String,
         path: String = "",
+        timeout: Duration? = nil,
         onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
     ) async throws {
         try await SMBClient.withDirectoryStream(
@@ -60,20 +70,24 @@ public enum SMBee {
             share: share,
             path: path,
             credential: credential,
+            timeout: timeout,
             onEntry: onEntry
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func stat(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         share: String,
-        path: String
+        path: String,
+        timeout: Duration? = nil
     ) async throws -> SMBFileStat {
-        try await SMBClient.stat(host: host, port: port, share: share, path: path, credential: credential)
+        try await SMBClient.stat(host: host, port: port, share: share, path: path, credential: credential, timeout: timeout)
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func updateMetadata(
         host: String,
         port: UInt16 = 445,
@@ -81,7 +95,8 @@ public enum SMBee {
         share: String,
         path: String,
         update: SMBFileMetadataUpdate,
-        directory: Bool = false
+        directory: Bool = false,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.updateMetadata(
             host: host,
@@ -90,21 +105,25 @@ public enum SMBee {
             path: path,
             update: update,
             directory: directory,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func read(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         share: String,
         path: String,
-        range: SMBReadRange? = nil
+        range: SMBReadRange? = nil,
+        timeout: Duration? = nil
     ) async throws -> [UInt8] {
-        try await SMBClient.read(host: host, port: port, share: share, path: path, range: range, credential: credential)
+        try await SMBClient.read(host: host, port: port, share: share, path: path, range: range, credential: credential, timeout: timeout)
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func withReadStream(
         host: String,
         port: UInt16 = 445,
@@ -112,6 +131,7 @@ public enum SMBee {
         share: String,
         path: String,
         range: SMBReadRange? = nil,
+        timeout: Duration? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         try await SMBClient.withReadStream(
@@ -121,10 +141,12 @@ public enum SMBee {
             path: path,
             range: range,
             credential: credential,
+            timeout: timeout,
             onChunk: onChunk
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func download(
         host: String,
         port: UInt16 = 445,
@@ -132,7 +154,8 @@ public enum SMBee {
         share: String,
         path: String,
         localFile: URL,
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.download(
             host: host,
@@ -141,10 +164,12 @@ public enum SMBee {
             path: path,
             localFile: localFile,
             overwrite: overwrite,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -152,7 +177,8 @@ public enum SMBee {
         share: String,
         path: String,
         localDirectory: URL,
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.downloadDirectory(
             host: host,
@@ -161,20 +187,24 @@ public enum SMBee {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func makeDirectory(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         share: String,
-        path: String
+        path: String,
+        timeout: Duration? = nil
     ) async throws {
-        try await SMBClient.makeDirectory(host: host, port: port, share: share, path: path, credential: credential)
+        try await SMBClient.makeDirectory(host: host, port: port, share: share, path: path, credential: credential, timeout: timeout)
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -182,7 +212,8 @@ public enum SMBee {
         share: String,
         path: String,
         data: [UInt8],
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.upload(
             host: host,
@@ -191,10 +222,12 @@ public enum SMBee {
             path: path,
             data: data,
             overwrite: overwrite,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -202,7 +235,8 @@ public enum SMBee {
         share: String,
         path: String,
         localDirectory: URL,
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.uploadDirectory(
             host: host,
@@ -211,10 +245,12 @@ public enum SMBee {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -222,7 +258,8 @@ public enum SMBee {
         share: String,
         path: String,
         localFile: URL,
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.upload(
             host: host,
@@ -231,10 +268,12 @@ public enum SMBee {
             path: path,
             localFile: localFile,
             overwrite: overwrite,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func copy(
         host: String,
         port: UInt16 = 445,
@@ -242,7 +281,8 @@ public enum SMBee {
         share: String,
         fromPath: String,
         toPath: String,
-        overwrite: Bool = false
+        overwrite: Bool = false,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.copy(
             host: host,
@@ -251,10 +291,12 @@ public enum SMBee {
             fromPath: fromPath,
             toPath: toPath,
             overwrite: overwrite,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
@@ -262,7 +304,8 @@ public enum SMBee {
         share: String,
         fromPath: String,
         toPath: String,
-        overwrite: Bool = false
+        overwrite: Bool = false,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.copyDirectory(
             host: host,
@@ -271,10 +314,12 @@ public enum SMBee {
             fromPath: fromPath,
             toPath: toPath,
             overwrite: overwrite,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func rename(
         host: String,
         port: UInt16 = 445,
@@ -282,7 +327,8 @@ public enum SMBee {
         share: String,
         fromPath: String,
         toPath: String,
-        replaceIfExists: Bool = false
+        replaceIfExists: Bool = false,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.rename(
             host: host,
@@ -291,10 +337,12 @@ public enum SMBee {
             fromPath: fromPath,
             toPath: toPath,
             replaceIfExists: replaceIfExists,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func delete(
         host: String,
         port: UInt16 = 445,
@@ -302,7 +350,8 @@ public enum SMBee {
         share: String,
         path: String,
         directory: Bool = false,
-        recursive: Bool = false
+        recursive: Bool = false,
+        timeout: Duration? = nil
     ) async throws {
         try await SMBClient.delete(
             host: host,
@@ -311,7 +360,8 @@ public enum SMBee {
             path: path,
             directory: directory,
             recursive: recursive,
-            credential: credential
+            credential: credential,
+            timeout: timeout
         )
     }
 }

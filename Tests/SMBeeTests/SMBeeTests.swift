@@ -584,6 +584,25 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testSMBeeListSharesPassesTimeoutToDefaultTransport() async throws {
+        let server = try POSIXLoopbackServer(mode: .acceptAndHold)
+        server.start()
+        defer { server.close() }
+
+        do {
+            _ = try await awaitWithTimeout(seconds: 2, "SMBee.listShares socket timeout") {
+                try await SMBee.listShares(
+                    host: "127.0.0.1",
+                    port: server.port,
+                    credential: SMBCredential(username: "user", password: "pass"),
+                    timeout: .milliseconds(100)
+                )
+            }
+            XCTFail("listShares unexpectedly succeeded without server response")
+        } catch SMBTransportError.timedOut {
+        }
+    }
+
     func testReadURLParserKeepsUserInfoPassword() throws {
         let endpoint = try SMBURLParser.parseReadURL("smb://user:pass@server:1445/share/path/to/file.txt")
 

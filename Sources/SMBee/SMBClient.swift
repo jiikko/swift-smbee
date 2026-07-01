@@ -415,11 +415,13 @@ public enum SMBClient {
         port: UInt16,
         share: String,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
         idempotent: Bool,
         operationName: String,
         operation: (SMBSession, UInt32) async throws -> T
     ) async throws -> T {
+        let makeTransport = makeTransport ?? { POSIXSocketTransport(timeout: timeout) }
         var retryConnectionLoss = idempotent
         while true {
             let transport = makeTransport()
@@ -446,29 +448,35 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         share: String,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
         try await connect(
             host: host,
             port: port,
             share: share,
             credentialProvider: { credential },
+            timeout: timeout,
             makeTransport: makeTransport
         )
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         share: String,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
+        let makeTransport = makeTransport ?? { POSIXSocketTransport(timeout: timeout) }
         let credential = try await credentialProvider()
         let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
         do {
@@ -481,12 +489,15 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func listShares(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> [SMBShareInfo] {
+        let makeTransport = makeTransport ?? { POSIXSocketTransport(timeout: timeout) }
         let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
         do {
             try await session.connect()
@@ -500,13 +511,15 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func list(
         host: String,
         port: UInt16 = 445,
         share: String,
         path: String = "",
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> [SMBDirectoryEntry] {
         let collector = SMBDirectoryEntryCollector()
         try await withDirectoryStream(
@@ -515,6 +528,7 @@ public enum SMBClient {
             share: share,
             path: path,
             credential: credential,
+            timeout: timeout,
             makeTransport: makeTransport
         ) { entry in
             collector.append(entry)
@@ -522,16 +536,18 @@ public enum SMBClient {
         return collector.entries
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func withDirectoryStream(
         host: String,
         port: UInt16 = 445,
         share: String,
         path: String = "",
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
         onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "LIST") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "LIST") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: true)
             do {
                 try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
@@ -543,15 +559,17 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func stat(
         host: String,
         port: UInt16 = 445,
         share: String,
         path: String,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBFileStat {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "STAT") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "STAT") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: false)
             do {
                 let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
@@ -564,6 +582,7 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func read(
         host: String,
         port: UInt16 = 445,
@@ -571,9 +590,10 @@ public enum SMBClient {
         path: String,
         range: SMBReadRange? = nil,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> [UInt8] {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: false)
             do {
                 let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
@@ -596,6 +616,7 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func withReadStream(
         host: String,
         port: UInt16 = 445,
@@ -603,11 +624,12 @@ public enum SMBClient {
         path: String,
         range: SMBReadRange? = nil,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         let progress = SMBReadStreamProgress()
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: false)
             do {
                 let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
@@ -651,6 +673,7 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func download(
         host: String,
         port: UInt16 = 445,
@@ -659,7 +682,8 @@ public enum SMBClient {
         localFile: URL,
         overwrite: Bool = true,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
         let fileManager = FileManager.default
         let destination = localFile.standardizedFileURL
@@ -679,6 +703,7 @@ public enum SMBClient {
                 share: share,
                 path: path,
                 credential: credential,
+                timeout: timeout,
                 makeTransport: makeTransport
             ) { chunk in
                 try handle.write(contentsOf: Data(chunk))
@@ -696,6 +721,7 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -704,7 +730,8 @@ public enum SMBClient {
         localDirectory: URL,
         overwrite: Bool = true,
         credential: SMBCredential,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: localDirectory, withIntermediateDirectories: true)
@@ -714,6 +741,7 @@ public enum SMBClient {
             share: share,
             path: path,
             credential: credential,
+            timeout: timeout,
             makeTransport: makeTransport
         )
         for entry in entries {
@@ -730,6 +758,7 @@ public enum SMBClient {
                     localDirectory: localChild,
                     overwrite: overwrite,
                     credential: credential,
+                    timeout: timeout,
                     makeTransport: makeTransport
                 )
             } else {
@@ -741,6 +770,7 @@ public enum SMBClient {
                     localFile: localChild,
                     overwrite: overwrite,
                     credential: credential,
+                    timeout: timeout,
                     makeTransport: makeTransport
                 )
             }
@@ -802,20 +832,23 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func makeDirectory(
         host: String,
         port: UInt16 = 445,
         share: String,
         path: String,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "MKDIR") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "MKDIR") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .makeDirectory(path: path))
             try await session.close(treeId: treeId, fileId: fileId)
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -824,9 +857,10 @@ public enum SMBClient {
         data: [UInt8],
         overwrite: Bool = true,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
             do {
                 try await session.write(treeId: treeId, fileId: fileId, data: data)
@@ -839,6 +873,7 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -847,7 +882,8 @@ public enum SMBClient {
         localDirectory: URL,
         overwrite: Bool = true,
         credential: SMBCredential,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
         if !path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/")).isEmpty {
             try await createDirectoryIfNeeded(
@@ -856,6 +892,7 @@ public enum SMBClient {
                 share: share,
                 path: path,
                 credential: credential,
+                timeout: timeout,
                 makeTransport: makeTransport
             )
         }
@@ -878,6 +915,7 @@ public enum SMBClient {
                     localDirectory: localChild,
                     overwrite: overwrite,
                     credential: credential,
+                    timeout: timeout,
                     makeTransport: makeTransport
                 )
             } else {
@@ -889,12 +927,14 @@ public enum SMBClient {
                     localFile: localChild,
                     overwrite: overwrite,
                     credential: credential,
+                    timeout: timeout,
                     makeTransport: makeTransport
                 )
             }
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -903,9 +943,10 @@ public enum SMBClient {
         localFile: URL,
         overwrite: Bool = true,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "UPLOAD") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
             let handle = try FileHandle(forReadingFrom: localFile)
             defer { try? handle.close() }
@@ -924,6 +965,7 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func copy(
         host: String,
         port: UInt16 = 445,
@@ -932,13 +974,15 @@ public enum SMBClient {
         toPath: String,
         overwrite: Bool = false,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
             try await session.copyFile(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
@@ -947,13 +991,15 @@ public enum SMBClient {
         toPath: String,
         overwrite: Bool = false,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
             try await session.copyDirectory(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func updateMetadata(
         host: String,
         port: UInt16 = 445,
@@ -962,9 +1008,10 @@ public enum SMBClient {
         update: SMBFileMetadataUpdate,
         directory: Bool = false,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "SET_METADATA") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "SET_METADATA") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .metadata(path: path, directory: directory))
             do {
                 try await session.setBasicInfo(treeId: treeId, fileId: fileId, update: update)
@@ -976,6 +1023,7 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func rename(
         host: String,
         port: UInt16 = 445,
@@ -984,9 +1032,10 @@ public enum SMBClient {
         toPath: String,
         replaceIfExists: Bool = false,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "RENAME") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "RENAME") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .rename(path: fromPath))
             do {
                 try await session.rename(treeId: treeId, fileId: fileId, newPath: toPath, replaceIfExists: replaceIfExists)
@@ -998,6 +1047,7 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func delete(
         host: String,
         port: UInt16 = 445,
@@ -1006,9 +1056,10 @@ public enum SMBClient {
         directory: Bool = false,
         recursive: Bool = false,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
-        try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "DELETE") { session, treeId in
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "DELETE") { session, treeId in
             if recursive {
                 try await session.deleteRecursively(treeId: treeId, path: path, directory: directory)
                 return
@@ -1023,7 +1074,8 @@ public enum SMBClient {
         share: String,
         path: String,
         credential: SMBCredential,
-        makeTransport: @Sendable () -> SMBTransport
+        timeout: Duration?,
+        makeTransport: (@Sendable () -> SMBTransport)?
     ) async throws {
         do {
             try await makeDirectory(
@@ -1032,6 +1084,7 @@ public enum SMBClient {
                 share: share,
                 path: path,
                 credential: credential,
+                timeout: timeout,
                 makeTransport: makeTransport
             )
         } catch SMBError.nameCollision {

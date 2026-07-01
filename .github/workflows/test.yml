@@ -91,7 +91,10 @@ jobs:
     name: code-coverage / .swift-version
     # swift test の line coverage を測る。test registration coverage とは別物:
     # こちらは「登録されたテストが Sources をどれだけ実行したか」を見る。
-    # 初期閾値は既存コードへ過剰に厳しくしない 50%。CI実績を見て段階的に引き上げる。
+    # 閾値は ratchet 運用: 現在の実測 (~69%) の少し下に床を置き、regression を弾きつつ
+    # churn/計測揺れの false failure を避ける。coverage が上がったら床も一段ずつ引き上げる。
+    # 注意: 分母には unit で測れない glue (SMBee.swift facade / smbcli の run() = E2E 担保) を
+    # 含む。facade/CLI を大きく増やすと比率が下がるので、その場合は glue を分母から除外する方針へ。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -103,7 +106,7 @@ jobs:
       - name: Check code coverage
         timeout-minutes: 15
         env:
-          MIN_LINE_COVERAGE: "50"
+          MIN_LINE_COVERAGE: "65"
         # The official swift:* images ship llvm-cov but NOT python3, which
         # check-code-coverage.sh uses to parse the llvm-cov JSON and render the report.
         # Install it inside the container before running the script.

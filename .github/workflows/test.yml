@@ -102,6 +102,16 @@ jobs:
         env:
           MIN_LINE_COVERAGE: "50"
         run: docker run --rm -e MIN_LINE_COVERAGE -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bash scripts/check-code-coverage.sh
+      - name: Publish coverage to job summary
+        # The coverage script runs inside `docker run`, so $GITHUB_STEP_SUMMARY (a host
+        # runner file) is not visible in the container. Publish the Markdown report from
+        # the host side instead. `if: always()` so the report still shows on threshold
+        # failure (the .md is written before the threshold check).
+        if: always()
+        run: |
+          if [ -f .build/code-coverage.md ]; then
+            cat .build/code-coverage.md >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Upload code coverage artifacts
         if: always()
         uses: actions/upload-artifact@v6

@@ -253,7 +253,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30 手動 smoke: `swift run smbcli ls smb://koji@127.0.0.1/koji` と、実 SMB サーバ上の
     一時 directory で `mkdir` / `put` / `cat` / `get` / `cp` / `put -r` / `get -r` / `rm -r` を確認。
     同等の command smoke を `.github/workflows/e2e.yml` に追加。
-- [ ] authentication options: NT hash 入力 / password provider callback / keychain 連携 / guest or anonymous の扱い
+- [x] authentication options: NT hash 入力 / password provider callback / keychain 連携 / guest or anonymous の扱い
   - secret を log に出さない方針は維持。CLI は `SMB_PASSWORD` 以外の安全な入力方法を追加する。
   - 2026-06-30: CLI に `--password-stdin` を追加。URL 埋め込み password → stdin → `SMB_PASSWORD` の
     優先順位で `ls/stat/cat/get/mkdir/put/mv/cp/rm` が共通利用する。
@@ -270,6 +270,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     **残 (本ライブラリ core 対象外): keychain 連携 = macOS Security.framework 依存で consumer 側
     (obaket/smbcli) の関心。Kerberos/GSS = MVP scope 外 ([`issues/005`](issues/005-auth-macos-finder-equivalent-smb-auth.md))。**
     ライブラリは credential-agnostic (password/ntHash/provider/anonymous) を維持する方針。
+  - 2026-07-01: `SMBCredentialProvider` を one-shot API 全体 (`listShares` / `list` / `stat` / `read` /
+    stream / download / upload / copy / metadata / rename / delete) に拡張。Keychain 等の consumer 依存
+    credential source は provider に閉じ込められるため、core の authentication options は完了扱い。
 - [ ] path handling: SMB パス正規化・`.`/`..`・区切り文字・URL percent decoding/encoding の仕様化
   - 2026-06-30: CLI URL parser で share/path component と userinfo の percent decode を実装。
     path component の `.` / `..` と decoded separator (`/` / `\`) は拒否し、URL `/` のみを

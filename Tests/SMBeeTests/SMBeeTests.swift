@@ -476,6 +476,41 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(String(decoding: readSecurityBuffer(type1, at: 16), as: UTF8.self), "PROVIDER-DOMAIN")
     }
 
+    func testCredentialProviderIsResolvedOnceForOneShotStat() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            negotiateResponse(messageId: 0),
+            sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff),
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(size: 7, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let providerCalls = LockedCounter()
+
+        let stat = try await SMBClient.stat(
+            host: "server",
+            share: "share",
+            path: "known.txt",
+            credentialProvider: {
+                providerCalls.increment()
+                return SMBCredential(username: "one-shot-user", password: "one-shot-pass", domain: "one-shot-domain")
+            },
+            makeTransport: { transport }
+        )
+
+        XCTAssertEqual(stat.size, 7)
+        XCTAssertEqual(providerCalls.value, 1)
+        let requests = try unframed(transport.outbound)
+        XCTAssertGreaterThanOrEqual(requests.count, 3)
+        let type1 = try SPNEGO.unwrapNTLMToken(Array(requests[1][88..<requests[1].count]))
+        XCTAssertEqual(String(decoding: readSecurityBuffer(type1, at: 16), as: UTF8.self), "ONE-SHOT-DOMAIN")
+    }
+
     func testSMB2HeaderRoundTrip() throws {
         let header = SMB2Header(
             creditCharge: 7,

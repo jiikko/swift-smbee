@@ -446,6 +446,29 @@ public enum SMBClient {
         }
     }
 
+    private static func withSession<T>(
+        host: String,
+        port: UInt16,
+        share: String,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        idempotent: Bool,
+        operationName: String,
+        operation: (SMBSession, UInt32) async throws -> T
+    ) async throws -> T {
+        let credential = try await credentialProvider()
+        return try await withSession(
+            host: host,
+            port: port,
+            share: share,
+            credential: credential,
+            makeTransport: makeTransport,
+            idempotent: idempotent,
+            operationName: operationName,
+            operation: operation
+        )
+    }
+
     public static func connect(
         host: String,
         port: UInt16 = 445,
@@ -500,6 +523,20 @@ public enum SMBClient {
         }
     }
 
+    public static func listShares(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> [SMBShareInfo] {
+        try await listShares(
+            host: host,
+            port: port,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
     public static func list(
         host: String,
         port: UInt16 = 445,
@@ -520,6 +557,24 @@ public enum SMBClient {
             collector.append(entry)
         }
         return collector.entries
+    }
+
+    public static func list(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String = "",
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> [SMBDirectoryEntry] {
+        try await list(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     public static func withDirectoryStream(
@@ -543,6 +598,26 @@ public enum SMBClient {
         }
     }
 
+    public static func withDirectoryStream(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String = "",
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
+    ) async throws {
+        try await withDirectoryStream(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport,
+            onEntry: onEntry
+        )
+    }
+
     public static func stat(
         host: String,
         port: UInt16 = 445,
@@ -562,6 +637,24 @@ public enum SMBClient {
                 throw error
             }
         }
+    }
+
+    public static func stat(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> SMBFileStat {
+        try await stat(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     public static func read(
@@ -594,6 +687,26 @@ public enum SMBClient {
                 throw error
             }
         }
+    }
+
+    public static func read(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        range: SMBReadRange? = nil,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> [UInt8] {
+        try await read(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            range: range,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     public static func withReadStream(
@@ -651,6 +764,28 @@ public enum SMBClient {
         }
     }
 
+    public static func withReadStream(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        range: SMBReadRange? = nil,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() },
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        try await withReadStream(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            range: range,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport,
+            onChunk: onChunk
+        )
+    }
+
     public static func download(
         host: String,
         port: UInt16 = 445,
@@ -694,6 +829,28 @@ public enum SMBClient {
             try? fileManager.removeItem(at: temporary)
             throw error
         }
+    }
+
+    public static func download(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await download(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localFile: localFile,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     public static func downloadDirectory(
@@ -745,6 +902,28 @@ public enum SMBClient {
                 )
             }
         }
+    }
+
+    public static func downloadDirectory(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localDirectory: URL,
+        overwrite: Bool = true,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await downloadDirectory(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localDirectory: localDirectory,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     fileprivate static func readAll(session: SMBSession, treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
@@ -816,6 +995,24 @@ public enum SMBClient {
         }
     }
 
+    public static func makeDirectory(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await makeDirectory(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -837,6 +1034,28 @@ public enum SMBClient {
                 throw error
             }
         }
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        data: [UInt8],
+        overwrite: Bool = true,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            data: data,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     public static func uploadDirectory(
@@ -895,6 +1114,28 @@ public enum SMBClient {
         }
     }
 
+    public static func uploadDirectory(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localDirectory: URL,
+        overwrite: Bool = true,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await uploadDirectory(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localDirectory: localDirectory,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -924,6 +1165,28 @@ public enum SMBClient {
         }
     }
 
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localFile: localFile,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
     public static func copy(
         host: String,
         port: UInt16 = 445,
@@ -939,6 +1202,28 @@ public enum SMBClient {
         }
     }
 
+    public static func copy(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool = false,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await copy(
+            host: host,
+            port: port,
+            share: share,
+            fromPath: fromPath,
+            toPath: toPath,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
@@ -952,6 +1237,28 @@ public enum SMBClient {
         try await withSession(host: host, port: port, share: share, credential: credential, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
             try await session.copyDirectory(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
         }
+    }
+
+    public static func copyDirectory(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool = false,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await copyDirectory(
+            host: host,
+            port: port,
+            share: share,
+            fromPath: fromPath,
+            toPath: toPath,
+            overwrite: overwrite,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     public static func updateMetadata(
@@ -976,6 +1283,28 @@ public enum SMBClient {
         }
     }
 
+    public static func updateMetadata(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        update: SMBFileMetadataUpdate,
+        directory: Bool = false,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await updateMetadata(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            update: update,
+            directory: directory,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
     public static func rename(
         host: String,
         port: UInt16 = 445,
@@ -998,6 +1327,28 @@ public enum SMBClient {
         }
     }
 
+    public static func rename(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        replaceIfExists: Bool = false,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await rename(
+            host: host,
+            port: port,
+            share: share,
+            fromPath: fromPath,
+            toPath: toPath,
+            replaceIfExists: replaceIfExists,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
     public static func delete(
         host: String,
         port: UInt16 = 445,
@@ -1015,6 +1366,28 @@ public enum SMBClient {
             }
             try await session.deleteNonRecursive(treeId: treeId, path: path, directory: directory)
         }
+    }
+
+    public static func delete(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        directory: Bool = false,
+        recursive: Bool = false,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws {
+        try await delete(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            directory: directory,
+            recursive: recursive,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
     }
 
     private static func createDirectoryIfNeeded(

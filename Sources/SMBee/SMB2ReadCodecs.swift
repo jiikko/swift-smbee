@@ -553,6 +553,7 @@ enum SMB2Write {
 
 enum SMB2Ioctl {
     static let fsctlPipeTransceive: UInt32 = 0x0011_c017
+    static let fsctlDfsGetReferrals: UInt32 = 0x0006_0194
     static let fsctlSrvRequestResumeKey: UInt32 = 0x0014_0078
     static let fsctlSrvCopychunkWrite: UInt32 = 0x0014_40f4
 

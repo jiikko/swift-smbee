@@ -49,6 +49,10 @@ public enum SMBCLIOutput {
         try encoder.encode(shares.map(ShareInfoJSON.init))
     }
 
+    public static func jsonData(for dfsReferral: SMBDfsReferralResult) throws -> Data {
+        try encoder.encode(DfsReferralJSON(dfsReferral))
+    }
+
     public static func jsonString(for probe: SMBProbeResult) throws -> String {
         try string(from: jsonData(for: probe))
     }
@@ -71,6 +75,10 @@ public enum SMBCLIOutput {
 
     public static func jsonString(for shares: [SMBShareInfo]) throws -> String {
         try string(from: jsonData(for: shares))
+    }
+
+    public static func jsonString(for dfsReferral: SMBDfsReferralResult) throws -> String {
+        try string(from: jsonData(for: dfsReferral))
     }
 
     public static func hex<T: FixedWidthInteger>(_ value: T, width: Int) -> String {
@@ -219,5 +227,37 @@ private struct ShareInfoJSON: Encodable {
         name = share.name
         type = share.type.map { SMBCLIOutput.hex($0, width: 8) }
         comment = share.comment
+    }
+}
+
+private struct DfsReferralJSON: Encodable {
+    var pathConsumed: Int
+    var headerFlags: String
+    var referrals: [DfsReferralEntryJSON]
+
+    init(_ result: SMBDfsReferralResult) {
+        pathConsumed = result.pathConsumed
+        headerFlags = SMBCLIOutput.hex(result.headerFlags, width: 8)
+        referrals = result.referrals.map(DfsReferralEntryJSON.init)
+    }
+}
+
+private struct DfsReferralEntryJSON: Encodable {
+    var versionNumber: UInt16
+    var serverType: UInt16
+    var flags: String
+    var timeToLive: UInt32
+    var dfsPath: String?
+    var alternatePath: String?
+    var networkAddress: String?
+
+    init(_ referral: SMBDfsReferral) {
+        versionNumber = referral.versionNumber
+        serverType = referral.serverType
+        flags = SMBCLIOutput.hex(referral.flags, width: 4)
+        timeToLive = referral.timeToLive
+        dfsPath = referral.dfsPath
+        alternatePath = referral.alternatePath
+        networkAddress = referral.networkAddress
     }
 }

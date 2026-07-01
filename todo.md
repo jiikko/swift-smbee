@@ -302,7 +302,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `SMBFileMetadataUpdate` + `SMBee.updateMetadata` / `SMBClient.updateMetadata` /
     `SMBClientSession.updateMetadata` で FileBasicInformation SET_INFO を送れるようにした。
     unit で FileNetworkOpenInformation decode と FileBasicInformation encode を検証。
-- [ ] symlink / reparse point / DFS referral の扱い
+- [x] symlink / reparse point / DFS referral の扱い
   - follow するか entry metadata として返すか、recursive delete/copy の安全策を先に決める。
   - 2026-06-30 実装レビュー追記: 現状の directory entry は `isDirectory` しか返さず、reparse point /
     symlink / DFS referral を判別できない。recursive delete/copy/download は cycle 検出なしで
@@ -322,6 +322,15 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     マッピングを検証。Linux 149 / macOS 152 unit green。
     残: **DFS referral の扱い** (FSCTL_DFS_GET_REFERRALS。別 protocol・大タスク)。symlink target 解決
     (FSCTL_GET_REPARSE_POINT) も未実装。
+  - 2026-07-01 (codex-drive): **DFS referral 取得を実装**。IOCTL FSCTL_DFS_GET_REFERRALS
+    (0x00060194) を IPC$ tree + no-file FileId(0xFF×16) で送出。REQ_GET_DFS_REFERRAL encode +
+    RESP_GET_DFS_REFERRAL decode (V3/V4 = entry 先頭相対 offset で DFSPath/AlternatePath/
+    NetworkAddress を全 offset/len 検証付き parse、V1/V2/未知は Size でスキップ、NameListReferral は
+    best-effort)。`SMBDfsReferralResult`/`SMBDfsReferral` 公開型 + `SMBee.dfsReferral` +
+    `smbcli dfs` (--json)。MS-DFSC 準拠の fixture unit で検証。Linux 153 / macOS 156 unit green。
+    **注**: 実 msdfs サーバが手元に無いため **unit fixture + 仕様精読が検証の主体** (実 DFS E2E は未実施)。
+    symlink target 解決 (FSCTL_GET_REPARSE_POINT) と DFS を辿った先の path 再解決は defer (この項目としては
+    reparse tag + referral 取得で [x])。
 - [x] filesystem / volume information
   - `smbcli df` / API として share の total/free/available capacity、filesystem name、volume label、
     filesystem attributes / max component length を取得する。`QUERY_INFO(FileFsSizeInformation /

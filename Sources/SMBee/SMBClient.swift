@@ -725,6 +725,45 @@ public enum SMBClient {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func dfsReferral(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        path: String,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws -> SMBDfsReferralResult {
+        let makeTransport = makeTransport ?? { POSIXSocketTransport(timeout: timeout) }
+        let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
+        do {
+            try await session.connect()
+            let treeId = try await session.treeConnect(share: "IPC$")
+            let result = try await session.dfsReferral(treeId: treeId, path: path)
+            await session.disconnect(treeId: treeId)
+            return result
+        } catch {
+            await session.closeTransport()
+            throw error
+        }
+    }
+
+    public static func dfsReferral(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        path: String,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+    ) async throws -> SMBDfsReferralResult {
+        try await dfsReferral(
+            host: host,
+            port: port,
+            credential: try await credentialProvider(),
+            path: path,
+            makeTransport: makeTransport
+        )
+    }
+
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func list(
         host: String,
         port: UInt16 = 445,
@@ -2535,6 +2574,19 @@ actor SMBSession {
             try? await close(treeId: treeId, fileId: fileId)
             throw error
         }
+    }
+
+    func dfsReferral(treeId: UInt32, path: String) async throws -> SMBDfsReferralResult {
+        let input = SMB2DfsReferral.encodeRequestInput(path: path)
+        let response = try await ioctl(
+            treeId: treeId,
+            fileId: Array(repeating: 0xff, count: 16),
+            ctlCode: SMB2Ioctl.fsctlDfsGetReferrals,
+            input: input,
+            maxOutputResponse: 65_536,
+            allowedStatuses: []
+        )
+        return try SMB2DfsReferral.decodeResponse(response.output)
     }
 
     func close(treeId: UInt32, fileId: [UInt8]) async throws {

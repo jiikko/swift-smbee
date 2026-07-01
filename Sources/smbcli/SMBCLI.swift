@@ -14,7 +14,7 @@ struct SMBCLI: AsyncParsableCommand {
         version: SMBee.version,
         subcommands: [
             Probe.self, Shares.self, List.self, Stat.self, ACL.self, DiskFree.self, Cat.self, Get.self,
-            MakeDirectory.self, Put.self, Copy.self, Move.self, Remove.self
+            MakeDirectory.self, Put.self, Copy.self, Move.self, Remove.self, Dfs.self
         ]
     )
 }
@@ -206,6 +206,53 @@ struct Shares: AsyncParsableCommand {
         for share in shares {
             print(share.name)
         }
+    }
+}
+
+struct Dfs: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "dfs", abstract: "Resolve DFS referral targets")
+
+    @Argument(help: "smb://user@host[:445]/dfsroot/link")
+    var url: String
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    @Flag(help: "Print JSON output")
+    var json = false
+
+    func run() async throws {
+        debug.apply()
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        let dfsPath = makeDfsPath(endpoint)
+        let result = try await SMBee.dfsReferral(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            path: dfsPath,
+            timeout: transport.duration
+        )
+        if json {
+            print(try SMBCLIOutput.jsonString(for: result))
+            return
+        }
+        print("pathConsumed: \(result.pathConsumed)")
+        print("headerFlags: \(SMBCLIOutput.hex(result.headerFlags, width: 8))")
+        for referral in result.referrals {
+            let target = referral.networkAddress ?? "(no network address)"
+            print("\(target) ttl=\(referral.timeToLive) serverType=\(referral.serverType) flags=\(SMBCLIOutput.hex(referral.flags, width: 4))")
+        }
+    }
+
+    private func makeDfsPath(_ endpoint: SMBURLParser.ReadURL) -> String {
+        let suffix = endpoint.path.isEmpty ? endpoint.share : "\(endpoint.share)\\\(endpoint.path)"
+        return "\\\\\(endpoint.host)\\\(suffix)"
     }
 }
 

@@ -51,6 +51,32 @@ public enum SMBee {
         try await SMBClient.listShares(host: host, port: port, credentialProvider: credentialProvider)
     }
 
+    /// Resolve a DFS namespace path to referral targets. This returns referral
+    /// metadata only; reconnecting to a target and rewriting paths is left to callers.
+    ///
+    /// - Parameter path: DFS path in `\\host\dfsroot\link` form.
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func dfsReferral(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        path: String,
+        timeout: Duration? = nil
+    ) async throws -> SMBDfsReferralResult {
+        try await SMBClient.dfsReferral(host: host, port: port, credential: credential, path: path, timeout: timeout)
+    }
+
+    /// Resolve a DFS namespace path to referral targets. This returns referral
+    /// metadata only; reconnecting to a target and rewriting paths is left to callers.
+    public static func dfsReferral(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        path: String
+    ) async throws -> SMBDfsReferralResult {
+        try await SMBClient.dfsReferral(host: host, port: port, credentialProvider: credentialProvider, path: path)
+    }
+
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func list(
         host: String,

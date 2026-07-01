@@ -1193,6 +1193,88 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try SMB2Ioctl.decodeResponse(response), output)
     }
 
+    func testSMB2DfsReferralRequestInputEncodesMaxLevelAndNullTerminatedPath() throws {
+        let input = SMB2DfsReferral.encodeRequestInput(path: "\\\\server\\dfsroot\\link", maxLevel: 4)
+
+        XCTAssertEqual(readUInt16LE(input, at: 0), 4)
+        XCTAssertEqual(Array(input[2..<input.count - 2]), NTLM.utf16le("\\\\server\\dfsroot\\link"))
+        XCTAssertEqual(Array(input[(input.count - 2)..<input.count]), [0, 0])
+    }
+
+    func testSMB2DfsReferralResponseDecodesV3Entries() throws {
+        let response = makeDfsReferralResponse(entries: [
+            makeDfsReferralV3Entry(
+                serverType: 0,
+                flags: 0,
+                ttl: 300,
+                dfsPath: "\\\\server\\dfsroot\\link",
+                alternatePath: "\\\\server\\dfsroot\\link",
+                networkAddress: "\\\\target-a\\share"
+            ),
+            makeDfsReferralV3Entry(
+                serverType: 1,
+                flags: 0,
+                ttl: 120,
+                dfsPath: "\\\\server\\dfsroot",
+                alternatePath: nil,
+                networkAddress: "\\\\target-b\\share"
+            ),
+        ])
+
+        let decoded = try SMB2DfsReferral.decodeResponse(response)
+
+        XCTAssertEqual(decoded.pathConsumed, 44)
+        XCTAssertEqual(decoded.headerFlags, 0x0000_0002)
+        XCTAssertEqual(decoded.referrals.count, 2)
+        XCTAssertEqual(decoded.referrals[0].serverType, 0)
+        XCTAssertEqual(decoded.referrals[0].timeToLive, 300)
+        XCTAssertEqual(decoded.referrals[0].dfsPath, "\\\\server\\dfsroot\\link")
+        XCTAssertEqual(decoded.referrals[0].networkAddress, "\\\\target-a\\share")
+        XCTAssertEqual(decoded.referrals[1].serverType, 1)
+        XCTAssertEqual(decoded.referrals[1].alternatePath, nil)
+        XCTAssertEqual(decoded.referrals[1].networkAddress, "\\\\target-b\\share")
+    }
+
+    func testSMB2DfsReferralResponseSkipsUnknownVersionBySize() throws {
+        var unknown = [UInt8]()
+        appendUInt16LE(99, to: &unknown)
+        appendUInt16LE(12, to: &unknown)
+        unknown.append(contentsOf: Array(repeating: 0xaa, count: 8))
+        let response = makeDfsReferralResponse(entries: [
+            unknown,
+            makeDfsReferralV3Entry(
+                serverType: 0,
+                flags: 0,
+                ttl: 60,
+                dfsPath: "\\\\server\\dfsroot\\link",
+                alternatePath: nil,
+                networkAddress: "\\\\target\\share"
+            ),
+        ])
+
+        let decoded = try SMB2DfsReferral.decodeResponse(response)
+
+        XCTAssertEqual(decoded.referrals.count, 1)
+        XCTAssertEqual(decoded.referrals[0].versionNumber, 3)
+        XCTAssertEqual(decoded.referrals[0].networkAddress, "\\\\target\\share")
+    }
+
+    func testSMB2DfsReferralResponseRejectsOutOfBoundsStringOffset() throws {
+        var entry = makeDfsReferralV3Entry(
+            serverType: 0,
+            flags: 0,
+            ttl: 60,
+            dfsPath: "\\\\server\\dfsroot\\link",
+            alternatePath: nil,
+            networkAddress: "\\\\target\\share"
+        )
+        writeUInt16LE(UInt16(entry.count + 2), to: &entry, at: 16)
+
+        XCTAssertThrowsError(try SMB2DfsReferral.decodeResponse(makeDfsReferralResponse(entries: [entry]))) { error in
+            XCTAssertEqual(error as? SMBCodecError, .truncated)
+        }
+    }
+
     func testSMB2CopyChunkDecodesResumeKeyFromResponseOutput() throws {
         let resumeKey = Array(0x30...0x47).map(UInt8.init)
         let decoded = try SMB2CopyChunk.decodeResumeKeyResponse(resumeKey + [0xaa, 0xbb])
@@ -3686,6 +3768,61 @@ final class SMBeeTests: XCTestCase {
         while bytes.count % 4 != 0 {
             bytes.append(0)
         }
+    }
+
+    private func makeDfsReferralResponse(entries: [[UInt8]]) -> [UInt8] {
+        var bytes: [UInt8] = []
+        appendUInt16LE(44, to: &bytes)
+        appendUInt16LE(UInt16(entries.count), to: &bytes)
+        appendUInt32LE(0x0000_0002, to: &bytes)
+        for entry in entries {
+            bytes.append(contentsOf: entry)
+        }
+        return bytes
+    }
+
+    private func makeDfsReferralV3Entry(
+        serverType: UInt16,
+        flags: UInt16,
+        ttl: UInt32,
+        dfsPath: String?,
+        alternatePath: String?,
+        networkAddress: String?
+    ) -> [UInt8] {
+        var entry = Array(repeating: UInt8(0), count: 34)
+        writeUInt16LE(3, to: &entry, at: 0)
+        writeUInt16LE(serverType, to: &entry, at: 4)
+        writeUInt16LE(flags, to: &entry, at: 6)
+        writeUInt32LE(ttl, to: &entry, at: 8)
+        writeUInt16LE(0, to: &entry, at: 18)
+        writeUInt16LE(0, to: &entry, at: 20)
+        writeUInt16LE(0, to: &entry, at: 22)
+        writeUInt16LE(0, to: &entry, at: 24)
+        writeUInt16LE(0, to: &entry, at: 26)
+        writeUInt16LE(0, to: &entry, at: 28)
+        writeUInt16LE(0, to: &entry, at: 30)
+        writeUInt16LE(0, to: &entry, at: 32)
+
+        if let dfsPath {
+            writeUInt16LE(UInt16(entry.count), to: &entry, at: 12)
+            appendNullTerminatedUTF16LE(dfsPath, to: &entry)
+        }
+        if let alternatePath {
+            writeUInt16LE(UInt16(entry.count), to: &entry, at: 14)
+            appendNullTerminatedUTF16LE(alternatePath, to: &entry)
+        }
+        if let networkAddress {
+            writeUInt16LE(UInt16(entry.count), to: &entry, at: 16)
+            appendNullTerminatedUTF16LE(networkAddress, to: &entry)
+        }
+        writeUInt16LE(UInt16(entry.count), to: &entry, at: 2)
+        return entry
+    }
+
+    private func appendNullTerminatedUTF16LE(_ value: String, to bytes: inout [UInt8]) {
+        bytes.append(contentsOf: NTLM.utf16le(value))
+        bytes.append(0)
+        bytes.append(0)
     }
 
     private func makeDirectoryEntry(

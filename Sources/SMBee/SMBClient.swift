@@ -1,6 +1,29 @@
 import Foundation
 // swiftlint:disable file_length type_body_length
 
+/// Extracts the `.size` file attribute as `UInt64`. On Darwin the value bridges to `NSNumber`, but on
+/// Linux swift-corelibs-foundation it is a plain `Int`, so `as? NSNumber` alone fails there. Handle both.
+private func smbFileSizeValue(from attributes: [FileAttributeKey: Any]) -> UInt64? {
+    guard let raw = attributes[.size] else { return nil }
+    if let number = raw as? NSNumber { return number.uint64Value }
+    if let value = raw as? UInt64 { return value }
+    if let value = raw as? Int, value >= 0 { return UInt64(value) }
+    return nil
+}
+
+/// Replaces `destination` (file or directory) with `source`. `replaceItemAt` gives an atomic swap on
+/// Darwin, but swift-corelibs-foundation implements it unreliably on Linux — it non-deterministically
+/// either throws "file doesn't exist" or returns without actually swapping, leaving the old content.
+/// So on Linux use a plain remove + move (loses cross-crash atomicity, which is best-effort anyway).
+private func smbReplaceItem(at destination: URL, with source: URL, fileManager: FileManager) throws {
+#if canImport(Darwin)
+    _ = try fileManager.replaceItemAt(destination, withItemAt: source)
+#else
+    try? fileManager.removeItem(at: destination)
+    try fileManager.moveItem(at: source, to: destination)
+#endif
+}
+
 public struct SMBDirectoryEntry: Equatable, Sendable {
     public var name: String
     public var fileSize: UInt64
@@ -589,7 +612,7 @@ public actor SMBClientSession {
     ) async throws {
         try ensureOpen()
         let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-        let totalBytes = (attributes[.size] as? NSNumber)?.uint64Value
+        let totalBytes = smbFileSizeValue(from: attributes)
         let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
         let handle = try FileHandle(forReadingFrom: fileURL)
         defer { try? handle.close() }
@@ -1391,7 +1414,7 @@ public enum SMBClient {
             }
             try handle.close()
             if overwrite, fileManager.fileExists(atPath: destination.path) {
-                _ = try fileManager.replaceItemAt(destination, withItemAt: temporary)
+                try smbReplaceItem(at: destination, with: temporary, fileManager: fileManager)
             } else {
                 try fileManager.moveItem(at: temporary, to: destination)
             }
@@ -1427,7 +1450,11 @@ public enum SMBClient {
     /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
     ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
     ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
-    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
+    ///   and `skipExisting` and `resume` are ignored because atomic downloads always build a fresh staged tree.
+    /// - Parameter resume: When true and `atomic` is false, skips files whose local destination size already
+    ///   matches the source size. Files that are missing or size-mismatched are downloaded with overwrite enabled.
+    ///   If both `resume` and `skipExisting` are true, `resume` takes precedence. This is size-based skip only,
+    ///   not byte-level partial-file resume.
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func downloadDirectory(
         host: String,
@@ -1438,6 +1465,7 @@ public enum SMBClient {
         overwrite: Bool = true,
         continueOnError: Bool = false,
         skipExisting: Bool = false,
+        resume: Bool = false,
         dryRun: Bool = false,
         atomic: Bool = false,
         credential: SMBCredential,
@@ -1475,6 +1503,7 @@ public enum SMBClient {
                 overwrite: overwrite,
                 continueOnError: continueOnError,
                 skipExisting: atomic ? false : skipExisting,
+                resume: atomic ? false : resume,
                 dryRun: dryRun,
                 credential: credential,
                 timeout: timeout,
@@ -1504,9 +1533,47 @@ public enum SMBClient {
             guard overwrite else {
                 throw SMBCodecError.invalidValue("local destination already exists")
             }
-            _ = try fileManager.replaceItemAt(destination, withItemAt: stagingDirectory)
+            try smbReplaceItem(at: destination, with: stagingDirectory, fileManager: fileManager)
         } else {
             try fileManager.moveItem(at: stagingDirectory, to: destination)
+        }
+    }
+
+    private static func localFileSize(at url: URL, fileManager: FileManager) throws -> UInt64 {
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        guard let size = smbFileSizeValue(from: attributes) else {
+            throw SMBCodecError.invalidValue("local file size unavailable")
+        }
+        return size
+    }
+
+    private static func existingLocalFileSize(at url: URL, fileManager: FileManager) -> UInt64? {
+        try? localFileSize(at: url, fileManager: fileManager)
+    }
+
+    private static func remoteFileMatchesSize(
+        host: String,
+        port: UInt16,
+        share: String,
+        path: String,
+        size: UInt64,
+        credential: SMBCredential,
+        timeout: Duration?,
+        makeTransport: (@Sendable () -> SMBTransport)?
+    ) async throws -> Bool {
+        do {
+            let stat = try await stat(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                credential: credential,
+                timeout: timeout,
+                makeTransport: makeTransport
+            )
+            return !stat.isDirectory && stat.size == size
+        } catch SMBError.notFound {
+            return false
         }
     }
 
@@ -1521,6 +1588,7 @@ public enum SMBClient {
         overwrite: Bool,
         continueOnError: Bool,
         skipExisting: Bool,
+        resume: Bool,
         dryRun: Bool,
         credential: SMBCredential,
         timeout: Duration?,
@@ -1553,7 +1621,11 @@ public enum SMBClient {
             let remoteChild = joinSMBPath(path, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
             let actionChild = reportedDirectory.appendingPathComponent(entry.name)
-            if skipExisting && fileManager.fileExists(atPath: localChild.path) {
+            if resume && !entry.isDirectory && existingLocalFileSize(at: localChild, fileManager: fileManager) == entry.fileSize {
+                onAction?(SMBRecursiveAction(kind: .skip, path: actionChild.path))
+                continue
+            }
+            if !resume && skipExisting && fileManager.fileExists(atPath: localChild.path) {
                 onAction?(SMBRecursiveAction(kind: .skip, path: actionChild.path))
                 continue
             }
@@ -1569,6 +1641,7 @@ public enum SMBClient {
                         overwrite: overwrite,
                         continueOnError: continueOnError,
                         skipExisting: skipExisting,
+                        resume: resume,
                         dryRun: dryRun,
                         credential: credential,
                         timeout: timeout,
@@ -1592,7 +1665,7 @@ public enum SMBClient {
                             share: share,
                             path: remoteChild,
                             localFile: localChild,
-                            overwrite: overwrite,
+                            overwrite: resume ? true : overwrite,
                             credential: credential,
                             timeout: timeout,
                             makeTransport: makeTransport
@@ -1610,7 +1683,11 @@ public enum SMBClient {
     /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
     ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
     ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
-    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
+    ///   and `skipExisting` and `resume` are ignored because atomic downloads always build a fresh staged tree.
+    /// - Parameter resume: When true and `atomic` is false, skips files whose local destination size already
+    ///   matches the source size. Files that are missing or size-mismatched are downloaded with overwrite enabled.
+    ///   If both `resume` and `skipExisting` are true, `resume` takes precedence. This is size-based skip only,
+    ///   not byte-level partial-file resume.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1620,6 +1697,7 @@ public enum SMBClient {
         overwrite: Bool = true,
         continueOnError: Bool = false,
         skipExisting: Bool = false,
+        resume: Bool = false,
         dryRun: Bool = false,
         atomic: Bool = false,
         credentialProvider: SMBCredentialProvider,
@@ -1635,6 +1713,7 @@ public enum SMBClient {
             overwrite: overwrite,
             continueOnError: continueOnError,
             skipExisting: skipExisting,
+            resume: resume,
             dryRun: dryRun,
             atomic: atomic,
             credential: try await credentialProvider(),
@@ -1837,6 +1916,10 @@ public enum SMBClient {
         )
     }
 
+    /// - Parameter resume: When true, skips files whose remote destination size already matches the local source
+    ///   size. Files that are missing or size-mismatched are uploaded with overwrite enabled. If both `resume`
+    ///   and `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not byte-level
+    ///   partial-file resume.
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func uploadDirectory(
         host: String,
@@ -1847,6 +1930,7 @@ public enum SMBClient {
         overwrite: Bool = true,
         continueOnError: Bool = false,
         skipExisting: Bool = false,
+        resume: Bool = false,
         dryRun: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
@@ -1863,6 +1947,7 @@ public enum SMBClient {
             overwrite: overwrite,
             continueOnError: continueOnError,
             skipExisting: skipExisting,
+            resume: resume,
             dryRun: dryRun,
             credential: credential,
             timeout: timeout,
@@ -1884,6 +1969,7 @@ public enum SMBClient {
         overwrite: Bool,
         continueOnError: Bool,
         skipExisting: Bool,
+        resume: Bool,
         dryRun: Bool,
         credential: SMBCredential,
         timeout: Duration?,
@@ -1907,7 +1993,7 @@ public enum SMBClient {
                         timeout: timeout,
                         makeTransport: makeTransport
                     )
-                    if skipExisting && !created {
+                    if skipExisting && !resume && !created {
                         onAction?(SMBRecursiveAction(kind: .skip, path: path))
                         return
                     }
@@ -1920,7 +2006,7 @@ public enum SMBClient {
             at: localDirectory,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: []
-        )
+        ).sorted { $0.lastPathComponent < $1.lastPathComponent }
         for localChild in contents {
             try Task.checkCancellation()
             let resourceValues = try localChild.resourceValues(forKeys: [.isDirectoryKey])
@@ -1936,6 +2022,7 @@ public enum SMBClient {
                         overwrite: overwrite,
                         continueOnError: continueOnError,
                         skipExisting: skipExisting,
+                        resume: resume,
                         dryRun: dryRun,
                         credential: credential,
                         timeout: timeout,
@@ -1950,6 +2037,22 @@ public enum SMBClient {
                 }
             } else {
                 do {
+                    if resume {
+                        let localSize = try localFileSize(at: localChild, fileManager: fileManager)
+                        if try await remoteFileMatchesSize(
+                            host: host,
+                            port: port,
+                            share: share,
+                            path: remoteChild,
+                            size: localSize,
+                            credential: credential,
+                            timeout: timeout,
+                            makeTransport: makeTransport
+                        ) {
+                            onAction?(SMBRecursiveAction(kind: .skip, path: remoteChild))
+                            continue
+                        }
+                    }
                     if dryRun {
                         onAction?(SMBRecursiveAction(kind: .upload, path: remoteChild))
                     } else {
@@ -1959,14 +2062,14 @@ public enum SMBClient {
                             share: share,
                             path: remoteChild,
                             localFile: localChild,
-                            overwrite: overwrite,
+                            overwrite: resume ? true : overwrite,
                             credential: credential,
                             timeout: timeout,
                             makeTransport: makeTransport
                         )
                         onAction?(SMBRecursiveAction(kind: .upload, path: remoteChild))
                     }
-                } catch SMBError.nameCollision where skipExisting {
+                } catch SMBError.nameCollision where skipExisting && !resume {
                     onAction?(SMBRecursiveAction(kind: .skip, path: remoteChild))
                 } catch {
                     guard continueOnError else { throw error }
@@ -1976,6 +2079,10 @@ public enum SMBClient {
         }
     }
 
+    /// - Parameter resume: When true, skips files whose remote destination size already matches the local source
+    ///   size. Files that are missing or size-mismatched are uploaded with overwrite enabled. If both `resume`
+    ///   and `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not byte-level
+    ///   partial-file resume.
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1985,6 +2092,7 @@ public enum SMBClient {
         overwrite: Bool = true,
         continueOnError: Bool = false,
         skipExisting: Bool = false,
+        resume: Bool = false,
         dryRun: Bool = false,
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
@@ -1999,6 +2107,7 @@ public enum SMBClient {
             overwrite: overwrite,
             continueOnError: continueOnError,
             skipExisting: skipExisting,
+            resume: resume,
             dryRun: dryRun,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,

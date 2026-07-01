@@ -4274,6 +4274,222 @@ final class SMBeeTests: XCTestCase {
         ])
     }
 
+    func testDownloadDirectoryResumeSkipsMatchingSizeAndDownloadsMismatchedFile() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
+        let destination = root.appendingPathComponent("downloaded")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("done".utf8).write(to: destination.appendingPathComponent("done.txt"))
+        try Data("old".utf8).write(to: destination.appendingPathComponent("partial.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let directoryId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        let partialId = hexBytes("00112233445566778899aabbccddeeff")
+        let listTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
+            smb2QueryDirectoryResponse(entries: [
+                makeDirectoryEntry(name: "done.txt", isDirectory: false, fileSize: 4, nextOffset: 128),
+                makeDirectoryEntry(name: "partial.txt", isDirectory: false, fileSize: 7, nextOffset: 0),
+            ], messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        let partialTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: partialId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(size: 7, messageId: 5, treeId: 0x3344),
+            smb2ReadResponse(Array("updated".utf8), messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        let factory = TransportFactorySequence([listTransport, partialTransport])
+        let recorder = RecursiveActionRecorder()
+
+        try await SMBClient.downloadDirectory(
+            host: "server",
+            share: "share",
+            path: "remote",
+            localDirectory: destination,
+            resume: true,
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: factory.make
+        ) { recorder.append($0) }
+
+        XCTAssertEqual(factory.makeCount, 2)
+        XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("done.txt"), encoding: .utf8), "done")
+        XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("partial.txt"), encoding: .utf8), "updated")
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .mkdir, path: destination.path),
+            SMBRecursiveAction(kind: .skip, path: destination.appendingPathComponent("done.txt").path),
+            SMBRecursiveAction(kind: .download, path: destination.appendingPathComponent("partial.txt").path),
+        ])
+        XCTAssertFalse(try outboundFrames(listTransport, containCommand: SMB2Commands.read))
+    }
+
+    func testDownloadDirectoryDryRunResumeReportsSkipAndTransferPlanWithoutReads() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
+        let destination = root.appendingPathComponent("downloaded")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        try Data("done".utf8).write(to: destination.appendingPathComponent("done.txt"))
+        try Data("old".utf8).write(to: destination.appendingPathComponent("partial.txt"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let directoryId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
+            smb2QueryDirectoryResponse(entries: [
+                makeDirectoryEntry(name: "done.txt", isDirectory: false, fileSize: 4, nextOffset: 128),
+                makeDirectoryEntry(name: "partial.txt", isDirectory: false, fileSize: 7, nextOffset: 0),
+            ], messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        let recorder = RecursiveActionRecorder()
+
+        try await SMBClient.downloadDirectory(
+            host: "server",
+            share: "share",
+            path: "remote",
+            localDirectory: destination,
+            resume: true,
+            dryRun: true,
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: { transport }
+        ) { recorder.append($0) }
+
+        XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("partial.txt"), encoding: .utf8), "old")
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .mkdir, path: destination.path),
+            SMBRecursiveAction(kind: .skip, path: destination.appendingPathComponent("done.txt").path),
+            SMBRecursiveAction(kind: .download, path: destination.appendingPathComponent("partial.txt").path),
+        ])
+        XCTAssertFalse(try outboundFrames(transport, containCommand: SMB2Commands.read))
+    }
+
+    func testUploadDirectoryResumeSkipsMatchingSizeAndUploadsMismatchedOrMissingFiles() async throws {
+        let localDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+        try Data("done".utf8).write(to: localDirectory.appendingPathComponent("done.txt"))
+        try Data("update".utf8).write(to: localDirectory.appendingPathComponent("mismatch.txt"))
+        try Data("new".utf8).write(to: localDirectory.appendingPathComponent("missing.txt"))
+        defer { try? FileManager.default.removeItem(at: localDirectory) }
+
+        let doneId = hexBytes("00112233445566778899aabbccddeeff")
+        let mismatchStatId = hexBytes("102132435465768798a9babbdcddedef")
+        let mismatchUploadId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        let missingUploadId = hexBytes("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        let doneStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: doneId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(size: 4, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
+        ]))
+        let mismatchStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: mismatchStatId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(size: 1, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
+        ]))
+        let mismatchUploadTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: mismatchUploadId, messageId: 4, treeId: 0x3344),
+            smb2WriteResponse(count: 6, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        let missingStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2StatusResponse(status: SMB2Status.objectNameNotFound, command: SMB2Commands.create, messageId: 4, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 6, treeId: 0),
+        ]))
+        let missingUploadTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: missingUploadId, messageId: 4, treeId: 0x3344),
+            smb2WriteResponse(count: 3, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        let factory = TransportFactorySequence([
+            doneStatTransport,
+            mismatchStatTransport,
+            mismatchUploadTransport,
+            missingStatTransport,
+            missingUploadTransport,
+        ])
+        let recorder = RecursiveActionRecorder()
+
+        try await SMBClient.uploadDirectory(
+            host: "server",
+            share: "share",
+            path: "",
+            localDirectory: localDirectory,
+            resume: true,
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: factory.make
+        ) { recorder.append($0) }
+
+        XCTAssertEqual(factory.makeCount, 5)
+        XCTAssertFalse(try outboundFrames(doneStatTransport, containCommand: SMB2Commands.write))
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .skip, path: "done.txt"),
+            SMBRecursiveAction(kind: .upload, path: "mismatch.txt"),
+            SMBRecursiveAction(kind: .upload, path: "missing.txt"),
+        ])
+    }
+
+    func testUploadDirectoryDryRunResumeReportsSkipAndTransferPlanWithoutWrites() async throws {
+        let localDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+        try Data("done".utf8).write(to: localDirectory.appendingPathComponent("done.txt"))
+        try Data("update".utf8).write(to: localDirectory.appendingPathComponent("mismatch.txt"))
+        defer { try? FileManager.default.removeItem(at: localDirectory) }
+
+        let doneId = hexBytes("00112233445566778899aabbccddeeff")
+        let mismatchId = hexBytes("102132435465768798a9babbdcddedef")
+        let doneStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: doneId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(size: 4, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
+        ]))
+        let mismatchStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: mismatchId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(size: 1, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
+        ]))
+        let factory = TransportFactorySequence([doneStatTransport, mismatchStatTransport])
+        let recorder = RecursiveActionRecorder()
+
+        try await SMBClient.uploadDirectory(
+            host: "server",
+            share: "share",
+            path: "",
+            localDirectory: localDirectory,
+            resume: true,
+            dryRun: true,
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: factory.make
+        ) { recorder.append($0) }
+
+        XCTAssertEqual(factory.makeCount, 2)
+        XCTAssertFalse(try outboundFrames(doneStatTransport, containCommand: SMB2Commands.write))
+        XCTAssertFalse(try outboundFrames(mismatchStatTransport, containCommand: SMB2Commands.write))
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .skip, path: "done.txt"),
+            SMBRecursiveAction(kind: .upload, path: "mismatch.txt"),
+        ])
+    }
+
     func testReadResponseAllowsZeroLengthData() throws {
         var response = try SMB2Header(command: SMB2Commands.read, messageId: 14).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
@@ -4850,6 +5066,15 @@ final class SMBeeTests: XCTestCase {
     private func atomicStagingDirectories(in directory: URL, destinationName: String) throws -> [String] {
         try FileManager.default.contentsOfDirectory(atPath: directory.path).filter {
             $0.hasPrefix(".\(destinationName).smbee-") && $0.hasSuffix(".tmp")
+        }
+    }
+
+    private func outboundFrames(_ transport: InMemoryTransport, containCommand command: UInt16) throws -> Bool {
+        try unframed(transport.outbound).contains { frame in
+            guard frame.count >= 4, Array(frame.prefix(4)) == [0xfe, 0x53, 0x4d, 0x42] else {
+                return false
+            }
+            return try SMB2Header.decode(frame).command == command
         }
     }
 

@@ -452,7 +452,11 @@ public enum SMBee {
     /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
     ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
     ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
-    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
+    ///   and `skipExisting` and `resume` are ignored because atomic downloads always build a fresh staged tree.
+    /// - Parameter resume: When true and `atomic` is false, skips files whose destination size already matches
+    ///   the source size. Missing or size-mismatched files are transferred with overwrite enabled. If both
+    ///   `resume` and `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not
+    ///   byte-level partial-file resume.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -463,6 +467,7 @@ public enum SMBee {
         overwrite: Bool = true,
         continueOnError: Bool = false,
         skipExisting: Bool = false,
+        resume: Bool = false,
         dryRun: Bool = false,
         atomic: Bool = false,
         timeout: Duration? = nil,
@@ -477,6 +482,7 @@ public enum SMBee {
             overwrite: overwrite,
             continueOnError: continueOnError,
             skipExisting: skipExisting,
+            resume: resume,
             dryRun: dryRun,
             atomic: atomic,
             credential: credential,
@@ -488,7 +494,11 @@ public enum SMBee {
     /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
     ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
     ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
-    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
+    ///   and `skipExisting` and `resume` are ignored because atomic downloads always build a fresh staged tree.
+    /// - Parameter resume: When true and `atomic` is false, skips files whose destination size already matches
+    ///   the source size. Missing or size-mismatched files are transferred with overwrite enabled. If both
+    ///   `resume` and `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not
+    ///   byte-level partial-file resume.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -499,6 +509,7 @@ public enum SMBee {
         overwrite: Bool = true,
         continueOnError: Bool = false,
         skipExisting: Bool = false,
+        resume: Bool = false,
         dryRun: Bool = false,
         atomic: Bool = false,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -512,6 +523,7 @@ public enum SMBee {
             overwrite: overwrite,
             continueOnError: continueOnError,
             skipExisting: skipExisting,
+            resume: resume,
             dryRun: dryRun,
             atomic: atomic,
             credentialProvider: credentialProvider,
@@ -635,6 +647,10 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter resume: When true, skips files whose remote destination size already matches the local source
+    ///   size. Missing or size-mismatched files are uploaded with overwrite enabled. If both `resume` and
+    ///   `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not byte-level
+    ///   partial-file resume.
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func uploadDirectory(
         host: String,
@@ -646,6 +662,7 @@ public enum SMBee {
         overwrite: Bool = true,
         continueOnError: Bool = false,
         skipExisting: Bool = false,
+        resume: Bool = false,
         dryRun: Bool = false,
         timeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -659,6 +676,7 @@ public enum SMBee {
             overwrite: overwrite,
             continueOnError: continueOnError,
             skipExisting: skipExisting,
+            resume: resume,
             dryRun: dryRun,
             credential: credential,
             timeout: timeout,
@@ -666,6 +684,10 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter resume: When true, skips files whose remote destination size already matches the local source
+    ///   size. Missing or size-mismatched files are uploaded with overwrite enabled. If both `resume` and
+    ///   `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not byte-level
+    ///   partial-file resume.
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -676,6 +698,7 @@ public enum SMBee {
         overwrite: Bool = true,
         continueOnError: Bool = false,
         skipExisting: Bool = false,
+        resume: Bool = false,
         dryRun: Bool = false,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
@@ -688,6 +711,7 @@ public enum SMBee {
             overwrite: overwrite,
             continueOnError: continueOnError,
             skipExisting: skipExisting,
+            resume: resume,
             dryRun: dryRun,
             credentialProvider: credentialProvider,
             onAction: onAction

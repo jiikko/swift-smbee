@@ -1,6 +1,6 @@
 # 007 ci: Swift 6.0 Linux unit test が stuck する
 
-状態: **done** (2026-07-01 恒久対処: Swift 6.0 を CI matrix から除外)
+状態: **done** (2026-07-01 真因修正: flaky test の順序 race を決定論化 + 明示 timeout。下記「真因の訂正」参照)
 起票: 2026-07-01
 関連: `.github/workflows/test.yml` / `Tests/SMBeeTests/SMBeeE2ETests.swift`
 GitHub Actions: https://github.com/jiikko/swift-smbee/actions/runs/28486174498/job/84433018363
@@ -147,6 +147,39 @@ container run --rm --cpus 2 -v "$PWD:/work" -w /work swift:6.0-noble bash -c '
 
 再現 script (下記) は Swift 6.0 toolchain 依存の記録として残すが、CI からは 6.0 が
 消えたため本 stall は再発しない。
+
+## 真因の訂正 (2026-07-01 追記)
+
+**「Swift 6.0 toolchain 固有」という上記の切り分けは誤りだった。** 6.0 を CI から外した後、
+run `28497055993` の **`build-test` (macOS macos-26 / Swift 6.3)** が同じ症状で hang した。
+= toolchain 非依存で、真因は **test 側の順序前提バグ**。
+
+### 真因
+
+`testConcurrentReadChunksSerializeWireTransactions` は 2 つの Task
+(`first` offset 0, `second` offset 3) を **同時起動**し、両者は
+`SMBWireTransactionGate` で直列化される。gate の **初回 acquire は race**
+(`enter()` を先に呼んだ Task が勝つ) で FIFO 保証がない。テストは `first` が必ず
+先取りする前提で `messageId 0` の応答を enqueue してから `await first.value` するため、
+スケジューリング次第で `second` が gate を勝ち取ると:
+
+- `second` が `messageId 0` (offset 3) を送信 → enqueue した応答を `second` が消費
+- テストは `await first.value` でブロックするが `first` は `messageId 1` 応答待ち。
+  その応答は enqueue される前 (await の後の行) → **永久 hang** → CI job が 10 分 stall
+
+production (`SMBWireTransactionGate` / `readChunk`) は正しい。fast multicore では
+`first` がほぼ必ず勝つため、低コアの CI runner (Linux 6.0 / macOS runner) でのみ間欠再現した
+(Swift 6.0 が特別だったのではなく、たまたま最初に踏んだのが 6.0 Linux だった)。
+
+### 修正 (commit: 本 issue と同 PR)
+
+- **根本修正**: `first` の frame 送出 (= gate 取得) を `waitForOutboundFrameCount` で確認
+  してから `second` を起動し、gate 保持順を first→second に**決定論化**。
+- **安全網**: `awaitWithTimeout` helper を追加し `Task.value` await を明示 timeout (5s) で包む。
+  将来別の順序 hang が起きても**握りつぶさず `SMBTestTimeoutError` を throw してテストを即 fail**
+  させ、CI job の 10 分 hang を防ぐ。
+
+検証: container `swift:6.2-noble` で該当テスト 20/20 green、全スイート 112+120 green。
 
 ## 完了条件
 

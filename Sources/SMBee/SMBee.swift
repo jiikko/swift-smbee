@@ -449,6 +449,10 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
+    ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
+    ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
+    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -457,7 +461,12 @@ public enum SMBee {
         path: String,
         localDirectory: URL,
         overwrite: Bool = true,
-        timeout: Duration? = nil
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        atomic: Bool = false,
+        timeout: Duration? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.downloadDirectory(
             host: host,
@@ -466,11 +475,20 @@ public enum SMBee {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
+            atomic: atomic,
             credential: credential,
-            timeout: timeout
+            timeout: timeout,
+            onAction: onAction
         )
     }
 
+    /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
+    ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
+    ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
+    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -478,7 +496,12 @@ public enum SMBee {
         share: String,
         path: String,
         localDirectory: URL,
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        atomic: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.downloadDirectory(
             host: host,
@@ -487,7 +510,12 @@ public enum SMBee {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
-            credentialProvider: credentialProvider
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
+            atomic: atomic,
+            credentialProvider: credentialProvider,
+            onAction: onAction
         )
     }
 
@@ -616,7 +644,11 @@ public enum SMBee {
         path: String,
         localDirectory: URL,
         overwrite: Bool = true,
-        timeout: Duration? = nil
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        timeout: Duration? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.uploadDirectory(
             host: host,
@@ -625,8 +657,12 @@ public enum SMBee {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
             credential: credential,
-            timeout: timeout
+            timeout: timeout,
+            onAction: onAction
         )
     }
 
@@ -637,7 +673,11 @@ public enum SMBee {
         share: String,
         path: String,
         localDirectory: URL,
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.uploadDirectory(
             host: host,
@@ -646,7 +686,11 @@ public enum SMBee {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
-            credentialProvider: credentialProvider
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
+            credentialProvider: credentialProvider,
+            onAction: onAction
         )
     }
 
@@ -745,7 +789,11 @@ public enum SMBee {
         fromPath: String,
         toPath: String,
         overwrite: Bool = false,
-        timeout: Duration? = nil
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        timeout: Duration? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.copyDirectory(
             host: host,
@@ -754,8 +802,12 @@ public enum SMBee {
             fromPath: fromPath,
             toPath: toPath,
             overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
             credential: credential,
-            timeout: timeout
+            timeout: timeout,
+            onAction: onAction
         )
     }
 
@@ -766,7 +818,11 @@ public enum SMBee {
         share: String,
         fromPath: String,
         toPath: String,
-        overwrite: Bool = false
+        overwrite: Bool = false,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.copyDirectory(
             host: host,
@@ -775,7 +831,11 @@ public enum SMBee {
             fromPath: fromPath,
             toPath: toPath,
             overwrite: overwrite,
-            credentialProvider: credentialProvider
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
+            credentialProvider: credentialProvider,
+            onAction: onAction
         )
     }
 
@@ -831,7 +891,10 @@ public enum SMBee {
         path: String,
         directory: Bool = false,
         recursive: Bool = false,
-        timeout: Duration? = nil
+        continueOnError: Bool = false,
+        dryRun: Bool = false,
+        timeout: Duration? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.delete(
             host: host,
@@ -840,8 +903,11 @@ public enum SMBee {
             path: path,
             directory: directory,
             recursive: recursive,
+            continueOnError: continueOnError,
+            dryRun: dryRun,
             credential: credential,
-            timeout: timeout
+            timeout: timeout,
+            onAction: onAction
         )
     }
 
@@ -852,7 +918,10 @@ public enum SMBee {
         share: String,
         path: String,
         directory: Bool = false,
-        recursive: Bool = false
+        recursive: Bool = false,
+        continueOnError: Bool = false,
+        dryRun: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBClient.delete(
             host: host,
@@ -861,7 +930,10 @@ public enum SMBee {
             path: path,
             directory: directory,
             recursive: recursive,
-            credentialProvider: credentialProvider
+            continueOnError: continueOnError,
+            dryRun: dryRun,
+            credentialProvider: credentialProvider,
+            onAction: onAction
         )
     }
 }

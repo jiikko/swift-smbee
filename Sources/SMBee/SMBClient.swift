@@ -618,10 +618,27 @@ public actor SMBClientSession {
         try await session.copyFile(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
     }
 
-    public func copyDirectory(fromPath: String, toPath: String, overwrite: Bool = false) async throws {
+    public func copyDirectory(
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool = false,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+    ) async throws {
         try ensureOpen()
         try SMBPath.validateDirectoryCopyTarget(fromPath: fromPath, toPath: toPath)
-        try await session.copyDirectory(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
+        try await session.copyDirectory(
+            treeId: treeId,
+            fromPath: fromPath,
+            toPath: toPath,
+            overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
+            onAction: onAction
+        )
     }
 
     public func rename(fromPath: String, toPath: String, replaceIfExists: Bool = false) async throws {
@@ -636,10 +653,28 @@ public actor SMBClientSession {
         }
     }
 
-    public func delete(path: String, directory: Bool = false, recursive: Bool = false) async throws {
+    public func delete(
+        path: String,
+        directory: Bool = false,
+        recursive: Bool = false,
+        continueOnError: Bool = false,
+        dryRun: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+    ) async throws {
         try ensureOpen()
         if recursive {
-            try await session.deleteRecursively(treeId: treeId, path: path, directory: directory)
+            try await session.deleteRecursively(
+                treeId: treeId,
+                path: path,
+                directory: directory,
+                continueOnError: continueOnError,
+                dryRun: dryRun,
+                onAction: onAction
+            )
+            return
+        }
+        if dryRun {
+            onAction?(SMBRecursiveAction(kind: .delete, path: path))
             return
         }
         try await session.deleteNonRecursive(treeId: treeId, path: path, directory: directory)
@@ -1389,6 +1424,10 @@ public enum SMBClient {
         )
     }
 
+    /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
+    ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
+    ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
+    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func downloadDirectory(
         host: String,
@@ -1397,22 +1436,78 @@ public enum SMBClient {
         path: String,
         localDirectory: URL,
         overwrite: Bool = true,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        atomic: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
-        try await downloadDirectoryRecursive(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            localDirectory: localDirectory,
-            overwrite: overwrite,
-            credential: credential,
-            timeout: timeout,
-            makeTransport: makeTransport,
-            depth: 0
-        )
+        let targetDirectory = localDirectory.standardizedFileURL
+        let downloadDirectory: URL
+        let actionDirectory: URL?
+        let stagingDirectory: URL?
+        if atomic && !dryRun {
+            let parent = targetDirectory.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+            let staging = parent.appendingPathComponent(
+                ".\(targetDirectory.lastPathComponent).smbee-\(UUID().uuidString).tmp"
+            )
+            downloadDirectory = staging
+            actionDirectory = targetDirectory
+            stagingDirectory = staging
+        } else {
+            downloadDirectory = targetDirectory
+            actionDirectory = nil
+            stagingDirectory = nil
+        }
+        let failures = SMBRecursiveFailureCollector()
+        do {
+            try await downloadDirectoryRecursive(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localDirectory: downloadDirectory,
+                actionDirectory: actionDirectory,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: atomic ? false : skipExisting,
+                dryRun: dryRun,
+                credential: credential,
+                timeout: timeout,
+                makeTransport: makeTransport,
+                failures: failures,
+                onAction: onAction,
+                depth: 0
+            )
+            try failures.throwIfNeeded()
+            if let stagingDirectory {
+                try replaceDownloadedDirectory(stagingDirectory, with: targetDirectory, overwrite: overwrite)
+            }
+        } catch {
+            if let stagingDirectory {
+                try? FileManager.default.removeItem(at: stagingDirectory)
+            }
+            throw error
+        }
+    }
+
+    /// Best-effort local atomicity for directory downloads: stage in a sibling directory and then
+    /// move/replace the destination. This does not make the final rename transactional across
+    /// filesystems or process crashes during replacement.
+    private static func replaceDownloadedDirectory(_ stagingDirectory: URL, with destination: URL, overwrite: Bool) throws {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: destination.path) {
+            guard overwrite else {
+                throw SMBCodecError.invalidValue("local destination already exists")
+            }
+            _ = try fileManager.replaceItemAt(destination, withItemAt: stagingDirectory)
+        } else {
+            try fileManager.moveItem(at: stagingDirectory, to: destination)
+        }
     }
 
     // swiftlint:disable:next function_parameter_count
@@ -1422,15 +1517,27 @@ public enum SMBClient {
         share: String,
         path: String,
         localDirectory: URL,
+        actionDirectory: URL?,
         overwrite: Bool,
+        continueOnError: Bool,
+        skipExisting: Bool,
+        dryRun: Bool,
         credential: SMBCredential,
         timeout: Duration?,
         makeTransport: (@Sendable () -> SMBTransport)?,
+        failures: SMBRecursiveFailureCollector,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)?,
         depth: Int
     ) async throws {
         try SMBPath.validateRecursionDepth(depth)
         let fileManager = FileManager.default
-        try fileManager.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+        let reportedDirectory = actionDirectory ?? localDirectory
+        if dryRun {
+            onAction?(SMBRecursiveAction(kind: .mkdir, path: reportedDirectory.path))
+        } else {
+            try fileManager.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+            onAction?(SMBRecursiveAction(kind: .mkdir, path: reportedDirectory.path))
+        }
         let entries = try await list(
             host: host,
             port: port,
@@ -1445,35 +1552,65 @@ public enum SMBClient {
             guard !entry.isReparsePoint else { continue }
             let remoteChild = joinSMBPath(path, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
+            let actionChild = reportedDirectory.appendingPathComponent(entry.name)
+            if skipExisting && fileManager.fileExists(atPath: localChild.path) {
+                onAction?(SMBRecursiveAction(kind: .skip, path: actionChild.path))
+                continue
+            }
             if entry.isDirectory {
-                try await downloadDirectoryRecursive(
-                    host: host,
-                    port: port,
-                    share: share,
-                    path: remoteChild,
-                    localDirectory: localChild,
-                    overwrite: overwrite,
-                    credential: credential,
-                    timeout: timeout,
-                    makeTransport: makeTransport,
-                    depth: depth + 1
-                )
+                do {
+                    try await downloadDirectoryRecursive(
+                        host: host,
+                        port: port,
+                        share: share,
+                        path: remoteChild,
+                        localDirectory: localChild,
+                        actionDirectory: actionChild,
+                        overwrite: overwrite,
+                        continueOnError: continueOnError,
+                        skipExisting: skipExisting,
+                        dryRun: dryRun,
+                        credential: credential,
+                        timeout: timeout,
+                        makeTransport: makeTransport,
+                        failures: failures,
+                        onAction: onAction,
+                        depth: depth + 1
+                    )
+                } catch {
+                    guard continueOnError else { throw error }
+                    failures.record(path: remoteChild, error: error)
+                }
             } else {
-                try await download(
-                    host: host,
-                    port: port,
-                    share: share,
-                    path: remoteChild,
-                    localFile: localChild,
-                    overwrite: overwrite,
-                    credential: credential,
-                    timeout: timeout,
-                    makeTransport: makeTransport
-                )
+                do {
+                    if dryRun {
+                        onAction?(SMBRecursiveAction(kind: .download, path: actionChild.path))
+                    } else {
+                        try await download(
+                            host: host,
+                            port: port,
+                            share: share,
+                            path: remoteChild,
+                            localFile: localChild,
+                            overwrite: overwrite,
+                            credential: credential,
+                            timeout: timeout,
+                            makeTransport: makeTransport
+                        )
+                        onAction?(SMBRecursiveAction(kind: .download, path: actionChild.path))
+                    }
+                } catch {
+                    guard continueOnError else { throw error }
+                    failures.record(path: remoteChild, error: error)
+                }
             }
         }
     }
 
+    /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
+    ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
+    ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
+    ///   and `skipExisting` is ignored because atomic downloads always build a fresh staged tree.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1481,8 +1618,13 @@ public enum SMBClient {
         path: String,
         localDirectory: URL,
         overwrite: Bool = true,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        atomic: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await downloadDirectory(
             host: host,
@@ -1491,8 +1633,13 @@ public enum SMBClient {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
+            atomic: atomic,
             credential: try await credentialProvider(),
-            makeTransport: makeTransport
+            makeTransport: makeTransport,
+            onAction: onAction
         )
     }
 
@@ -1698,10 +1845,15 @@ public enum SMBClient {
         path: String,
         localDirectory: URL,
         overwrite: Bool = true,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
+        let failures = SMBRecursiveFailureCollector()
         try await uploadDirectoryRecursive(
             host: host,
             port: port,
@@ -1709,11 +1861,17 @@ public enum SMBClient {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
             credential: credential,
             timeout: timeout,
             makeTransport: makeTransport,
+            failures: failures,
+            onAction: onAction,
             depth: 0
         )
+        try failures.throwIfNeeded()
     }
 
     // swiftlint:disable:next function_parameter_count
@@ -1724,22 +1882,38 @@ public enum SMBClient {
         path: String,
         localDirectory: URL,
         overwrite: Bool,
+        continueOnError: Bool,
+        skipExisting: Bool,
+        dryRun: Bool,
         credential: SMBCredential,
         timeout: Duration?,
         makeTransport: (@Sendable () -> SMBTransport)?,
+        failures: SMBRecursiveFailureCollector,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)?,
         depth: Int
     ) async throws {
         try SMBPath.validateRecursionDepth(depth)
         if !path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/")).isEmpty {
-            try await createDirectoryIfNeeded(
-                host: host,
-                port: port,
-                share: share,
-                path: path,
-                credential: credential,
-                timeout: timeout,
-                makeTransport: makeTransport
-            )
+            if dryRun {
+                onAction?(SMBRecursiveAction(kind: .mkdir, path: path))
+            } else {
+                do {
+                    let created = try await createDirectoryIfNeeded(
+                        host: host,
+                        port: port,
+                        share: share,
+                        path: path,
+                        credential: credential,
+                        timeout: timeout,
+                        makeTransport: makeTransport
+                    )
+                    if skipExisting && !created {
+                        onAction?(SMBRecursiveAction(kind: .skip, path: path))
+                        return
+                    }
+                    onAction?(SMBRecursiveAction(kind: .mkdir, path: path))
+                }
+            }
         }
         let fileManager = FileManager.default
         let contents = try fileManager.contentsOfDirectory(
@@ -1752,30 +1926,52 @@ public enum SMBClient {
             let resourceValues = try localChild.resourceValues(forKeys: [.isDirectoryKey])
             let remoteChild = joinSMBPath(path, localChild.lastPathComponent)
             if resourceValues.isDirectory == true {
-                try await uploadDirectoryRecursive(
-                    host: host,
-                    port: port,
-                    share: share,
-                    path: remoteChild,
-                    localDirectory: localChild,
-                    overwrite: overwrite,
-                    credential: credential,
-                    timeout: timeout,
-                    makeTransport: makeTransport,
-                    depth: depth + 1
-                )
+                do {
+                    try await uploadDirectoryRecursive(
+                        host: host,
+                        port: port,
+                        share: share,
+                        path: remoteChild,
+                        localDirectory: localChild,
+                        overwrite: overwrite,
+                        continueOnError: continueOnError,
+                        skipExisting: skipExisting,
+                        dryRun: dryRun,
+                        credential: credential,
+                        timeout: timeout,
+                        makeTransport: makeTransport,
+                        failures: failures,
+                        onAction: onAction,
+                        depth: depth + 1
+                    )
+                } catch {
+                    guard continueOnError else { throw error }
+                    failures.record(path: remoteChild, error: error)
+                }
             } else {
-                try await upload(
-                    host: host,
-                    port: port,
-                    share: share,
-                    path: remoteChild,
-                    localFile: localChild,
-                    overwrite: overwrite,
-                    credential: credential,
-                    timeout: timeout,
-                    makeTransport: makeTransport
-                )
+                do {
+                    if dryRun {
+                        onAction?(SMBRecursiveAction(kind: .upload, path: remoteChild))
+                    } else {
+                        try await upload(
+                            host: host,
+                            port: port,
+                            share: share,
+                            path: remoteChild,
+                            localFile: localChild,
+                            overwrite: overwrite,
+                            credential: credential,
+                            timeout: timeout,
+                            makeTransport: makeTransport
+                        )
+                        onAction?(SMBRecursiveAction(kind: .upload, path: remoteChild))
+                    }
+                } catch SMBError.nameCollision where skipExisting {
+                    onAction?(SMBRecursiveAction(kind: .skip, path: remoteChild))
+                } catch {
+                    guard continueOnError else { throw error }
+                    failures.record(path: remoteChild, error: error)
+                }
             }
         }
     }
@@ -1787,8 +1983,12 @@ public enum SMBClient {
         path: String,
         localDirectory: URL,
         overwrite: Bool = true,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await uploadDirectory(
             host: host,
@@ -1797,8 +1997,12 @@ public enum SMBClient {
             path: path,
             localDirectory: localDirectory,
             overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
             credential: try await credentialProvider(),
-            makeTransport: makeTransport
+            makeTransport: makeTransport,
+            onAction: onAction
         )
     }
 
@@ -1896,13 +2100,26 @@ public enum SMBClient {
         fromPath: String,
         toPath: String,
         overwrite: Bool = false,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "COPY") { session, treeId in
             try SMBPath.validateDirectoryCopyTarget(fromPath: fromPath, toPath: toPath)
-            try await session.copyDirectory(treeId: treeId, fromPath: fromPath, toPath: toPath, overwrite: overwrite)
+            try await session.copyDirectory(
+                treeId: treeId,
+                fromPath: fromPath,
+                toPath: toPath,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                dryRun: dryRun,
+                onAction: onAction
+            )
         }
     }
 
@@ -1913,8 +2130,12 @@ public enum SMBClient {
         fromPath: String,
         toPath: String,
         overwrite: Bool = false,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await copyDirectory(
             host: host,
@@ -1923,8 +2144,12 @@ public enum SMBClient {
             fromPath: fromPath,
             toPath: toPath,
             overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
             credential: try await credentialProvider(),
-            makeTransport: makeTransport
+            makeTransport: makeTransport,
+            onAction: onAction
         )
     }
 
@@ -2028,13 +2253,27 @@ public enum SMBClient {
         path: String,
         directory: Bool = false,
         recursive: Bool = false,
+        continueOnError: Bool = false,
+        dryRun: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "DELETE") { session, treeId in
             if recursive {
-                try await session.deleteRecursively(treeId: treeId, path: path, directory: directory)
+                try await session.deleteRecursively(
+                    treeId: treeId,
+                    path: path,
+                    directory: directory,
+                    continueOnError: continueOnError,
+                    dryRun: dryRun,
+                    onAction: onAction
+                )
+                return
+            }
+            if dryRun {
+                onAction?(SMBRecursiveAction(kind: .delete, path: path))
                 return
             }
             try await session.deleteNonRecursive(treeId: treeId, path: path, directory: directory)
@@ -2048,8 +2287,11 @@ public enum SMBClient {
         path: String,
         directory: Bool = false,
         recursive: Bool = false,
+        continueOnError: Bool = false,
+        dryRun: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await delete(
             host: host,
@@ -2058,11 +2300,15 @@ public enum SMBClient {
             path: path,
             directory: directory,
             recursive: recursive,
+            continueOnError: continueOnError,
+            dryRun: dryRun,
             credential: try await credentialProvider(),
-            makeTransport: makeTransport
+            makeTransport: makeTransport,
+            onAction: onAction
         )
     }
 
+    @discardableResult
     private static func createDirectoryIfNeeded(
         host: String,
         port: UInt16,
@@ -2071,7 +2317,7 @@ public enum SMBClient {
         credential: SMBCredential,
         timeout: Duration?,
         makeTransport: (@Sendable () -> SMBTransport)?
-    ) async throws {
+    ) async throws -> Bool {
         do {
             try await makeDirectory(
                 host: host,
@@ -2082,8 +2328,9 @@ public enum SMBClient {
                 timeout: timeout,
                 makeTransport: makeTransport
             )
+            return true
         } catch SMBError.nameCollision {
-            return
+            return false
         }
     }
 
@@ -2703,16 +2950,40 @@ actor SMBSession {
         return chunks
     }
 
-    func copyDirectory(treeId: UInt32, fromPath: String, toPath: String, overwrite: Bool, depth: Int = 0) async throws {
+    func copyDirectory(
+        treeId: UInt32,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        depth: Int = 0,
+        failures: SMBRecursiveFailureCollector? = nil
+    ) async throws {
+        let collector = failures ?? SMBRecursiveFailureCollector()
         try Task.checkCancellation()
         try SMBPath.validateRecursionDepth(depth)
         try SMBPath.validateDirectoryCopyTarget(fromPath: fromPath, toPath: toPath)
         let sourceFileId = try await create(treeId: treeId, path: fromPath, directory: true)
         do {
-            let destinationFileId = try await create(treeId: treeId, request: .makeDirectory(path: toPath))
-            try await close(treeId: treeId, fileId: destinationFileId)
+            if dryRun {
+                onAction?(SMBRecursiveAction(kind: .mkdir, path: toPath))
+            } else {
+                let destinationFileId = try await create(treeId: treeId, request: .makeDirectory(path: toPath))
+                try await close(treeId: treeId, fileId: destinationFileId)
+                onAction?(SMBRecursiveAction(kind: .mkdir, path: toPath))
+            }
         } catch SMBError.nameCollision where overwrite {
             // Existing destination directories are reused only when overwrite is explicit.
+        } catch SMBError.nameCollision where skipExisting {
+            onAction?(SMBRecursiveAction(kind: .skip, path: toPath))
+            try? await close(treeId: treeId, fileId: sourceFileId)
+            if failures == nil {
+                try collector.throwIfNeeded()
+            }
+            return
         } catch {
             try? await close(treeId: treeId, fileId: sourceFileId)
             throw error
@@ -2724,21 +2995,46 @@ actor SMBSession {
                 let sourceChild = self.joinSMBPath(fromPath, entry.name)
                 let destinationChild = self.joinSMBPath(toPath, entry.name)
                 if entry.isDirectory && !entry.isReparsePoint {
-                    try await self.copyDirectory(
-                        treeId: treeId,
-                        fromPath: sourceChild,
-                        toPath: destinationChild,
-                        overwrite: overwrite,
-                        depth: depth + 1
-                    )
+                    do {
+                        try await self.copyDirectory(
+                            treeId: treeId,
+                            fromPath: sourceChild,
+                            toPath: destinationChild,
+                            overwrite: overwrite,
+                            continueOnError: continueOnError,
+                            skipExisting: skipExisting,
+                            dryRun: dryRun,
+                            onAction: onAction,
+                            depth: depth + 1,
+                            failures: collector
+                        )
+                    } catch {
+                        guard continueOnError else { throw error }
+                        collector.record(path: sourceChild, error: error)
+                    }
                 } else {
-                    try await self.copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+                    do {
+                        if dryRun {
+                            onAction?(SMBRecursiveAction(kind: .copy, path: destinationChild))
+                        } else {
+                            try await self.copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+                            onAction?(SMBRecursiveAction(kind: .copy, path: destinationChild))
+                        }
+                    } catch SMBError.nameCollision where skipExisting {
+                        onAction?(SMBRecursiveAction(kind: .skip, path: destinationChild))
+                    } catch {
+                        guard continueOnError else { throw error }
+                        collector.record(path: sourceChild, error: error)
+                    }
                 }
             }
             try? await close(treeId: treeId, fileId: sourceFileId)
         } catch {
             try? await close(treeId: treeId, fileId: sourceFileId)
             throw error
+        }
+        if failures == nil {
+            try collector.throwIfNeeded()
         }
     }
 
@@ -2798,7 +3094,17 @@ actor SMBSession {
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "FLUSH")
     }
 
-    func deleteRecursively(treeId: UInt32, path: String, directory: Bool, depth: Int = 0) async throws {
+    func deleteRecursively(
+        treeId: UInt32,
+        path: String,
+        directory: Bool,
+        continueOnError: Bool = false,
+        dryRun: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        depth: Int = 0,
+        failures: SMBRecursiveFailureCollector? = nil
+    ) async throws {
+        let collector = failures ?? SMBRecursiveFailureCollector()
         try Task.checkCancellation()
         try SMBPath.validateRecursionDepth(depth)
         if directory {
@@ -2807,12 +3113,21 @@ actor SMBSession {
                 try await queryDirectory(treeId: treeId, fileId: fileId) { entry in
                     try Task.checkCancellation()
                     guard !entry.isReparsePoint else { return }
-                    try await self.deleteRecursively(
-                        treeId: treeId,
-                        path: self.joinSMBPath(path, entry.name),
-                        directory: entry.isDirectory,
-                        depth: depth + 1
-                    )
+                    do {
+                        try await self.deleteRecursively(
+                            treeId: treeId,
+                            path: self.joinSMBPath(path, entry.name),
+                            directory: entry.isDirectory,
+                            continueOnError: continueOnError,
+                            dryRun: dryRun,
+                            onAction: onAction,
+                            depth: depth + 1,
+                            failures: collector
+                        )
+                    } catch {
+                        guard continueOnError else { throw error }
+                        collector.record(path: self.joinSMBPath(path, entry.name), error: error)
+                    }
                 }
                 try? await close(treeId: treeId, fileId: fileId)
             } catch {
@@ -2820,8 +3135,21 @@ actor SMBSession {
                 throw error
             }
         }
-        let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: directory))
-        try await close(treeId: treeId, fileId: fileId)
+        do {
+            if dryRun {
+                onAction?(SMBRecursiveAction(kind: .delete, path: path))
+            } else {
+                let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: directory))
+                try await close(treeId: treeId, fileId: fileId)
+                onAction?(SMBRecursiveAction(kind: .delete, path: path))
+            }
+        } catch {
+            guard continueOnError else { throw error }
+            collector.record(path: path, error: error)
+        }
+        if failures == nil {
+            try collector.throwIfNeeded()
+        }
     }
 
     func rename(treeId: UInt32, fileId: [UInt8], newPath: String, replaceIfExists: Bool) async throws {

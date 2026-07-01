@@ -634,9 +634,7 @@ struct Move: AsyncParsableCommand {
         debug.apply()
         let (from, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         let to = try SMBURLParser.parseReadURL(destination)
-        guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
-            throw ValidationError("mv source and destination must use the same user, host, port, and share")
-        }
+        try validateSameShare(source: from, destination: to, commandName: "mv")
         try await SMBee.rename(
             host: from.host,
             port: from.port,
@@ -678,9 +676,7 @@ struct Copy: AsyncParsableCommand {
         debug.apply()
         let (from, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         let to = try SMBURLParser.parseReadURL(destination)
-        guard from.host == to.host, from.port == to.port, from.username == to.username, from.share == to.share else {
-            throw ValidationError("cp source and destination must use the same user, host, port, and share")
-        }
+        try validateSameShare(source: from, destination: to, commandName: "cp")
         if recursive {
             try await SMBee.copyDirectory(
                 host: from.host,
@@ -818,12 +814,29 @@ func makeReadEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SM
     try makeEndpointAndCredential(url: url, auth: auth)
 }
 
+// mv / cp は同一 authenticated session / tree 内の操作なので、source と destination が
+// 同じ user/host/port/share を指すことを要求する。Move/Copy で重複していた guard を集約し、
+// 単体テスト可能な pure helper にした (挙動は従来どおり、不一致で ValidationError)。
+func validateSameShare(
+    source: SMBURLParser.ReadURL,
+    destination: SMBURLParser.ReadURL,
+    commandName: String
+) throws {
+    guard source.host == destination.host,
+          source.port == destination.port,
+          source.username == destination.username,
+          source.share == destination.share
+    else {
+        throw ValidationError("\(commandName) source and destination must use the same user, host, port, and share")
+    }
+}
+
 func makeEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {
     let endpoint = try SMBURLParser.parseReadURL(url)
     return (endpoint, try makeCredential(username: endpoint.username, password: endpoint.password, auth: auth))
 }
 
-private func makeCredential(username: String?, password urlPassword: String?, auth: AuthOptions) throws -> SMBCredential {
+func makeCredential(username: String?, password urlPassword: String?, auth: AuthOptions) throws -> SMBCredential {
     if auth.usesAnonymousAuthentication || username?.isEmpty != false {
         guard (!auth.usesAnonymousAuthentication || username?.isEmpty != false),
               urlPassword == nil,
@@ -886,7 +899,7 @@ private func promptPasswordInteractively() throws -> String {
     return String(cString: raw)
 }
 
-private func parseNTHash(_ value: String) throws -> [UInt8] {
+func parseNTHash(_ value: String) throws -> [UInt8] {
     let hex = value.trimmingCharacters(in: .whitespacesAndNewlines)
     guard hex.count == 32 else {
         throw ValidationError("NT hash must be 32 hexadecimal characters")
@@ -905,7 +918,7 @@ private func parseNTHash(_ value: String) throws -> [UInt8] {
     return bytes
 }
 
-private func formatTransferProgress(_ progress: SMBTransferProgress) -> String {
+func formatTransferProgress(_ progress: SMBTransferProgress) -> String {
     let transferred = formatByteCount(progress.bytesTransferred)
     let speed = "\(formatByteCount(UInt64(max(0, progress.bytesPerSecond))))/s"
     guard let totalBytes = progress.totalBytes else {
@@ -938,7 +951,7 @@ func writeStandardError(_ string: String) {
     FileHandle.standardError.write(Data(string.utf8))
 }
 
-private func parseRange(_ value: String) throws -> SMBReadRange {
+func parseRange(_ value: String) throws -> SMBReadRange {
     let parts = value.split(separator: "-", omittingEmptySubsequences: false)
     guard parts.count == 2,
           let start = UInt64(parts[0]),

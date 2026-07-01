@@ -1083,6 +1083,177 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(factory.makeCount, 4)
     }
 
+    func testSMBeeFacadeConnectUsesTransportOverrideAndTeardown() async throws {
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 4, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 5, treeId: 0),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        let session = try await SMBee.connect(
+            host: "server",
+            credential: SMBCredential(username: "user", password: "pass"),
+            share: "share"
+        )
+        await session.close()
+
+        // handshake (NEGOTIATE + SESSION_SETUP x2 + TREE_CONNECT) + best-effort teardown.
+        XCTAssertEqual(try unframed(transport.outbound).count, 6)
+    }
+
+    func testSMBeeFacadeWithDirectoryStreamUsesTransportOverride() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2QueryDirectoryResponse(entries: [
+                makeDirectoryEntry(name: "a.txt", isDirectory: false, fileSize: 1, nextOffset: 0),
+            ], messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        let collector = TestDirectoryEntryCollector()
+        try await SMBee.withDirectoryStream(
+            host: "server",
+            credential: SMBCredential(username: "user", password: "pass"),
+            share: "share",
+            path: ""
+        ) { entry in
+            collector.append(entry)
+        }
+
+        XCTAssertEqual(collector.entries.map(\.name), ["a.txt"])
+    }
+
+    func testSMBeeFacadeVolumeInfoUsesTransportOverride() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+
+        var fullSize = SMBByteWriter()
+        fullSize.writeUInt64LE(1000)  // TotalAllocationUnits
+        fullSize.writeUInt64LE(400)   // CallerAvailableAllocationUnits
+        fullSize.writeUInt64LE(400)   // ActualAvailableAllocationUnits
+        fullSize.writeUInt32LE(2)     // SectorsPerAllocationUnit
+        fullSize.writeUInt32LE(512)   // BytesPerSector
+
+        var attribute = SMBByteWriter()
+        attribute.writeUInt32LE(0)    // FileSystemAttributes
+        attribute.writeUInt32LE(255)  // MaximumComponentNameLength
+        let fsName = NTLM.utf16le("NTFS")
+        attribute.writeUInt32LE(UInt32(fsName.count))
+        attribute.writeBytes(fsName)
+
+        var volume = SMBByteWriter()
+        volume.writeUInt64LE(0)             // VolumeCreationTime
+        volume.writeUInt32LE(0x1234_5678)   // VolumeSerialNumber
+        let label = NTLM.utf16le("VOL")
+        volume.writeUInt32LE(UInt32(label.count))
+        volume.writeUInt8(0)                // SupportsObjects
+        volume.writeUInt8(0)                // Reserved
+        volume.writeBytes(label)
+
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(payload: fullSize.bytes),
+            smb2QueryInfoResponse(payload: attribute.bytes),
+            smb2QueryInfoResponse(payload: volume.bytes),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 9, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 10, treeId: 0),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        let info = try await SMBee.volumeInfo(
+            host: "server",
+            credential: SMBCredential(username: "user", password: "pass"),
+            share: "share"
+        )
+
+        XCTAssertEqual(info.totalBytes, 1000 * 2 * 512)
+        XCTAssertEqual(info.availableBytes, 400 * 2 * 512)
+        XCTAssertEqual(info.filesystemName, "NTFS")
+        XCTAssertEqual(info.volumeLabel, "VOL")
+    }
+
+    func testSMBeeFacadeUpdateMetadataUsesTransportOverride() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.setInfo, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        try await SMBee.updateMetadata(
+            host: "server",
+            credential: SMBCredential(username: "user", password: "pass"),
+            share: "share",
+            path: "file.txt",
+            update: SMBFileMetadataUpdate(attributes: 0x20)
+        )
+
+        // NEGOTIATE + SESSION_SETUP x2 + TREE_CONNECT + CREATE + SET_INFO + CLOSE + teardown x2.
+        // Requests are transform-encrypted so we assert the frame count, not decoded headers.
+        XCTAssertEqual(try unframed(transport.outbound).count, 9)
+    }
+
+    func testSMBeeFacadeSecurityInfoUsesTransportOverride() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let owner = sidBytes(authority: 5, subAuthorities: [32, 544])
+        let group = sidBytes(authority: 5, subAuthorities: [32, 545])
+        let everyone = sidBytes(authority: 1, subAuthorities: [0])
+        let ace = aceBytes(type: 0, flags: 0, accessMask: 0x001f_01ff, sid: everyone)
+        var acl = Array(repeating: UInt8(0), count: 8)
+        acl[0] = 2  // AclRevision
+        writeUInt16LE(UInt16(8 + ace.count), to: &acl, at: 2)  // AclSize
+        writeUInt16LE(1, to: &acl, at: 4)  // AceCount
+        acl.append(contentsOf: ace)
+
+        let ownerOffset = 20  // self-relative SECURITY_DESCRIPTOR header size
+        let groupOffset = ownerOffset + owner.count
+        let daclOffset = groupOffset + group.count
+        var sd = SMBByteWriter()
+        sd.writeUInt8(1)          // Revision
+        sd.writeUInt8(0)          // Sbz1
+        sd.writeUInt16LE(0x8004)  // Control: SELF_RELATIVE | DACL_PRESENT
+        sd.writeUInt32LE(UInt32(ownerOffset))
+        sd.writeUInt32LE(UInt32(groupOffset))
+        sd.writeUInt32LE(0)       // OffsetSacl
+        sd.writeUInt32LE(UInt32(daclOffset))
+        sd.writeBytes(owner)
+        sd.writeBytes(group)
+        sd.writeBytes(acl)
+
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(payload: sd.bytes),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        let info = try await SMBee.securityInfo(
+            host: "server",
+            credential: SMBCredential(username: "user", password: "pass"),
+            share: "share",
+            path: "file.txt"
+        )
+
+        XCTAssertEqual(info.ownerSID, "S-1-5-32-544")
+        XCTAssertEqual(info.groupSID, "S-1-5-32-545")
+        XCTAssertEqual(info.dacl?.count, 1)
+    }
+
     func testSMB2HeaderRoundTrip() throws {
         let header = SMB2Header(
             creditCharge: 7,

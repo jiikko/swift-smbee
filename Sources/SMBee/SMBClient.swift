@@ -1722,7 +1722,11 @@ actor SMBSession {
 
     private func nextTransformNonce(length: Int = 11) -> [UInt8] {
         defer { transformNonceCounter += 1 }
-        let value = transformNonceCounter
+        return Self.transformNonce(counter: transformNonceCounter, length: length)
+    }
+
+    static func transformNonce(counter value: UInt64, length: Int) -> [UInt8] {
+        precondition(length >= 8 && length <= 16)
         let bytes = [
             UInt8((value >> 56) & 0xff),
             UInt8((value >> 48) & 0xff),
@@ -1732,11 +1736,8 @@ actor SMBSession {
             UInt8((value >> 16) & 0xff),
             UInt8((value >> 8) & 0xff),
             UInt8(value & 0xff),
-            0,
-            0,
-            0
         ]
-        return Array(bytes.prefix(length))
+        return bytes + Array(repeating: 0, count: length - bytes.count)
     }
 
     private func negotiatedWriteChunkSize() -> Int {

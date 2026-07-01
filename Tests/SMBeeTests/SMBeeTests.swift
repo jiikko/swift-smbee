@@ -783,6 +783,17 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testSMB3TransformNonceLengthMatchesEncryptionAlgorithmNonceSizes() {
+        XCTAssertEqual(
+            SMBSession.transformNonce(counter: 0x0102_0304_0506_0708, length: 11),
+            hexBytes("0102030405060708000000")
+        )
+        XCTAssertEqual(
+            SMBSession.transformNonce(counter: 0x0102_0304_0506_0708, length: 12),
+            hexBytes("010203040506070800000000")
+        )
+    }
+
     func testSMB302KeyDerivationLabelAndContextBytes() {
         XCTAssertEqual(hex(SMBCrypto.smb3SigningLabel), "534d4232414553434d414300")
         XCTAssertEqual(hex(SMBCrypto.smb3SigningContext), "536d625369676e00")

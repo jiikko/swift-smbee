@@ -15,9 +15,13 @@ concurrency:
 
 jobs:
   e2e-api:
-    name: API E2E
+    name: API E2E / Swift ${{ matrix.swift_version }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        swift_version: ["6.0", "6.2"]
     env:
       SAMBA_CONTAINER: smbee-samba-api
       SAMBA_BASE_IMAGE: ubuntu:24.04
@@ -31,7 +35,7 @@ jobs:
       - name: Set up Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: "6.0"
+          swift-version: ${{ matrix.swift_version }}
       - run: swift --version
 
       - name: Start Samba
@@ -59,9 +63,13 @@ jobs:
         run: docker rm -f "${SAMBA_CONTAINER}" || true
 
   e2e-cli:
-    name: smbcli E2E
+    name: smbcli E2E / Swift ${{ matrix.swift_version }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        swift_version: ["6.0", "6.2"]
     env:
       SAMBA_CONTAINER: smbee-samba-cli
       SAMBA_BASE_IMAGE: ubuntu:24.04
@@ -75,7 +83,7 @@ jobs:
       - name: Set up Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: "6.0"
+          swift-version: ${{ matrix.swift_version }}
       - run: swift --version
 
       - name: Start Samba

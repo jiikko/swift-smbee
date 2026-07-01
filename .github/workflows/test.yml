@@ -35,15 +35,20 @@ jobs:
         run: swift test --skip SMBeeE2ETests
 
   linux-build-test:
+    name: linux-build-test / Swift ${{ matrix.swift_version }}
     # Linux runner で、Network.framework 依存が SMB 本体へ漏れていないことと、
     # unit/vector テストが Linux 上でも通ることを PR 時点で明示的に確認する。
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        swift_version: ["6.0", "6.2"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: "6.0"
+          swift-version: ${{ matrix.swift_version }}
       - name: Swift version
         run: swift --version
       - name: Build on Linux

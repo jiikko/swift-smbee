@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   samba-compat:
-    name: ${{ matrix.samba_base }} / ${{ matrix.profile }}
+    name: ${{ matrix.samba_base }} / ${{ matrix.profile }} / Swift ${{ matrix.swift_version }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -23,14 +23,34 @@ jobs:
         include:
           - samba_base: ubuntu:24.04
             profile: smb302-encrypted-required
+            swift_version: "6.0"
+          - samba_base: ubuntu:24.04
+            profile: smb302-encrypted-required
+            swift_version: "6.2"
           - samba_base: ubuntu:24.04
             profile: smb311-signing-required
+            swift_version: "6.0"
+          - samba_base: ubuntu:24.04
+            profile: smb311-signing-required
+            swift_version: "6.2"
           - samba_base: ubuntu:24.04
             profile: smb311-encrypted-required
+            swift_version: "6.0"
+          - samba_base: ubuntu:24.04
+            profile: smb311-encrypted-required
+            swift_version: "6.2"
           - samba_base: ubuntu:22.04
             profile: smb302-encrypted-required
+            swift_version: "6.0"
+          - samba_base: ubuntu:22.04
+            profile: smb302-encrypted-required
+            swift_version: "6.2"
           - samba_base: debian:12
             profile: smb302-encrypted-required
+            swift_version: "6.0"
+          - samba_base: debian:12
+            profile: smb302-encrypted-required
+            swift_version: "6.2"
     env:
       SAMBA_CONTAINER: smbee-samba-${{ strategy.job-index }}
       SAMBA_BASE_IMAGE: ${{ matrix.samba_base }}
@@ -44,7 +64,7 @@ jobs:
       - name: Set up Swift
         uses: swift-actions/setup-swift@v2
         with:
-          swift-version: "6.0"
+          swift-version: ${{ matrix.swift_version }}
 
       - name: Print matrix context
         run: |

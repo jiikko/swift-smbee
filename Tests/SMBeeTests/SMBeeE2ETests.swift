@@ -101,6 +101,52 @@ final class SMBeeE2ETests: XCTestCase {
         )
         XCTAssertNotNil(securityInfo.ownerSID)
         XCTAssertGreaterThan(securityInfo.dacl?.count ?? 0, 0)
+        if let originalDACL = securityInfo.dacl, originalDACL.allSatisfy({ $0.trusteeSID != nil }) {
+            let addedACE = SMBAccessControlEntry(type: 0, flags: 0, accessMask: 0x0002_0000, trusteeSID: "S-1-1-0")
+            let replacementDACL = originalDACL + [addedACE]
+            do {
+                try await SMBee.setSecurityInfo(
+                    host: host,
+                    port: port,
+                    credential: credential,
+                    share: share,
+                    path: "known.txt",
+                    dacl: replacementDACL
+                )
+                let updatedSecurityInfo = try await SMBee.securityInfo(
+                    host: host,
+                    port: port,
+                    credential: credential,
+                    share: share,
+                    path: "known.txt"
+                )
+                // Samba is POSIX-ACL backed and normalizes the NT access mask on write
+                // (observed: requested 0x00020000 stored as 0x00120089), so the round-trip is
+                // not mask-exact. Assert the added trustee gained an ACCESS_ALLOWED (type 0) ACE.
+                XCTAssertTrue(
+                    updatedSecurityInfo.dacl?.contains { $0.trusteeSID == "S-1-1-0" && $0.type == 0 } == true,
+                    "expected an ACCESS_ALLOWED ACE for the added trustee after SET_SECURITY"
+                )
+                try await SMBee.setSecurityInfo(
+                    host: host,
+                    port: port,
+                    credential: credential,
+                    share: share,
+                    path: "known.txt",
+                    dacl: originalDACL
+                )
+            } catch {
+                try? await SMBee.setSecurityInfo(
+                    host: host,
+                    port: port,
+                    credential: credential,
+                    share: share,
+                    path: "known.txt",
+                    dacl: originalDACL
+                )
+                throw error
+            }
+        }
 
         let volumeInfo = try await SMBee.volumeInfo(
             host: host,

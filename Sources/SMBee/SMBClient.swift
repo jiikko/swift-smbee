@@ -469,6 +469,27 @@ public actor SMBClientSession {
         }
     }
 
+    public func setSecurityInfo(path: String, dacl: [SMBAccessControlEntry], force: Bool = false) async throws {
+        try ensureOpen()
+        let current = try await securityInfo(path: path)
+        try SMB2SetInfo.validateWritableDACL(dacl, force: force)
+        let fileId = try await session.create(treeId: treeId, request: .setSecurity(path: path))
+        do {
+            try await session.setSecurityInfo(
+                treeId: treeId,
+                fileId: fileId,
+                ownerSID: current.ownerSID,
+                groupSID: current.groupSID,
+                dacl: dacl,
+                force: force
+            )
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     public func volumeInfo() async throws -> SMBVolumeInfo {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, path: "", directory: true)
@@ -1019,6 +1040,47 @@ public enum SMBClient {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func setSecurityInfo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        dacl: [SMBAccessControlEntry],
+        force: Bool = false,
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws {
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "SET_SECURITY") { session, treeId in
+            let readFileId = try await session.create(treeId: treeId, request: .querySecurity(path: path))
+            let current: SMBSecurityInfo
+            do {
+                current = try await session.querySecurityInfo(treeId: treeId, fileId: readFileId)
+                try? await session.close(treeId: treeId, fileId: readFileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: readFileId)
+                throw error
+            }
+            try SMB2SetInfo.validateWritableDACL(dacl, force: force)
+            let writeFileId = try await session.create(treeId: treeId, request: .setSecurity(path: path))
+            do {
+                try await session.setSecurityInfo(
+                    treeId: treeId,
+                    fileId: writeFileId,
+                    ownerSID: current.ownerSID,
+                    groupSID: current.groupSID,
+                    dacl: dacl,
+                    force: force
+                )
+                try? await session.close(treeId: treeId, fileId: writeFileId)
+            } catch {
+                try? await session.close(treeId: treeId, fileId: writeFileId)
+                throw error
+            }
+        }
+    }
+
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func volumeInfo(
         host: String,
         port: UInt16 = 445,
@@ -1088,6 +1150,30 @@ public enum SMBClient {
             port: port,
             share: share,
             path: path,
+            credential: try await credentialProvider(),
+            timeout: timeout,
+            makeTransport: makeTransport
+        )
+    }
+
+    public static func setSecurityInfo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        dacl: [SMBAccessControlEntry],
+        force: Bool = false,
+        credentialProvider: SMBCredentialProvider,
+        timeout: Duration? = nil,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+    ) async throws {
+        try await setSecurityInfo(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            dacl: dacl,
+            force: force,
             credential: try await credentialProvider(),
             timeout: timeout,
             makeTransport: makeTransport
@@ -2750,6 +2836,30 @@ actor SMBSession {
         let response = try await signedWireTransaction(packet: packet, responseLabel: "SET_INFO basic response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "SET_INFO basic")
+    }
+
+    func setSecurityInfo(
+        treeId: UInt32,
+        fileId: [UInt8],
+        ownerSID: String?,
+        groupSID: String?,
+        dacl: [SMBAccessControlEntry],
+        force: Bool
+    ) async throws {
+        let packet = try SMB2SetInfo.encodeSecurityDescriptorRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            ownerSID: ownerSID,
+            groupSID: groupSID,
+            dacl: dacl,
+            force: force
+        )
+        debugDump("SET_INFO security request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "SET_INFO security response")
+        let header = try SMB2Header.decode(response)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "SET_INFO security")
     }
 
     func listShares(treeId: UInt32) async throws -> [SMBShareInfo] {

@@ -307,6 +307,15 @@ struct SMB2CreateRequest {
         )
     }
 
+    static func setSecurity(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0004_0000,
+            createDisposition: 0x0000_0001,
+            createOptions: 0
+        )
+    }
+
     static func namedPipe(path: String) -> SMB2CreateRequest {
         SMB2CreateRequest(
             path: path,
@@ -760,6 +769,13 @@ struct SMB2CopyChunkResponse: Equatable {
 enum SMB2SetInfo {
     private static let fixedPartSize = 32
     private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
+    static let infoTypeFile: UInt8 = 0x01
+    static let infoTypeSecurity: UInt8 = 0x03
+    static let securityDACL: UInt32 = 0x0000_0004
+    static let accessAllowedAceType: UInt8 = 0x00
+    static let accessDeniedAceType: UInt8 = 0x01
+    private static let securityDescriptorSelfRelative: UInt16 = 0x8000
+    private static let securityDescriptorDACLPresent: UInt16 = 0x0004
 
     static func encodeRenameRequest(
         messageId: UInt64,
@@ -810,12 +826,145 @@ enum SMB2SetInfo {
         )
     }
 
+    static func encodeSecurityDescriptorRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        ownerSID: String?,
+        groupSID: String?,
+        dacl: [SMBAccessControlEntry],
+        force: Bool = false
+    ) throws -> [UInt8] {
+        let descriptor = try encodeSecurityDescriptor(ownerSID: ownerSID, groupSID: groupSID, dacl: dacl, force: force)
+        return try encodeRequest(
+            messageId: messageId,
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            infoType: infoTypeSecurity,
+            fileInfoClass: 0,
+            additionalInformation: securityDACL,
+            buffer: descriptor
+        )
+    }
+
+    static func encodeSecurityDescriptor(
+        ownerSID: String?,
+        groupSID: String?,
+        dacl: [SMBAccessControlEntry],
+        force: Bool = false
+    ) throws -> [UInt8] {
+        try validateWritableDACL(dacl, force: force)
+        var payload = Array(repeating: UInt8(0), count: 20)
+        payload[0] = 1
+        writeUInt16LE(securityDescriptorSelfRelative | securityDescriptorDACLPresent, to: &payload, at: 2)
+        if let ownerSID {
+            writeUInt32LE(UInt32(payload.count), to: &payload, at: 4)
+            payload.append(contentsOf: try encodeSID(ownerSID))
+        }
+        if let groupSID {
+            writeUInt32LE(UInt32(payload.count), to: &payload, at: 8)
+            payload.append(contentsOf: try encodeSID(groupSID))
+        }
+        writeUInt32LE(UInt32(payload.count), to: &payload, at: 16)
+        payload.append(contentsOf: try encodeACL(dacl))
+        return payload
+    }
+
+    static func validateWritableDACL(_ dacl: [SMBAccessControlEntry], force: Bool = false) throws {
+        for ace in dacl {
+            guard ace.trusteeSID != nil else {
+                throw SMBCodecError.invalidValue("DACL ACE trustee SID is required for SET_SECURITY")
+            }
+        }
+        guard !force else { return }
+        guard !dacl.isEmpty else {
+            throw SMBCodecError.invalidValue("refusing to write empty DACL without force")
+        }
+        guard dacl.contains(where: { $0.type == accessAllowedAceType }) else {
+            throw SMBCodecError.invalidValue("refusing to write DACL without ACCESS_ALLOWED ACE without force")
+        }
+    }
+
+    static func encodeSID(_ sid: String) throws -> [UInt8] {
+        let parts = sid.split(separator: "-")
+        guard parts.count >= 3, parts[0] == "S", parts[1] == "1" else {
+            throw SMBCodecError.invalidValue("invalid SID string")
+        }
+        guard let authority = UInt64(parts[2]), authority <= 0x0000_ffff_ffff else {
+            throw SMBCodecError.invalidValue("invalid SID identifier authority")
+        }
+        let subAuthorityStrings = parts.dropFirst(3)
+        guard subAuthorityStrings.count <= Int(UInt8.max) else {
+            throw SMBCodecError.invalidValue("SID has too many sub-authorities")
+        }
+        var writer = SMBByteWriter()
+        writer.writeUInt8(1)
+        writer.writeUInt8(UInt8(subAuthorityStrings.count))
+        for shift in stride(from: 40, through: 0, by: -8) {
+            writer.writeUInt8(UInt8((authority >> UInt64(shift)) & 0xff))
+        }
+        for part in subAuthorityStrings {
+            guard let value = UInt32(part) else {
+                throw SMBCodecError.invalidValue("invalid SID sub-authority")
+            }
+            writer.writeUInt32LE(value)
+        }
+        return writer.bytes
+    }
+
+    static func encodeACL(_ dacl: [SMBAccessControlEntry]) throws -> [UInt8] {
+        guard dacl.count <= Int(UInt16.max) else {
+            throw SMBCodecError.invalidValue("DACL has too many ACEs")
+        }
+        var aces: [UInt8] = []
+        for ace in dacl {
+            aces.append(contentsOf: try encodeACE(ace))
+        }
+        let aclSize = 8 + aces.count
+        guard aclSize <= Int(UInt16.max) else {
+            throw SMBCodecError.invalidValue("DACL is too large")
+        }
+        var writer = SMBByteWriter()
+        writer.writeUInt8(2)
+        writer.writeUInt8(0)
+        writer.writeUInt16LE(UInt16(aclSize))
+        writer.writeUInt16LE(UInt16(dacl.count))
+        writer.writeUInt16LE(0)
+        writer.writeBytes(aces)
+        return writer.bytes
+    }
+
+    static func encodeACE(_ ace: SMBAccessControlEntry) throws -> [UInt8] {
+        guard ace.type == accessAllowedAceType || ace.type == accessDeniedAceType else {
+            throw SMBCodecError.invalidValue("unsupported ACE type for SET_SECURITY")
+        }
+        guard let trusteeSID = ace.trusteeSID else {
+            throw SMBCodecError.invalidValue("DACL ACE trustee SID is required for SET_SECURITY")
+        }
+        let sid = try encodeSID(trusteeSID)
+        let aceSize = 8 + sid.count
+        guard aceSize <= Int(UInt16.max) else {
+            throw SMBCodecError.invalidValue("ACE is too large")
+        }
+        var writer = SMBByteWriter()
+        writer.writeUInt8(ace.type)
+        writer.writeUInt8(ace.flags)
+        writer.writeUInt16LE(UInt16(aceSize))
+        writer.writeUInt32LE(ace.accessMask)
+        writer.writeBytes(sid)
+        return writer.bytes
+    }
+
     private static func encodeRequest(
         messageId: UInt64,
         sessionId: UInt64,
         treeId: UInt32,
         fileId: [UInt8],
+        infoType: UInt8 = infoTypeFile,
         fileInfoClass: UInt8,
+        additionalInformation: UInt32 = 0,
         buffer: [UInt8]
     ) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
@@ -823,12 +972,12 @@ enum SMB2SetInfo {
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(33)
-        writer.writeUInt8(0x01)
+        writer.writeUInt8(infoType)
         writer.writeUInt8(fileInfoClass)
         writer.writeUInt32LE(UInt32(buffer.count))
         writer.writeUInt16LE(UInt16(bufferOffset))
         writer.writeUInt16LE(0)
-        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(additionalInformation)
         writer.writeBytes(fileId)
         writer.writeBytes(buffer.isEmpty ? [0] : buffer)
         return writer.bytes
@@ -836,6 +985,18 @@ enum SMB2SetInfo {
 
     private static func relativeInfoName(_ path: String) throws -> String {
         try SMBPath.normalize(path)
+    }
+
+    private static func writeUInt16LE(_ value: UInt16, to bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8(value & 0xff)
+        bytes[offset + 1] = UInt8((value >> 8) & 0xff)
+    }
+
+    private static func writeUInt32LE(_ value: UInt32, to bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8(value & 0xff)
+        bytes[offset + 1] = UInt8((value >> 8) & 0xff)
+        bytes[offset + 2] = UInt8((value >> 16) & 0xff)
+        bytes[offset + 3] = UInt8((value >> 24) & 0xff)
     }
 }
 

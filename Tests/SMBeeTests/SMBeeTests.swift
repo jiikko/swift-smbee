@@ -2362,6 +2362,19 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_1040)
     }
 
+    func testCreateSetSecurityRequestUsesWriteDACAccess() throws {
+        let request = try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            request: .setSecurity(path: "out.txt")
+        )
+
+        XCTAssertEqual(readUInt32LE(request, at: 88), 0x0004_0000)
+        XCTAssertEqual(readUInt32LE(request, at: 100), 0x0000_0001)
+        XCTAssertEqual(readUInt32LE(request, at: 104), 0)
+    }
+
     func testDeleteNonRecursiveRetriesAsDirectoryWhenCreateReportsFileIsADirectory() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([
@@ -3140,6 +3153,80 @@ final class SMBeeTests: XCTestCase {
         let info = try SMB2QueryInfo.decodeSecurityInfo(smb2QueryInfoResponse(payload: payload))
 
         XCTAssertEqual(info.dacl, [SMBAccessControlEntry(type: 0x05, flags: 0x11, accessMask: 0x0002_0000, trusteeSID: nil)])
+    }
+
+    func testSecuritySIDEncoderMatchesMSDTYPBytes() throws {
+        XCTAssertEqual(
+            try SMB2SetInfo.encodeSID("S-1-5-32-544"),
+            [0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00]
+        )
+    }
+
+    func testSecurityDescriptorEncodeRoundTripsThroughDecoder() throws {
+        let dacl = [
+            SMBAccessControlEntry(type: 0, flags: 0, accessMask: 0x001f_01ff, trusteeSID: "S-1-1-0"),
+            SMBAccessControlEntry(type: 1, flags: 0x10, accessMask: 0x0001_0000, trusteeSID: "S-1-5-21-1000-1001-1002")
+        ]
+
+        let descriptor = try SMB2SetInfo.encodeSecurityDescriptor(
+            ownerSID: "S-1-5-32-544",
+            groupSID: "S-1-5-32-545",
+            dacl: dacl
+        )
+        let info = try SMB2QueryInfo.decodeSecurityDescriptor(descriptor)
+
+        XCTAssertEqual(info.ownerSID, "S-1-5-32-544")
+        XCTAssertEqual(info.groupSID, "S-1-5-32-545")
+        XCTAssertEqual(info.controlFlags, 0x8004)
+        XCTAssertEqual(info.dacl, dacl)
+    }
+
+    func testSetInfoSecurityRequestUsesSecurityInfoTypeAndDACLAdditionalInformation() throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let request = try SMB2SetInfo.encodeSecurityDescriptorRequest(
+            messageId: 7,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            fileId: fileId,
+            ownerSID: nil,
+            groupSID: nil,
+            dacl: [SMBAccessControlEntry(type: 0, flags: 0, accessMask: 0x001f_01ff, trusteeSID: "S-1-1-0")]
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.setInfo)
+        XCTAssertEqual(request[66], 0x03)
+        XCTAssertEqual(request[67], 0)
+        XCTAssertEqual(readUInt16LE(request, at: 72), 96)
+        XCTAssertEqual(readUInt32LE(request, at: 76), 0x0000_0004)
+        XCTAssertEqual(Array(request[80..<96]), fileId)
+        XCTAssertEqual(request[96], 1)
+        XCTAssertEqual(readUInt16LE(request, at: 98), 0x8004)
+    }
+
+    func testSetSecurityLockoutGuardRejectsEmptyOrDenyOnlyDACLUnlessForced() throws {
+        XCTAssertThrowsError(try SMB2SetInfo.validateWritableDACL([], force: false)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .invalidValue("refusing to write empty DACL without force"))
+        }
+        let denyOnly = [SMBAccessControlEntry(type: 1, flags: 0, accessMask: 0x001f_01ff, trusteeSID: "S-1-1-0")]
+        XCTAssertThrowsError(try SMB2SetInfo.validateWritableDACL(denyOnly, force: false)) { error in
+            XCTAssertEqual(error as? SMBCodecError, .invalidValue("refusing to write DACL without ACCESS_ALLOWED ACE without force"))
+        }
+        XCTAssertNoThrow(try SMB2SetInfo.validateWritableDACL([], force: true))
+        XCTAssertNoThrow(try SMB2SetInfo.validateWritableDACL(denyOnly, force: true))
+    }
+
+    func testSetSecurityRejectsACEWithoutTrusteeSID() throws {
+        XCTAssertThrowsError(
+            try SMB2SetInfo.encodeSecurityDescriptor(
+                ownerSID: nil,
+                groupSID: nil,
+                dacl: [SMBAccessControlEntry(type: 0, flags: 0, accessMask: 1, trusteeSID: nil)],
+                force: true
+            )
+        ) { error in
+            XCTAssertEqual(error as? SMBCodecError, .invalidValue("DACL ACE trustee SID is required for SET_SECURITY"))
+        }
     }
 
     func testTreeConnectResponseDecodesSharePolicy() throws {

@@ -16,7 +16,8 @@ struct SMBCLI: AsyncParsableCommand {
         version: SMBee.version,
         subcommands: [
             Probe.self, Shares.self, List.self, Stat.self, ACL.self, DiskFree.self, Cat.self, Get.self,
-            MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Watch.self, Dfs.self
+            MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Watch.self, Dfs.self,
+            SetACL.self
         ]
     )
 }
@@ -472,6 +473,59 @@ struct ACL: AsyncParsableCommand {
         for ace in dacl {
             print("  type=\(ace.type) flags=0x\(String(format: "%02x", ace.flags)) mask=0x\(String(format: "%08x", ace.accessMask)) sid=\(ace.trusteeSID ?? "none")")
         }
+    }
+}
+
+struct SetACL: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "setacl", abstract: "Replace an SMB file DACL")
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var url: String
+
+    @Option(name: .long, parsing: .upToNextOption, help: "ACCESS_ALLOWED ACE as SID:MASK, repeatable")
+    var allow: [String] = []
+
+    @Option(name: .long, parsing: .upToNextOption, help: "ACCESS_DENIED ACE as SID:MASK, repeatable")
+    var deny: [String] = []
+
+    @Flag(help: "Allow empty or deny-only DACLs")
+    var force = false
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    func run() async throws {
+        debug.apply()
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        let dacl = try allow.map { try parseACE($0, type: 0) } + deny.map { try parseACE($0, type: 1) }
+        try await SMBee.setSecurityInfo(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            dacl: dacl,
+            force: force,
+            timeout: transport.duration
+        )
+    }
+
+    private func parseACE(_ value: String, type: UInt8) throws -> SMBAccessControlEntry {
+        let parts = value.split(separator: ":", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else {
+            throw ValidationError("ACE must be SID:MASK")
+        }
+        let maskText = parts[1].hasPrefix("0x") || parts[1].hasPrefix("0X") ? String(parts[1].dropFirst(2)) : parts[1]
+        guard let mask = UInt32(maskText, radix: parts[1].hasPrefix("0x") || parts[1].hasPrefix("0X") ? 16 : 10) else {
+            throw ValidationError("ACE mask must be decimal or 0x-prefixed hex")
+        }
+        return SMBAccessControlEntry(type: type, flags: 0, accessMask: mask, trusteeSID: parts[0])
     }
 }
 

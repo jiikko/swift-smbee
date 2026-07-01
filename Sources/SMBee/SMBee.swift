@@ -230,6 +230,39 @@ public enum SMBee {
         try await SMBClient.securityInfo(host: host, port: port, share: share, path: path, credentialProvider: credentialProvider, timeout: timeout)
     }
 
+    /// Writes the file's DACL (read-modify-write: owner/group are preserved). A structural
+    /// lockout guard rejects an empty or deny-only DACL unless `force` is set.
+    ///
+    /// - Note: The server may normalize the requested access masks. Samba (POSIX-ACL backed)
+    ///   maps NT masks to its canonical representation (e.g. a requested `0x00020000` reads back
+    ///   as `0x00120089`), so the round-trip is not guaranteed to be mask-exact.
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func setSecurityInfo(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        dacl: [SMBAccessControlEntry],
+        force: Bool = false,
+        timeout: Duration? = nil
+    ) async throws {
+        try await SMBClient.setSecurityInfo(host: host, port: port, share: share, path: path, dacl: dacl, force: force, credential: credential, timeout: timeout)
+    }
+
+    public static func setSecurityInfo(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        dacl: [SMBAccessControlEntry],
+        force: Bool = false,
+        timeout: Duration? = nil
+    ) async throws {
+        try await SMBClient.setSecurityInfo(host: host, port: port, share: share, path: path, dacl: dacl, force: force, credentialProvider: credentialProvider, timeout: timeout)
+    }
+
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func volumeInfo(
         host: String,

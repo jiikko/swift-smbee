@@ -87,38 +87,8 @@ jobs:
       - name: smbcli command smoke
         env:
           SMB_PASSWORD: smbee
-        run: |
-          set -euxo pipefail
-          SMBCLI=".build/debug/smbcli"
-          SMB_URL="smb://smbee@${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public"
-          root="smbee-gha-cli-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          local_dir="$(mktemp -d)"
-          cleanup() {
-            "${SMBCLI}" rm -r "${SMB_URL}/${root}" || true
-            rm -rf "${local_dir}"
-          }
-          trap cleanup EXIT
-
-          mkdir -p "${local_dir}/dir/child"
-          printf "hello smbee command smoke\n" > "${local_dir}/file.txt"
-          printf "nested payload\n" > "${local_dir}/dir/child/nested.txt"
-
-          "${SMBCLI}" ls "${SMB_URL}"
-          "${SMBCLI}" shares "smb://smbee@${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}" | grep -Fx public
-          "${SMBCLI}" mkdir "${SMB_URL}/${root}"
-          "${SMBCLI}" put "${local_dir}/file.txt" "${SMB_URL}/${root}/file.txt"
-          "${SMBCLI}" cat "${SMB_URL}/${root}/file.txt" | cmp "${local_dir}/file.txt" -
-          "${SMBCLI}" get "${SMB_URL}/${root}/file.txt" "${local_dir}/downloaded.txt"
-          cmp "${local_dir}/file.txt" "${local_dir}/downloaded.txt"
-          "${SMBCLI}" cp "${SMB_URL}/${root}/file.txt" "${SMB_URL}/${root}/copied.txt"
-          "${SMBCLI}" cat "${SMB_URL}/${root}/copied.txt" | cmp "${local_dir}/file.txt" -
-          "${SMBCLI}" put -r "${local_dir}/dir" "${SMB_URL}/${root}/uploaded-dir"
-          "${SMBCLI}" ls "${SMB_URL}/${root}/uploaded-dir/child"
-          "${SMBCLI}" get -r "${SMB_URL}/${root}/uploaded-dir" "${local_dir}/downloaded-dir"
-          cmp "${local_dir}/dir/child/nested.txt" "${local_dir}/downloaded-dir/child/nested.txt"
-          "${SMBCLI}" cp -r "${SMB_URL}/${root}/uploaded-dir" "${SMB_URL}/${root}/copied-dir"
-          "${SMBCLI}" cat "${SMB_URL}/${root}/copied-dir/child/nested.txt" | cmp "${local_dir}/dir/child/nested.txt" -
-          "${SMBCLI}" rm -r "${SMB_URL}/${root}"
+          SMBEE_E2E_SMOKE_ROOT: smbee-gha-cli-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bin/e2e/smbcli-smoke.sh
 
       - name: Samba logs (debug)
         if: always()

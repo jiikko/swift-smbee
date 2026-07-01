@@ -108,35 +108,6 @@ printf '\n== Build smbcli ==\n'
 swift build --product smbcli
 
 printf '\n== smbcli command smoke ==\n'
-SMBCLI=".build/debug/smbcli"
-SMB_URL="smb://${SMBEE_E2E_USERNAME}@${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/${SMBEE_E2E_SHARE}"
-root="smbee-local-container-cli-$$"
-local_dir="$(mktemp -d)"
-cleanup_local() {
-  SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" rm -r "${SMB_URL}/${root}" >/dev/null 2>&1 || true
-  rm -rf "${local_dir}"
-}
-trap 'cleanup_local; cleanup' EXIT
-
-mkdir -p "${local_dir}/dir/child"
-printf "hello smbee command smoke\n" > "${local_dir}/file.txt"
-printf "nested payload\n" > "${local_dir}/dir/child/nested.txt"
-
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" ls "${SMB_URL}"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" shares "smb://${SMBEE_E2E_USERNAME}@${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}" | grep -Fx "${SMBEE_E2E_SHARE}"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mkdir "${SMB_URL}/${root}"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" put "${local_dir}/file.txt" "${SMB_URL}/${root}/file.txt"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cat "${SMB_URL}/${root}/file.txt" | cmp "${local_dir}/file.txt" -
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" get "${SMB_URL}/${root}/file.txt" "${local_dir}/downloaded.txt"
-cmp "${local_dir}/file.txt" "${local_dir}/downloaded.txt"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cp "${SMB_URL}/${root}/file.txt" "${SMB_URL}/${root}/copied.txt"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cat "${SMB_URL}/${root}/copied.txt" | cmp "${local_dir}/file.txt" -
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" put -r "${local_dir}/dir" "${SMB_URL}/${root}/uploaded-dir"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" ls "${SMB_URL}/${root}/uploaded-dir/child"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" get -r "${SMB_URL}/${root}/uploaded-dir" "${local_dir}/downloaded-dir"
-cmp "${local_dir}/dir/child/nested.txt" "${local_dir}/downloaded-dir/child/nested.txt"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cp -r "${SMB_URL}/${root}/uploaded-dir" "${SMB_URL}/${root}/copied-dir"
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cat "${SMB_URL}/${root}/copied-dir/child/nested.txt" | cmp "${local_dir}/dir/child/nested.txt" -
-SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" rm -r "${SMB_URL}/${root}"
+SMBEE_E2E_SMOKE_ROOT="smbee-local-container-cli-$$" bin/e2e/smbcli-smoke.sh
 
 printf '\nLocal container E2E completed successfully.\n'

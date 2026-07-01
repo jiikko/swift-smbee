@@ -178,10 +178,7 @@ struct Shares: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let endpoint = try SMBURLParser.parseServerURL(url)
-        guard let username = endpoint.username, !username.isEmpty else {
-            throw ValidationError("SMB URL must include a username")
-        }
-        let credential = try makeCredential(username: username, password: nil, auth: auth)
+        let credential = try makeCredential(username: endpoint.username, password: nil, auth: auth)
         let shares = try await SMBee.listShares(
             host: endpoint.host,
             port: endpoint.port,
@@ -530,6 +527,16 @@ struct AuthOptions: ParsableArguments {
 
     @Flag(help: "Read password from standard input")
     var passwordStdin = false
+
+    @Flag(help: "Authenticate anonymously")
+    var anonymous = false
+
+    @Flag(help: "Alias for --anonymous")
+    var guest = false
+
+    var usesAnonymousAuthentication: Bool {
+        anonymous || guest
+    }
 }
 
 struct DebugOptions: ParsableArguments {
@@ -555,13 +562,25 @@ private func makeReadEndpointAndCredential(url: String, auth: AuthOptions) throw
 
 private func makeEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURLParser.ReadURL, SMBCredential) {
     let endpoint = try SMBURLParser.parseReadURL(url)
-    guard let username = endpoint.username, !username.isEmpty else {
-        throw ValidationError("SMB URL must include a username")
-    }
-    return (endpoint, try makeCredential(username: username, password: endpoint.password, auth: auth))
+    return (endpoint, try makeCredential(username: endpoint.username, password: endpoint.password, auth: auth))
 }
 
-private func makeCredential(username: String, password urlPassword: String?, auth: AuthOptions) throws -> SMBCredential {
+private func makeCredential(username: String?, password urlPassword: String?, auth: AuthOptions) throws -> SMBCredential {
+    if auth.usesAnonymousAuthentication || username?.isEmpty != false {
+        guard (!auth.usesAnonymousAuthentication || username?.isEmpty != false),
+              urlPassword == nil,
+              auth.ntHash == nil,
+              !auth.passwordStdin,
+              ProcessInfo.processInfo.environment["SMB_PASSWORD"] == nil,
+              ProcessInfo.processInfo.environment["SMB_NT_HASH"] == nil
+        else {
+            throw ValidationError("Anonymous authentication cannot be combined with a username, password, or NT hash")
+        }
+        return .anonymous
+    }
+    guard let username else {
+        throw ValidationError("SMB URL must include a username")
+    }
     if let ntHash = try readNTHash(options: auth) {
         guard urlPassword == nil, !auth.passwordStdin, ProcessInfo.processInfo.environment["SMB_PASSWORD"] == nil else {
             throw ValidationError("Use either an NT hash or a password, not both")

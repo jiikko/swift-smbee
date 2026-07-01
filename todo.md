@@ -237,7 +237,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: `SMBSession.copyDirectory` / `deleteRecursively` は `queryDirectory(... onEntry:)`
     の callback traversal に変更し、directory entry 配列集約を避けるよう修正。残:
     one-shot `downloadDirectory` の session 境界を含む streaming traversal 化と安全策。
-- [ ] recursive operation safety / transfer atomicity
+- [x] recursive operation safety / transfer atomicity
   - copy/delete/download/upload の recursive 系は実装済みだが、汎用 smbclient としては failure 中断時の
     partial tree の扱い、同名衝突時の rollback/skip/overwrite policy、最大 depth、source が destination
     配下にある場合の自己再帰防止を API/CLI option として明示する。
@@ -250,8 +250,23 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     copyDirectory 入口で、`validateRecursionDepth`(`maxRecursionDepth=64`)を
     copyDirectory/deleteRecursively/downloadDirectory/uploadDirectory の再帰に配線。exit code は 1 に分類。
     Linux 138 / macOS 141 unit green。
-    **残 (設計判断ゆえ本タスクでは未着手)**: failure 中断時の partial tree の rollback/skip policy、
-    同名衝突の overwrite policy の option 化、directory 単位 atomicity、resume/verify/cleanup。
+  - 2026-07-02 (codex-drive、MR1-3): 残っていた失敗/atomicity/resume を実装:
+    - **MR1 失敗ポリシー**: recursive copy/delete/download/upload に `continueOnError` (途中失敗を
+      `SMBRecursiveFailure` に集約し継続、完了後 `SMBError.recursiveOperationIncomplete` を throw) /
+      `skipExisting` / `dryRun` (`onAction` で計画報告、mutate せず) を追加。smbcli cp/get/put/rm -r に
+      `--continue-on-error` / `--skip-existing` / `--dry-run`。
+    - **MR2 best-effort atomicity (download)**: `downloadDirectory` に `atomic: Bool`。sibling staging dir
+      (`.<dest>.smbee-<UUID>.tmp`) に全 tree を落とし成功で move/replace、失敗で staging 削除 (partial tree を
+      最終地点に残さない)。SMB は tree の真の transactional 操作を持たないため best-effort (rename はクラッシュ/
+      fs 跨ぎまで非保証) と doc 明記。upload/remote-copy の atomicity は SMB rename が非信頼のため対象外。
+    - **MR3 resume-by-skip (download/upload)**: `resume: Bool`。dest が存在し size 一致なら skip、欠落/不一致は
+      再転送。byte-level partial resume は対象外 (size 一致=完了の近似)。
+    - Linux 固有バグ 2 件を観測駆動で修正: `attributes[.size] as? NSNumber` (Linux は Int) →
+      `smbFileSizeValue` 集約 / `FileManager.replaceItemAt` が Linux で非決定的に壊れる →
+      `#if canImport(Darwin)` で macOS=replaceItemAt / Linux=remove+move 分岐。
+    - macOS 215 / Linux 212 unit green。
+  - **残 (defer)**: directory 単位の真の transactional atomicity (SMB プロトコル上不可)、byte-level partial-file
+    resume、verify (checksum) は範囲外。upload の atomicity は SMB rename 非信頼のため未対応。
 - [x] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 2026-06-30: `SMBee.withDirectoryStream` / `SMBClient.withDirectoryStream` を追加。`SMBSession`
     は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で

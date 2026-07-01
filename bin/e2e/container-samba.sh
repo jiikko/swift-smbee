@@ -15,6 +15,8 @@ SMBEE_E2E_USERNAME="${SMBEE_E2E_USERNAME:-smbee}"
 SMBEE_E2E_PASSWORD="${SMBEE_E2E_PASSWORD:-smbee}"
 SMBEE_E2E_SHARE="${SMBEE_E2E_SHARE:-public}"
 SMBEE_E2E_KEEP_CONTAINER="${SMBEE_E2E_KEEP_CONTAINER:-0}"
+SMBEE_E2E_TEST_FILTER="${SMBEE_E2E_TEST_FILTER:-SMBeeE2ETests}"
+SMBEE_E2E_SKIP_CLI_SMOKE="${SMBEE_E2E_SKIP_CLI_SMOKE:-0}"
 
 cd "${REPO_ROOT}"
 
@@ -102,12 +104,16 @@ printf '\n== Probe negotiated parameters ==\n'
 SMBEE_DEBUG=1 swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
 
 printf '\n== Samba-backed API E2E tests ==\n'
-SMBEE_DEBUG=1 swift test --filter SMBeeE2ETests
+SMBEE_DEBUG=1 swift test --filter "${SMBEE_E2E_TEST_FILTER}"
 
-printf '\n== Build smbcli ==\n'
-swift build --product smbcli
+if [ "${SMBEE_E2E_SKIP_CLI_SMOKE}" = "1" ]; then
+  printf '\n== smbcli command smoke skipped ==\n'
+else
+  printf '\n== Build smbcli ==\n'
+  swift build --product smbcli
 
-printf '\n== smbcli command smoke ==\n'
-SMBEE_E2E_SMOKE_ROOT="smbee-local-container-cli-$$" bin/e2e/smbcli-smoke.sh
+  printf '\n== smbcli command smoke ==\n'
+  SMBEE_E2E_SMOKE_ROOT="smbee-local-container-cli-$$" bin/e2e/smbcli-smoke.sh
+fi
 
 printf '\nLocal container E2E completed successfully.\n'

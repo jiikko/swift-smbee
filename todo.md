@@ -36,12 +36,12 @@
   (SMBTransportError.connectionClosed/.socketFailure) 時に idempotent 操作 (probe/ls/stat/cat) のみ
   新 transport で最大 1 回再接続+やり直し。mutation は再試行せず SMBError.connectionLost。
   非接続喪失エラー・CancellationError は即 rethrow。
-- 🧊 E (defer 維持・2026-06-30 再確認): 3.1.1 GMAC/GCM 経路。**ローカルで E2E 検証不可**
-  (docker/Samba 無し・macOS は 3.0.2 上限) のため、検証可能な 3.1.1 サーバが用意できるまで
-  実サーバ確認は保留。NEGOTIATE contexts / unpadded final context parser / preauth integrity SHA-512
-  running hash / SP800-108 KDF (preauth-hash context) / AES-GCM TRANSFORM_HEADER fixture /
-  session への 3.1.1 KDF + GCM 暗号配線は実装済み。残: 実 Samba 3.1.1 交渉確認 + GMAC 署名の
-  実 packet fixture / 実サーバ検証。
+- 🧊 E (defer 維持・2026-07-01 再確認): 3.1.1 GMAC/GCM 経路。Apple container + Samba
+  profile でローカル probe 検証可能。NEGOTIATE contexts / unpadded final context parser /
+  preauth integrity SHA-512 running hash / SP800-108 KDF (preauth-hash context) /
+  AES-GCM TRANSFORM_HEADER fixture / session への 3.1.1 KDF + GCM 暗号配線は実装済み。
+  残: 3.1.1 authenticated full E2E（GMAC signing-only response verify / GCM encrypted session）の
+  実サーバ検証と修正。
 - ✅ 公開 read streaming API (2026-06-30): `SMBee.withReadStream(... onChunk:)` (scoped callback)。
   SMBSession.readChunks primitive に集約し既存 `[UInt8]` 一括 read は互換維持。chunk yield 後は透過 retry
   せず connectionLost に昇格。`smbcli cat` も streaming 化 (大ファイルを全量 lift しない)。実機 macOS で
@@ -54,10 +54,9 @@
 ---
 
 MVP scope: **SMB 3.0.2 + 3.1.1 / NTLMv2 / negotiated dialect 依存の署名・暗号 /
-対象=macOS SMBX(実上限 3.0.2) + Samba(3.1.1 想定)**。
+対象=macOS SMBX(実上限 3.0.2) + Windows SMB Server + Samba**。
 3.1.1 は AES-128-GMAC 署名 + AES-128-GCM 暗号（swift-crypto）。3.0.2 は
-AES-CMAC 署名 + AES-128-CCM 暗号（swift-crypto に無いため Phase 2 で pure-Swift 実装または
-pure-Swift cross-platform lib を踏襲、Linux ビルド維持）。
+AES-CMAC 署名 + AES-128-CCM 暗号（in-repo pure-Swift 実装、Linux ビルド維持）。
 read 先行 → write。**read 成功を理由に write へ自動 GO しない**（各 Phase 末でレビュー）。
 
 ---
@@ -89,7 +88,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [x] `smbcli probe smb://host[:445]` で表示
 - [x] **実測**: macOS SMBX は macOS 26.5.1 でも **3.0.2 上限**。3.1.1 は喋らない。
   - probe(NEGOTIATE) は 3.0.2 macOS に対して成功済み。
-- [ ] **実測**: Samba が **3.1.1 + GMAC + GCM** を交渉するか ⓥ
+- [x] **実測**: Samba が **3.1.1 + GMAC + GCM** を交渉するか ⓥ
   - 2026-06-30 実装レビュー追記: 現状の `SMBNegotiateCodec.encodeEncryptionData()` は
     AES-128-CCM だけを提示している一方、3.1.1 authenticated path は AES-128-GCM を必須として
     guard している。3.1.1 実測前に request context を設計どおり AES-128-GCM 優先
@@ -99,6 +98,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: `.github/workflows/samba-compat.yml` と `test/e2e/smb/smb311-*.conf` を追加。
     `smb311-encrypted-required` で 3.1.1 + GMAC + GCM の probe / authenticated E2E を
     workflow_dispatch / schedule で確認できる状態にした。残: GitHub Actions 上の初回実行結果を記録する。
+  - 2026-07-01: Apple container + Ubuntu 24.04 Samba + `smb311-encrypted-required` で
+    `dialect: 0x0311`, `signing: 0x0002`, `cipher: 0x0002`, `preauthHash: 0x0001` を実測。
+    `.github/workflows/e2e.yml` に PR / push で走る probe matrix lane を追加。
 - [x] 既知課題: Samba 3.1.1 response の parser が `truncated` になるバグを調査
   - 2026-06-30: NEGOTIATE context parser が「最後の context も 8-byte padding あり」と仮定していた
     ため、最後の context が unpadded の response で `truncated` になり得た。最終 context は padding

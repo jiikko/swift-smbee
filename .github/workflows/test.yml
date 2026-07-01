@@ -19,7 +19,7 @@ jobs:
     # macOS runner は内蔵Swiftを使うため、.swift-version は厳密pinではなく最低要求versionとして検証する。
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Verify Swift version compatibility
         run: |
           required="$(tr -d '[:space:]' < .swift-version)"
@@ -51,7 +51,7 @@ jobs:
     # unit/vector テストが Linux 上でも通ることを PR 時点で明示的に確認する。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read Swift version
         id: swift-version
         run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
@@ -76,7 +76,7 @@ jobs:
     # 下限として使い、Linux SwiftPM/XCTest 上の登録漏れを早めに検出する。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read Swift version
         id: swift-version
         run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
@@ -99,7 +99,7 @@ jobs:
     # 初期閾値は既存コードへ過剰に厳しくしない 50%。CI実績を見て段階的に引き上げる。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read Swift version
         id: swift-version
         run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
@@ -116,7 +116,7 @@ jobs:
         run: bash scripts/check-code-coverage.sh
       - name: Upload code coverage artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: swift-code-coverage
           # Expiring artifact (short retention). The formatted Markdown report is also
@@ -132,7 +132,7 @@ jobs:
   performance-regression:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read Swift version
         id: swift-version
         run: echo "version=$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"

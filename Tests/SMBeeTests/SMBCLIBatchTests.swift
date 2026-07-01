@@ -89,4 +89,82 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(command.dryRun)
         XCTAssertTrue(command.noOverwrite)
     }
+
+    func testProbeParsesServerUrlAndCommonFlags() throws {
+        let command = try Probe.parse(["smb://host:1445", "--json", "--timeout", "1.25", "--debug"])
+
+        XCTAssertEqual(command.url, "smb://host:1445")
+        XCTAssertTrue(command.json)
+        XCTAssertEqual(command.transport.timeout, 1.25)
+        XCTAssertTrue(command.debug.debug)
+    }
+
+    func testSharesListStatDiskFreeACLAndDfsParseJsonTimeoutAndAuth() throws {
+        let shares = try Shares.parse(["smb://user@host", "--domain", "WORK", "--json", "--timeout", "2"])
+        XCTAssertEqual(shares.url, "smb://user@host")
+        XCTAssertEqual(shares.auth.domain, "WORK")
+        XCTAssertTrue(shares.json)
+        XCTAssertEqual(shares.transport.timeout, 2)
+
+        let list = try List.parse(["smb://user@host/share/dir", "--json", "--guest"])
+        XCTAssertEqual(list.url, "smb://user@host/share/dir")
+        XCTAssertTrue(list.json)
+        XCTAssertTrue(list.auth.guest)
+
+        let stat = try Stat.parse(["smb://user@host/share/file.txt", "--json"])
+        XCTAssertEqual(stat.url, "smb://user@host/share/file.txt")
+        XCTAssertTrue(stat.json)
+
+        let df = try DiskFree.parse(["smb://user@host/share", "--json"])
+        XCTAssertEqual(df.url, "smb://user@host/share")
+        XCTAssertTrue(df.json)
+
+        let acl = try ACL.parse(["smb://user@host/share/file.txt", "--json"])
+        XCTAssertEqual(acl.url, "smb://user@host/share/file.txt")
+        XCTAssertTrue(acl.json)
+
+        let dfs = try Dfs.parse(["smb://user@host/dfsroot/link", "--json"])
+        XCTAssertEqual(dfs.url, "smb://user@host/dfsroot/link")
+        XCTAssertTrue(dfs.json)
+    }
+
+    func testCatGetPutMkdirMoveCopyRemoveParsePositionalsAndFlags() throws {
+        let cat = try Cat.parse(["smb://user@host/share/file.txt", "--range", "2-9", "--trace-wire"])
+        XCTAssertEqual(cat.url, "smb://user@host/share/file.txt")
+        XCTAssertEqual(cat.range, "2-9")
+        XCTAssertTrue(cat.debug.traceWire)
+
+        let get = try Get.parse(["smb://user@host/share/dir", "/tmp/out", "--recursive", "--no-overwrite", "--progress"])
+        XCTAssertEqual(get.source, "smb://user@host/share/dir")
+        XCTAssertEqual(get.destination, "/tmp/out")
+        XCTAssertTrue(get.recursive)
+        XCTAssertTrue(get.noOverwrite)
+        XCTAssertTrue(get.progress)
+
+        let put = try Put.parse(["/tmp/in", "smb://user@host/share/file.txt", "--recursive", "--no-overwrite", "--progress"])
+        XCTAssertEqual(put.source, "/tmp/in")
+        XCTAssertEqual(put.destination, "smb://user@host/share/file.txt")
+        XCTAssertTrue(put.recursive)
+        XCTAssertTrue(put.noOverwrite)
+        XCTAssertTrue(put.progress)
+
+        let mkdir = try MakeDirectory.parse(["smb://user@host/share/new"])
+        XCTAssertEqual(mkdir.url, "smb://user@host/share/new")
+
+        let move = try Move.parse(["smb://user@host/share/old", "smb://user@host/share/new", "--replace"])
+        XCTAssertEqual(move.source, "smb://user@host/share/old")
+        XCTAssertEqual(move.destination, "smb://user@host/share/new")
+        XCTAssertTrue(move.replace)
+
+        let copy = try Copy.parse(["smb://user@host/share/source", "smb://user@host/share/destination", "--replace", "--recursive"])
+        XCTAssertEqual(copy.source, "smb://user@host/share/source")
+        XCTAssertEqual(copy.destination, "smb://user@host/share/destination")
+        XCTAssertTrue(copy.replace)
+        XCTAssertTrue(copy.recursive)
+
+        let remove = try Remove.parse(["smb://user@host/share/dead", "--directory", "--recursive"])
+        XCTAssertEqual(remove.url, "smb://user@host/share/dead")
+        XCTAssertTrue(remove.directory)
+        XCTAssertTrue(remove.recursive)
+    }
 }

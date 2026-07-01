@@ -586,6 +586,13 @@ public actor SMBClientSession {
 public enum SMBClient {
     private static let localWriteChunkLimit = 64 * 1024
 
+    static func resolvedTransportFactory(
+        _ makeTransport: (@Sendable () -> SMBTransport)?,
+        timeout: Duration?
+    ) -> @Sendable () -> SMBTransport {
+        makeTransport ?? SMBTransportTestOverride.factory ?? { POSIXSocketTransport(timeout: timeout) }
+    }
+
     private static func withSession<T>(
         host: String,
         port: UInt16,
@@ -597,7 +604,7 @@ public enum SMBClient {
         operationName: String,
         operation: (SMBSession, UInt32) async throws -> T
     ) async throws -> T {
-        let makeTransport = makeTransport ?? { POSIXSocketTransport(timeout: timeout) }
+        let makeTransport = resolvedTransportFactory(makeTransport, timeout: timeout)
         var retryConnectionLoss = idempotent
         while true {
             let transport = makeTransport()
@@ -629,7 +636,7 @@ public enum SMBClient {
         port: UInt16,
         share: String,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() },
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
         idempotent: Bool,
         operationName: String,
         operation: (SMBSession, UInt32) async throws -> T
@@ -675,7 +682,7 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
-        let makeTransport = makeTransport ?? { POSIXSocketTransport(timeout: timeout) }
+        let makeTransport = resolvedTransportFactory(makeTransport, timeout: timeout)
         let credential = try await credentialProvider()
         let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
         do {
@@ -696,7 +703,7 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> [SMBShareInfo] {
-        let makeTransport = makeTransport ?? { POSIXSocketTransport(timeout: timeout) }
+        let makeTransport = resolvedTransportFactory(makeTransport, timeout: timeout)
         let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
         do {
             try await session.connect()
@@ -714,7 +721,7 @@ public enum SMBClient {
         host: String,
         port: UInt16 = 445,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws -> [SMBShareInfo] {
         try await listShares(
             host: host,
@@ -733,7 +740,7 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBDfsReferralResult {
-        let makeTransport = makeTransport ?? { POSIXSocketTransport(timeout: timeout) }
+        let makeTransport = resolvedTransportFactory(makeTransport, timeout: timeout)
         let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
         do {
             try await session.connect()
@@ -752,7 +759,7 @@ public enum SMBClient {
         port: UInt16 = 445,
         credentialProvider: SMBCredentialProvider,
         path: String,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws -> SMBDfsReferralResult {
         try await dfsReferral(
             host: host,
@@ -794,7 +801,7 @@ public enum SMBClient {
         share: String,
         path: String = "",
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws -> [SMBDirectoryEntry] {
         try await list(
             host: host,
@@ -835,7 +842,7 @@ public enum SMBClient {
         share: String,
         path: String = "",
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() },
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
     ) async throws {
         try await withDirectoryStream(
@@ -922,7 +929,7 @@ public enum SMBClient {
         port: UInt16 = 445,
         share: String,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws -> SMBVolumeInfo {
         try await volumeInfo(
             host: host,
@@ -939,7 +946,7 @@ public enum SMBClient {
         share: String,
         path: String,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws -> SMBFileStat {
         try await stat(
             host: host,
@@ -958,7 +965,7 @@ public enum SMBClient {
         path: String,
         credentialProvider: SMBCredentialProvider,
         timeout: Duration? = nil,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws -> SMBSecurityInfo {
         try await securityInfo(
             host: host,
@@ -1013,7 +1020,7 @@ public enum SMBClient {
         path: String,
         range: SMBReadRange? = nil,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws -> [UInt8] {
         try await read(
             host: host,
@@ -1093,7 +1100,7 @@ public enum SMBClient {
         path: String,
         range: SMBReadRange? = nil,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() },
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         try await withReadStream(
@@ -1166,7 +1173,7 @@ public enum SMBClient {
         localFile: URL,
         overwrite: Bool = true,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await download(
             host: host,
@@ -1273,7 +1280,7 @@ public enum SMBClient {
         localDirectory: URL,
         overwrite: Bool = true,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await downloadDirectory(
             host: host,
@@ -1378,7 +1385,7 @@ public enum SMBClient {
         share: String,
         path: String,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await makeDirectory(
             host: host,
@@ -1424,7 +1431,7 @@ public enum SMBClient {
         data: [UInt8],
         overwrite: Bool = true,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await upload(
             host: host,
@@ -1536,7 +1543,7 @@ public enum SMBClient {
         localDirectory: URL,
         overwrite: Bool = true,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await uploadDirectory(
             host: host,
@@ -1589,7 +1596,7 @@ public enum SMBClient {
         localFile: URL,
         overwrite: Bool = true,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await upload(
             host: host,
@@ -1628,7 +1635,7 @@ public enum SMBClient {
         toPath: String,
         overwrite: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await copy(
             host: host,
@@ -1668,7 +1675,7 @@ public enum SMBClient {
         toPath: String,
         overwrite: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await copyDirectory(
             host: host,
@@ -1714,7 +1721,7 @@ public enum SMBClient {
         update: SMBFileMetadataUpdate,
         directory: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await updateMetadata(
             host: host,
@@ -1760,7 +1767,7 @@ public enum SMBClient {
         toPath: String,
         replaceIfExists: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await rename(
             host: host,
@@ -1803,7 +1810,7 @@ public enum SMBClient {
         directory: Bool = false,
         recursive: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
         try await delete(
             host: host,

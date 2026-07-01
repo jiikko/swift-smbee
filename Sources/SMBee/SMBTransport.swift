@@ -1,5 +1,12 @@
 import Foundation
 
+public enum SMBTransportError: Error, Equatable {
+    case connectionClosed
+    case invalidAddress
+    case socketFailure(String)
+    case timedOut
+}
+
 public protocol SMBTransport: Sendable {
     func connect(host: String, port: UInt16) async throws
     func send(_ bytes: [UInt8]) async throws

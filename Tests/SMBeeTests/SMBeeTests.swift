@@ -3,6 +3,12 @@ import Foundation
 import XCTest
 @testable import SMBee
 
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
+
 #if canImport(Network)
 import Network
 #endif
@@ -11,6 +17,123 @@ private struct SMBTestTimeoutError: Error, CustomStringConvertible {
     let label: String
     let seconds: Double
     var description: String { "test await '\(label)' timed out after \(seconds)s (likely wire-transaction ordering deadlock)" }
+}
+
+private var streamSocketType: Int32 {
+    #if os(Linux)
+    Int32(SOCK_STREAM.rawValue)
+    #else
+    Int32(SOCK_STREAM)
+    #endif
+}
+
+private func saFamily(_ value: Int32) -> sa_family_t {
+    sa_family_t(value)
+}
+
+private func closeFD(_ fd: Int32) {
+    #if os(Linux)
+    _ = Glibc.close(fd)
+    #else
+    _ = Darwin.close(fd)
+    #endif
+}
+
+private final class POSIXLoopbackServer: @unchecked Sendable {
+    enum Mode {
+        case echoOnce
+        case acceptAndHold
+    }
+
+    let port: UInt16
+    private let listenFD: Int32
+    private let mode: Mode
+    private let lock = NSLock()
+    private var acceptedFD: Int32 = -1
+
+    init(mode: Mode) throws {
+        self.mode = mode
+        let listenDescriptor = socket(AF_INET, streamSocketType, Int32(IPPROTO_TCP))
+        guard listenDescriptor >= 0 else { throw SMBTransportError.socketFailure("socket failed") }
+
+        var reuse: Int32 = 1
+        _ = setsockopt(
+            listenDescriptor,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &reuse,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+
+        var address = sockaddr_in()
+        address.sin_family = saFamily(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                bind(listenDescriptor, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            closeFD(listenDescriptor)
+            throw SMBTransportError.socketFailure("bind failed")
+        }
+        guard listen(listenDescriptor, 1) == 0 else {
+            closeFD(listenDescriptor)
+            throw SMBTransportError.socketFailure("listen failed")
+        }
+
+        var boundAddress = sockaddr_in()
+        var boundAddressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                getsockname(listenDescriptor, sockaddrPointer, &boundAddressLength)
+            }
+        }
+        guard nameResult == 0 else {
+            closeFD(listenDescriptor)
+            throw SMBTransportError.socketFailure("getsockname failed")
+        }
+        listenFD = listenDescriptor
+        port = UInt16(bigEndian: boundAddress.sin_port)
+    }
+
+    func start() {
+        DispatchQueue.global().async { [self] in
+            let clientFD = accept(listenFD, nil, nil)
+            guard clientFD >= 0 else { return }
+            lock.lock()
+            acceptedFD = clientFD
+            lock.unlock()
+
+            switch mode {
+            case .echoOnce:
+                var buffer = [UInt8](repeating: 0, count: 64)
+                let bufferCount = buffer.count
+                let count = buffer.withUnsafeMutableBytes { recv(clientFD, $0.baseAddress, bufferCount, 0) }
+                if count > 0 {
+                    _ = buffer.withUnsafeBytes { send(clientFD, $0.baseAddress, count, 0) }
+                }
+                closeAccepted()
+            case .acceptAndHold:
+                break
+            }
+        }
+    }
+
+    func close() {
+        closeFD(listenFD)
+        closeAccepted()
+    }
+
+    private func closeAccepted() {
+        lock.lock()
+        let descriptor = acceptedFD
+        acceptedFD = -1
+        lock.unlock()
+        if descriptor >= 0 { closeFD(descriptor) }
+    }
 }
 
 private final class BlockingReceiveTransport: SMBTransport, @unchecked Sendable {
@@ -392,6 +515,73 @@ private final class TestContinuationResumer<Success: Sendable>: @unchecked Senda
 final class SMBeeTests: XCTestCase {
     func testVersionIsNotEmpty() {
         XCTAssertFalse(SMBee.version.isEmpty)
+    }
+
+    func testPOSIXSocketTransportLoopbackRoundTrip() async throws {
+        let server = try POSIXLoopbackServer(mode: .echoOnce)
+        server.start()
+        defer { server.close() }
+
+        let transport = POSIXSocketTransport(timeout: .seconds(1))
+        defer { transport.close() }
+
+        try await awaitWithTimeout("connect POSIXSocketTransport") {
+            try await transport.connect(host: "127.0.0.1", port: server.port)
+        }
+        try await awaitWithTimeout("send POSIXSocketTransport payload") {
+            try await transport.send([0xde, 0xad, 0xbe, 0xef])
+        }
+        let received = try await awaitWithTimeout("receive POSIXSocketTransport payload") {
+            try await transport.receive(maxLength: 4)
+        }
+
+        XCTAssertEqual(received, [0xde, 0xad, 0xbe, 0xef])
+    }
+
+    func testPOSIXSocketTransportReceiveCancellationClosesSocket() async throws {
+        let server = try POSIXLoopbackServer(mode: .acceptAndHold)
+        server.start()
+        defer { server.close() }
+
+        let transport = POSIXSocketTransport()
+        defer { transport.close() }
+        try await awaitWithTimeout("connect POSIXSocketTransport to silent server") {
+            try await transport.connect(host: "127.0.0.1", port: server.port)
+        }
+
+        let receiveTask = Task {
+            try await transport.receive(maxLength: 1)
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        receiveTask.cancel()
+
+        do {
+            _ = try await awaitWithTimeout(seconds: 2, "cancel POSIXSocketTransport receive") {
+                try await receiveTask.value
+            }
+            XCTFail("receive unexpectedly succeeded after cancellation")
+        } catch is CancellationError {
+        }
+    }
+
+    func testPOSIXSocketTransportReceiveTimeout() async throws {
+        let server = try POSIXLoopbackServer(mode: .acceptAndHold)
+        server.start()
+        defer { server.close() }
+
+        let transport = POSIXSocketTransport(timeout: .milliseconds(100))
+        defer { transport.close() }
+        try await awaitWithTimeout("connect POSIXSocketTransport to timeout server") {
+            try await transport.connect(host: "127.0.0.1", port: server.port)
+        }
+
+        do {
+            _ = try await awaitWithTimeout(seconds: 2, "timeout POSIXSocketTransport receive") {
+                try await transport.receive(maxLength: 1)
+            }
+            XCTFail("receive unexpectedly succeeded without server response")
+        } catch SMBTransportError.timedOut {
+        }
     }
 
     func testReadURLParserKeepsUserInfoPassword() throws {

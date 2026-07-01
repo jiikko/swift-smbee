@@ -1050,7 +1050,7 @@ extension Error {
     var isSMBConnectionLoss: Bool {
         guard let transportError = self as? SMBTransportError else { return false }
         switch transportError {
-        case .connectionClosed, .socketFailure:
+        case .connectionClosed, .socketFailure, .timedOut:
             return true
         case .invalidAddress:
             return false

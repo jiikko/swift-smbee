@@ -7,10 +7,14 @@ public enum SMBCrypto {
     static let smb302EncryptionLabel = Array("SMB2AESCCM".utf8) + [0]
     static let smb302EncryptionContext = Array("ServerIn ".utf8) + [0]
     static let smb302DecryptionContext = Array("ServerOut".utf8) + [0]
-    static let smb311SigningLabel = Array("SMBSigningKey".utf8)
-    static let smb311EncryptionLabel = Array("SMBC2SCipherKey".utf8)
-    static let smb311DecryptionLabel = Array("SMBS2CCipherKey".utf8)
-    static let smb311ApplicationLabel = Array("SMBAppKey".utf8)
+    // MS-SMB2 §3.1.4.2: these SP800-108 labels are the ASCII string WITH its terminating
+    // null, just like the 3.0.x labels above ("SMB2AESCMAC\0" etc). The KDF then adds the
+    // separator 0x00, so the fixed input is `<label>\0` + `\0` + context. Omitting the
+    // label's own null derives a key the server disagrees with → STATUS_ACCESS_DENIED.
+    static let smb311SigningLabel = Array("SMBSigningKey".utf8) + [0]
+    static let smb311EncryptionLabel = Array("SMBC2SCipherKey".utf8) + [0]
+    static let smb311DecryptionLabel = Array("SMBS2CCipherKey".utf8) + [0]
+    static let smb311ApplicationLabel = Array("SMBAppKey".utf8) + [0]
 
     public static func sha512(_ bytes: [UInt8]) -> [UInt8] {
         Array(SHA512.hash(data: bytes))

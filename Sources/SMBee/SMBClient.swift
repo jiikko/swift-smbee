@@ -1151,8 +1151,11 @@ actor SMBSession {
         )
         debugLine("SESSION_SETUP#2 request length=\(authPacket.count)")
         preauthMessages.append(authPacket)
+        // MS-SMB2 §3.2.5.3.1: preauth integrity hash for key derivation covers messages
+        // up to the final SESSION_SETUP *request*. The terminal STATUS_SUCCESS response is
+        // NOT folded into the hash — including it derives a signing/encryption key that
+        // differs from the server's, so every signed/encrypted 3.1.1 op fails verification.
         let authResponse = try await unsignedWireTransaction(packet: authPacket, responseLabel: "SESSION_SETUP#2 response")
-        preauthMessages.append(authResponse)
         let authHeader = try SMB2Header.decode(authResponse)
         try SMBErrorMapper.throwIfFailure(status: authHeader.status, operation: "SESSION_SETUP")
         sessionId = authHeader.sessionId

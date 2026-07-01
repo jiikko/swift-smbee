@@ -810,19 +810,22 @@ final class SMBeeTests: XCTestCase {
         let preauthHash = SMBCrypto.smb311PreauthIntegrityHash(messages)
         let sessionKey = Array(UInt8(0)...UInt8(15))
 
-        XCTAssertEqual(hex(SMBCrypto.smb311SigningLabel), "534d425369676e696e674b6579")
-        XCTAssertEqual(hex(SMBCrypto.smb311EncryptionLabel), "534d424332534369706865724b6579")
-        XCTAssertEqual(hex(SMBCrypto.smb311DecryptionLabel), "534d425332434369706865724b6579")
-        XCTAssertEqual(hex(SMBCrypto.smb311ApplicationLabel), "534d424170704b6579")
+        // Labels are the ASCII string WITH terminating null (MS-SMB2 §3.1.4.2). The derived
+        // keys below are validated against real Samba 3.1.1 signing-required (E2E green), not
+        // only self-consistent — a missing label null previously derived keys the server rejected.
+        XCTAssertEqual(hex(SMBCrypto.smb311SigningLabel), "534d425369676e696e674b657900")
+        XCTAssertEqual(hex(SMBCrypto.smb311EncryptionLabel), "534d424332534369706865724b657900")
+        XCTAssertEqual(hex(SMBCrypto.smb311DecryptionLabel), "534d425332434369706865724b657900")
+        XCTAssertEqual(hex(SMBCrypto.smb311ApplicationLabel), "534d424170704b657900")
         XCTAssertEqual(
             hex(preauthHash),
             "304e5266d152ea390203ff2ebd32632669f607debb5af2f85ece3932fd6d7091" +
                 "42f9e1c44900c1a8e2bf509791c11af65a77fd48f61ddf8a7000ae694ebfb7d2"
         )
-        XCTAssertEqual(hex(SMBCrypto.smb311SigningKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "dae2715960a353373c17f4081ce84a3e")
-        XCTAssertEqual(hex(SMBCrypto.smb311EncryptionKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "651c2ddb43d0d8efa327d5fe8a755c29")
-        XCTAssertEqual(hex(SMBCrypto.smb311DecryptionKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "e851efe5671dfd7dd362cec27539128b")
-        XCTAssertEqual(hex(SMBCrypto.smb311ApplicationKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "4eabeb1151ac8d2d4fb3445781419c41")
+        XCTAssertEqual(hex(SMBCrypto.smb311SigningKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "715673a12970311509579f717524e5d3")
+        XCTAssertEqual(hex(SMBCrypto.smb311EncryptionKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "5dd0bf079b35fa86f2a6dc924d9b3b36")
+        XCTAssertEqual(hex(SMBCrypto.smb311DecryptionKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "76e3458ed426672f6d93d64ba32d15f1")
+        XCTAssertEqual(hex(SMBCrypto.smb311ApplicationKey(sessionKey: sessionKey, preauthIntegrityHash: preauthHash)), "9606b4561edc89a465a1d0d4093710b8")
     }
 
     func testSMB302EncryptionKeyDerivationLabels() {

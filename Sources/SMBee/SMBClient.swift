@@ -468,7 +468,7 @@ public actor SMBClientSession {
 
     public func stat(path: String) async throws -> SMBFileStat {
         try ensureOpen()
-        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+        let fileId = try await session.createForMetadata(treeId: treeId, path: path)
         do {
             let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
             try? await session.close(treeId: treeId, fileId: fileId)
@@ -1062,7 +1062,7 @@ public enum SMBClient {
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBFileStat {
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "STAT") { session, treeId in
-            let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+            let fileId = try await session.createForMetadata(treeId: treeId, path: path)
             do {
                 let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
                 try? await session.close(treeId: treeId, fileId: fileId)
@@ -2635,6 +2635,21 @@ actor SMBSession {
         let fileId = try SMB2Create.decodeFileId(response)
         debugLine("CREATE response FileId: \(SMBDebug.hex(fileId))")
         return fileId
+    }
+
+    /// stat / metadata 取得用に handle を開く。まず file を想定して
+    /// `directory: false` で CREATE し、対象が directory で
+    /// `STATUS_FILE_IS_A_DIRECTORY` を返したら `directory: true` で 1 回だけ
+    /// retry する (`deleteNonRecursive` の自動判定と同型)。これにより file /
+    /// directory どちらの path でも stat が通る (実 Samba / macOS SMB server は
+    /// directory を directory:false の CREATE で拒否する)。常に directory:true で
+    /// 開かないのは、そうすると file の open が壊れるサーバがあり得るため。
+    func createForMetadata(treeId: UInt32, path: String) async throws -> [UInt8] {
+        do {
+            return try await create(treeId: treeId, path: path, directory: false)
+        } catch SMBError.fileIsADirectory {
+            return try await create(treeId: treeId, path: path, directory: true)
+        }
     }
 
     func deleteNonRecursive(treeId: UInt32, path: String, directory: Bool) async throws {

@@ -2420,6 +2420,37 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(requests[2][72..<88]), fileId)
     }
 
+    func testCreateForMetadataRetriesAsDirectoryWhenFileIsADirectory() async throws {
+        // stat 用の handle open。file 想定 (directory:false) の CREATE が
+        // STATUS_FILE_IS_A_DIRECTORY を返したら directory:true で 1 回 retry して
+        // handle を返す (S0c。deleteNonRecursive の自動判定と同型)。
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2StatusResponse(status: SMB2Status.fileIsADirectory, command: SMB2Commands.create, messageId: 0, treeId: 0x3344),
+            smb2CreateResponse(fileId: fileId, messageId: 1, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let returned = try await session.createForMetadata(treeId: 0x3344, path: "folder")
+
+        XCTAssertEqual(returned, fileId)
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(try SMB2Header.decode(requests[0]).command, SMB2Commands.create)
+        XCTAssertEqual(try SMB2Header.decode(requests[1]).command, SMB2Commands.create)
+        // 1 回目は non-directory bit (FILE_NON_DIRECTORY_FILE 0x40)、2 回目は
+        // directory bit (FILE_DIRECTORY_FILE 0x1) を CreateOptions (offset 104) に持つ。
+        XCTAssertEqual(readUInt32LE(requests[0], at: 104) & 0x40, 0x40)
+        XCTAssertEqual(readUInt32LE(requests[1], at: 104) & 0x1, 0x1)
+    }
+
     func testCreateResponseDecodesFileIdAtResponseStructureOffset64() throws {
         var response = try SMB2Header(
             command: SMB2Commands.create,
@@ -5277,13 +5308,16 @@ final class SMBeeTests: XCTestCase {
         changeTime: UInt64 = 0,
         attributes: UInt32 = 0
     ) throws -> [UInt8] {
+        // FILE_NETWORK_OPEN_INFORMATION (MS-FSCC 2.4.65) の正しい layout で組む:
+        // CreationTime 0 / LastAccessTime 8 / LastWriteTime 16 / ChangeTime 24 /
+        // AllocationSize 32 / EndOfFile 40 / FileAttributes 48 / Reserved 52.
         var payload = Array(repeating: UInt8(0), count: 56)
         writeUInt64LE(creationTime, to: &payload, at: 0)
-        writeUInt64LE(lastAccessTime, to: &payload, at: 16)
-        writeUInt64LE(lastWriteTime, to: &payload, at: 24)
-        writeUInt64LE(changeTime, to: &payload, at: 32)
+        writeUInt64LE(lastAccessTime, to: &payload, at: 8)
+        writeUInt64LE(lastWriteTime, to: &payload, at: 16)
+        writeUInt64LE(changeTime, to: &payload, at: 24)
         writeUInt64LE(size, to: &payload, at: 40)
-        writeUInt32LE(attributes, to: &payload, at: 52)
+        writeUInt32LE(attributes, to: &payload, at: 48)
         var response = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
         writeUInt16LE(9, to: &response, at: 64)

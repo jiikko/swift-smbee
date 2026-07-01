@@ -374,12 +374,19 @@ enum SMB2QueryInfo {
     static func decodeNetworkOpenInformation(_ bytes: [UInt8]) throws -> SMBFileStat {
         let data = try decodeOutputBuffer(bytes)
         guard data.count >= 56 else { throw SMBCodecError.truncated }
+        // FILE_NETWORK_OPEN_INFORMATION (MS-FSCC 2.4.65):
+        //   CreationTime 0 / LastAccessTime 8 / LastWriteTime 16 / ChangeTime 24 /
+        //   AllocationSize 32 / EndOfFile 40 / FileAttributes 48 / Reserved 52.
+        // 旧実装は LastAccess/LastWrite/ChangeTime を 8 byte ずらして読み、FileAttributes を
+        // Reserved (offset 52) から読んでいたため isDirectory が常に false だった
+        // (size = EndOfFile 40 だけ偶然正しい)。directory stat の isDirectory が効かない
+        // 原因だったので正しい offset に修正する。
         let creationTime = readUInt64LE(data, at: 0)
-        let lastAccessTime = readUInt64LE(data, at: 16)
-        let lastWriteTime = readUInt64LE(data, at: 24)
-        let changeTime = readUInt64LE(data, at: 32)
+        let lastAccessTime = readUInt64LE(data, at: 8)
+        let lastWriteTime = readUInt64LE(data, at: 16)
+        let changeTime = readUInt64LE(data, at: 24)
         let endOfFile = readUInt64LE(data, at: 40)
-        let attributes = readUInt32LE(data, at: 52)
+        let attributes = readUInt32LE(data, at: 48)
         return SMBFileStat(
             size: endOfFile,
             modifiedTime: filetimeToDate(lastWriteTime),

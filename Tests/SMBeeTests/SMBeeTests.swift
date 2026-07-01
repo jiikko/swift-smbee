@@ -3,6 +3,12 @@ import Foundation
 import XCTest
 @testable import SMBee
 
+private struct SMBTestTimeoutError: Error, CustomStringConvertible {
+    let label: String
+    let seconds: Double
+    var description: String { "test await '\(label)' timed out after \(seconds)s (likely wire-transaction ordering deadlock)" }
+}
+
 private final class BlockingReceiveTransport: SMBTransport, @unchecked Sendable {
     private let receiveState = ReceiveState()
 
@@ -1927,23 +1933,28 @@ final class SMBeeTests: XCTestCase {
         let first = Task {
             try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
         }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        var requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(readUInt64LE(requests[0], at: 72), 0)
+
         let second = Task {
             try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 3, length: 2)
         }
 
-        try await waitForOutboundFrameCount(1, transport: transport)
         XCTAssertEqual(try unframed(transport.outbound).count, 1)
         transport.enqueueInbound(try framed([smb2ReadResponse(Array("hel".utf8), messageId: 0, treeId: 0x3344)]))
-        let firstData = try await first.value
+        let firstData = try await awaitWithTimeout("first.readChunk") { try await first.value }
         XCTAssertEqual(firstData, Array("hel".utf8))
 
         try await waitForOutboundFrameCount(2, transport: transport)
-        let requests = try unframed(transport.outbound)
+        requests = try unframed(transport.outbound)
         XCTAssertEqual(requests.count, 2)
         XCTAssertEqual(readUInt64LE(requests[0], at: 72), 0)
         XCTAssertEqual(readUInt64LE(requests[1], at: 72), 3)
         transport.enqueueInbound(try framed([smb2ReadResponse(Array("lo".utf8), messageId: 1, treeId: 0x3344)]))
-        let secondData = try await second.value
+        let secondData = try await awaitWithTimeout("second.readChunk") { try await second.value }
         XCTAssertEqual(secondData, Array("lo".utf8))
     }
 
@@ -2997,6 +3008,29 @@ final class SMBeeTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("timed out waiting for \(expectedCount) outbound SMB frames")
+    }
+
+    // 無制限に await するテスト内 Task (例: session.readChunk の Task.value) を、
+    // 明示タイムアウトで包む安全網。順序前提の破れ等で continuation が resume されない
+    // と CI job 全体が 10 分 hang する (issue 007) ので、テスト側で bound して即 fail させる。
+    // hang は continuation 待ち (協調プールは空き) なので sleep タスクは確実に発火する。
+    private func awaitWithTimeout<T: Sendable>(
+        seconds: Double = 5,
+        _ label: String,
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw SMBTestTimeoutError(label: label, seconds: seconds)
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw SMBTestTimeoutError(label: label, seconds: seconds)
+            }
+            return result
+        }
     }
 
     private func smb2CreateResponse(fileId: [UInt8], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {

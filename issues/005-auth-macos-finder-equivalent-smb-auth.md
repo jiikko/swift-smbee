@@ -1,18 +1,24 @@
 # 005 auth: macOS Finder相当のSMB認証をobaket/SMBeeで実現できるか調査する
 
-状態: **open**（調査課題。下記の一部前提は 2026-07-01 に実装で前進）
+状態: **open**（SMBee core の NTLM/credential 土台は完了。残りは Finder 相当認証の実測と macOS 依存方針）
 起票: 2026-06-30
 関連: `Sources/SMBee/NTLM.swift` / `Sources/SMBee/SMBClient.swift` / `Sources/smbcli/SMBCLI.swift` / `issues/001-bug-macos-ntlm-logon-failure.md`
 
 ## 進捗 (2026-07-01)
 
-SMBee 側で本 issue に関連する auth 基盤を実装した（commit c8172c3、[todo.md](../todo.md) の authentication options 参照）。
+SMBee 側で本 issue に関連する auth 基盤を実装した（commit c8172c3 / 17b897d、
+[todo.md](../todo.md) の authentication options 参照）。
 
-- **guest / anonymous NTLM** を実装（`SMBCredential.anonymous`、CLL `--anonymous`/`--guest`、
+- **guest / anonymous NTLM** を実装（`SMBCredential.anonymous`、CLI `--anonymous`/`--guest`、
   NTLM anonymous Type3、signing 不可時の unsigned フォールバック）。実 Samba guest で ls/cat/stat 成功。
   → 「現状の仮説」の **3. guest / local account fallback** はクライアント側で検証可能になった。
-- **password provider callback**（`SMBCredentialProvider` = lazy closure）を `connect` に追加。
+- **password provider callback**（`SMBCredentialProvider` = lazy async closure）を persistent `connect` と
+  one-shot API 全体（`listShares` / `list` / `stat` / `read` / stream / download / upload /
+  copy / metadata / rename / delete）に追加。
   → Keychain 等から遅延取得した credential を SMBee に渡す配線点ができた（Keychain lookup 自体は下記のとおり consumer 責務）。
+- **SMB 3.1.1 の auth 後 crypto** は GMAC signing-only / GCM encrypted session とも Samba E2E green。
+  つまり NTLM で session key material が得られる経路については、3.0.2/3.1.1 とも
+  `TREE_CONNECT` 以降の signing/encryption が実サーバで確認済み。
 
 本 issue の残りは **SMBee ライブラリ core の外**にある macOS システム依存部分に絞られる:
 
@@ -22,14 +28,20 @@ SMBee 側で本 issue に関連する auth 基盤を実装した（commit c8172c
 - **Kerberos / GSS / SPNEGO(Kerberos mech)**: MVP scope 外。SMBee の NTLM 経路は壊さない（「やらないこと」参照）。
 - **macOS mount delegation / NetFS SSO**: obaket 側の統合方針の問題。
 
-→ 従って本 issue は「SMBee で実装する課題」ではなく「**obaket がどの方式を採用するかの意思決定 + macOS 依存部分**」の
-調査として残る。SMBee が提供する土台（password / ntHash / provider / anonymous）は出揃った。
+→ 従って本 issue は、現時点では「SMBee の NTLM auth 実装課題」ではなく
+「**obaket がどの方式を採用するかの意思決定 + macOS 依存部分**」の調査として残る。
+SMBee が提供する土台（password / ntHash / provider / anonymous / SMB3 signing+encryption）は出揃った。
 
 ## 背景
 
 obaket から、別の macOS の「ファイル共有」で公開されている SMB share に接続したい。
 
-現在の SMBee は、`SMBCredential(username/password/ntHash/domain)` を受け取り、NTLMv2 token を自前で生成し、SPNEGO wrapper に包んで `SESSION_SETUP` へ送っている。これは password / NT hash 前提の認証経路であり、Finder が macOS-to-macOS SMB 接続時に使っている可能性のある「ログイン済み資格情報」「Keychain」「Kerberos / GSS / SPNEGO」「macOS SMB stack 内部のSSO」とは別物である。
+現在の SMBee は、`SMBCredential(username/password/ntHash/domain)` または
+`SMBCredentialProvider` から得た credential を使い、NTLMv2 token を自前で生成し、SPNEGO wrapper に包んで
+`SESSION_SETUP` へ送っている。anonymous/guest も NTLM anonymous Type3 として扱う。
+これは password / NT hash / provider 前提の認証経路であり、Finder が macOS-to-macOS SMB 接続時に
+使っている可能性のある「ログイン済み資格情報」「Keychain」「Kerberos / GSS / SPNEGO」
+「macOS SMB stack 内部のSSO」とは別物である。
 
 この issue では、いきなり Kerberos 実装に入らない。まず、Finder が macOS クライアントから macOS ファイル共有サーバへ接続するとき、本当に Kerberos 相当の認証を使っているのかを実測で確認する。そのうえで、obaket / SMBee でどこまで再現するかを判断する。
 
@@ -59,8 +71,11 @@ Finder 相当認証の正体は複数あり得る。
 
 ### SMBee としての成功
 
-- SMB2/3 `SESSION_SETUP` の security blob に Kerberos / GSS / SPNEGO token を載せられる。
-- 認証後、`TREE_CONNECT` 以降の SMB signing / encryption に必要な session key material を取得できる。
+- NTLM 経路は完了済み: password / NT hash / provider / anonymous を扱え、認証後の
+  SMB signing / encryption に必要な session key material を使って 3.0.2/3.1.1 の実 Samba E2E が通る。
+- Finder 相当認証を SMBee core で扱う場合は、SMB2/3 `SESSION_SETUP` の security blob に
+  Kerberos / GSS / SPNEGO token を載せられる。
+- GSS 認証後、`TREE_CONNECT` 以降の SMB signing / encryption に必要な session key material を取得できる。
 - NTLM 経路を壊さず、auth backend として NTLM / GSS を切り替えられる。
 
 ### 撤退条件
@@ -78,15 +93,19 @@ Finder 相当認証の正体は複数あり得る。
 
 確認すること:
 
-- `SMBCredential` が password / NT hash / domain だけを表現していること。
-- `SMBSession.connect()` が `NTLM.makeType1` → `SESSION_SETUP#1` → `NTLM.makeType3` → `SESSION_SETUP#2` を直書きしていること。
-- `SPNEGO` が NTLM OID だけを広告していること。
-- `smbcli` が `--domain` / `--nt-hash` / `--password-stdin` / `SMB_PASSWORD` / `SMB_NT_HASH` 前提であること。
+- `SMBCredential` は password / NT hash / domain / anonymous を表現する。
+- `SMBCredentialProvider` は lazy async closure として persistent `connect` と one-shot API 全体で利用できる。
+- `SMBSession.connect()` は現在も `NTLM.makeType1` → `SESSION_SETUP#1` → `NTLM.makeType3` →
+  `SESSION_SETUP#2` の NTLM 経路を直書きしている。
+- `SPNEGO` は NTLM OID だけを広告している。Kerberos mech は未実装。
+- `smbcli` は `--domain` / `--nt-hash` / `--password-stdin` / `--anonymous` / `--guest` /
+  `SMB_PASSWORD` / `SMB_NT_HASH` 前提である。
 
 成果物:
 
-- 現行 NTLM 認証経路の短いメモ。
-- `SMBAuthenticator` のような抽象化が必要な差し替え点リスト。
+- [x] 現行 NTLM 認証経路の短いメモ（本節 + `todo.md` authentication options）。
+- [x] provider 入口は実装済み。Keychain など consumer 依存 credential source は provider に閉じ込める。
+- [ ] `SMBAuthenticator` のような抽象化が必要な差し替え点リスト（GSS を実装する場合のみ必要）。
 
 ## Phase 1 — Finder が本当にKerberos相当か実測する
 
@@ -231,11 +250,32 @@ enum SMBAuthStep: Sendable {
 
 目的: NTLMとGSS/Kerberosを共存させる。
 
+### 現在の実装済みAPI
+
+NTLM 系は `SMBCredential` と `SMBCredentialProvider` で扱う。
+
+```swift
+public struct SMBCredential: Sendable {
+    public init(username: String, password: String, domain: String = "")
+    public init(username: String, ntHash: [UInt8], domain: String = "") throws
+    public static var anonymous: SMBCredential { get }
+}
+
+public typealias SMBCredentialProvider = @Sendable () async throws -> SMBCredential
+```
+
+既存の `credential: SMBCredential` API は維持しつつ、one-shot API 全体に
+`credentialProvider: SMBCredentialProvider` overload を追加済み。これにより Keychain lookup、
+UI prompt、consumer 側 secret store は SMBee core に持ち込まずに接続直前へ遅延できる。
+
 ### API案
+
+GSS/Kerberos を SMBee core に入れる場合は、credential provider とは別の auth backend が必要。
 
 ```swift
 public enum SMBAuthentication: Sendable {
     case ntlm(SMBCredential)
+    case ntlmProvider(SMBCredentialProvider)
     case macOSDefaultGSS(servicePrincipal: String? = nil)
 }
 ```
@@ -266,6 +306,10 @@ public static func list(
 ) async throws -> [SMBDirectoryEntry]
 ```
 
+ただし、Finder 実測の結果が Keychain + NTLM で足りる場合は、
+`SMBAuthentication` を追加せず `SMBCredentialProvider` のまま進める方が単純。
+`SMBAuthentication` は **GSS/Kerberos を実装すると決めた時点**で導入する。
+
 ### CLI案
 
 ```sh
@@ -275,6 +319,8 @@ smbcli ls --auth macos-default smb://host/share/path
 ```
 
 `--auth macos-default` では username/password を要求しない。
+Keychain + NTLM 案では `--auth macos-default` ではなく、consumer/smbcli 側で Keychain から
+password を取得して `SMBCredentialProvider` に渡す実装になる。
 
 ## Phase 5 — obaket統合方針
 
@@ -308,8 +354,12 @@ smbcli ls --auth macos-default smb://host/share/path
 Finder実測の結果が Keychain + NTLM だった場合の現実解。
 
 - obaket が Keychain から SMB password を読む/保存する。
-- SMBee は既存 NTLM 経路を使う。
+- SMBee は既存 NTLM 経路を使う。実装上は `SMBCredentialProvider` で Keychain lookup を遅延実行し、
+  `SMBCredential(username:password:domain:)` または `SMBCredential(username:ntHash:domain:)` を返す。
 - ユーザーには「Finder相当」ではなく「Keychain保存済み資格情報で接続」と説明する。
+
+現状ではこの Option C が最小追加実装で済む。SMBee core 側は対応済みで、残る作業は
+obaket/smbcli の macOS-only Keychain adapter と UX。
 
 ## テスト計画
 
@@ -360,8 +410,9 @@ Finder実測の結果が Keychain + NTLM だった場合の現実解。
 
 ### Phase 4 完了条件
 
-- [ ] `SMBAuthenticator` / `SMBAuthentication` のAPI案を固める。
-- [ ] 既存 `SMBCredential` APIを壊さない移行案を用意する。
+- [x] 既存 `SMBCredential` APIを壊さず、`SMBCredentialProvider` overload を全 one-shot API に追加済み。
+- [x] Keychain + NTLM 方針の場合の API は確定: consumer が provider 内で Keychain lookup する。
+- [ ] GSS/Kerberos を SMBee core に入れる場合の `SMBAuthenticator` / `SMBAuthentication` API案を固める。
 - [ ] `smbcli --auth macos-default` 相当のCLI UXを決める。
 
 ### Phase 5 完了条件

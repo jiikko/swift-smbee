@@ -233,6 +233,13 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: `SMBSession.copyDirectory` / `deleteRecursively` は `queryDirectory(... onEntry:)`
     の callback traversal に変更し、directory entry 配列集約を避けるよう修正。残:
     one-shot `downloadDirectory` の session 境界を含む streaming traversal 化と安全策。
+- [ ] recursive operation safety / transfer atomicity
+  - copy/delete/download/upload の recursive 系は実装済みだが、汎用 smbclient としては failure 中断時の
+    partial tree の扱い、同名衝突時の rollback/skip/overwrite policy、最大 depth、source が destination
+    配下にある場合の自己再帰防止を API/CLI option として明示する。
+  - local download は temp file → move/replace で単一 file の atomicity を確保済み。directory download /
+    upload / remote copy は directory 単位の atomicity は無いので、resume / verify / cleanup policy を
+    別タスクとして設計する。
 - [x] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 2026-06-30: `SMBee.withDirectoryStream` / `SMBClient.withDirectoryStream` を追加。`SMBSession`
     は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で
@@ -296,10 +303,25 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `isReparsePoint` helper を追加。recursive copy/delete/download は reparse point を directory として
     辿らない安全側 policy にした。残: reparse tag 本体の取得 (`FileAttributeTagInformation` など) と
     DFS referral の扱い。
+- [ ] filesystem / volume information
+  - `smbcli df` / API として share の total/free/available capacity、filesystem name、volume label、
+    filesystem attributes / max component length を取得する。`QUERY_INFO(FileFsSizeInformation /
+    FileFsAttributeInformation / FileFsVolumeInformation)` 相当。
+  - upload / copy 前の空き容量チェックや GUI の容量表示で必要。server 実装差が出やすいため Samba /
+    macOS SMBX / Windows で fixture または smoke を取る。
+- [ ] change notification / directory watch
+  - ファイルブラウザ基盤として、ディレクトリ変更検知 (`CHANGE_NOTIFY`) の API を検討する。
+    long-poll/async response、cancellation、再接続時の再購読、overflow 時の full rescan 方針が必要。
+  - CLI では `smbcli watch smb://...` 相当。MVP の copy/read/write には不要なので後回し。
 - [ ] ACL / owner / SID metadata
   - `QUERY_SECURITY` / `SET_SECURITY`。MVP では扱わないが、管理系 smbclient としては必要。
 - [ ] locking / durable handle / lease / oplock の扱い
   - concurrent clients や大ファイル操作の堅牢性向け。最初は明示的に unsupported としてエラーを設計する。
+- [ ] multi-share / multi-tree session reuse
+  - 現在の persistent `SMBClientSession` は 1 share = 1 TREE_CONNECT 前提。汎用 smbclient では同一
+    authenticated session 上で複数 share / IPC$ / DFS target を扱いたい場面がある。
+  - API は `SMBServerSession` (session-level) と `SMBTreeSession` (tree-level) に分けるか、
+    既存 `SMBClientSession` を維持して one-shot API だけで複数 share を扱うかを設計する。
 - [x] dialect / encryption policy の整理
   - 2026-06-30 実装レビュー追加: NEGOTIATE は 2.0.2 / 2.1 も提示するが authenticated path は
     3.0+ だけを受ける。probe 専用 dialect と authenticated dialect policy を分けるか、
@@ -318,6 +340,13 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     で抑えているが、CreditCharge / CreditRequest / CreditResponse を管理していない。大きな IO や
     multi-credit server での挙動を MS-SMB2 と実 packet で確認し、必要なら messageId/credit allocator を
     `SMBWireTransactionGate` の後継として設計する。
+- [ ] resume / sparse file / integrity verification
+  - `get` / `put` / `cp` は streaming だが中断後 resume は未実装。remote/local size と mtime/hash
+    照合、range read/write による resume、既存 partial file の扱いを設計する。
+  - sparse file / allocation size / zero range の扱いも未実装。巨大 VM image や backup 用途では
+    通信量と local disk 使用量に影響するため、`FSCTL_SET_ZERO_DATA` 等を調査する。
+  - 暗号化 transport の integrity とは別に、consumer visible な transfer verification (size / optional hash)
+    を API/CLI option として検討する。
 - [x] session lifecycle: TREE_DISCONNECT / LOGOFF
   - 2026-06-30 実装レビュー追加: close は TCP close のみで、TREE_DISCONNECT / LOGOFF を送らない。
     persistent session API の `close()` で graceful teardown するか、best-effort に留めるかを決める。
@@ -346,8 +375,22 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     JSON は sortedKeys / hex 文字列 / ISO8601、human 出力は不変。SMBError → distinct exit code
     (0/1/2/3/4/5) を exhaustive switch でマッピングし docs/smbcli-exit-codes.md に記載。unit +
     実 Samba live check 済み。**残: interactive password prompt (TTY 依存) のみ**。
+- [ ] CLI batch / wildcard ergonomics
+  - `smbclient` 互換の対話 shell までは MVP 外だが、運用用途では wildcard (`*.log`) / glob、
+    `mget`/`mput` 的な複数 path、`--include`/`--exclude`、dry-run、確認 prompt が欲しくなる。
+  - shell 側 glob と SMB 側 pattern matching の責務を分け、URL percent decode / path validation と
+    矛盾しない CLI surface を設計する。
 - [ ] compatibility matrix: macOS SMBX / Samba / Windows Server / NAS (Synology/QNAP 等)
   - dialect/signing/encryption/quirk を記録し、手動 smoke 手順を docs 化する。
+  - 2026-07-01 現状: Samba は 3.0.2 encrypted-required / 3.1.1 signing-required /
+    3.1.1 encrypted-required / guest profile を自動・ローカル E2E で確認済み。macOS SMBX は 3.0.2 smoke
+    済み。**Windows Server / NAS は未実測**なので、smbclient として名乗る前に read/write/share discovery/
+    metadata/copy fallback の Tier 3 smoke を追加する。
+- [ ] packaging / API stability
+  - SwiftPM library と CLI は動くが、SemVer、public API の source compatibility、deprecated credential
+    surface (`SMBCredential.password` 露出)、DocC/API examples、binary/release artifact の方針は未整理。
+  - consumer (obaket / GUI) が依存し始める前に public 型の命名、Sendable、error taxonomy、cancellation
+    semantics を凍結する。
 - [ ] NetBIOS name / port 139 / hostname discovery は原則 scope 外だが、必要になったら separate transport として検討
   - 現状は direct TCP 445 のみ。
 

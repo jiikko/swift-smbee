@@ -189,7 +189,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 実装済みの `probe/ls/stat/cat/mkdir/put/mv/rm` は最小 SMB client としては動くが、汎用 smbclient /
 ファイルブラウザ基盤としては下記が未実装。obaket 連携や GUI consumer の要件が出た順に着手する。
 
-- [ ] share discovery: `TREE_CONNECT` 前にサーバ上の共有一覧を取る API / `smbcli shares`
+- [x] share discovery: `TREE_CONNECT` 前にサーバ上の共有一覧を取る API / `smbcli shares`
   - 2026-06-30 調査: SMB2 単体の既存 command set では足りず、現実的には `IPC$` へ TREE_CONNECT →
     `srvsvc` named pipe CREATE → DCE/RPC bind → SRVSVC `NetrShareEnum` が必要。MS-RAP は古く、
     DFS referral は share enumeration そのものではないため、第一候補は SRVSVC over named pipe。
@@ -203,6 +203,11 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30: SRVSVC over IPC$ の最小実装を追加。`srvsvc` named pipe に DCE/RPC bind →
     `NetrShareEnum` Level 1 を送り、`SMBShareInfo(name/type/comment)` を decode。unit fixture と
     Samba E2E/CLI smoke を追加。残: macOS SMBX 手動 smoke、guest/anonymous 方針は認証 backend 拡張時に扱う。
+  - 2026-07-01 堅牢化 (commit a155b7f): DCE/RPC 複数 fragment reassembly (PFC_LAST_FRAG) と
+    FSCTL_PIPE_TRANSCEIVE の STATUS_BUFFER_OVERFLOW → pipe 継続 read を実装。従来は先頭 fragment のみ
+    decode し share 数が多いと黙って切り捨てていた。150 share の Samba で全列挙を実測 (wire trace で
+    部分応答 + 継続 READ + reassembly 確認)。unit fixture 追加。**API 本体は完了**。残は macOS SMBX 手動
+    smoke (Tier 3 / user-gated) と guest/anonymous policy (認証 backend 拡張時)。
 - [x] download API / `smbcli get`: remote file を local file へ streaming 保存
   - 2026-06-30: `SMBee.download` / `SMBClient.download` / `smbcli get` を追加。既存 `withReadStream` を使い、
     local temp file へ streaming 書き込み後に move/replace。`--no-overwrite` 対応。Samba E2E に round-trip

@@ -46,10 +46,10 @@ jobs:
       SMBEE_E2E_HOST: 127.0.0.1
       SMBEE_E2E_PORT: "445"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Swift
-        uses: swift-actions/setup-swift@v2
+        uses: swift-actions/setup-swift@v3
         with:
           swift-version: ${{ matrix.swift_version }}
 

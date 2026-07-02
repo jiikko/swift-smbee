@@ -228,6 +228,9 @@ struct Watch: AsyncParsableCommand {
     @OptionGroup
     var debug: DebugOptions
 
+    @Flag(help: "Print newline-delimited JSON events")
+    var json = false
+
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
@@ -241,6 +244,10 @@ struct Watch: AsyncParsableCommand {
                 watchTree: recursive,
                 timeout: transport.duration
             ) { event in
+                if json {
+                    print(try SMBCLIOutput.jsonString(for: event))
+                    return
+                }
                 switch event {
                 case .overflow:
                     print("overflow: rescan needed")

@@ -59,7 +59,7 @@ Status labels:
 | Feature | Spec | Implementation | Unit | Samba E2E | macOS SMBX | Windows/NAS | Status | Limitations |
 |---|---|---|---|---|---|---|---|---|
 | `smbcli` core commands | CLI | `Sources/smbcli` | yes | yes | smoke | no | covered | Interactive shell is out of scope. |
-| JSON output | CLI | `SMBCLIOutput.swift`, `smbcli` | yes | partial | no | no | partial | Not every command has JSON output, including `watch`. |
+| JSON output | CLI | `SMBCLIOutput.swift`, `smbcli` | yes | partial | no | no | partial | Core inspection commands and `watch` have JSON output. Mutating commands mostly still use human output only. |
 | exit codes | CLI | `SMBCLI.swift`, `docs/smbcli-exit-codes.md` | yes | yes | no | no | covered | Keep exhaustive mapping as `SMBError` evolves. |
 | debug redaction | operational | `SMBDebug.swift`, `smbcli --debug/--trace-wire` | yes | yes | no | no | covered | Raw wire trace remains explicitly opt-in. |
 | timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBTransferProgress.swift` | yes | yes | no | no | partial | Socket-level timeout only; full operation deadline is future work. |

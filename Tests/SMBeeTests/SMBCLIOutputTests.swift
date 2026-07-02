@@ -199,6 +199,26 @@ final class SMBCLIOutputTests: XCTestCase {
         XCTAssertEqual(dacl[0]["trusteeName"] as? String, "Everyone")
     }
 
+    func testChangeNotifyJSONShapes() throws {
+        let event = SMBChangeNotifyEvent.changes([
+            SMBFileChange(action: .added, name: "new.txt"),
+            SMBFileChange(action: .renamedNewName, name: "renamed.txt"),
+        ])
+
+        let object = try jsonObject(SMBCLIOutput.jsonData(for: event))
+
+        XCTAssertEqual(object["type"] as? String, "changes")
+        let changes = try XCTUnwrap(object["changes"] as? [[String: Any]])
+        XCTAssertEqual(changes[0]["action"] as? String, "added")
+        XCTAssertEqual(changes[0]["name"] as? String, "new.txt")
+        XCTAssertEqual(changes[1]["action"] as? String, "renamedNewName")
+        XCTAssertEqual(changes[1]["name"] as? String, "renamed.txt")
+
+        let overflow = try jsonObject(SMBCLIOutput.jsonData(for: SMBChangeNotifyEvent.overflow))
+        XCTAssertEqual(overflow["type"] as? String, "overflow")
+        XCTAssertEqual(overflow["rescanRequired"] as? Bool, true)
+    }
+
     func testSMBErrorExitCodeMapping() {
         XCTAssertEqual(SMBCLIExitCode.code(for: .logonFailure(status: 0, operation: "SESSION_SETUP")), 3)
         XCTAssertEqual(SMBCLIExitCode.code(for: .accessDenied(status: 0, operation: "CREATE")), 3)

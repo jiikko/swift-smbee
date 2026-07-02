@@ -57,6 +57,10 @@ public enum SMBCLIOutput {
         try encoder.encode(DfsReferralJSON(dfsReferral))
     }
 
+    public static func jsonData(for changeNotifyEvent: SMBChangeNotifyEvent) throws -> Data {
+        try encoder.encode(ChangeNotifyEventJSON(changeNotifyEvent))
+    }
+
     public static func jsonString(for probe: SMBProbeResult) throws -> String {
         try string(from: jsonData(for: probe))
     }
@@ -87,6 +91,21 @@ public enum SMBCLIOutput {
 
     public static func jsonString(for dfsReferral: SMBDfsReferralResult) throws -> String {
         try string(from: jsonData(for: dfsReferral))
+    }
+
+    public static func jsonString(for changeNotifyEvent: SMBChangeNotifyEvent) throws -> String {
+        try string(from: jsonData(for: changeNotifyEvent))
+    }
+
+    public static func changeActionName(_ action: SMBFileChangeAction) -> String {
+        switch action {
+        case .added: "added"
+        case .removed: "removed"
+        case .modified: "modified"
+        case .renamedOldName: "renamedOldName"
+        case .renamedNewName: "renamedNewName"
+        case .other(let raw): "other(\(raw))"
+        }
     }
 
     public static func hex<T: FixedWidthInteger>(_ value: T, width: Int) -> String {
@@ -289,5 +308,34 @@ private struct DfsReferralEntryJSON: Encodable {
         dfsPath = referral.dfsPath
         alternatePath = referral.alternatePath
         networkAddress = referral.networkAddress
+    }
+}
+
+private struct ChangeNotifyEventJSON: Encodable {
+    var type: String
+    var rescanRequired: Bool?
+    var changes: [FileChangeJSON]?
+
+    init(_ event: SMBChangeNotifyEvent) {
+        switch event {
+        case .overflow:
+            type = "overflow"
+            rescanRequired = true
+            changes = nil
+        case .changes(let entries):
+            type = "changes"
+            rescanRequired = nil
+            changes = entries.map(FileChangeJSON.init)
+        }
+    }
+}
+
+private struct FileChangeJSON: Encodable {
+    var action: String
+    var name: String
+
+    init(_ change: SMBFileChange) {
+        action = SMBCLIOutput.changeActionName(change.action)
+        name = change.name
     }
 }

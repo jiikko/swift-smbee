@@ -375,6 +375,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `SMBClientSession.withChangeNotifications` / `SMBee.withChangeNotifications` (callback) + `smbcli watch`
     (`-r` で watch-tree)。fixture unit + **実 Samba E2E** (dir watch → file 作成 → ADDED 通知を bounded 受信) green。
     残: `smbcli watch` の `--json` は未実装 (human のみ)。再接続時の再購読は同一 session 前提 (自動再接続は未配線)。
+  - 2026-07-02: `smbcli watch --json` を追加。CHANGE_NOTIFY events は NDJSON で `changes` / `overflow`
+    を出せる。残: reconnect時の再購読。
 - [x] ACL / owner / SID metadata
   - `QUERY_SECURITY` / `SET_SECURITY`。MVP では扱わないが、管理系 smbclient としては必要。
   - 2026-07-01 (codex-drive): **READ (QUERY_SECURITY) を実装**。QUERY_INFO に

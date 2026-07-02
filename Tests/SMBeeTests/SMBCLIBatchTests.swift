@@ -140,6 +140,11 @@ final class SMBCLIBatchTests: XCTestCase {
         let dfs = try Dfs.parse(["smb://user@host/dfsroot/link", "--json"])
         XCTAssertEqual(dfs.url, "smb://user@host/dfsroot/link")
         XCTAssertTrue(dfs.json)
+
+        let watch = try Watch.parse(["smb://user@host/share/dir", "--recursive", "--json"])
+        XCTAssertEqual(watch.url, "smb://user@host/share/dir")
+        XCTAssertTrue(watch.recursive)
+        XCTAssertTrue(watch.json)
     }
 
     func testCatGetPutMkdirMoveCopyRemoveParsePositionalsAndFlags() throws {

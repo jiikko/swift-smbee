@@ -721,6 +721,12 @@ struct Get: AsyncParsableCommand {
     @Flag(help: "Show planned recursive actions without modifying destinations")
     var dryRun = false
 
+    @Option(help: "Include recursive files matching this glob. Can be repeated")
+    var include: [String] = []
+
+    @Option(help: "Exclude recursive files or directories matching this glob. Can be repeated")
+    var exclude: [String] = []
+
     @Flag(help: "Show transfer progress")
     var progress = false
 
@@ -751,7 +757,9 @@ struct Get: AsyncParsableCommand {
                     skipExisting: skipExisting,
                     resume: resume,
                     dryRun: dryRun,
-                    timeout: transport.duration
+                    timeout: transport.duration,
+                    include: include,
+                    exclude: exclude
                 ) { action in writeRecursiveAction(action) }
             }
             return
@@ -839,6 +847,12 @@ struct Put: AsyncParsableCommand {
     @Flag(help: "Show planned recursive actions without modifying destinations")
     var dryRun = false
 
+    @Option(help: "Include recursive files matching this glob. Can be repeated")
+    var include: [String] = []
+
+    @Option(help: "Exclude recursive files or directories matching this glob. Can be repeated")
+    var exclude: [String] = []
+
     @Flag(help: "Show transfer progress")
     var progress = false
 
@@ -869,7 +883,9 @@ struct Put: AsyncParsableCommand {
                     skipExisting: skipExisting,
                     resume: resume,
                     dryRun: dryRun,
-                    timeout: transport.duration
+                    timeout: transport.duration,
+                    include: include,
+                    exclude: exclude
                 ) { action in writeRecursiveAction(action) }
             }
             return
@@ -974,6 +990,12 @@ struct Copy: AsyncParsableCommand {
     @Flag(help: "Show planned recursive actions without modifying destinations")
     var dryRun = false
 
+    @Option(help: "Include recursive files matching this glob. Can be repeated")
+    var include: [String] = []
+
+    @Option(help: "Exclude recursive files or directories matching this glob. Can be repeated")
+    var exclude: [String] = []
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -1001,7 +1023,9 @@ struct Copy: AsyncParsableCommand {
                     continueOnError: continueOnError,
                     skipExisting: skipExisting,
                     dryRun: dryRun,
-                    timeout: transport.duration
+                    timeout: transport.duration,
+                    include: include,
+                    exclude: exclude
                 ) { action in writeRecursiveAction(action) }
             }
             return

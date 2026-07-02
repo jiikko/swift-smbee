@@ -438,6 +438,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-07-02: `put` / `SMBee.upload(fileURL/localFile:)` / `SMBClient.upload(fileURL/localFile:)` に
     byte-level upload resume を追加。remote size から local file を seek し、同 offset へ WRITE する。
     remote が local より大きい場合は拒否。CLI smoke に `put --resume` round-trip を追加。
+  - 2026-07-02: `get -r` / `put -r` / `cp -r` に `--include` / `--exclude` を追加。recursive file は
+    basename または relative path glob で選別し、directory は exclude で枝刈りする。
   - sparse file / allocation size / zero range の扱いも未実装。巨大 VM image や backup 用途では
     通信量と local disk 使用量に影響するため、`FSCTL_SET_ZERO_DATA` 等を調査する。
   - 暗号化 transport の integrity とは別に、consumer visible な transfer verification (size / optional hash)

@@ -4380,6 +4380,56 @@ final class SMBeeTests: XCTestCase {
         ])
     }
 
+    func testSessionCopyDirectoryDryRunFiltersRecursiveFiles() async throws {
+        let sourceRootId = hexBytes("00000000000000000000000000000051")
+        let sourceChildId = hexBytes("00000000000000000000000000000052")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceRootId, messageId: 0, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(entries: [
+                makeDirectoryEntry(name: "keep.log", isDirectory: false, fileSize: 0, nextOffset: 128),
+                makeDirectoryEntry(name: "skip.tmp", isDirectory: false, fileSize: 0, nextOffset: 256),
+                makeDirectoryEntry(name: "nested", isDirectory: true, nextOffset: 0),
+            ], messageId: 1, treeId: 0x3344),
+            try smb2CreateResponse(fileId: sourceChildId, messageId: 2, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(entries: [
+                makeDirectoryEntry(name: "child.log", isDirectory: false, fileSize: 0, nextOffset: 128),
+                makeDirectoryEntry(name: "skip.log", isDirectory: false, fileSize: 0, nextOffset: 0),
+            ], messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 4, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 5, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let recorder = RecursiveActionRecorder()
+
+        try await session.copyDirectory(
+            treeId: 0x3344,
+            fromPath: "src",
+            toPath: "dst",
+            overwrite: false,
+            dryRun: true,
+            include: ["*.log"],
+            exclude: ["nested/skip*"]
+        ) { action in
+            recorder.append(action)
+        }
+
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .mkdir, path: "dst"),
+            SMBRecursiveAction(kind: .copy, path: "dst\\keep.log"),
+            SMBRecursiveAction(kind: .mkdir, path: "dst\\nested"),
+            SMBRecursiveAction(kind: .copy, path: "dst\\nested\\child.log"),
+        ])
+    }
+
     func testWriteRequestUsesOffsetLengthFileIdAndDataBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let payload = Array("hello".utf8)
@@ -4699,6 +4749,59 @@ final class SMBeeTests: XCTestCase {
         ])
     }
 
+    func testDownloadDirectoryDryRunFiltersRecursiveFiles() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
+        let destination = root.appendingPathComponent("downloaded")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let rootId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        let nestedId = hexBytes("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        let listRootTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: rootId, messageId: 4, treeId: 0x3344),
+            smb2QueryDirectoryResponse(entries: [
+                makeDirectoryEntry(name: "keep.log", isDirectory: false, fileSize: 1, nextOffset: 128),
+                makeDirectoryEntry(name: "skip.tmp", isDirectory: false, fileSize: 1, nextOffset: 256),
+                makeDirectoryEntry(name: "nested", isDirectory: true, nextOffset: 0),
+            ], messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        let listNestedTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: nestedId, messageId: 4, treeId: 0x3344),
+            smb2QueryDirectoryResponse(entries: [
+                makeDirectoryEntry(name: "child.log", isDirectory: false, fileSize: 1, nextOffset: 128),
+                makeDirectoryEntry(name: "skip.log", isDirectory: false, fileSize: 1, nextOffset: 0),
+            ], messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        let factory = TransportFactorySequence([listRootTransport, listNestedTransport])
+        let recorder = RecursiveActionRecorder()
+
+        try await SMBClient.downloadDirectory(
+            host: "server",
+            share: "share",
+            path: "remote",
+            localDirectory: destination,
+            dryRun: true,
+            include: ["*.log"],
+            exclude: ["nested/skip*"],
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: factory.make
+        ) { recorder.append($0) }
+
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .mkdir, path: destination.path),
+            SMBRecursiveAction(kind: .download, path: destination.appendingPathComponent("keep.log").path),
+            SMBRecursiveAction(kind: .mkdir, path: destination.appendingPathComponent("nested").path),
+            SMBRecursiveAction(kind: .download, path: destination.appendingPathComponent("nested/child.log").path),
+        ])
+    }
+
     func testDownloadDirectoryResumeSkipsMatchingSizeAndDownloadsMismatchedFile() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
         let destination = root.appendingPathComponent("downloaded")
@@ -4912,6 +5015,37 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(recorder.actions, [
             SMBRecursiveAction(kind: .skip, path: "done.txt"),
             SMBRecursiveAction(kind: .upload, path: "mismatch.txt"),
+        ])
+    }
+
+    func testUploadDirectoryDryRunFiltersRecursiveFiles() async throws {
+        let localDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
+        let nested = localDirectory.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data("a".utf8).write(to: localDirectory.appendingPathComponent("keep.log"))
+        try Data("b".utf8).write(to: localDirectory.appendingPathComponent("skip.tmp"))
+        try Data("c".utf8).write(to: nested.appendingPathComponent("child.log"))
+        try Data("d".utf8).write(to: nested.appendingPathComponent("skip.log"))
+        defer { try? FileManager.default.removeItem(at: localDirectory) }
+        let recorder = RecursiveActionRecorder()
+
+        try await SMBClient.uploadDirectory(
+            host: "server",
+            share: "share",
+            path: "remote",
+            localDirectory: localDirectory,
+            dryRun: true,
+            include: ["*.log"],
+            exclude: ["nested/skip*"],
+            credential: SMBCredential(username: "user", password: "pass"),
+            onAction: { recorder.append($0) }
+        )
+
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .mkdir, path: "remote"),
+            SMBRecursiveAction(kind: .upload, path: "remote\\keep.log"),
+            SMBRecursiveAction(kind: .mkdir, path: "remote\\nested"),
+            SMBRecursiveAction(kind: .upload, path: "remote\\nested\\child.log"),
         ])
     }
 

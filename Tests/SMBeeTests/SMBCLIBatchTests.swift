@@ -173,21 +173,47 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(cat.range, "2-9")
         XCTAssertTrue(cat.debug.traceWire)
 
-        let get = try Get.parse(["smb://user@host/share/dir", "/tmp/out", "--recursive", "--no-overwrite", "--progress", "--resume"])
+        let get = try Get.parse([
+            "smb://user@host/share/dir",
+            "/tmp/out",
+            "--recursive",
+            "--no-overwrite",
+            "--progress",
+            "--resume",
+            "--include",
+            "*.log",
+            "--exclude",
+            "debug*",
+        ])
         XCTAssertEqual(get.source, "smb://user@host/share/dir")
         XCTAssertEqual(get.destination, "/tmp/out")
         XCTAssertTrue(get.recursive)
         XCTAssertTrue(get.noOverwrite)
         XCTAssertTrue(get.progress)
         XCTAssertTrue(get.resume)
+        XCTAssertEqual(get.include, ["*.log"])
+        XCTAssertEqual(get.exclude, ["debug*"])
 
-        let put = try Put.parse(["/tmp/in", "smb://user@host/share/file.txt", "--recursive", "--no-overwrite", "--progress", "--resume"])
+        let put = try Put.parse([
+            "/tmp/in",
+            "smb://user@host/share/file.txt",
+            "--recursive",
+            "--no-overwrite",
+            "--progress",
+            "--resume",
+            "--include",
+            "*.txt",
+            "--exclude",
+            "nested/skip*",
+        ])
         XCTAssertEqual(put.source, "/tmp/in")
         XCTAssertEqual(put.destination, "smb://user@host/share/file.txt")
         XCTAssertTrue(put.recursive)
         XCTAssertTrue(put.noOverwrite)
         XCTAssertTrue(put.progress)
         XCTAssertTrue(put.resume)
+        XCTAssertEqual(put.include, ["*.txt"])
+        XCTAssertEqual(put.exclude, ["nested/skip*"])
 
         let mkdir = try MakeDirectory.parse(["smb://user@host/share/new"])
         XCTAssertEqual(mkdir.url, "smb://user@host/share/new")
@@ -197,11 +223,22 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(move.destination, "smb://user@host/share/new")
         XCTAssertTrue(move.replace)
 
-        let copy = try Copy.parse(["smb://user@host/share/source", "smb://user@host/share/destination", "--replace", "--recursive"])
+        let copy = try Copy.parse([
+            "smb://user@host/share/source",
+            "smb://user@host/share/destination",
+            "--replace",
+            "--recursive",
+            "--include",
+            "*.dat",
+            "--exclude",
+            "tmp*",
+        ])
         XCTAssertEqual(copy.source, "smb://user@host/share/source")
         XCTAssertEqual(copy.destination, "smb://user@host/share/destination")
         XCTAssertTrue(copy.replace)
         XCTAssertTrue(copy.recursive)
+        XCTAssertEqual(copy.include, ["*.dat"])
+        XCTAssertEqual(copy.exclude, ["tmp*"])
 
         let remove = try Remove.parse(["smb://user@host/share/dead", "--directory", "--recursive"])
         XCTAssertEqual(remove.url, "smb://user@host/share/dead")

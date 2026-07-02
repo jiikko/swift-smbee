@@ -1,4 +1,9 @@
 import Foundation
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 // swiftlint:disable file_length type_body_length
 
 /// Extracts the `.size` file attribute as `UInt64`. On Darwin the value bridges to `NSNumber`, but on
@@ -22,6 +27,28 @@ private func smbReplaceItem(at destination: URL, with source: URL, fileManager: 
     try? fileManager.removeItem(at: destination)
     try fileManager.moveItem(at: source, to: destination)
 #endif
+}
+
+private func smbGlobMatches(_ pattern: String, _ value: String) -> Bool {
+    fnmatch(pattern, value, 0) == 0
+}
+
+private func recursiveEntryIsIncluded(name: String, relativePath: String, include: [String]) -> Bool {
+    guard !include.isEmpty else { return true }
+    return include.contains { recursiveGlobMatches($0, name: name, relativePath: relativePath) }
+}
+
+private func recursiveEntryIsExcluded(name: String, relativePath: String, exclude: [String]) -> Bool {
+    exclude.contains { recursiveGlobMatches($0, name: name, relativePath: relativePath) }
+}
+
+private func recursiveGlobMatches(_ pattern: String, name: String, relativePath: String) -> Bool {
+    let normalizedPattern = pattern.replacingOccurrences(of: "\\", with: "/")
+    let normalizedRelativePath = relativePath.replacingOccurrences(of: "\\", with: "/")
+    return smbGlobMatches(pattern, name)
+        || smbGlobMatches(pattern, relativePath)
+        || smbGlobMatches(normalizedPattern, name)
+        || smbGlobMatches(normalizedPattern, normalizedRelativePath)
 }
 
 public struct SMBDirectoryEntry: Equatable, Sendable {
@@ -803,6 +830,8 @@ public actor SMBClientSession {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try ensureOpen()
@@ -815,6 +844,8 @@ public actor SMBClientSession {
             continueOnError: continueOnError,
             skipExisting: skipExisting,
             dryRun: dryRun,
+            include: include,
+            exclude: exclude,
             onAction: onAction
         )
     }
@@ -1808,6 +1839,8 @@ public enum SMBClient {
         resume: Bool = false,
         dryRun: Bool = false,
         atomic: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
@@ -1845,6 +1878,8 @@ public enum SMBClient {
                 skipExisting: atomic ? false : skipExisting,
                 resume: atomic ? false : resume,
                 dryRun: dryRun,
+                include: include,
+                exclude: exclude,
                 credential: credential,
                 timeout: timeout,
                 makeTransport: makeTransport,
@@ -1930,11 +1965,14 @@ public enum SMBClient {
         skipExisting: Bool,
         resume: Bool,
         dryRun: Bool,
+        include: [String],
+        exclude: [String],
         credential: SMBCredential,
         timeout: Duration?,
         makeTransport: (@Sendable () -> SMBTransport)?,
         failures: SMBRecursiveFailureCollector,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)?,
+        relativePath: String = "",
         depth: Int
     ) async throws {
         try SMBPath.validateRecursionDepth(depth)
@@ -1959,8 +1997,12 @@ public enum SMBClient {
             try Task.checkCancellation()
             guard !entry.isReparsePoint else { continue }
             let remoteChild = joinSMBPath(path, entry.name)
+            let relativeChild = joinSMBPath(relativePath, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
             let actionChild = reportedDirectory.appendingPathComponent(entry.name)
+            if recursiveEntryIsExcluded(name: entry.name, relativePath: relativeChild, exclude: exclude) {
+                continue
+            }
             if resume && !entry.isDirectory && existingLocalFileSize(at: localChild, fileManager: fileManager) == entry.fileSize {
                 onAction?(SMBRecursiveAction(kind: .skip, path: actionChild.path))
                 continue
@@ -1983,11 +2025,14 @@ public enum SMBClient {
                         skipExisting: skipExisting,
                         resume: resume,
                         dryRun: dryRun,
+                        include: include,
+                        exclude: exclude,
                         credential: credential,
                         timeout: timeout,
                         makeTransport: makeTransport,
                         failures: failures,
                         onAction: onAction,
+                        relativePath: relativeChild,
                         depth: depth + 1
                     )
                 } catch {
@@ -1995,6 +2040,9 @@ public enum SMBClient {
                     failures.record(path: remoteChild, error: error)
                 }
             } else {
+                guard recursiveEntryIsIncluded(name: entry.name, relativePath: relativeChild, include: include) else {
+                    continue
+                }
                 do {
                     if dryRun {
                         onAction?(SMBRecursiveAction(kind: .download, path: actionChild.path))
@@ -2040,6 +2088,8 @@ public enum SMBClient {
         resume: Bool = false,
         dryRun: Bool = false,
         atomic: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -2056,6 +2106,8 @@ public enum SMBClient {
             resume: resume,
             dryRun: dryRun,
             atomic: atomic,
+            include: include,
+            exclude: exclude,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
             onAction: onAction
@@ -2275,6 +2327,8 @@ public enum SMBClient {
         skipExisting: Bool = false,
         resume: Bool = false,
         dryRun: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
@@ -2292,6 +2346,8 @@ public enum SMBClient {
             skipExisting: skipExisting,
             resume: resume,
             dryRun: dryRun,
+            include: include,
+            exclude: exclude,
             credential: credential,
             timeout: timeout,
             makeTransport: makeTransport,
@@ -2314,11 +2370,14 @@ public enum SMBClient {
         skipExisting: Bool,
         resume: Bool,
         dryRun: Bool,
+        include: [String],
+        exclude: [String],
         credential: SMBCredential,
         timeout: Duration?,
         makeTransport: (@Sendable () -> SMBTransport)?,
         failures: SMBRecursiveFailureCollector,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)?,
+        relativePath: String = "",
         depth: Int
     ) async throws {
         try SMBPath.validateRecursionDepth(depth)
@@ -2354,6 +2413,10 @@ public enum SMBClient {
             try Task.checkCancellation()
             let resourceValues = try localChild.resourceValues(forKeys: [.isDirectoryKey])
             let remoteChild = joinSMBPath(path, localChild.lastPathComponent)
+            let relativeChild = joinSMBPath(relativePath, localChild.lastPathComponent)
+            if recursiveEntryIsExcluded(name: localChild.lastPathComponent, relativePath: relativeChild, exclude: exclude) {
+                continue
+            }
             if resourceValues.isDirectory == true {
                 do {
                     try await uploadDirectoryRecursive(
@@ -2367,11 +2430,14 @@ public enum SMBClient {
                         skipExisting: skipExisting,
                         resume: resume,
                         dryRun: dryRun,
+                        include: include,
+                        exclude: exclude,
                         credential: credential,
                         timeout: timeout,
                         makeTransport: makeTransport,
                         failures: failures,
                         onAction: onAction,
+                        relativePath: relativeChild,
                         depth: depth + 1
                     )
                 } catch {
@@ -2379,6 +2445,9 @@ public enum SMBClient {
                     failures.record(path: remoteChild, error: error)
                 }
             } else {
+                guard recursiveEntryIsIncluded(name: localChild.lastPathComponent, relativePath: relativeChild, include: include) else {
+                    continue
+                }
                 do {
                     if resume {
                         let localSize = try localFileSize(at: localChild, fileManager: fileManager)
@@ -2437,6 +2506,8 @@ public enum SMBClient {
         skipExisting: Bool = false,
         resume: Bool = false,
         dryRun: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -2452,6 +2523,8 @@ public enum SMBClient {
             skipExisting: skipExisting,
             resume: resume,
             dryRun: dryRun,
+            include: include,
+            exclude: exclude,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
             onAction: onAction
@@ -2559,6 +2632,8 @@ public enum SMBClient {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
@@ -2574,6 +2649,8 @@ public enum SMBClient {
                 continueOnError: continueOnError,
                 skipExisting: skipExisting,
                 dryRun: dryRun,
+                include: include,
+                exclude: exclude,
                 onAction: onAction
             )
         }
@@ -2589,6 +2666,8 @@ public enum SMBClient {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -2603,6 +2682,8 @@ public enum SMBClient {
             continueOnError: continueOnError,
             skipExisting: skipExisting,
             dryRun: dryRun,
+            include: include,
+            exclude: exclude,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
             onAction: onAction
@@ -3418,8 +3499,11 @@ actor SMBSession {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
         depth: Int = 0,
+        relativePath: String = "",
         failures: SMBRecursiveFailureCollector? = nil
     ) async throws {
         let collector = failures ?? SMBRecursiveFailureCollector()
@@ -3454,6 +3538,10 @@ actor SMBSession {
                 try Task.checkCancellation()
                 let sourceChild = self.joinSMBPath(fromPath, entry.name)
                 let destinationChild = self.joinSMBPath(toPath, entry.name)
+                let relativeChild = self.joinSMBPath(relativePath, entry.name)
+                if recursiveEntryIsExcluded(name: entry.name, relativePath: relativeChild, exclude: exclude) {
+                    return
+                }
                 if entry.isDirectory && !entry.isReparsePoint {
                     do {
                         try await self.copyDirectory(
@@ -3464,8 +3552,11 @@ actor SMBSession {
                             continueOnError: continueOnError,
                             skipExisting: skipExisting,
                             dryRun: dryRun,
+                            include: include,
+                            exclude: exclude,
                             onAction: onAction,
                             depth: depth + 1,
+                            relativePath: relativeChild,
                             failures: collector
                         )
                     } catch {
@@ -3473,6 +3564,9 @@ actor SMBSession {
                         collector.record(path: sourceChild, error: error)
                     }
                 } else {
+                    guard recursiveEntryIsIncluded(name: entry.name, relativePath: relativeChild, include: include) else {
+                        return
+                    }
                     do {
                         if dryRun {
                             onAction?(SMBRecursiveAction(kind: .copy, path: destinationChild))

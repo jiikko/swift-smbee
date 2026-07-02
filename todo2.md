@@ -286,31 +286,18 @@ Linux/macOS smbclient として必要な理由:
 
 ### P1-5. lease / oplock break handling
 
-状態: `missing`
+状態: `implemented` (policy = 要求しない + unsolicited break の安全処理)
 
-実装確認:
+実装確認 / 決定 (2026-07-03):
 
-- `CREATE` request に oplock level / lease create context がない。
-- oplock break / lease break notification decoder がない。
-
-Linux/macOS smbclient として必要な理由:
-
-- 複数クライアントが同じファイルを扱う環境では、cache coherence と server通知を無視できない。
-- ファイルブラウザ用途では aggressive caching しなければ回避できるが、明示的に「lease/oplock未対応」とする必要がある。
-
-やること:
-
-- まず方針を決める:
-  - cacheしないので lease/oplock を要求しない。
-  - それでも server から break が来る可能性を扱う。
-- 対応する場合:
-  - oplock break / lease break async response を受ける。
-  - callback API か内部 ack を実装する。
-
-完了条件:
-
-- 未対応方針なら、CREATE で lease/oplock を要求しないことを coverage に記録。
-- 対応方針なら、break notification の fixture と Samba/Windows smoke を持つ。
+- 方針確定: **cache しないので lease/oplock を要求しない**。CREATE の RequestedOplockLevel は
+  常に NONE (`SMB2Create.encodeRequest` の該当 byte は 0 固定)。lease create context も送らない。
+- それでも server から届きうる unsolicited notification (OPLOCK_BREAK command 18 /
+  MessageId 0xFFFFFFFFFFFFFFFF) は、response demux が orphan queue に溜め込まず drop する
+  (`SMBSession.dispatchReceivedPacket`)。unit coverage あり
+  (`testUnsolicitedOplockBreakNotificationIsIgnoredByDemux`)。
+- break の ack / callback API は非対応 (oplock を要求しない限り ack 義務は発生しない)。
+  将来 lease を要求する場合はこの drop policy を再設計すること。
 
 ### P1-6. SMB2 LOCK / byte-range locking
 

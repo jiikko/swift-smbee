@@ -4184,6 +4184,14 @@ actor SMBSession {
 
     private func dispatchReceivedPacket(_ packet: [UInt8]) throws {
         let header = try SMB2Header.decode(packet)
+        // Server-initiated notifications (oplock/lease break) arrive with MessageId
+        // 0xFFFFFFFFFFFFFFFF and never correspond to a request. This client never requests
+        // oplocks or leases (CREATE RequestedOplockLevel is always NONE), so drop them
+        // instead of queueing them as orphan responses forever.
+        if header.command == SMB2Commands.oplockBreak || header.messageId == UInt64.max {
+            debugLine("ignoring unsolicited server notification (command \(header.command), messageId \(header.messageId))")
+            return
+        }
         guard var pending = pendingResponses[header.messageId] else {
             orphanResponses[header.messageId] = packet
             debugLine("SMB response queued for future message id \(header.messageId)")

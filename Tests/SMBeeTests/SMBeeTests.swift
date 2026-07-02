@@ -3999,6 +3999,37 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(firstData, Array("hel".utf8))
     }
 
+    func testUnsolicitedOplockBreakNotificationIsIgnoredByDemux() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let read = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 5)
+        }
+        try await waitForOutboundFrameCount(1, transport: transport)
+
+        // Server-initiated break notification: MessageId = 0xFFFF... / command = OPLOCK_BREAK.
+        // It must be dropped, not queued as an orphan or delivered to the pending read.
+        let breakNotification = try smb2StatusResponse(
+            status: SMB2Status.success,
+            command: SMB2Commands.oplockBreak,
+            messageId: UInt64.max,
+            treeId: 0x3344
+        )
+        transport.enqueueInbound(try framed([breakNotification]))
+        transport.enqueueInbound(try framed([smb2ReadResponse(Array("hello".utf8), messageId: 0, treeId: 0x3344)]))
+
+        let data = try await awaitWithTimeout("read.readChunk") { try await read.value }
+        XCTAssertEqual(data, Array("hello".utf8))
+    }
+
     func testSessionCopyFileFallsBackToReadWriteWhenServerSideCopyIsUnsupported() async throws {
         let sourceFileId = hexBytes("00112233445566778899aabbccddeeff")
         let destinationFileId = hexBytes("ffeeddccbbaa99887766554433221100")

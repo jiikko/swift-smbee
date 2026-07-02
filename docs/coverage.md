@@ -30,7 +30,7 @@ Status labels:
 
 | Feature | Spec | Implementation | Unit | Samba E2E | macOS SMBX | Windows/NAS | Status | Limitations |
 |---|---|---|---|---|---|---|---|---|
-| CREATE / CLOSE / FLUSH | MS-SMB2 3.2.4.5, 3.2.4.17, 3.2.4.7 | `SMBClient.swift`, `SMB2ReadCodecs.swift` | yes | yes | smoke | no | covered | Durable handles, leases, and oplocks are unsupported. |
+| CREATE / CLOSE / FLUSH | MS-SMB2 3.2.4.5, 3.2.4.17, 3.2.4.7 | `SMBClient.swift`, `SMB2ReadCodecs.swift` | yes | yes | smoke | no | covered | Durable handles, leases, and oplocks are unsupported by policy: CREATE always requests oplock level NONE, and unsolicited server break notifications are dropped by the response demux. |
 | QUERY_DIRECTORY streaming | MS-SMB2 3.2.4.18 | `SMBClient.swift`, `SMBee.withDirectoryStream` | yes | yes | smoke | no | covered | Existing `list` collector remains for compatibility. |
 | QUERY_INFO stat | MS-SMB2, MS-FSCC | `SMB2ReadCodecs.swift`, `SMBClient.swift` | yes | yes | smoke | no | covered | Reparse target data is not decoded. |
 | READ full/range/streaming | MS-SMB2 3.2.4.6 | `SMBClient.swift`, `SMBee.withReadStream` | yes | yes | smoke | no | covered | CLI size verification exists for single-file and recursive get. >4GiB E2E is gated/manual. |

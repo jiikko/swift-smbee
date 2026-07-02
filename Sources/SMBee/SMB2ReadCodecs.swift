@@ -19,6 +19,7 @@ enum SMB2Commands {
     static let setInfo: UInt16 = 17
     static let queryInfo: UInt16 = 16
     static let queryDirectory: UInt16 = 14
+    static let oplockBreak: UInt16 = 18
 }
 
 public struct SMBFileChange: Equatable, Sendable {

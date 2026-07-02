@@ -202,6 +202,54 @@ final class SMBeeE2ETests: XCTestCase {
         XCTAssertTrue(shares.contains { $0.name == "public" })
     }
 
+    func testAuthenticatedFastSmoke() async throws {
+        guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
+        let portString = environment["SMBEE_E2E_PORT"] ?? "445"
+        guard let port = UInt16(portString) else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16, got \(portString)")
+            return
+        }
+        let username = environment["SMBEE_E2E_USERNAME"] ?? "smbee"
+        let password = environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
+        let share = environment["SMBEE_E2E_SHARE"] ?? "public"
+        let credential = SMBCredential(username: username, password: password)
+        let suffix = UUID().uuidString
+        let directory = "smbee-fast-\(suffix)"
+        let file = "\(directory)\\roundtrip.txt"
+        let payload = Array("fast smoke \(suffix)\n".utf8)
+
+        try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: directory)
+        do {
+            let rootEntries = try await SMBee.list(host: host, port: port, credential: credential, share: share)
+            XCTAssertTrue(rootEntries.contains { $0.name == "known.txt" && !$0.isDirectory })
+
+            try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: file, data: payload)
+            let stat = try await SMBee.stat(host: host, port: port, credential: credential, share: share, path: file)
+            XCTAssertEqual(stat.size, UInt64(payload.count))
+            let roundTrip = try await SMBee.read(host: host, port: port, credential: credential, share: share, path: file)
+            XCTAssertEqual(roundTrip, payload)
+
+            try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: file)
+            try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: directory, directory: true)
+        } catch {
+            try? await SMBee.delete(
+                host: host,
+                port: port,
+                credential: credential,
+                share: share,
+                path: directory,
+                directory: true,
+                recursive: true
+            )
+            throw error
+        }
+    }
+
     func testAuthenticatedWriteOperations() async throws {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
             throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")

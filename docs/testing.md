@@ -74,9 +74,10 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 - `.github/workflows/e2e.yml` は PR / push 用の代表 smoke。profile は
   `test/e2e/smb/smb302-encrypted-required.conf` を使い、macOS SMBX mirror として
   SMB 3.0.2 + signing mandatory + encryption required を維持する。
-- `.github/workflows/e2e.yml` の API E2E matrix は `smb302-encrypted-required` を full scope、
-  `smb311-encrypted-required` を negotiate scope で回し、Samba が SMB 3.1.1 + AES-GMAC + AES-GCM を
-  交渉することを PR / push でも確認する。3.1.1 の authenticated full E2E は compat / 修正対象。
+- `.github/workflows/e2e.yml` の API E2E matrix は `smb302-encrypted-required` を full scope で回し、
+  `smb311-signing-required` と `smb311-encrypted-required` は authenticated fast smoke
+  (connect / list / write / stat / read / delete) で回す。これにより PR / push でも 3.1.1 の
+  GMAC signing-only path と GCM encrypted path を最低 1 本ずつ通す。
 - `.github/workflows/samba-compat.yml` は重い互換性 matrix。`workflow_dispatch` と週次 schedule で、
   distro-provided Samba、Swift 6.0 / 6.2、`test/e2e/smb/*.conf` profile の代表組み合わせを回す。
 
@@ -112,6 +113,16 @@ SMB 3.1.1 の NEGOTIATE だけをローカルで確認する場合:
 SAMBA_CONFIG=test/e2e/smb/smb311-encrypted-required.conf \
 SMBEE_E2E_PROFILE=smb311-encrypted-required \
 SMBEE_E2E_TEST_FILTER=SMBeeE2ETests.testProbeNegotiatesExpectedProfile \
+SMBEE_E2E_SKIP_CLI_SMOKE=1 \
+bin/e2e/container-samba.sh
+```
+
+SMB 3.1.1 の authenticated fast smoke をローカルで確認する場合:
+
+```sh
+SAMBA_CONFIG=test/e2e/smb/smb311-encrypted-required.conf \
+SMBEE_E2E_PROFILE=smb311-encrypted-required \
+SMBEE_E2E_TEST_FILTER=SMBeeE2ETests.testAuthenticatedFastSmoke \
 SMBEE_E2E_SKIP_CLI_SMOKE=1 \
 bin/e2e/container-samba.sh
 ```
@@ -153,6 +164,18 @@ Samba profile:
 **macOS のファイル共有（SMBX）** と **Windows SMB Server** に対し `smbcli probe` + ゴールデンパスを
 手動で 1 周。Tier 2 の Samba では拾えない実サーバ固有挙動（交渉値・quirk）を確認する。
 「自発実行はビルドまで、実行はユーザー」運用に乗せる。
+
+共通の手動 smoke は `bin/e2e/smoke-real-server.sh` を使う。
+
+```sh
+swift build --product smbcli
+SMB_PASSWORD='...' bin/e2e/smoke-real-server.sh smb://user@host/share
+```
+
+結果は [compatibility-matrix.md](compatibility-matrix.md) に記録する。
+GitHub Actions の `windows-latest` は将来 Windows SMB Server host として使える候補だが、
+現状の SMBee client は POSIX/Darwin/Linux transport 前提なので、Windows runner 上で直接 client E2E を
+回すには Windows transport 対応を先に入れる。
 
 ## まとめ
 

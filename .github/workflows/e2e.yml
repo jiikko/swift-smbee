@@ -30,14 +30,18 @@ jobs:
             profile: smb302-encrypted-required
             scope: full
             test_filter: SMBeeE2ETests
-          # SMB 3.1.1 authenticated full E2E is still tracked separately:
-          # signing-only currently needs server packet verification work, and
-          # encrypted sessions need the remaining GCM path fixes. Keep this
-          # lane in the main API E2E matrix as the negotiated-handshake check.
+          # Keep full 3.1.1 coverage in samba-compat.yml, but gate PR/push on an
+          # authenticated read/write smoke for both 3.1.1 signing-only and
+          # encrypted profiles. This catches GMAC/GCM regressions without making
+          # the main feedback loop run the entire compatibility matrix.
+          - swift_version: "6.2"
+            profile: smb311-signing-required
+            scope: authenticated-smoke
+            test_filter: SMBeeE2ETests.testAuthenticatedFastSmoke
           - swift_version: "6.2"
             profile: smb311-encrypted-required
-            scope: negotiate
-            test_filter: SMBeeE2ETests.testProbeNegotiatesExpectedProfile
+            scope: authenticated-smoke
+            test_filter: SMBeeE2ETests.testAuthenticatedFastSmoke
     env:
       SAMBA_CONTAINER: smbee-samba-api-${{ matrix.profile }}-${{ matrix.swift_version }}
       SAMBA_BASE_IMAGE: ubuntu:24.04

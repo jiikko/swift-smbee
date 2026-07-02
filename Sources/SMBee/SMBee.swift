@@ -1,12 +1,12 @@
 import Foundation
 
+// swiftlint:disable file_length type_body_length
 /// SMBee 🐝 — a pure-Swift SMB2/3 client.
 ///
 /// SMB protocol / framing / NTLMv2 flow / SMB3 crypto framing は本ライブラリで
 /// 自作し、暗号プリミティブの計算は swift-crypto と in-repo pure-Swift 実装に委ねる。
 /// 対象サーバは SMB 3.x サーバ (macOS SMBX / Windows SMB Server / Samba)。
 /// 自動 E2E は Samba、手動 smoke は実サーバで確認する。
-// swiftlint:disable:next type_body_length
 public enum SMBee {
     /// ライブラリのバージョン (暫定)。
     public static let version = "0.0.1"

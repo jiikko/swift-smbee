@@ -183,6 +183,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--verify",
             "size",
             "--create-dirs",
+            "--json",
             "--include",
             "*.log",
             "--exclude",
@@ -196,6 +197,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(get.resume)
         XCTAssertEqual(get.verify, .size)
         XCTAssertTrue(get.createDirs)
+        XCTAssertTrue(get.json)
         XCTAssertEqual(get.include, ["*.log"])
         XCTAssertEqual(get.exclude, ["debug*"])
 
@@ -209,6 +211,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--verify",
             "size",
             "--create-dirs",
+            "--json",
             "--include",
             "*.txt",
             "--exclude",
@@ -222,11 +225,13 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(put.resume)
         XCTAssertEqual(put.verify, .size)
         XCTAssertTrue(put.createDirs)
+        XCTAssertTrue(put.json)
         XCTAssertEqual(put.include, ["*.txt"])
         XCTAssertEqual(put.exclude, ["nested/skip*"])
 
-        let mkdir = try MakeDirectory.parse(["smb://user@host/share/new"])
+        let mkdir = try MakeDirectory.parse(["smb://user@host/share/new", "--json"])
         XCTAssertEqual(mkdir.url, "smb://user@host/share/new")
+        XCTAssertTrue(mkdir.json)
 
         let move = try Move.parse(["smb://user@host/share/old", "smb://user@host/share/new", "--replace"])
         XCTAssertEqual(move.source, "smb://user@host/share/old")
@@ -238,6 +243,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "smb://user@host/share/destination",
             "--replace",
             "--recursive",
+            "--json",
             "--include",
             "*.dat",
             "--exclude",
@@ -247,12 +253,14 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(copy.destination, "smb://user@host/share/destination")
         XCTAssertTrue(copy.replace)
         XCTAssertTrue(copy.recursive)
+        XCTAssertTrue(copy.json)
         XCTAssertEqual(copy.include, ["*.dat"])
         XCTAssertEqual(copy.exclude, ["tmp*"])
 
-        let remove = try Remove.parse(["smb://user@host/share/dead", "--directory", "--recursive"])
+        let remove = try Remove.parse(["smb://user@host/share/dead", "--directory", "--recursive", "--json"])
         XCTAssertEqual(remove.url, "smb://user@host/share/dead")
         XCTAssertTrue(remove.directory)
         XCTAssertTrue(remove.recursive)
+        XCTAssertTrue(remove.json)
     }
 }

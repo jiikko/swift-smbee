@@ -124,4 +124,13 @@ final class SMBCLIHelperTests: XCTestCase {
         XCTAssertEqual(options.operationDuration, .seconds(2) + .milliseconds(500))
         XCTAssertEqual(options.perFileDuration, .seconds(1) + .milliseconds(250))
     }
+
+    func testSuccessJSONStringShape() throws {
+        let data = try XCTUnwrap(successJSONString(command: "put", path: "dir\\file.txt").data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(object["ok"] as? Bool, true)
+        XCTAssertEqual(object["command"] as? String, "put")
+        XCTAssertEqual(object["path"] as? String, "dir\\file.txt")
+    }
 }

@@ -588,13 +588,13 @@ Linux/macOS smbclient として必要な理由:
 
 - `probe` / `ls` / `stat` / `shares` / `df` / `acl` / `dfs` は JSON 出力がある。
 - 2026-07-02: `watch --json` は newline-delimited JSON 出力あり。
-- `get/put/cp/mv/rm/mkdir/setacl` は成功時の structured output がない。
 - 2026-07-02: `docs/smbcli-json.md` に JSON 対応コマンドと、mutating command は exit status を
   安定した成功/失敗 signal とする方針を記録。
+- 2026-07-02: mutating commands (`get` / `put` / `cp` / `mv` / `rm` / `mkdir` / `setacl`) に
+  `--json` 成功 object (`ok`, `command`, `path`) を追加。dry-run recursive は human plan を優先。
 
 やること:
 
-- mutating command に success JSON object を足すかは必要になった時に個別設計する。
 - error JSON は別 flag にするか検討する。
 
 完了条件:

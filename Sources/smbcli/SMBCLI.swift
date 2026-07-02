@@ -615,6 +615,9 @@ struct SetACL: AsyncParsableCommand {
     @Flag(help: "Allow empty or deny-only DACLs")
     var force = false
 
+    @Flag(help: "Output a JSON success object")
+    var json = false
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -639,6 +642,9 @@ struct SetACL: AsyncParsableCommand {
                 force: force,
                 timeout: transport.duration
             )
+        }
+        if json {
+            print(try successJSONString(command: "setacl", path: endpoint.path))
         }
     }
 
@@ -736,6 +742,9 @@ struct Get: AsyncParsableCommand {
     @Option(help: "Verify completed single-file transfer: none or size")
     var verify: TransferVerifyMode = .none
 
+    @Flag(help: "Output a JSON success object")
+    var json = false
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -802,6 +811,9 @@ struct Get: AsyncParsableCommand {
         if verify == .size {
             try await verifyDownloadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: destination), transport: transport)
         }
+        if json {
+            print(try successJSONString(command: "get", path: endpoint.path))
+        }
         progressWriter?.finish()
     }
 }
@@ -811,6 +823,9 @@ struct MakeDirectory: AsyncParsableCommand {
 
     @Argument(help: "smb://user@host[:445]/share/path")
     var url: String
+
+    @Flag(help: "Output a JSON success object")
+    var json = false
 
     @OptionGroup
     var auth: AuthOptions
@@ -833,6 +848,9 @@ struct MakeDirectory: AsyncParsableCommand {
                 path: endpoint.path,
                 timeout: transport.duration
             )
+        }
+        if json {
+            print(try successJSONString(command: "mkdir", path: endpoint.path))
         }
     }
 }
@@ -878,6 +896,9 @@ struct Put: AsyncParsableCommand {
 
     @Option(help: "Verify completed single-file transfer: none or size")
     var verify: TransferVerifyMode = .none
+
+    @Flag(help: "Output a JSON success object")
+    var json = false
 
     @OptionGroup
     var auth: AuthOptions
@@ -939,6 +960,9 @@ struct Put: AsyncParsableCommand {
             if verify == .size {
                 try await verifyUploadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: source), transport: transport)
             }
+            if json {
+                print(try successJSONString(command: "put", path: endpoint.path))
+            }
             progressWriter.finish()
             return
         }
@@ -961,6 +985,9 @@ struct Put: AsyncParsableCommand {
         if verify == .size {
             try await verifyUploadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: source), transport: transport)
         }
+        if json {
+            print(try successJSONString(command: "put", path: endpoint.path))
+        }
     }
 }
 
@@ -975,6 +1002,9 @@ struct Move: AsyncParsableCommand {
 
     @Flag(help: "Replace destination if it exists")
     var replace = false
+
+    @Flag(help: "Output a JSON success object")
+    var json = false
 
     @OptionGroup
     var auth: AuthOptions
@@ -1001,6 +1031,9 @@ struct Move: AsyncParsableCommand {
                 replaceIfExists: replace,
                 timeout: transport.duration
             )
+        }
+        if json {
+            print(try successJSONString(command: "mv", path: to.path))
         }
     }
 }
@@ -1035,6 +1068,9 @@ struct Copy: AsyncParsableCommand {
     @Option(help: "Exclude recursive files or directories matching this glob. Can be repeated")
     var exclude: [String] = []
 
+    @Flag(help: "Output a JSON success object")
+    var json = false
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -1068,6 +1104,9 @@ struct Copy: AsyncParsableCommand {
                     perFileTimeout: transport.perFileDuration
                 ) { action in writeRecursiveAction(action) }
             }
+            if json && !dryRun {
+                print(try successJSONString(command: "cp", path: to.path))
+            }
             return
         }
         try await transport.withOperationDeadline {
@@ -1081,6 +1120,9 @@ struct Copy: AsyncParsableCommand {
                 overwrite: replace,
                 timeout: transport.duration
             )
+        }
+        if json {
+            print(try successJSONString(command: "cp", path: to.path))
         }
     }
 }
@@ -1102,6 +1144,9 @@ struct Remove: AsyncParsableCommand {
 
     @Flag(help: "Show planned recursive actions without modifying destinations")
     var dryRun = false
+
+    @Flag(help: "Output a JSON success object")
+    var json = false
 
     @OptionGroup
     var auth: AuthOptions
@@ -1128,6 +1173,9 @@ struct Remove: AsyncParsableCommand {
                 dryRun: dryRun,
                 timeout: transport.duration
             ) { action in writeRecursiveAction(action) }
+        }
+        if json && !dryRun {
+            print(try successJSONString(command: "rm", path: endpoint.path))
         }
     }
 }
@@ -1251,6 +1299,21 @@ private func makeRemoteParentDirectories(
         } catch SMBError.nameCollision {
         }
     }
+}
+
+func successJSONString(command: String, path: String? = nil) throws -> String {
+    var object: [String: Any] = [
+        "ok": true,
+        "command": command,
+    ]
+    if let path {
+        object["path"] = path
+    }
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    guard let string = String(data: data, encoding: .utf8) else {
+        throw ValidationError("failed to encode JSON")
+    }
+    return string
 }
 
 private final class TransferProgressWriter: @unchecked Sendable {

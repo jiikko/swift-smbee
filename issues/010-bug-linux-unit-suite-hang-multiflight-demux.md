@@ -1,6 +1,7 @@
 # 010 bug: Linux ユニットスイートが hang する (multi-flight demux の messageId 順 race + 未 resume continuation)
 
-状態: **open** (bug / 優先度 高 — master の CI を赤くしている)
+状態: **一部対応済み** (A のテスト側修正 + §修正方針 2 + awaitWithTimeout の穴 = 2026-07-03 対応。
+構造修正 §1 (session 所有 reader) と §3 (release request timeout) が残)
 起票: 2026-07-03
 関連:
 - `Sources/SMBee/SMBClient.swift`: `demuxedWireTransaction` / `startReceiveLoopIfNeeded` / `receiveLoop` /
@@ -191,6 +192,22 @@ credit waiter / 登録済み未送信 pending という別クラスの待ち手�
 4. **§修正方針 3 の release request timeout** を defense-in-depth として追加。
 5. 変更したら **必ず `swift build && swift test` → `bin/e2e/container-samba.sh`** (CLAUDE.md 必須)。
 6. commit 粒度 1 マイルストーン = 1 commit、submodule push 後に親参照 bump。
+
+## 対応状況 (2026-07-03)
+
+- ✅ **A (テスト層)**: `testConcurrentReadChunksDemuxOutOfOrderResponses` を spawn 順 = messageId 順の
+  前提から外し、outbound header を decode して offset→messageId map で応答を返すよう修正
+  (§修正方針 4)。`requests[0] offset==0` の順序 assert も撤去。
+- ✅ **awaitWithTimeout の穴**: task group をやめ resume-once box + watchdog に変更。
+  uncancellable な operation は leak させて job hang を防ぐ (doc コメントに契約を明記)。
+- ✅ **§修正方針 2**: `SMB2CreditWindow.reserve` は throwing + task cancellation 対応 (先行 commit)。
+  本 commit で `failAllWaiters(_:)` を追加し `failAllPendingResponses` / `closeTransport` から drain。
+  回帰 unit (`testSMB2CreditWindowFailAllWaitersDrainsParkedReserves`) あり。
+- ⬜ **§修正方針 1** (session 所有 single reader / loop 生存条件の撤去) — 未着手。wire 中核の
+  構造変更で container smoke 必須。B の循環待ちの根治はここ。
+- ⬜ **§修正方針 3** (release request timeout) — 未着手。
+- Linux 実機 backtrace での A 確定は未実施 (このマシンに container なし)。テスト修正後の
+  Linux CI green 継続を代替観測とする。issues/013 の CI 観測 (sample/stdbuf) は継続。
 
 ## 併せて検討 (別スコープ可)
 

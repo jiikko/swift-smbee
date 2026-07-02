@@ -4021,6 +4021,9 @@ actor SMBSession {
 
     func closeTransport() {
         transport.close()
+        // Parked credit waiters can no longer be granted once the transport is closed.
+        let creditWindow = creditWindow
+        Task { await creditWindow.failAllWaiters(SMBTransportError.connectionClosed) }
     }
 
     private func unsignedWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
@@ -4299,6 +4302,11 @@ actor SMBSession {
         for waiter in pending.values {
             waiter.continuation.resume(throwing: error)
         }
+        // Credit waiters are only ever resumed by grants from received responses; once the
+        // receive path is dead they must be drained too (issues/010 §B invariant: every
+        // session-owned continuation is resumed by some terminal event).
+        let creditWindow = creditWindow
+        Task { await creditWindow.failAllWaiters(error) }
     }
 
     private func reserveCredit(_ packet: [UInt8]) async throws -> UInt16 {

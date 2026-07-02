@@ -168,6 +168,17 @@ actor SMB2CreditWindow {
         }
     }
 
+    /// Teardown drain: every parked waiter is resumed with `error`. Without this, waiters
+    /// leak when the session dies while credits are exhausted (issues/010 §B — grant only
+    /// arrives from received responses, which stop on transport failure).
+    func failAllWaiters(_ error: Error) {
+        let parked = waiters
+        waiters.removeAll()
+        for waiter in parked {
+            waiter.continuation.resume(throwing: error)
+        }
+    }
+
     private func cancelWaiter(id: UInt64) {
         guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
         let waiter = waiters.remove(at: index)

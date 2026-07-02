@@ -1613,6 +1613,25 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(waiters, 0)
     }
 
+    func testSMB2CreditWindowFailAllWaitersDrainsParkedReserves() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0)
+        let task = Task {
+            try await window.reserve(charge: 1)
+        }
+        while await window.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+        await window.failAllWaiters(SMBTransportError.connectionClosed)
+        do {
+            _ = try await awaitWithTimeout("drained reserve") { try await task.value }
+            XCTFail("drained reserve unexpectedly returned")
+        } catch let error as SMBTransportError {
+            XCTAssertEqual(error, .connectionClosed)
+        }
+        let waiters = await window.pendingWaiterCount
+        XCTAssertEqual(waiters, 0)
+    }
+
     func testSMB2CreditWindowDoesNotConsumeZeroChargeRequests() async throws {
         let window = SMB2CreditWindow(initialCredits: 1)
 
@@ -4115,14 +4134,23 @@ final class SMBeeTests: XCTestCase {
         try await waitForOutboundFrameCount(2, transport: transport)
         let requests = try unframed(transport.outbound)
         XCTAssertEqual(requests.count, 2)
-        XCTAssertEqual(readUInt64LE(requests[0], at: 72), 0)
-        XCTAssertEqual(readUInt64LE(requests[1], at: 72), 3)
+        // messageId assignment follows actor arrival order, which is scheduler dependent:
+        // do NOT assume `first` got messageId 0 (issues/010 — the old assumption made the
+        // Linux global executor hang the suite when `second` arrived first). Map each
+        // request's messageId by its read offset instead, and answer out of order.
+        let headersByOffset = Dictionary(uniqueKeysWithValues: try requests.map { request in
+            (readUInt64LE(request, at: 72), try SMB2Header.decode(request))
+        })
+        guard let firstHeader = headersByOffset[0], let secondHeader = headersByOffset[3] else {
+            XCTFail("expected READ requests for offsets 0 and 3, got \(headersByOffset.keys.sorted())")
+            return
+        }
 
-        transport.enqueueInbound(try framed([smb2ReadResponse(Array("lo".utf8), messageId: 1, treeId: 0x3344)]))
+        transport.enqueueInbound(try framed([smb2ReadResponse(Array("lo".utf8), messageId: secondHeader.messageId, treeId: 0x3344)]))
         let secondData = try await awaitWithTimeout("second.readChunk") { try await second.value }
         XCTAssertEqual(secondData, Array("lo".utf8))
 
-        transport.enqueueInbound(try framed([smb2ReadResponse(Array("hel".utf8), messageId: 0, treeId: 0x3344)]))
+        transport.enqueueInbound(try framed([smb2ReadResponse(Array("hel".utf8), messageId: firstHeader.messageId, treeId: 0x3344)]))
         let firstData = try await awaitWithTimeout("first.readChunk") { try await first.value }
         XCTAssertEqual(firstData, Array("hel".utf8))
     }
@@ -6147,17 +6175,59 @@ final class SMBeeTests: XCTestCase {
         _ label: String,
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                throw SMBTestTimeoutError(label: label, seconds: seconds)
+        // NOT a task group: withThrowingTaskGroup awaits all children before returning, so an
+        // operation stuck on an uncancellable await (e.g. `Task.value` of a task whose
+        // continuation is never resumed) hangs the group even after the watchdog fires — the
+        // exact CI-killing hole from issues/010 (and issues/done/007). Resume-once racing
+        // lets the timeout win; a truly stuck operation task is leaked, which is acceptable
+        // in tests and strictly better than hanging the whole job.
+        let box = ResumeOnceBox<T>()
+        let operationTask = Task { @Sendable in
+            do {
+                box.resume(.success(try await operation()))
+            } catch {
+                box.resume(.failure(error))
             }
-            defer { group.cancelAll() }
-            guard let result = try await group.next() else {
-                throw SMBTestTimeoutError(label: label, seconds: seconds)
+        }
+        let watchdogTask = Task { @Sendable in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            operationTask.cancel()
+            box.resume(.failure(SMBTestTimeoutError(label: label, seconds: seconds)))
+        }
+        defer { watchdogTask.cancel() }
+        return try await withCheckedThrowingContinuation { continuation in
+            box.install(continuation)
+        }
+    }
+
+    /// Resumes an installed continuation with the first result; later results are dropped.
+    private final class ResumeOnceBox<T: Sendable>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<T, Error>?
+        private var pendingResult: Result<T, Error>?
+
+        func install(_ continuation: CheckedContinuation<T, Error>) {
+            lock.lock()
+            if let result = pendingResult {
+                lock.unlock()
+                continuation.resume(with: result)
+                return
             }
-            return result
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func resume(_ result: Result<T, Error>) {
+            lock.lock()
+            guard pendingResult == nil else {
+                lock.unlock()
+                return
+            }
+            pendingResult = result
+            let continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(with: result)
         }
     }
 

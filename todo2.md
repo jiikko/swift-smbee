@@ -526,7 +526,7 @@ Linux/macOS smbclient として必要な理由:
   公開 API `setSecurityInfo(path:ownerSID:groupSID:dacl:force:)` (session/facade) と
   `smbcli setacl --owner/--group` を追加。DACL-only の旧経路は read-modify-write を廃止
   (AdditionalInformation の semantics 上、選択しない component はサーバが触らない)。
-  fixture unit + 実 Samba E2E (現 owner/group の書き戻し round-trip) を追加。
+  fixture unit + 実 Samba E2E を追加。実測: Samba (POSIX backend) は非特権ユーザーの owner/group 書き込みを chown 相当として ACCESS_DENIED にするため、E2E は accessDenied を server policy として許容 (wire path は unit fixture で担保)。
 - SACL は SeSecurityPrivilege 要求のため **対象外で確定** (docs/coverage.md に明記)。
   任意 owner への変更は server 側 privilege が必要な旨も doc に明記。
 

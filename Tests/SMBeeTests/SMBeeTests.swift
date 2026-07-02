@@ -3355,10 +3355,13 @@ final class SMBeeTests: XCTestCase {
 
         let requests = try unframed(transport.outbound)
         var commands = requests.map { try? SMB2Header.decode($0).command }
-        // close() cancels the keepalive task; if that lands while the ECHO transaction is
-        // still awaiting its response, the session legitimately sends SMB2 CANCEL first.
-        // The race is timing-dependent (observed on Linux CI), so tolerate one CANCEL.
+        // Timing tolerances for slow CI runners (both observed on GitHub Actions):
+        // - close() cancelling the keepalive mid-ECHO legitimately sends SMB2 CANCEL
+        // - a slow close can let the 50ms keepalive interval fire more than one ECHO
         commands.removeAll { $0 == SMB2Commands.cancel }
+        while commands.count > 3, commands.first == SMB2Commands.echo, commands.dropFirst().first == SMB2Commands.echo {
+            commands.removeFirst()
+        }
         XCTAssertEqual(commands, [
             SMB2Commands.echo,
             SMB2Commands.treeDisconnect,

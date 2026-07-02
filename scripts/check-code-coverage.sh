@@ -25,7 +25,13 @@ mkdir -p "$(dirname "$COVERAGE_JSON")"
 # Keep E2E/Samba-backed tests in their dedicated workflows. Coverage should measure
 # deterministic unit/vector coverage for the package code.
 echo "CODE_COVERAGE_INFO command=swift test --enable-code-coverage --skip SMBeeE2ETests"
-swift test --enable-code-coverage --skip SMBeeE2ETests
+# stdbuf keeps per-test output line-buffered so an intermittent hang (issues/013)
+# shows the last started test in CI logs instead of an empty buffer.
+if command -v stdbuf >/dev/null 2>&1; then
+  stdbuf -oL -eL swift test --enable-code-coverage --skip SMBeeE2ETests
+else
+  swift test --enable-code-coverage --skip SMBeeE2ETests
+fi
 
 profdata=""
 # NOTE: `swift test --show-codecov-path` on recent SwiftPM prints the path to the exported

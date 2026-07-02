@@ -1688,6 +1688,84 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNil(names[1])
     }
 
+    func testLSARPCOpenPolicyAndCloseCodecs() throws {
+        let stub = LSARPC.encodeOpenPolicy2Request()
+        XCTAssertEqual(stub.count, 32)
+        XCTAssertEqual(readUInt32LE(stub, at: 0), 0) // SystemName NULL
+        XCTAssertEqual(readUInt32LE(stub, at: 4), 24) // ObjectAttributes.Length
+        XCTAssertEqual(readUInt32LE(stub, at: 28), LSARPC.policyLookupNames)
+
+        let handle = Array(repeating: UInt8(0x22), count: 20)
+        var response = handle
+        response.append(contentsOf: [0, 0, 0, 0]) // status success
+        XCTAssertEqual(try LSARPC.decodePolicyHandleResponse(response, operation: "LsarOpenPolicy2"), handle)
+
+        var denied = handle
+        denied.append(contentsOf: [0x22, 0x00, 0x00, 0xc0]) // STATUS_ACCESS_DENIED
+        XCTAssertThrowsError(try LSARPC.decodePolicyHandleResponse(denied, operation: "LsarOpenPolicy2")) { error in
+            guard case SMBError.accessDenied = error else {
+                return XCTFail("expected accessDenied, got \(error)")
+            }
+        }
+
+        XCTAssertEqual(try LSARPC.encodeCloseRequest(handle: handle), handle)
+        XCTAssertThrowsError(try LSARPC.encodeCloseRequest(handle: [1, 2, 3]))
+        XCTAssertThrowsError(try LSARPC.encodeLookupSidsRequest(handle: handle, sids: []))
+    }
+
+    func testLSARPCLookupSidsResponseWithoutDomainsDecodesUnmapped() throws {
+        // STATUS_NONE_MAPPED with NULL domains and NULL names array.
+        var writer = NDRWriter()
+        writer.writeUInt32(0) // ReferencedDomains NULL
+        writer.writeUInt32(0) // TranslatedNames.Entries
+        writer.writeUInt32(0) // TranslatedNames.Names NULL
+        writer.writeUInt32(0) // MappedCount
+        writer.writeUInt32(LSARPC.statusNoneMapped)
+        let names = try LSARPC.decodeLookupSidsResponse(writer.bytes)
+        XCTAssertTrue(names.isEmpty)
+
+        var failed = NDRWriter()
+        failed.writeUInt32(0)
+        failed.writeUInt32(0)
+        failed.writeUInt32(0)
+        failed.writeUInt32(0)
+        failed.writeUInt32(0xc000_0022) // STATUS_ACCESS_DENIED
+        XCTAssertThrowsError(try LSARPC.decodeLookupSidsResponse(failed.bytes))
+    }
+
+    func testResolvedSIDNameQualifiedNameFallsBackWithoutDomain() {
+        XCTAssertEqual(SMBResolvedSIDName(use: 1, domain: nil, name: "alice").qualifiedName, "alice")
+        XCTAssertEqual(SMBResolvedSIDName(use: 1, domain: "", name: "alice").qualifiedName, "alice")
+    }
+
+    func testTransferVerificationLocalSHA256MatchesEmptyAndKnownVectors() throws {
+        let dir = FileManager.default.temporaryDirectory
+        let empty = dir.appendingPathComponent("smbee-empty-\(UUID().uuidString)")
+        try Data().write(to: empty)
+        defer { try? FileManager.default.removeItem(at: empty) }
+        // SHA-256("") NIST vector.
+        XCTAssertEqual(
+            try SMBTransferVerification.localSHA256Hex(fileURL: empty),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
+
+        // Multi-MiB file to exercise the streaming read loop (>1 chunk).
+        let big = dir.appendingPathComponent("smbee-big-\(UUID().uuidString)")
+        try Data(repeating: 0x5a, count: 3 * 1024 * 1024 + 7).write(to: big)
+        defer { try? FileManager.default.removeItem(at: big) }
+        XCTAssertEqual(try SMBTransferVerification.localSHA256Hex(fileURL: big).count, 64)
+    }
+
+    func testLookupSIDsEmptyInputShortCircuits() async throws {
+        // No SIDs must not open a connection; returns [] without touching the transport.
+        let empty = try await SMBee.lookupSIDs(
+            host: "unused",
+            credential: SMBCredential(username: "u", password: "p"),
+            sids: []
+        )
+        XCTAssertTrue(empty.isEmpty)
+    }
+
     func testSMB2CreditWindowFailAllWaitersDrainsParkedReserves() async throws {
         let window = SMB2CreditWindow(initialCredits: 0)
         let task = Task {

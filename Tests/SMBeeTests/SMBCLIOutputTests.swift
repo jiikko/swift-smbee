@@ -199,6 +199,29 @@ final class SMBCLIOutputTests: XCTestCase {
         XCTAssertEqual(dacl[0]["trusteeName"] as? String, "Everyone")
     }
 
+    func testSecurityInfoJSONPrefersLSARPCResolvedNames() throws {
+        let info = SMBSecurityInfo(
+            ownerSID: "S-1-5-21-1-2-3-1000",
+            groupSID: "S-1-5-21-1-2-3-513",
+            dacl: [
+                SMBAccessControlEntry(type: 0, flags: 0, accessMask: 0x001f_01ff, trusteeSID: "S-1-1-0")
+            ],
+            controlFlags: 0x8004
+        )
+        let resolved = [
+            "S-1-5-21-1-2-3-1000": "WORKGROUP\\alice",
+            // Resolved map wins over the well-known table when both could match.
+            "S-1-1-0": "EVERYONE\\override",
+        ]
+
+        let object = try jsonObject(SMBCLIOutput.jsonData(for: info, resolveSIDs: true, resolvedNames: resolved))
+
+        XCTAssertEqual(object["ownerName"] as? String, "WORKGROUP\\alice")
+        XCTAssertNil(object["groupName"] as? String)
+        let dacl = try XCTUnwrap(object["dacl"] as? [[String: Any]])
+        XCTAssertEqual(dacl[0]["trusteeName"] as? String, "EVERYONE\\override")
+    }
+
     func testChangeNotifyJSONShapes() throws {
         let event = SMBChangeNotifyEvent.changes([
             SMBFileChange(action: .added, name: "new.txt"),

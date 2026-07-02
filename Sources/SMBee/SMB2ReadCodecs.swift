@@ -72,6 +72,17 @@ public struct SMBChangeNotifyFilter: OptionSet, Sendable {
 public enum SMBChangeNotifyEvent: Equatable, Sendable {
     case changes([SMBFileChange])
     case overflow
+
+    public var changes: [SMBFileChange]? {
+        if case .changes(let changes) = self {
+            return changes
+        }
+        return nil
+    }
+
+    public var requiresRescan: Bool {
+        self == .overflow
+    }
 }
 
 enum SMB2Logoff {

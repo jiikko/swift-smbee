@@ -545,17 +545,16 @@ Linux/macOS smbclient として必要な理由:
 
 - `withChangeNotifications` はある。
 - 2026-07-02: `smbcli watch --json` を追加。CHANGE_NOTIFY events は newline-delimited JSON として `changes` / `overflow` を出力できる。
+- 2026-07-02: `SMBChangeNotifyEvent.changes` / `requiresRescan` を追加し、overflow を machine-readable な full-rescan signal として扱えるようにした。
 - 再接続時の再購読は未配線。
 
 やること:
 
 - reconnect時の resubscribe。
-- overflow時に full rescan を呼び出し側へ促すだけでなく、helper API を用意するか決める。
 
 完了条件:
 
 - watch中に接続断 -> reconnect -> 再購読できる。
-- overflowを machine-readable に扱える。
 
 ### P2-4. CLI batch / wildcard の拡張
 

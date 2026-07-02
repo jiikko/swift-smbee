@@ -39,7 +39,7 @@ Status labels:
 | mkdir / rename / delete | MS-SMB2 CREATE, SET_INFO | `SMBClient.swift` | yes | yes | smoke | no | covered | Mutation retry is intentionally conservative. |
 | recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | No true transactional directory atomicity; directory resume is size-based skip and checksum verify is unsupported. |
 | server-side copychunk | MS-FSCC FSCTL_SRV_COPYCHUNK | `SMBClient.swift` | yes | fallback observed | no | no | underverified | Samba test FS returns unsupported and exercises fallback; offload-capable server smoke is missing. |
-| change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications`, `smbcli watch --json` | yes | yes | no | no | underverified | Reconnect/resubscribe is not implemented. |
+| change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications`, `SMBChangeNotifyEvent.requiresRescan`, `smbcli watch --json` | yes | yes | no | no | underverified | Reconnect/resubscribe is not implemented. |
 
 ## Metadata And Admin Operations
 

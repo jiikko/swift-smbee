@@ -2721,6 +2721,19 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(collector.events, [.overflow])
     }
 
+    func testChangeNotifyEventConvenienceProperties() {
+        let changes = [
+            SMBFileChange(action: .added, name: "new.txt"),
+        ]
+        let changeEvent = SMBChangeNotifyEvent.changes(changes)
+        let overflowEvent = SMBChangeNotifyEvent.overflow
+
+        XCTAssertEqual(changeEvent.changes, changes)
+        XCTAssertFalse(changeEvent.requiresRescan)
+        XCTAssertNil(overflowEvent.changes)
+        XCTAssertTrue(overflowEvent.requiresRescan)
+    }
+
     func testSessionQueryDirectoryStreamsPagesUntilNoMoreFiles() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([

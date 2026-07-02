@@ -787,7 +787,7 @@ struct Get: AsyncParsableCommand {
                     exclude: exclude,
                     perFileTimeout: transport.perFileDuration,
                     onAction: { action in
-                        writeRecursiveAction(action)
+                        writeRecursiveAction(action, json: json)
                         verifier.record(action)
                     },
                     onProgress: { progress in
@@ -805,6 +805,9 @@ struct Get: AsyncParsableCommand {
                     localDirectory: localDirectory,
                     transport: transport
                 )
+            }
+            if json && !dryRun {
+                print(try successJSONString(command: "get", path: endpoint.path))
             }
             return
         }
@@ -960,7 +963,7 @@ struct Put: AsyncParsableCommand {
                     exclude: exclude,
                     perFileTimeout: transport.perFileDuration,
                     onAction: { action in
-                        writeRecursiveAction(action)
+                        writeRecursiveAction(action, json: json)
                         verifier.record(action)
                     },
                     onProgress: { progress in
@@ -978,6 +981,9 @@ struct Put: AsyncParsableCommand {
                     localDirectory: localDirectory,
                     transport: transport
                 )
+            }
+            if json && !dryRun {
+                print(try successJSONString(command: "put", path: endpoint.path))
             }
             return
         }
@@ -1149,7 +1155,7 @@ struct Copy: AsyncParsableCommand {
                     exclude: exclude,
                     perFileTimeout: transport.perFileDuration
                 ) { action in
-                    writeRecursiveAction(action)
+                    writeRecursiveAction(action, json: json)
                     verifier.record(action)
                 }
             }
@@ -1225,7 +1231,7 @@ struct Remove: AsyncParsableCommand {
                 continueOnError: continueOnError,
                 dryRun: dryRun,
                 timeout: transport.duration
-            ) { action in writeRecursiveAction(action) }
+            ) { action in writeRecursiveAction(action, json: json) }
         }
         if json && !dryRun {
             print(try successJSONString(command: "rm", path: endpoint.path))
@@ -1795,8 +1801,22 @@ func writeStandardError(_ string: String) {
     FileHandle.standardError.write(Data(string.utf8))
 }
 
-func writeRecursiveAction(_ action: SMBRecursiveAction) {
-    FileHandle.standardOutput.write(Data("\(action.kind.rawValue) \(action.path)\n".utf8))
+func recursiveActionLine(_ action: SMBRecursiveAction, json: Bool) -> String {
+    guard json else {
+        return "\(action.kind.rawValue) \(action.path)"
+    }
+    // Newline-delimited JSON, matching `watch --json`: keeps stdout machine-parseable
+    // when recursive commands run with --json (issues/010).
+    let object: [String: String] = ["action": action.kind.rawValue, "path": action.path]
+    guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+          let line = String(data: data, encoding: .utf8) else {
+        return "{\"action\":\"\(action.kind.rawValue)\"}"
+    }
+    return line
+}
+
+func writeRecursiveAction(_ action: SMBRecursiveAction, json: Bool = false) {
+    FileHandle.standardOutput.write(Data((recursiveActionLine(action, json: json) + "\n").utf8))
 }
 
 func parseRange(_ value: String) throws -> SMBReadRange {

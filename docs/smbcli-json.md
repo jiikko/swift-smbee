@@ -30,6 +30,14 @@ Mutating commands with stable success JSON output:
 - `rm`
 - `setacl`
 
+Recursive runs (`get -r` / `put -r` / `cp -r` / `rm -r`) with `--json` print
+each action as newline-delimited JSON on stdout, followed by the success
+object (suppressed for `--dry-run`, where the NDJSON lines are the plan):
+
+```json
+{"action":"download","path":"dir\\file.txt"}
+```
+
 Success output shape:
 
 ```json

@@ -171,6 +171,15 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(watch.json)
     }
 
+    func testRecursiveActionLineFormats() throws {
+        let action = SMBRecursiveAction(kind: .download, path: "dir\\file.txt")
+        XCTAssertEqual(recursiveActionLine(action, json: false), "download dir\\file.txt")
+        XCTAssertEqual(
+            recursiveActionLine(action, json: true),
+            "{\"action\":\"download\",\"path\":\"dir\\\\file.txt\"}"
+        )
+    }
+
     func testVerifyHashModeParsesAndLocalHashMatchesKnownVector() throws {
         let get = try Get.parse(["smb://user@host/share/f", "/tmp/out", "--verify", "hash"])
         XCTAssertEqual(get.verify, .hash)

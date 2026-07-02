@@ -14,7 +14,17 @@
 3. `--continue-on-error` の部分失敗は最後に `recursiveOperationIncomplete` を throw するが、
    (2) と合わせると recursive get/put の JSON consumer には成功/部分失敗の安定 signal が無い。
 
-## 対応方針（案）
+## 対応 (2026-07-03 完了)
+
+- `--json` 時は recursive action 行を NDJSON (`{"action":...,"path":...}`) として stdout に出力
+  (`recursiveActionLine`)。`watch --json` と同じ NDJSON 方針。
+- `get -r --json` / `put -r --json` も成功時に success object を出す (`cp -r` と同一)。
+  dry-run では NDJSON の plan のみで success object は出さない。
+- 部分失敗 (`--continue-on-error`) は既存の structured stderr error object + exit code が signal。
+- `docs/smbcli-json.md` 更新、unit (`testRecursiveActionLineFormats`) 追加。
+- なお `--resume`×`--skip-existing` 等のフラグ相互作用ガードは対象外のまま (必要なら別 issue)。
+
+## 対応方針（案・当初）
 
 - `--json` 時は action 行を stderr へ逃がすか、`watch --json` と同様 NDJSON
   (`{"action":"download","path":...}`) として stdout に統一する。docs/smbcli-json.md の

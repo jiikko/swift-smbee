@@ -572,10 +572,11 @@ Linux/macOS smbclient として必要な理由:
 - 2026-07-02: `mget -r` / `mput -r` を追加。recursive match は basename glob + relative-path exclude を使い、転送時は relative path を保存する。
 - 2026-07-02: `get -r` / `put -r` / `cp -r` に `--include` / `--exclude` を追加。file は include/exclude、directory は exclude による枝刈りを行う。dry-run unit coverage あり。
 - 2026-07-02: single-file `get` / `put` に `--create-dirs` を追加。`get` は local parent、`put` は remote parent を作成する。CLI parse coverage あり。
+- 2026-07-02: `get -r --progress` / `put -r --progress` を追加。recursive transfer の実ファイル転送ごとに既存 byte progress を stderr に出す。skip/dry-run は progress なし。
 
 やること:
 
-- `--progress` を複数ファイル・recursive transfer に対応する。
+- `mget` / `mput` の per-file `--progress` を追加する。
 
 完了条件:
 

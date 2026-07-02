@@ -1847,7 +1847,8 @@ public enum SMBClient {
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
-        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         let targetDirectory = localDirectory.standardizedFileURL
         let downloadDirectory: URL
@@ -1889,6 +1890,7 @@ public enum SMBClient {
                 makeTransport: makeTransport,
                 failures: failures,
                 onAction: onAction,
+                onProgress: onProgress,
                 depth: 0
             )
             try failures.throwIfNeeded()
@@ -1977,6 +1979,7 @@ public enum SMBClient {
         makeTransport: (@Sendable () -> SMBTransport)?,
         failures: SMBRecursiveFailureCollector,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)?,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)?,
         relativePath: String = "",
         depth: Int
     ) async throws {
@@ -2038,6 +2041,7 @@ public enum SMBClient {
                         makeTransport: makeTransport,
                         failures: failures,
                         onAction: onAction,
+                        onProgress: onProgress,
                         relativePath: relativeChild,
                         depth: depth + 1
                     )
@@ -2063,7 +2067,8 @@ public enum SMBClient {
                                 overwrite: resume ? true : overwrite,
                                 credential: credential,
                                 timeout: timeout,
-                                makeTransport: makeTransport
+                                makeTransport: makeTransport,
+                                onProgress: onProgress
                             )
                         }
                         onAction?(SMBRecursiveAction(kind: .download, path: actionChild.path))
@@ -2101,7 +2106,8 @@ public enum SMBClient {
         perFileTimeout: Duration? = nil,
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
-        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await downloadDirectory(
             host: host,
@@ -2120,7 +2126,8 @@ public enum SMBClient {
             perFileTimeout: perFileTimeout,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
-            onAction: onAction
+            onAction: onAction,
+            onProgress: onProgress
         )
     }
 
@@ -2343,7 +2350,8 @@ public enum SMBClient {
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
-        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         let failures = SMBRecursiveFailureCollector()
         try await uploadDirectoryRecursive(
@@ -2365,6 +2373,7 @@ public enum SMBClient {
             makeTransport: makeTransport,
             failures: failures,
             onAction: onAction,
+            onProgress: onProgress,
             depth: 0
         )
         try failures.throwIfNeeded()
@@ -2390,6 +2399,7 @@ public enum SMBClient {
         makeTransport: (@Sendable () -> SMBTransport)?,
         failures: SMBRecursiveFailureCollector,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)?,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)?,
         relativePath: String = "",
         depth: Int
     ) async throws {
@@ -2451,6 +2461,7 @@ public enum SMBClient {
                         makeTransport: makeTransport,
                         failures: failures,
                         onAction: onAction,
+                        onProgress: onProgress,
                         relativePath: relativeChild,
                         depth: depth + 1
                     )
@@ -2492,7 +2503,8 @@ public enum SMBClient {
                                 overwrite: resume ? true : overwrite,
                                 credential: credential,
                                 timeout: timeout,
-                                makeTransport: makeTransport
+                                makeTransport: makeTransport,
+                                onProgress: onProgress
                             )
                         }
                         onAction?(SMBRecursiveAction(kind: .upload, path: remoteChild))
@@ -2527,7 +2539,8 @@ public enum SMBClient {
         perFileTimeout: Duration? = nil,
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
-        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await uploadDirectory(
             host: host,
@@ -2545,7 +2558,8 @@ public enum SMBClient {
             perFileTimeout: perFileTimeout,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
-            onAction: onAction
+            onAction: onAction,
+            onProgress: onProgress
         )
     }
 
@@ -2560,7 +2574,8 @@ public enum SMBClient {
         resume: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil
+        makeTransport: (@Sendable () -> SMBTransport)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await upload(
             host: host,
@@ -2572,7 +2587,8 @@ public enum SMBClient {
             resume: resume,
             credential: credential,
             timeout: timeout,
-            makeTransport: makeTransport
+            makeTransport: makeTransport,
+            onProgress: onProgress
         )
     }
 
@@ -2585,7 +2601,8 @@ public enum SMBClient {
         overwrite: Bool = true,
         resume: Bool = false,
         credentialProvider: SMBCredentialProvider,
-        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await upload(
             host: host,
@@ -2596,7 +2613,8 @@ public enum SMBClient {
             overwrite: overwrite,
             resume: resume,
             credential: try await credentialProvider(),
-            makeTransport: makeTransport
+            makeTransport: makeTransport,
+            onProgress: onProgress
         )
     }
 

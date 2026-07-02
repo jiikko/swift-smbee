@@ -526,7 +526,8 @@ public enum SMBee {
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
-        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await SMBClient.downloadDirectory(
             host: host,
@@ -545,7 +546,8 @@ public enum SMBee {
             perFileTimeout: perFileTimeout,
             credential: credential,
             timeout: timeout,
-            onAction: onAction
+            onAction: onAction,
+            onProgress: onProgress
         )
     }
 
@@ -573,7 +575,8 @@ public enum SMBee {
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
-        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await SMBClient.downloadDirectory(
             host: host,
@@ -591,7 +594,8 @@ public enum SMBee {
             exclude: exclude,
             perFileTimeout: perFileTimeout,
             credentialProvider: credentialProvider,
-            onAction: onAction
+            onAction: onAction,
+            onProgress: onProgress
         )
     }
 
@@ -736,7 +740,8 @@ public enum SMBee {
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
-        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await SMBClient.uploadDirectory(
             host: host,
@@ -754,7 +759,8 @@ public enum SMBee {
             perFileTimeout: perFileTimeout,
             credential: credential,
             timeout: timeout,
-            onAction: onAction
+            onAction: onAction,
+            onProgress: onProgress
         )
     }
 
@@ -777,7 +783,8 @@ public enum SMBee {
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
-        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await SMBClient.uploadDirectory(
             host: host,
@@ -794,7 +801,8 @@ public enum SMBee {
             exclude: exclude,
             perFileTimeout: perFileTimeout,
             credentialProvider: credentialProvider,
-            onAction: onAction
+            onAction: onAction,
+            onProgress: onProgress
         )
     }
 

@@ -485,8 +485,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     - M4: SMBTransferProgress (bytesTransferred/totalBytes?/bytesPerSecond) + onProgress を read/upload/
       download に追加。ContinuousClock でレート算出。
     - M5: smbcli に --timeout (TransportOptions) と get/put の --progress (stderr, \r live 更新) を配線。
+    - 2026-07-02: recursive `get -r --progress` / `put -r --progress` を追加。各ファイルの既存
+      onProgress を facade から CLI へ流す。skip/dry-run は progress を出さない。
     - 残: 全操作 deadline (per-operation withTimeout ラップ) は未対応 (今回は socket-level のみ)。
-      put --progress はファイルを Data に読み込む経路 (streaming ではない) = 大ファイルでメモリ増。
+      `mget` / `mput` の個別ファイル progress は未対応。
 - [x] CLI UX: `--password-stdin` / interactive password prompt / `--json` / exit code 表 / `--debug` redaction policy
   - 自動化用途と人間操作の両方を想定。
   - 2026-07-01: interactive password prompt を実装。`readPassword` の最終フォールバックとして
@@ -516,7 +518,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `--exclude` (repeatable) / `--dry-run` / `--no-overwrite`。0 match は exit 0 + stderr 警告。
     glob helper (`globMatches`/`batchGlobEntries`) を切り出して unit test。転送は既に E2E 実証済みの
     list/download/upload を合成。Linux 160 / macOS 163 unit green (test target が smbcli を import)。
-    残 (defer): recursive (`-r`)、`--create-dirs`、個別ファイル progress、対話 shell、確認 prompt
+    残 (defer): `mget` / `mput` の個別ファイル progress、対話 shell、確認 prompt
     (mget/mput は非破壊なので --dry-run で代替)。
 - [ ] compatibility matrix: macOS SMBX / Samba / Windows Server / NAS (Synology/QNAP 等)
   - dialect/signing/encryption/quirk を記録し、手動 smoke 手順を docs 化する。

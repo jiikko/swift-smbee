@@ -4890,6 +4890,7 @@ final class SMBeeTests: XCTestCase {
         ]))
         let factory = TransportFactorySequence([listTransport, partialTransport])
         let recorder = RecursiveActionRecorder()
+        let progress = TransferProgressCollector()
 
         try await SMBClient.downloadDirectory(
             host: "server",
@@ -4898,12 +4899,16 @@ final class SMBeeTests: XCTestCase {
             localDirectory: destination,
             resume: true,
             credential: SMBCredential(username: "user", password: "pass"),
-            makeTransport: factory.make
-        ) { recorder.append($0) }
+            makeTransport: factory.make,
+            onAction: { recorder.append($0) },
+            onProgress: progress.append
+        )
 
         XCTAssertEqual(factory.makeCount, 2)
         XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("done.txt"), encoding: .utf8), "done")
         XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("partial.txt"), encoding: .utf8), "updated")
+        XCTAssertEqual(progress.snapshots.map(\.bytesTransferred), [7])
+        XCTAssertEqual(progress.snapshots.map(\.totalBytes), [7])
         XCTAssertEqual(recorder.actions, [
             SMBRecursiveAction(kind: .mkdir, path: destination.path),
             SMBRecursiveAction(kind: .skip, path: destination.appendingPathComponent("done.txt").path),
@@ -5009,6 +5014,7 @@ final class SMBeeTests: XCTestCase {
             missingUploadTransport,
         ])
         let recorder = RecursiveActionRecorder()
+        let progress = TransferProgressCollector()
 
         try await SMBClient.uploadDirectory(
             host: "server",
@@ -5017,11 +5023,15 @@ final class SMBeeTests: XCTestCase {
             localDirectory: localDirectory,
             resume: true,
             credential: SMBCredential(username: "user", password: "pass"),
-            makeTransport: factory.make
-        ) { recorder.append($0) }
+            makeTransport: factory.make,
+            onAction: { recorder.append($0) },
+            onProgress: progress.append
+        )
 
         XCTAssertEqual(factory.makeCount, 5)
         XCTAssertFalse(try outboundFrames(doneStatTransport, containCommand: SMB2Commands.write))
+        XCTAssertEqual(progress.snapshots.map(\.bytesTransferred), [6, 3])
+        XCTAssertEqual(progress.snapshots.map(\.totalBytes), [6, 3])
         XCTAssertEqual(recorder.actions, [
             SMBRecursiveAction(kind: .skip, path: "done.txt"),
             SMBRecursiveAction(kind: .upload, path: "mismatch.txt"),

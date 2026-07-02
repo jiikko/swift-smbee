@@ -768,7 +768,7 @@ struct Get: AsyncParsableCommand {
             }
             let verifier = RecursiveTransferVerifier()
             let localDirectory = URL(fileURLWithPath: destination).standardizedFileURL
-            // ⓥ Directory transfer progress is not exposed by the facade yet.
+            let progressWriter = progress ? TransferProgressWriter() : nil
             try await transport.withOperationDeadline {
                 try await SMBee.downloadDirectory(
                     host: endpoint.host,
@@ -785,12 +785,17 @@ struct Get: AsyncParsableCommand {
                     timeout: transport.duration,
                     include: include,
                     exclude: exclude,
-                    perFileTimeout: transport.perFileDuration
-                ) { action in
-                    writeRecursiveAction(action)
-                    verifier.record(action)
-                }
+                    perFileTimeout: transport.perFileDuration,
+                    onAction: { action in
+                        writeRecursiveAction(action)
+                        verifier.record(action)
+                    },
+                    onProgress: { progress in
+                        progressWriter?.emit(progress)
+                    }
+                )
             }
+            progressWriter?.finish()
             if verify == .size {
                 try await verifyRecursiveDownloadSizes(
                     actions: verifier.actions,
@@ -937,7 +942,7 @@ struct Put: AsyncParsableCommand {
             }
             let verifier = RecursiveTransferVerifier()
             let localDirectory = URL(fileURLWithPath: source).standardizedFileURL
-            // ⓥ Directory transfer progress is not exposed by the facade yet.
+            let progressWriter = progress ? TransferProgressWriter() : nil
             try await transport.withOperationDeadline {
                 try await SMBee.uploadDirectory(
                     host: endpoint.host,
@@ -954,12 +959,17 @@ struct Put: AsyncParsableCommand {
                     timeout: transport.duration,
                     include: include,
                     exclude: exclude,
-                    perFileTimeout: transport.perFileDuration
-                ) { action in
-                    writeRecursiveAction(action)
-                    verifier.record(action)
-                }
+                    perFileTimeout: transport.perFileDuration,
+                    onAction: { action in
+                        writeRecursiveAction(action)
+                        verifier.record(action)
+                    },
+                    onProgress: { progress in
+                        progressWriter?.emit(progress)
+                    }
+                )
             }
+            progressWriter?.finish()
             if verify == .size {
                 try await verifyRecursiveUploadSizes(
                     actions: verifier.actions,

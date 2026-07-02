@@ -26,6 +26,17 @@
   resume されない経路が残っている / `SMB2CreditWindow.reserve` 待ちが grant の来ない状態で
   永久 block（cancellation 非対応の待ち）。
 
+## 追加観測 (2026-07-03)
+
+- run 28605761487 では **macOS `build-test` も hang** (Build complete! 以降テスト出力ゼロで
+  10 分 timeout、orphan に xctest + swift-package)。Linux 限定ではない。
+- ローカル `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` での hang 再現は **別問題**
+  (swift-test driver の build フェーズ / SwiftLint plugin × llbuild lane が semaphore 待ちで
+  deadlock) であり、CI の「build 完了後・テスト出力ゼロ」hang とは一致しない。
+- 対応 (観測強化): test.yml の macOS job は 480s で self-timeout して hung xctest を
+  `sample` で stack dump、Linux job は `stdbuf -oL` で最後に開始した test 名が残るようにした。
+  次に hang した run のログで真因を特定する。
+
 ## 次の観測手段（instrument-before-second-fix）
 
 - CI (Linux) で `swift test --parallel` ではなく verbose + 各 test の timeout を付け、

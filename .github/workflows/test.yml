@@ -46,7 +46,26 @@ jobs:
         # Samba-backed tests run in the E2E workflows. Keep the generic macOS
         # check to deterministic unit/vector coverage; macos-26 can hang after
         # compiling when the skipped async E2E XCTest cases are included.
-        run: swift test --skip SMBeeE2ETests
+        # An intermittent post-build hang with zero test output is under
+        # investigation (issues/013): bound the run ourselves and dump the
+        # hung xctest stacks before the job-level timeout would kill us blind.
+        run: |
+          swift test --skip SMBeeE2ETests &
+          test_pid=$!
+          for _ in $(seq 1 480); do
+            kill -0 "$test_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$test_pid" 2>/dev/null; then
+            echo "::error::swift test still running after 480s; sampling hung processes (issues/013)"
+            for pid in $(pgrep -x xctest) $(pgrep -f SMBeePackageTests); do
+              echo "--- sample of pid $pid ---"
+              sample "$pid" 5 2>/dev/null || true
+            done
+            kill -9 "$test_pid" 2>/dev/null || true
+            exit 1
+          fi
+          wait "$test_pid"
 
   linux-build-test:
     name: linux-build-test / .swift-version
@@ -66,7 +85,9 @@ jobs:
         timeout-minutes: 10
         # Samba-backed tests run in the E2E workflows. Keep the generic Linux
         # job on deterministic unit/vector coverage.
-        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift test --skip SMBeeE2ETests
+        # stdbuf keeps per-test output line-buffered so an intermittent hang
+        # (issues/013) shows the last started test instead of an empty log.
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" stdbuf -oL -eL swift test --skip SMBeeE2ETests
 
   test-registration-coverage:
     name: test-registration-coverage / .swift-version

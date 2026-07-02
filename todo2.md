@@ -594,10 +594,12 @@ Linux/macOS smbclient として必要な理由:
   安定した成功/失敗 signal とする方針を記録。
 - 2026-07-02: mutating commands (`get` / `put` / `cp` / `mv` / `rm` / `mkdir` / `setacl`) に
   `--json` 成功 object (`ok`, `command`, `path`) を追加。dry-run recursive は human plan を優先。
+- 2026-07-02: `--json` 指定時の error output を structured stderr object (`ok=false`, `category`,
+  `exitCode`, `error`) に変更。
 
 やること:
 
-- error JSON は別 flag にするか検討する。
+- 追加の JSON schema が増えたら `docs/smbcli-json.md` を更新する。
 
 完了条件:
 

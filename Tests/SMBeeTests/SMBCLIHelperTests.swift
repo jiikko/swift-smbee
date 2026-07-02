@@ -133,4 +133,15 @@ final class SMBCLIHelperTests: XCTestCase {
         XCTAssertEqual(object["command"] as? String, "put")
         XCTAssertEqual(object["path"] as? String, "dir\\file.txt")
     }
+
+    func testErrorJSONStringShape() throws {
+        let error = SMBError.notFound(status: 0xc000_0034, operation: "CREATE")
+        let data = try XCTUnwrap(errorJSONString(error).data(using: .utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(object["ok"] as? Bool, false)
+        XCTAssertEqual(object["category"] as? String, "smb")
+        XCTAssertEqual(object["exitCode"] as? Int, Int(SMBCLIExitCode.notFound))
+        XCTAssertNotNil(object["error"] as? String)
+    }
 }

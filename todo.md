@@ -453,7 +453,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-07-02: single-file `get` / `put` に `--create-dirs` を追加。`get` は local parent、
     `put` は remote parent を作成する。
   - 2026-07-02: mutating commands (`get` / `put` / `cp` / `mv` / `rm` / `mkdir` / `setacl`) に
-    `--json` 成功 object (`ok`, `command`, `path`) を追加。structured error JSON は未実装。
+    `--json` 成功 object (`ok`, `command`, `path`) を追加。
+  - 2026-07-02: `--json` 指定時の error output を structured stderr object (`ok=false`, `category`,
+    `exitCode`, `error`) に変更。
   - sparse file / allocation size / zero range の扱いも未実装。巨大 VM image や backup 用途では
     通信量と local disk 使用量に影響するため、`FSCTL_SET_ZERO_DATA` 等を調査する。
   - 暗号化 transport の integrity とは別に、consumer visible な transfer verification (size / optional hash)

@@ -61,7 +61,7 @@ Status labels:
 | Feature | Spec | Implementation | Unit | Samba E2E | macOS SMBX | Windows/NAS | Status | Limitations |
 |---|---|---|---|---|---|---|---|---|
 | `smbcli` core commands | CLI | `Sources/smbcli` | yes | yes | smoke | no | covered | Interactive shell is out of scope. `mget -r` / `mput -r` preserve relative paths; per-file progress for batch transfers is future work. |
-| JSON output | CLI | `SMBCLIOutput.swift`, `smbcli`, `docs/smbcli-json.md` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands expose success JSON when `--json` is set. Structured error JSON is not implemented. |
+| JSON output | CLI | `SMBCLIOutput.swift`, `smbcli`, `docs/smbcli-json.md` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands expose success JSON when `--json` is set. `--json` errors use a structured stderr object. |
 | exit codes | CLI | `SMBCLI.swift`, `docs/smbcli-exit-codes.md` | yes | yes | no | no | covered | Keep exhaustive mapping as `SMBError` evolves. |
 | debug redaction | operational | `SMBDebug.swift`, `smbcli --debug/--trace-wire` | yes | yes | no | no | covered | Raw wire trace remains explicitly opt-in. |
 | timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift`, `SMB2Cancel` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. `smbcli --operation-timeout` wraps all commands, and recursive transfers have per-file timeout. Public API operation deadline parameters are not broadly implemented. CHANGE_NOTIFY cancellation sends SMB2 CANCEL. |

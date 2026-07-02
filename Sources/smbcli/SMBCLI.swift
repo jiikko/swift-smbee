@@ -55,6 +55,11 @@ enum SMBCLIMain {
     }
 
     private static func printError(_ error: Error) {
+        if CommandLine.arguments.contains("--json") {
+            writeStandardError((try? errorJSONString(error)) ?? "{\"ok\":false,\"error\":\"failed to encode error\"}")
+            writeStandardError("\n")
+            return
+        }
         if case let SMBError.recursiveOperationIncomplete(failures) = error {
             writeStandardError("Error: recursive operation incomplete\n")
             for failure in failures {
@@ -1474,6 +1479,28 @@ func successJSONString(command: String, path: String? = nil) throws -> String {
     ]
     if let path {
         object["path"] = path
+    }
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    guard let string = String(data: data, encoding: .utf8) else {
+        throw ValidationError("failed to encode JSON")
+    }
+    return string
+}
+
+func errorJSONString(_ error: Error) throws -> String {
+    var object: [String: Any] = [
+        "ok": false,
+        "error": String(describing: error),
+    ]
+    if let smbError = error as? SMBError {
+        object["category"] = "smb"
+        object["exitCode"] = Int(SMBCLIExitCode.code(for: smbError))
+    } else if SMBCLI.exitCode(for: error) == .validationFailure {
+        object["category"] = "usage"
+        object["exitCode"] = Int(SMBCLIExitCode.usage)
+    } else {
+        object["category"] = "other"
+        object["exitCode"] = Int(SMBCLIExitCode.other)
     }
     let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     guard let string = String(data: data, encoding: .utf8) else {

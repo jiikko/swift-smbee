@@ -151,6 +151,7 @@ public enum SMBReparseKind: Equatable, Sendable {
     case mountPoint
     case dfs
     case nfs
+    case lxSymlink
     case other(UInt32)
 
     public init(tag: UInt32) {
@@ -163,6 +164,8 @@ public enum SMBReparseKind: Equatable, Sendable {
             self = .dfs
         case SMBReparseTags.nfs:
             self = .nfs
+        case SMBReparseTags.lxSymlink:
+            self = .lxSymlink
         default:
             self = .other(tag)
         }
@@ -180,6 +183,8 @@ extension SMBReparseKind: CustomStringConvertible {
             "dfs"
         case .nfs:
             "nfs"
+        case .lxSymlink:
+            "lxSymlink"
         case .other(let tag):
             "other(0x" + String(format: "%08x", tag) + ")"
         }
@@ -287,8 +292,11 @@ public enum SMBReparseTags {
     public static let symlink: UInt32 = 0xa000_000c
     public static let mountPoint: UInt32 = 0xa000_0003
     public static let dfs: UInt32 = 0x8000_000a
-    // ⓥ NFS tag value is included for classification only; resolving NFS reparse data is out of scope.
-    public static let nfs: UInt32 = 0x8000_0027
+    // NFS tag is included for classification only; MS-FSCC marks its reparse data as
+    // server-side interpretation only, so it stays opaque to this client.
+    public static let nfs: UInt32 = 0x8000_0014
+    // WSL symbolic link; reparse data layout is public (MS-FSCC §2.1.2.7).
+    public static let lxSymlink: UInt32 = 0xa000_001d
 }
 
 public struct SMBFileMetadataUpdate: Equatable, Sendable {

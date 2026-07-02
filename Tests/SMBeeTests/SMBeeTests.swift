@@ -1776,6 +1776,40 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNil(reparsePoint.flags)
     }
 
+    func testSMB2ReparsePointDecodesLxSymlinkBuffer() throws {
+        // REPARSE_DATA_BUFFER: tag + dataLength + reserved, then Version(=2) + UTF-8 target.
+        let target = Array("../relative/target".utf8)
+        var writer = SMBByteWriter()
+        writer.writeUInt32LE(SMBReparseTags.lxSymlink)
+        writer.writeUInt16LE(UInt16(4 + target.count))
+        writer.writeUInt16LE(0)
+        writer.writeUInt32LE(2)
+        writer.writeBytes(target)
+
+        let reparsePoint = try SMB2ReparsePoint.decode(writer.bytes)
+        XCTAssertEqual(reparsePoint.kind, .lxSymlink)
+        XCTAssertEqual(reparsePoint.substituteName, "../relative/target")
+        XCTAssertNil(reparsePoint.printName)
+    }
+
+    func testSMB2ReparsePointKeepsDfsAndNfsDataOpaque() throws {
+        // MS-FSCC: DFS/NFS reparse data is server-side only; clients treat it as opaque.
+        for tag in [SMBReparseTags.dfs, SMBReparseTags.nfs] {
+            var writer = SMBByteWriter()
+            writer.writeUInt32LE(tag)
+            writer.writeUInt16LE(4)
+            writer.writeUInt16LE(0)
+            writer.writeBytes([0xde, 0xad, 0xbe, 0xef])
+
+            let reparsePoint = try SMB2ReparsePoint.decode(writer.bytes)
+            XCTAssertEqual(reparsePoint.tag, tag)
+            XCTAssertNil(reparsePoint.substituteName)
+            XCTAssertEqual(reparsePoint.rawData, [0xde, 0xad, 0xbe, 0xef])
+        }
+        XCTAssertEqual(SMBReparseTags.nfs, 0x8000_0014)
+        XCTAssertEqual(SMBReparseKind(tag: 0x8000_0014), .nfs)
+    }
+
     func testSMB2DfsReferralRequestInputEncodesMaxLevelAndNullTerminatedPath() throws {
         let input = SMB2DfsReferral.encodeRequestInput(path: "\\\\server\\dfsroot\\link", maxLevel: 4)
 

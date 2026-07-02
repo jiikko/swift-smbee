@@ -393,9 +393,16 @@ Linux/macOS smbclient として必要な理由:
 - symlink / junction / mount point / DFS link はファイルブラウザで必ず問題になる。
 - targetを表示できないと、UI/CLIで「何があるか」は分かっても「どこへ向いているか」が分からない。
 
+- 2026-07-03: DFS reparse data の扱いを確定。MS-FSCC の reparse tag 表は DFS (0x8000000A) /
+  NFS (0x80000014) の reparse data を "server-side interpretation only, not meaningful over the
+  wire" と定めており、クライアントは opaque として扱うのが正。decode branch にその旨を明記し、
+  DFS link の解決は FSCTL_DFS_GET_REFERRALS (`smbcli dfs`) を使う。**bug fix**: `SMBReparseTags.nfs`
+  が 0x80000027 (存在しない値) だったのを MS-FSCC 正値 0x80000014 に修正。
+  加えて LX symlink (0xA000001D, MS-FSCC §2.1.2.7 で公開レイアウト) の target decode を追加
+  (`SMBReparseKind.lxSymlink`)。unit fixture あり。
+
 やること:
 
-- DFS reparse data の decoder を分ける。
 - Samba / Windows / macOS SMBX で `smbcli readlink` smoke を取る。
 - recursive operation の policy を明示する:
   - followしない

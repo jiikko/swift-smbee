@@ -814,9 +814,25 @@ enum SMB2ReparsePoint {
             return try decodeSymbolicLink(tag: tag, data: data)
         case SMBReparseTags.mountPoint:
             return try decodeMountPoint(tag: tag, data: data)
+        case SMBReparseTags.lxSymlink:
+            return try decodeLxSymlink(tag: tag, data: data)
         default:
+            // DFS (0x8000000A) and NFS (0x80000014) reparse data are marked
+            // "server-side interpretation only, not meaningful over the wire" in the
+            // MS-FSCC reparse tag table, so clients must treat them as opaque. For DFS
+            // links use FSCTL_DFS_GET_REFERRALS (`smbcli dfs`) to resolve targets.
             return SMBReparsePoint(tag: tag, rawData: data)
         }
+    }
+
+    private static func decodeLxSymlink(tag: UInt32, data: [UInt8]) throws -> SMBReparsePoint {
+        // MS-FSCC §2.1.2.7: Version(4, MUST be 2) + UTF-8 target path.
+        guard data.count >= 4 else { throw SMBCodecError.truncated }
+        guard readUInt32LE(data, at: 0) == 2 else {
+            throw SMBCodecError.invalidValue("unsupported LX symlink reparse data version")
+        }
+        let target = String(decoding: data.dropFirst(4), as: UTF8.self)
+        return SMBReparsePoint(tag: tag, substituteName: target, rawData: data)
     }
 
     private static func decodeSymbolicLink(tag: UInt32, data: [UInt8]) throws -> SMBReparsePoint {

@@ -13,7 +13,10 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 ## スコープ (MVP)
 
 - 対象サーバ: **SMB 3.x サーバ**（macOS SMBX / Windows SMB Server / Samba）。現時点の自動 E2E は Samba、Windows 実機 smoke は未追加。
-- dialect: **SMB 3.0.2 / SMB 3.1.1**（サーバとの NEGOTIATE 結果に従う。macOS SMBX は現状 3.0.2 上限、Samba では 3.1.1 profile も検証。Windows SMB Server は実機 smoke 未追加）
+- dialect: authenticated operations are **SMB 3.x only**: **SMB 3.0 / 3.0.2 / 3.1.1**
+  （サーバとの NEGOTIATE 結果に従う。probe は SMB 2.0.2 / 2.1 も表示できるが、SMB 2.1 以下への
+  authenticated fallback は非対応。macOS SMBX は現状 3.0.2 上限、Samba では 3.1.1 profile も検証。
+  Windows SMB Server は実機 smoke 未追加）
 - signing / encryption: negotiated dialect に応じて AES-CMAC / AES-CCM（3.0.x）または AES-GMAC / AES-GCM（3.1.1）
 - 認証: **NTLMv2**（Kerberos は対象外）
 - まず CLI (`smbcli`) で動かし、後段で GUI から利用する

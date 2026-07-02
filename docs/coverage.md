@@ -17,7 +17,7 @@ Status labels:
 |---|---|---|---|---|---|---|---|---|
 | Direct TCP framing | MS-SMB2 2.1 | `DirectTCPFraming.swift`, `SMBTransport.swift` | yes | yes | smoke | no | covered | Port 445 only. NetBIOS port 139 is out of scope. |
 | NEGOTIATE probe | MS-SMB2 3.2.4.2 | `SMBNegotiate.swift`, `SMBProbe.swift` | yes | yes | smoke | no | covered | Probe advertises SMB 2.0.2/2.1/3.x, but authenticated connect is SMB 3.x only. |
-| Authenticated dialect policy | MS-SMB2 3.2.4.2 | `SMBNegotiateCodec.authenticatedDialects` | yes | yes | smoke | no | covered | SMB 2.1 authenticated fallback is unsupported. |
+| Authenticated dialect policy | MS-SMB2 3.2.4.2 | `SMBNegotiateCodec.authenticatedDialects` | yes | yes | smoke | no | covered | SMB 3.x only. SMB 2.0.2/2.1 are probe-only and authenticated connect returns a diagnostic `protocolError`. |
 | SMB 3.0.2 signing/encryption | MS-SMB2, RFC4493, SP800-38C | `SMBSessionCrypto.swift`, `AESCMAC.swift`, `AESCCM.swift` | yes | yes | smoke | no | covered | Uses AES-CMAC signing and AES-128-CCM encryption. |
 | SMB 3.1.1 signing/encryption | MS-SMB2 3.1.4.1, 3.1.4.2 | `SMBSessionCrypto.swift`, `SMB3TransformHeader.swift`, `SMBCrypto.swift` | yes | yes | no | no | underverified | Samba is covered; Windows/NAS SMB 3.1.1 smoke is still missing. |
 | NTLMv2 + SPNEGO | MS-NLMP, MS-SPNG | `NTLM.swift`, `SMBClient.swift` | yes | yes | smoke | no | covered | Kerberos/GSS is unsupported. |

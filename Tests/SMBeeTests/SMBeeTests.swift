@@ -933,6 +933,31 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testAuthenticatedConnectRejectsSMB21OnlyServerWithDiagnostic() async throws {
+        let inbound = try framed([
+            negotiateResponse(messageId: 0, dialect: SMBNegotiateConstants.dialect210),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+
+        do {
+            _ = try await SMBClient.connect(
+                host: "server",
+                share: "share",
+                credential: SMBCredential(username: "user", password: "pass"),
+                makeTransport: { transport }
+            )
+            XCTFail("expected SMB 2.1 authenticated connection to be rejected")
+        } catch SMBError.protocolError(let message) {
+            XCTAssertEqual(message, SMBNegotiateCodec.authenticatedUnsupportedMessage)
+            let requests = try unframed(transport.outbound)
+            XCTAssertEqual(requests.count, 1)
+            let header = try SMB2Header.decode(requests[0])
+            XCTAssertEqual(header.command, SMBNegotiateConstants.commandNegotiate)
+        } catch {
+            XCTFail("expected protocolError, got \(error)")
+        }
+    }
+
     func testCredentialProviderIsResolvedOnceWhenConnectingPersistentSession() async throws {
         let inbound = try framed([
             negotiateResponse(messageId: 0),
@@ -5426,12 +5451,12 @@ final class SMBeeTests: XCTestCase {
         return signed
     }
 
-    private func negotiateResponse(messageId: UInt64) throws -> [UInt8] {
+    private func negotiateResponse(messageId: UInt64, dialect: UInt16 = SMBNegotiateConstants.dialect302) throws -> [UInt8] {
         var response = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 65))
         writeUInt16LE(65, to: &response, at: 64)
         writeUInt16LE(SMBNegotiateConstants.signingEnabled, to: &response, at: 66)
-        writeUInt16LE(SMBNegotiateConstants.dialect302, to: &response, at: 68)
+        writeUInt16LE(dialect, to: &response, at: 68)
         response.replaceSubrange(72..<88, with: Array(repeating: UInt8(0x42), count: 16))
         writeUInt32LE(1_048_576, to: &response, at: 92)
         writeUInt32LE(1_048_576, to: &response, at: 96)

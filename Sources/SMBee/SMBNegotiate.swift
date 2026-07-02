@@ -46,6 +46,12 @@ public enum SMBNegotiateCodec {
         SMBNegotiateConstants.dialect302,
         SMBNegotiateConstants.dialect311,
     ]
+    public static let authenticatedUnsupportedMessage =
+        "Authenticated SMB connections require SMB 3.x (3.0, 3.0.2, or 3.1.1). SMB 2.0.2/2.1 are probe-only and not supported for authenticated operations."
+
+    public static func supportsAuthenticatedConnection(dialect: UInt16) -> Bool {
+        authenticatedDialects.contains(dialect)
+    }
 
     public static func encodeRequest(
         clientGuid: UUID,

@@ -2519,11 +2519,8 @@ actor SMBSession {
         let result = try SMBNegotiateCodec.decodeResponse(negotiateResponse)
         maxReadSize = result.maxReadSize
         maxWriteSize = result.maxWriteSize
-        guard result.dialect == SMBNegotiateConstants.dialect311
-            || result.dialect == SMBNegotiateConstants.dialect302
-            || result.dialect == SMBNegotiateConstants.dialect300
-        else {
-            throw SMBCodecError.invalidValue("authenticated path currently supports SMB 3.0.x and 3.1.1")
+        guard SMBNegotiateCodec.supportsAuthenticatedConnection(dialect: result.dialect) else {
+            throw SMBError.protocolError(SMBNegotiateCodec.authenticatedUnsupportedMessage)
         }
         if result.dialect == SMBNegotiateConstants.dialect311 {
             guard result.preauthHashAlgorithm == SMBNegotiateConstants.sha512,

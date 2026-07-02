@@ -38,7 +38,9 @@ Specifications**。周辺の暗号・交渉メカニズムの一部だけが IET
 ## MVP スコープ（SMBee）
 
 - **transport**: direct TCP、**port 445**、各 SMB2 メッセージの前に **4 byte の big-endian length**（最上位 byte は 0）。NetBIOS session service は使わない。
-- **dialect**: **SMB 3.0.2 と SMB 3.1.1 の両対応**。macOS SMBX の実上限は 3.0.2
+- **dialect**: authenticated operations are **SMB 3.x only**（3.0 / 3.0.2 / 3.1.1）。
+  probe は SMB 2.0.2 / 2.1 も提示・表示できるが、SMB 2.1 以下への authenticated fallback は
+  security policy を下げるため非対応。macOS SMBX の実上限は 3.0.2
   （macOS 26.5.1 でも 0x0302 が上限）、Windows SMB Server / Samba 等は negotiated dialect に従う。
 - **auth**: **NTLMv2**（SPNEGO 包装）。**Kerberos は対象外**。
 - **signing / encryption**: negotiated dialect 依存。

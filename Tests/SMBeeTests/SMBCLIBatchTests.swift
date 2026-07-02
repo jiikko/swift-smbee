@@ -50,6 +50,22 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(files.map(\.name), ["a.log"])
     }
 
+    func testLocalRecursiveBatchGlobEntriesPreservesRelativePaths() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let nested = directory.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try Data("a".utf8).write(to: directory.appendingPathComponent("a.log"))
+        try Data("b".utf8).write(to: nested.appendingPathComponent("b.log"))
+        try Data("c".utf8).write(to: nested.appendingPathComponent("c.txt"))
+
+        let files = try localRecursiveBatchGlobEntries(directory: directory.path, include: "*.log", exclude: ["nested\\skip*"])
+
+        XCTAssertEqual(files.map(\.name), ["a.log", "nested\\b.log"])
+    }
+
     func testMGetParsesPositionalsAndFlags() throws {
         let command = try MGet.parse([
             "smb://user@host/share/dir",
@@ -61,6 +77,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "*.bak",
             "--dry-run",
             "--no-overwrite",
+            "--recursive",
         ])
 
         XCTAssertEqual(command.remoteDirectory, "smb://user@host/share/dir")
@@ -69,6 +86,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(command.exclude, ["debug-*", "*.bak"])
         XCTAssertTrue(command.dryRun)
         XCTAssertTrue(command.noOverwrite)
+        XCTAssertTrue(command.recursive)
     }
 
     func testMPutParsesPositionalsAndFlags() throws {
@@ -80,6 +98,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "file9.*",
             "--dry-run",
             "--no-overwrite",
+            "--recursive",
         ])
 
         XCTAssertEqual(command.localDirectory, "/tmp/in")
@@ -88,6 +107,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(command.exclude, ["file9.*"])
         XCTAssertTrue(command.dryRun)
         XCTAssertTrue(command.noOverwrite)
+        XCTAssertTrue(command.recursive)
     }
 
     func testProbeParsesServerUrlAndCommonFlags() throws {

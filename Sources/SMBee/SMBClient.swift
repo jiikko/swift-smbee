@@ -420,6 +420,11 @@ public actor SMBClientSession {
         await session.disconnect(treeId: treeId)
     }
 
+    public func echo() async throws {
+        try ensureOpen()
+        try await session.echo()
+    }
+
     public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
         let collector = SMBDirectoryEntryCollector()
         try await withDirectoryStream(path: path) { entry in
@@ -872,6 +877,47 @@ public enum SMBClient {
         try await listShares(
             host: host,
             port: port,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
+    /// Send an authenticated SMB2 ECHO on a connected tree and return when the server replies.
+    ///
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func echo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws {
+        try await withSession(
+            host: host,
+            port: port,
+            share: share,
+            credential: credential,
+            timeout: timeout,
+            makeTransport: makeTransport,
+            idempotent: true,
+            operationName: "ECHO"
+        ) { session, _ in
+            try await session.echo()
+        }
+    }
+
+    public static func echo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+    ) async throws {
+        try await echo(
+            host: host,
+            port: port,
+            share: share,
             credential: try await credentialProvider(),
             makeTransport: makeTransport
         )
@@ -3369,6 +3415,13 @@ actor SMBSession {
         let response = try await signedWireTransaction(packet: packet, responseLabel: "LOGOFF response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "LOGOFF")
+    }
+
+    func echo() async throws {
+        let packet = try SMB2Echo.encodeRequest(messageId: nextMessageId(), sessionId: sessionId)
+        debugDump("ECHO request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "ECHO response")
+        try SMB2Echo.decodeResponse(response)
     }
 
     func disconnect(treeId: UInt32) async {

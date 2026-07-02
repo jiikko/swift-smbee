@@ -51,6 +51,29 @@ public enum SMBee {
         try await SMBClient.listShares(host: host, port: port, credentialProvider: credentialProvider)
     }
 
+    /// Send an authenticated SMB2 ECHO and return when the server replies.
+    ///
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func echo(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        timeout: Duration? = nil
+    ) async throws {
+        try await SMBClient.echo(host: host, port: port, share: share, credential: credential, timeout: timeout)
+    }
+
+    /// Send an authenticated SMB2 ECHO and return when the server replies.
+    public static func echo(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String
+    ) async throws {
+        try await SMBClient.echo(host: host, port: port, share: share, credentialProvider: credentialProvider)
+    }
+
     /// Resolve a DFS namespace path to referral targets. This returns referral
     /// metadata only; reconnecting to a target and rewriting paths is left to callers.
     ///

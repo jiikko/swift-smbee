@@ -13,6 +13,7 @@ enum SMB2Commands {
     static let write: UInt16 = 9
     static let ioctl: UInt16 = 11
     static let cancel: UInt16 = 12
+    static let echo: UInt16 = 13
     static let changeNotify: UInt16 = 15
     static let setInfo: UInt16 = 17
     static let queryInfo: UInt16 = 16
@@ -92,6 +93,27 @@ enum SMB2TreeDisconnect {
         writer.writeUInt16LE(4)
         writer.writeUInt16LE(0)
         return writer.bytes
+    }
+}
+
+enum SMB2Echo {
+    static func encodeRequest(messageId: UInt64, sessionId: UInt64) throws -> [UInt8] {
+        let header = try SMB2Header(command: SMB2Commands.echo, messageId: messageId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(4)
+        writer.writeUInt16LE(0)
+        return writer.bytes
+    }
+
+    static func decodeResponse(_ bytes: [UInt8]) throws {
+        let header = try SMB2Header.decode(bytes)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "ECHO")
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 4 else {
+            throw SMBCodecError.invalidValue("invalid ECHO response structure size")
+        }
+        try reader.skip(count: 2)
     }
 }
 

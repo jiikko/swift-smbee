@@ -1161,6 +1161,26 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try unframed(transport.outbound).count, 6)
     }
 
+    func testSMBeeFacadeEchoUsesTransportOverrideAndTeardown() async throws {
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2EchoResponse(messageId: 4),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 5, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 6, treeId: 0),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        try await SMBee.echo(
+            host: "server",
+            credential: SMBCredential(username: "user", password: "pass"),
+            share: "share"
+        )
+
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 7)
+        // Requests after TREE_CONNECT are transform-encrypted in this fixture.
+    }
+
     func testSMBeeFacadeWithDirectoryStreamUsesTransportOverride() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
@@ -1330,6 +1350,21 @@ final class SMBeeTests: XCTestCase {
         let encoded = try header.encode()
         XCTAssertEqual(encoded.count, 64)
         XCTAssertEqual(try SMB2Header.decode(encoded), header)
+    }
+
+    func testSMB2EchoRequestAndResponseShape() throws {
+        let request = try SMB2Echo.encodeRequest(messageId: 21, sessionId: 0x1122_3344)
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.echo)
+        XCTAssertEqual(header.messageId, 21)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 4)
+        XCTAssertEqual(readUInt16LE(request, at: 66), 0)
+
+        var response = try SMB2Header(command: SMB2Commands.echo, messageId: 21, sessionId: 0x1122_3344).encode()
+        response.append(contentsOf: [4, 0, 0, 0])
+        XCTAssertNoThrow(try SMB2Echo.decodeResponse(response))
     }
 
     func testSMB2CreditChargeAndBalanceHelpers() {
@@ -5235,6 +5270,12 @@ final class SMBeeTests: XCTestCase {
 
     private func smb2StatusResponse(status: UInt32, command: UInt16, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
         try SMB2Header(status: status, command: command, messageId: messageId, treeId: treeId).encode()
+    }
+
+    private func smb2EchoResponse(messageId: UInt64) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.echo, messageId: messageId).encode()
+        response.append(contentsOf: [4, 0, 0, 0])
+        return response
     }
 
     // SMB2 ERROR Response (MS-SMB2 §2.2.2): StructureSize=9, ErrorContextCount, Reserved,

@@ -614,12 +614,14 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-7. SMB ECHO / keepalive
 
-状態: `missing`
+状態: `partial`
 
 実装確認:
 
-- `SMB2Commands` に ECHO command 定数がない。
-- `SMB2Echo` codec / public API / CLI は確認できない。
+- 2026-07-02: `SMB2Commands.echo` / `SMB2Echo` codec を追加。
+- 2026-07-02: `SMBClientSession.echo()` / `SMBee.echo(...)` / `smbcli ping` を追加。
+- 2026-07-02: codec shape、facade teardown、CLI parse の unit coverage を追加。
+- persistent session の automatic / periodic keepalive は未実装。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -627,12 +629,12 @@ Linux/macOS smbclient として必要な理由:
 
 やること:
 
-- SMB2 ECHO codec を実装。
 - persistent session に optional keepalive を追加。
-- `smbcli ping` または `probe --echo` を検討。
+- keepalive 間隔、失敗時の session state、API surface を決める。
 
 完了条件:
 
+- authenticated ECHO を明示的に送れる。
 - idle session で periodic ECHO を送れる。
 - server切断を bounded に検出できる。
 

@@ -23,6 +23,7 @@ Status labels:
 | NTLMv2 + SPNEGO | MS-NLMP, MS-SPNG | `NTLM.swift`, `SMBClient.swift` | yes | yes | smoke | no | covered | Kerberos/GSS is unsupported. |
 | Anonymous/guest NTLM | MS-NLMP | `NTLM.swift`, `SMBClient.swift`, `smbcli` | yes | yes | no | no | underverified | Samba guest path covered only. |
 | SESSION_SETUP / TREE_CONNECT | MS-SMB2 3.2.4.3, 3.2.4.4 | `SMBClient.swift` | yes | yes | smoke | no | covered | Authenticated session is tied to one tree in `SMBClientSession`. |
+| ECHO | MS-SMB2 3.2.4.25 | `SMB2ReadCodecs.swift`, `SMBClient.echo`, `smbcli ping` | yes | no | no | no | partial | Manual authenticated ECHO is implemented. Automatic periodic keepalive and real-server smoke are missing. |
 | TREE_DISCONNECT / LOGOFF | MS-SMB2 3.2.4.23, 3.2.4.24 | `SMBClient.swift` | yes | yes | no | no | covered | Best-effort on clean close. |
 
 ## File Operations

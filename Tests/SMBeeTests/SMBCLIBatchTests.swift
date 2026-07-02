@@ -99,6 +99,14 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(command.debug.debug)
     }
 
+    func testPingParsesReadUrlAndAuth() throws {
+        let command = try Ping.parse(["smb://user@host/share", "--domain", "WORK", "--timeout", "1.5"])
+
+        XCTAssertEqual(command.url, "smb://user@host/share")
+        XCTAssertEqual(command.auth.domain, "WORK")
+        XCTAssertEqual(command.transport.timeout, 1.5)
+    }
+
     func testSharesListStatDiskFreeACLAndDfsParseJsonTimeoutAndAuth() throws {
         let shares = try Shares.parse(["smb://user@host", "--domain", "WORK", "--json", "--timeout", "2"])
         XCTAssertEqual(shares.url, "smb://user@host")

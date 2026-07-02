@@ -15,7 +15,7 @@ struct SMBCLI: AsyncParsableCommand {
         abstract: "🐝 SMBee command-line client",
         version: SMBee.version,
         subcommands: [
-            Probe.self, Shares.self, List.self, Stat.self, ACL.self, DiskFree.self, Cat.self, Get.self,
+            Probe.self, Ping.self, Shares.self, List.self, Stat.self, ACL.self, DiskFree.self, Cat.self, Get.self,
             MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Watch.self, Dfs.self,
             SetACL.self
         ]
@@ -161,6 +161,35 @@ struct List: AsyncParsableCommand {
         if json {
             print(try SMBCLIOutput.jsonString(for: collector.entries))
         }
+    }
+}
+
+struct Ping: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "ping", abstract: "Send an authenticated SMB2 ECHO")
+
+    @Argument(help: "smb://user@host[:445]/share")
+    var url: String
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    func run() async throws {
+        debug.apply()
+        let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
+        try await SMBee.echo(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            timeout: transport.duration
+        )
+        print("ok")
     }
 }
 

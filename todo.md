@@ -418,6 +418,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     で抑えているが、CreditCharge / CreditRequest / CreditResponse を管理していない。大きな IO や
     multi-credit server での挙動を MS-SMB2 と実 packet で確認し、必要なら messageId/credit allocator を
     `SMBWireTransactionGate` の後継として設計する。
+  - 2026-07-02: READ/WRITE の CreditCharge / CreditRequest、response grant tracking、credit-aware
+    chunk planner は実装済み。credit-window blocking allocator と真の multi-flight demux は未実装。
 - [ ] resume / sparse file / integrity verification
   - `get` / `put` / `cp` は streaming だが中断後 resume は未実装。remote/local size と mtime/hash
     照合、range read/write による resume、既存 partial file の扱いを設計する。

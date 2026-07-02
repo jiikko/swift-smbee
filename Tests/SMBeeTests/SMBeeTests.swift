@@ -1181,6 +1181,38 @@ final class SMBeeTests: XCTestCase {
         // Requests after TREE_CONNECT are transform-encrypted in this fixture.
     }
 
+    func testSMBeeFacadeReadlinkUsesTransportOverrideAndTeardown() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2IoctlResponse(
+                output: reparseSymlinkBuffer(substituteName: "\\??\\C:\\target.txt", printName: "target.txt"),
+                status: SMB2Status.success,
+                messageId: 5,
+                treeId: 0x3344,
+                fileId: fileId,
+                ctlCode: SMB2Ioctl.fsctlGetReparsePoint
+            ),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        let reparsePoint = try await SMBee.readlink(
+            host: "server",
+            credential: SMBCredential(username: "user", password: "pass"),
+            share: "share",
+            path: "link"
+        )
+
+        XCTAssertEqual(reparsePoint.kind, .symlink)
+        XCTAssertEqual(reparsePoint.substituteName, "\\??\\C:\\target.txt")
+        XCTAssertEqual(reparsePoint.printName, "target.txt")
+        XCTAssertEqual(try unframed(transport.outbound).count, 9)
+    }
+
     func testSMBeeFacadeWithDirectoryStreamUsesTransportOverride() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
@@ -1587,6 +1619,30 @@ final class SMBeeTests: XCTestCase {
         response.append(contentsOf: output)
 
         XCTAssertEqual(try SMB2Ioctl.decodeResponse(response), output)
+    }
+
+    func testSMB2ReparsePointDecodesSymbolicLinkBuffer() throws {
+        let reparsePoint = try SMB2ReparsePoint.decode(
+            reparseSymlinkBuffer(substituteName: "\\??\\C:\\target.txt", printName: "target.txt", flags: 1)
+        )
+
+        XCTAssertEqual(reparsePoint.tag, SMBReparseTags.symlink)
+        XCTAssertEqual(reparsePoint.kind, .symlink)
+        XCTAssertEqual(reparsePoint.substituteName, "\\??\\C:\\target.txt")
+        XCTAssertEqual(reparsePoint.printName, "target.txt")
+        XCTAssertEqual(reparsePoint.flags, 1)
+    }
+
+    func testSMB2ReparsePointDecodesMountPointBuffer() throws {
+        let reparsePoint = try SMB2ReparsePoint.decode(
+            reparseMountPointBuffer(substituteName: "\\??\\C:\\target", printName: "target")
+        )
+
+        XCTAssertEqual(reparsePoint.tag, SMBReparseTags.mountPoint)
+        XCTAssertEqual(reparsePoint.kind, .mountPoint)
+        XCTAssertEqual(reparsePoint.substituteName, "\\??\\C:\\target")
+        XCTAssertEqual(reparsePoint.printName, "target")
+        XCTAssertNil(reparsePoint.flags)
     }
 
     func testSMB2DfsReferralRequestInputEncodesMaxLevelAndNullTerminatedPath() throws {
@@ -5334,6 +5390,40 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(UInt32(output.count), to: &response, at: 100)
         response.append(contentsOf: output)
         return response
+    }
+
+    private func reparseSymlinkBuffer(substituteName: String, printName: String, flags: UInt32 = 0) -> [UInt8] {
+        let substitute = NTLM.utf16le(substituteName)
+        let print = NTLM.utf16le(printName)
+        let dataLength = 12 + substitute.count + print.count
+        var bytes: [UInt8] = []
+        bytes.append(contentsOf: [0x0c, 0x00, 0x00, 0xa0])
+        bytes.append(contentsOf: [UInt8(dataLength & 0xff), UInt8((dataLength >> 8) & 0xff), 0, 0])
+        bytes.append(contentsOf: [0, 0, UInt8(substitute.count & 0xff), UInt8((substitute.count >> 8) & 0xff)])
+        bytes.append(contentsOf: [UInt8(substitute.count & 0xff), UInt8((substitute.count >> 8) & 0xff), UInt8(print.count & 0xff), UInt8((print.count >> 8) & 0xff)])
+        bytes.append(contentsOf: [
+            UInt8(flags & 0xff),
+            UInt8((flags >> 8) & 0xff),
+            UInt8((flags >> 16) & 0xff),
+            UInt8((flags >> 24) & 0xff),
+        ])
+        bytes.append(contentsOf: substitute)
+        bytes.append(contentsOf: print)
+        return bytes
+    }
+
+    private func reparseMountPointBuffer(substituteName: String, printName: String) -> [UInt8] {
+        let substitute = NTLM.utf16le(substituteName)
+        let print = NTLM.utf16le(printName)
+        let dataLength = 8 + substitute.count + print.count
+        var bytes: [UInt8] = []
+        bytes.append(contentsOf: [0x03, 0x00, 0x00, 0xa0])
+        bytes.append(contentsOf: [UInt8(dataLength & 0xff), UInt8((dataLength >> 8) & 0xff), 0, 0])
+        bytes.append(contentsOf: [0, 0, UInt8(substitute.count & 0xff), UInt8((substitute.count >> 8) & 0xff)])
+        bytes.append(contentsOf: [UInt8(substitute.count & 0xff), UInt8((substitute.count >> 8) & 0xff), UInt8(print.count & 0xff), UInt8((print.count >> 8) & 0xff)])
+        bytes.append(contentsOf: substitute)
+        bytes.append(contentsOf: print)
+        return bytes
     }
 
     private func waitForOutboundFrameCount(_ expectedCount: Int, transport: ControlledReceiveTransport) async throws {

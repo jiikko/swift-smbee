@@ -123,6 +123,11 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(stat.url, "smb://user@host/share/file.txt")
         XCTAssertTrue(stat.json)
 
+        let readlink = try Readlink.parse(["smb://user@host/share/link", "--json", "--timeout", "3"])
+        XCTAssertEqual(readlink.url, "smb://user@host/share/link")
+        XCTAssertTrue(readlink.json)
+        XCTAssertEqual(readlink.transport.timeout, 3)
+
         let df = try DiskFree.parse(["smb://user@host/share", "--json"])
         XCTAssertEqual(df.url, "smb://user@host/share")
         XCTAssertTrue(df.json)

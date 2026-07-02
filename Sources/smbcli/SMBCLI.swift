@@ -15,7 +15,7 @@ struct SMBCLI: AsyncParsableCommand {
         abstract: "🐝 SMBee command-line client",
         version: SMBee.version,
         subcommands: [
-            Probe.self, Ping.self, Shares.self, List.self, Stat.self, ACL.self, DiskFree.self, Cat.self, Get.self,
+            Probe.self, Ping.self, Shares.self, List.self, Stat.self, Readlink.self, ACL.self, DiskFree.self, Cat.self, Get.self,
             MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Watch.self, Dfs.self,
             SetACL.self
         ]
@@ -421,6 +421,53 @@ struct Stat: AsyncParsableCommand {
         }
         if let changeTime = stat.changeTime {
             print("chtime: \(formatDate(changeTime))")
+        }
+    }
+}
+
+struct Readlink: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "readlink", abstract: "Read SMB reparse point target data")
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var url: String
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    @Flag(help: "Print JSON output")
+    var json = false
+
+    func run() async throws {
+        debug.apply()
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        let reparsePoint = try await SMBee.readlink(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            timeout: transport.duration
+        )
+        if json {
+            print(try SMBCLIOutput.jsonString(for: reparsePoint))
+            return
+        }
+        print("tag: \(SMBCLIOutput.hex(reparsePoint.tag, width: 8))")
+        print("kind: \(reparsePoint.kind.description)")
+        if let substituteName = reparsePoint.substituteName {
+            print("substituteName: \(substituteName)")
+        }
+        if let printName = reparsePoint.printName {
+            print("printName: \(printName)")
+        }
+        if let flags = reparsePoint.flags {
+            print("flags: \(SMBCLIOutput.hex(flags, width: 8))")
         }
     }
 }

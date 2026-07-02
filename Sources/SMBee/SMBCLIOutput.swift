@@ -37,6 +37,10 @@ public enum SMBCLIOutput {
         try encoder.encode(FileStatJSON(stat))
     }
 
+    public static func jsonData(for reparsePoint: SMBReparsePoint) throws -> Data {
+        try encoder.encode(ReparsePointJSON(reparsePoint))
+    }
+
     public static func jsonData(for volumeInfo: SMBVolumeInfo) throws -> Data {
         try encoder.encode(VolumeInfoJSON(volumeInfo))
     }
@@ -63,6 +67,10 @@ public enum SMBCLIOutput {
 
     public static func jsonString(for stat: SMBFileStat) throws -> String {
         try string(from: jsonData(for: stat))
+    }
+
+    public static func jsonString(for reparsePoint: SMBReparsePoint) throws -> String {
+        try string(from: jsonData(for: reparsePoint))
     }
 
     public static func jsonString(for volumeInfo: SMBVolumeInfo) throws -> String {
@@ -165,6 +173,22 @@ private struct FileStatJSON: Encodable {
         lastAccessTime = SMBCLIOutput.dateString(stat.lastAccessTime)
         modifiedTime = SMBCLIOutput.dateString(stat.modifiedTime)
         changeTime = SMBCLIOutput.dateString(stat.changeTime)
+    }
+}
+
+private struct ReparsePointJSON: Encodable {
+    var tag: String
+    var kind: String
+    var substituteName: String?
+    var printName: String?
+    var flags: String?
+
+    init(_ reparsePoint: SMBReparsePoint) {
+        tag = SMBCLIOutput.hex(reparsePoint.tag, width: 8)
+        kind = reparsePoint.kind.description
+        substituteName = reparsePoint.substituteName
+        printName = reparsePoint.printName
+        flags = reparsePoint.flags.map { SMBCLIOutput.hex($0, width: 8) }
     }
 }
 

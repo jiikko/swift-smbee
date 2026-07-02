@@ -320,6 +320,15 @@ struct SMB2CreateRequest {
         )
     }
 
+    static func reparsePoint(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0080,
+            createDisposition: 0x0000_0001,
+            createOptions: 0x0000_0020 | 0x0020_0000
+        )
+    }
+
     static func querySecurity(path: String) -> SMB2CreateRequest {
         SMB2CreateRequest(
             path: path,
@@ -673,6 +682,7 @@ enum SMB2Write {
 enum SMB2Ioctl {
     static let fsctlPipeTransceive: UInt32 = 0x0011_c017
     static let fsctlDfsGetReferrals: UInt32 = 0x0006_0194
+    static let fsctlGetReparsePoint: UInt32 = 0x0009_00a8
     static let fsctlSrvRequestResumeKey: UInt32 = 0x0014_0078
     static let fsctlSrvCopychunkWrite: UInt32 = 0x0014_40f4
 
@@ -747,6 +757,63 @@ enum SMB2Ioctl {
 struct SMB2IoctlResponse {
     var status: UInt32
     var output: [UInt8]
+}
+
+enum SMB2ReparsePoint {
+    static func decode(_ bytes: [UInt8]) throws -> SMBReparsePoint {
+        guard bytes.count >= 8 else { throw SMBCodecError.truncated }
+        let tag = readUInt32LE(bytes, at: 0)
+        let dataLength = Int(readUInt16LE(bytes, at: 4))
+        guard bytes.count >= 8 + dataLength else { throw SMBCodecError.truncated }
+        let data = Array(bytes[8..<8 + dataLength])
+        switch tag {
+        case SMBReparseTags.symlink:
+            return try decodeSymbolicLink(tag: tag, data: data)
+        case SMBReparseTags.mountPoint:
+            return try decodeMountPoint(tag: tag, data: data)
+        default:
+            return SMBReparsePoint(tag: tag, rawData: data)
+        }
+    }
+
+    private static func decodeSymbolicLink(tag: UInt32, data: [UInt8]) throws -> SMBReparsePoint {
+        guard data.count >= 12 else { throw SMBCodecError.truncated }
+        let substituteOffset = Int(readUInt16LE(data, at: 0))
+        let substituteLength = Int(readUInt16LE(data, at: 2))
+        let printOffset = Int(readUInt16LE(data, at: 4))
+        let printLength = Int(readUInt16LE(data, at: 6))
+        let flags = readUInt32LE(data, at: 8)
+        let pathBuffer = Array(data.dropFirst(12))
+        return SMBReparsePoint(
+            tag: tag,
+            substituteName: try decodePathBuffer(pathBuffer, offset: substituteOffset, length: substituteLength),
+            printName: try decodePathBuffer(pathBuffer, offset: printOffset, length: printLength),
+            flags: flags,
+            rawData: data
+        )
+    }
+
+    private static func decodeMountPoint(tag: UInt32, data: [UInt8]) throws -> SMBReparsePoint {
+        guard data.count >= 8 else { throw SMBCodecError.truncated }
+        let substituteOffset = Int(readUInt16LE(data, at: 0))
+        let substituteLength = Int(readUInt16LE(data, at: 2))
+        let printOffset = Int(readUInt16LE(data, at: 4))
+        let printLength = Int(readUInt16LE(data, at: 6))
+        let pathBuffer = Array(data.dropFirst(8))
+        return SMBReparsePoint(
+            tag: tag,
+            substituteName: try decodePathBuffer(pathBuffer, offset: substituteOffset, length: substituteLength),
+            printName: try decodePathBuffer(pathBuffer, offset: printOffset, length: printLength),
+            rawData: data
+        )
+    }
+
+    private static func decodePathBuffer(_ bytes: [UInt8], offset: Int, length: Int) throws -> String {
+        guard offset >= 0, length >= 0, offset + length <= bytes.count else {
+            throw SMBCodecError.truncated
+        }
+        return decodeUTF16LE(Array(bytes[offset..<offset + length]))
+    }
 }
 
 enum SMB2CopyChunk {

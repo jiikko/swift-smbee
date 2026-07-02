@@ -405,7 +405,8 @@ Linux/macOS smbclient として必要な理由:
 実装確認:
 
 - `SMBFileStat.reparseTag` と `SMBReparseKind` はある。
-- `todo.md` に symlink target 解決 `FSCTL_GET_REPARSE_POINT` は未実装と記録されている。
+- 2026-07-02: `FSCTL_GET_REPARSE_POINT` / `SMB2ReparsePoint` decoder を追加。symlink / mount point は target 名を decode し、未知 tag は raw data として返す。
+- 2026-07-02: `SMBClientSession.readlink()` / `SMBee.readlink(...)` / `smbcli readlink` を追加。codec / facade / CLI parse / JSON の unit coverage あり。
 - recursive copy/delete/download は reparse point を directory として辿らない安全側 policy になっている。
 
 Linux/macOS smbclient として必要な理由:
@@ -415,9 +416,8 @@ Linux/macOS smbclient として必要な理由:
 
 やること:
 
-- `FSCTL_GET_REPARSE_POINT` を実装する。
-- symlink / mount point / DFS reparse data の decoder を分ける。
-- CLI: `smbcli readlink` または `stat --json` に target を出す。
+- DFS reparse data の decoder を分ける。
+- Samba / Windows / macOS SMBX で `smbcli readlink` smoke を取る。
 - recursive operation の policy を明示する:
   - followしない
   - same-shareだけfollow

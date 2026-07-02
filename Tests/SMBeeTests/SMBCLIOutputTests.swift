@@ -100,6 +100,24 @@ final class SMBCLIOutputTests: XCTestCase {
         XCTAssertNil(object["reparseKind"])
     }
 
+    func testReparsePointJSONShape() throws {
+        let reparsePoint = SMBReparsePoint(
+            tag: SMBReparseTags.symlink,
+            substituteName: "\\??\\C:\\target.txt",
+            printName: "target.txt",
+            flags: 1,
+            rawData: [0xde, 0xad]
+        )
+
+        let object = try jsonObject(SMBCLIOutput.jsonData(for: reparsePoint))
+
+        XCTAssertEqual(object["tag"] as? String, "0xa000000c")
+        XCTAssertEqual(object["kind"] as? String, "symlink")
+        XCTAssertEqual(object["substituteName"] as? String, "\\??\\C:\\target.txt")
+        XCTAssertEqual(object["printName"] as? String, "target.txt")
+        XCTAssertEqual(object["flags"] as? String, "0x00000001")
+    }
+
     func testSharesJSONShape() throws {
         let shares = [
             SMBShareInfo(name: "public", type: 0x0000_0000, comment: "Public files"),

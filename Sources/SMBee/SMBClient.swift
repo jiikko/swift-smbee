@@ -95,6 +95,30 @@ public struct SMBFileStat: Equatable, Sendable {
     }
 }
 
+public struct SMBReparsePoint: Equatable, Sendable {
+    public var tag: UInt32
+    public var kind: SMBReparseKind
+    public var substituteName: String?
+    public var printName: String?
+    public var flags: UInt32?
+    public var rawData: [UInt8]
+
+    public init(
+        tag: UInt32,
+        substituteName: String? = nil,
+        printName: String? = nil,
+        flags: UInt32? = nil,
+        rawData: [UInt8] = []
+    ) {
+        self.tag = tag
+        self.kind = SMBReparseKind(tag: tag)
+        self.substituteName = substituteName
+        self.printName = printName
+        self.flags = flags
+        self.rawData = rawData
+    }
+}
+
 public enum SMBReparseKind: Equatable, Sendable {
     case symlink
     case mountPoint
@@ -494,6 +518,19 @@ public actor SMBClientSession {
             let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
             try? await session.close(treeId: treeId, fileId: fileId)
             return stat
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func readlink(path: String) async throws -> SMBReparsePoint {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .reparsePoint(path: path))
+        do {
+            let reparsePoint = try await session.reparsePoint(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return reparsePoint
         } catch {
             try? await session.close(treeId: treeId, fileId: fileId)
             throw error
@@ -1136,6 +1173,32 @@ public enum SMBClient {
         }
     }
 
+    /// Read reparse point target data using FSCTL_GET_REPARSE_POINT.
+    ///
+    /// This opens the path with FILE_OPEN_REPARSE_POINT so the target itself is not followed.
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func readlink(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws -> SMBReparsePoint {
+        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "READLINK") { session, treeId in
+            let fileId = try await session.create(treeId: treeId, request: .reparsePoint(path: path))
+            do {
+                let reparsePoint = try await session.reparsePoint(treeId: treeId, fileId: fileId)
+                try? await session.close(treeId: treeId, fileId: fileId)
+                return reparsePoint
+            } catch {
+                try? await session.close(treeId: treeId, fileId: fileId)
+                throw error
+            }
+        }
+    }
+
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func securityInfo(
         host: String,
@@ -1247,6 +1310,24 @@ public enum SMBClient {
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws -> SMBFileStat {
         try await stat(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            credential: try await credentialProvider(),
+            makeTransport: makeTransport
+        )
+    }
+
+    public static func readlink(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        credentialProvider: SMBCredentialProvider,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+    ) async throws -> SMBReparsePoint {
+        try await readlink(
             host: host,
             port: port,
             share: share,
@@ -3410,6 +3491,18 @@ actor SMBSession {
             allowedStatuses: []
         )
         return try SMB2DfsReferral.decodeResponse(response.output)
+    }
+
+    func reparsePoint(treeId: UInt32, fileId: [UInt8]) async throws -> SMBReparsePoint {
+        let response = try await ioctl(
+            treeId: treeId,
+            fileId: fileId,
+            ctlCode: SMB2Ioctl.fsctlGetReparsePoint,
+            input: [],
+            maxOutputResponse: 16 * 1024,
+            allowedStatuses: []
+        )
+        return try SMB2ReparsePoint.decode(response.output)
     }
 
     func close(treeId: UInt32, fileId: [UInt8]) async throws {

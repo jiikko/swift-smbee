@@ -52,7 +52,7 @@ Status labels:
 | DACL write | MS-SMB2 SET_INFO security, MS-DTYP | `SMBClient.setSecurityInfo` | yes | yes | no | no | partial | Owner/group/SACL write is unsupported. Samba may normalize masks. |
 | SID name resolution | MS-LSAT | none | no | no | no | no | unsupported | Well-known SID table and LSARPC lookup are future work. |
 | DFS referral metadata | MS-DFSC, MS-FSCC FSCTL_DFS_GET_REFERRALS | `SMB2DfsReferral.swift`, `SMBClient.dfsReferral` | yes | no | no | no | underverified | Real msdfs server E2E and auto-follow are missing. |
-| reparse tag metadata | MS-FSCC FileAttributeTagInformation | `SMB2ReadCodecs.swift`, `SMBFileStat` | yes | yes | no | no | partial | FSCTL_GET_REPARSE_POINT target resolution is unsupported. |
+| reparse point metadata / target | MS-FSCC FileAttributeTagInformation, FSCTL_GET_REPARSE_POINT | `SMB2ReadCodecs.swift`, `SMBFileStat`, `SMBee.readlink`, `smbcli readlink` | yes | yes | no | no | partial | Tag metadata is covered by Samba E2E. Target decode has unit coverage; real-server readlink smoke and DFS reparse-data decode are missing. |
 
 ## CLI And Operational Coverage
 

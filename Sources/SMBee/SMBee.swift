@@ -230,6 +230,31 @@ public enum SMBee {
         try await SMBClient.stat(host: host, port: port, share: share, path: path, credentialProvider: credentialProvider)
     }
 
+    /// Read reparse point target data without following the target.
+    ///
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    public static func readlink(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        share: String,
+        path: String,
+        timeout: Duration? = nil
+    ) async throws -> SMBReparsePoint {
+        try await SMBClient.readlink(host: host, port: port, share: share, path: path, credential: credential, timeout: timeout)
+    }
+
+    /// Read reparse point target data without following the target.
+    public static func readlink(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String
+    ) async throws -> SMBReparsePoint {
+        try await SMBClient.readlink(host: host, port: port, share: share, path: path, credentialProvider: credentialProvider)
+    }
+
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func securityInfo(
         host: String,

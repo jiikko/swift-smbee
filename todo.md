@@ -350,6 +350,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     **注**: 実 msdfs サーバが手元に無いため **unit fixture + 仕様精読が検証の主体** (実 DFS E2E は未実施)。
     symlink target 解決 (FSCTL_GET_REPARSE_POINT) と DFS を辿った先の path 再解決は defer (この項目としては
     reparse tag + referral 取得で [x])。
+  - 2026-07-02: `FSCTL_GET_REPARSE_POINT` と `SMBee.readlink` / `smbcli readlink` を追加。
+    symlink / mount point target decode は unit coverage あり。DFS reparse data decode と実サーバ readlink smoke は残。
 - [x] filesystem / volume information
   - `smbcli df` / API として share の total/free/available capacity、filesystem name、volume label、
     filesystem attributes / max component length を取得する。`QUERY_INFO(FileFsSizeInformation /

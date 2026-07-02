@@ -240,7 +240,7 @@ Linux/macOS smbclient として必要な理由:
 - 2026-07-02: 最小 credit accounting を追加。READ/WRITE request は payload length から `CreditCharge` を計算し、`CreditRequest` も同値に設定する。`SMBSession` は送信時に charge を消費し、response header の `credits` grant を balance に加算して debug trace できる。
 - 2026-07-02: read/write chunk planner を current credit balance で cap する helper を追加。直列 I/O の範囲では credit window を超える chunk を選ばない。
 - 2026-07-02: `SMB2CreditWindow` actor を追加。READ/WRITE 送信前に CreditCharge を reserve し、不足時は grant まで待つ。response Credits で grant、send 失敗時は refund する。
-- multi-flight demux は未実装。
+- 2026-07-03: `SMBSession` の response 待機を `messageId` keyed demux に変更。複数 request を in-flight にし、out-of-order response を正しい呼び出し元へ配送できる。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -249,7 +249,6 @@ Linux/macOS smbclient として必要な理由:
 
 やること:
 
-- multi-flight 化する場合は messageId/async response demux と合わせて設計する。
 - copychunk と encryption overhead を含む chunk planner の E2E 検証を広げる。
 - E2E: large file read/write を 1MiB 超、4GiB 境界、encrypted session で実行。
 

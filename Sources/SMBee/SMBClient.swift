@@ -2379,7 +2379,7 @@ public enum SMBClient {
         try failures.throwIfNeeded()
     }
 
-    // swiftlint:disable:next function_parameter_count
+    // swiftlint:disable:next function_body_length function_parameter_count
     private static func uploadDirectoryRecursive(
         host: String,
         port: UInt16,
@@ -2930,22 +2930,26 @@ extension Error {
     }
 }
 
-/// Wire transaction は直列化する。
-///
+private struct SMBPendingResponse {
+    let label: String
+    let longPoll: Bool
+    var pendingCount: Int = 0
+    let continuation: CheckedContinuation<[UInt8], Error>
+}
+
 /// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
-/// actor reentrancy により `sendSigned` → `receive` 間で別の wire 操作が入り得るため、各 request/response
-/// pair は `SMBWireTransactionGate` で直列化する。これにより同一 `SMBSession` への並行呼び出しでも
-/// 応答取り違えは起きない。READ/WRITE の CreditCharge と server grant は `SMB2CreditWindow` で
-/// reserve/grant する。SMB2 本来の multi-flight 並行化はまだ行わない。
+/// actor reentrancy により `sendSigned` → response 待機の間で別の wire 操作が入り得るため、response は
+/// `messageId` ごとの pending continuation へ demux する。これにより同一 `SMBSession` への並行
+/// wire 操作でも複数 request を in-flight にでき、応答取り違えは起きない。READ/WRITE の
+/// CreditCharge と server grant は `SMB2CreditWindow` で reserve/grant する。
 ///
-/// 真の multi-flight が必要になったら MS-SMB2 の messageId/credit ベース応答多重分離へ置き換える
-/// (背景と対応案は issues/done/002-design-smbsession-concurrent-multiflight.md)。
+/// 高レベル operation 全体はロックしない。複数 request からなる操作を並行実行した場合の意味論は
+/// SMB server と呼び出し元の ordering に依存するため、共有 session API を公開する際に別途整理する。
 actor SMBSession {
     private let host: String
     private let port: UInt16
     private let credential: SMBCredential
     private let transport: SMBTransport
-    private let wireTransactionGate = SMBWireTransactionGate()
     private var messageId: UInt64 = 0
     private var sessionId: UInt64 = 0
     private var signingKey: [UInt8]?
@@ -2956,7 +2960,11 @@ actor SMBSession {
     private var transformNonceCounter: UInt64 = 0
     private var maxReadSize: UInt32 = UInt32.max
     private var maxWriteSize: UInt32 = UInt32.max
-    private let creditWindow = SMB2CreditWindow(initialCredits: 1)
+    private let creditWindow: SMB2CreditWindow
+    private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
+    private var sentResponseMessageIds: Set<UInt64> = []
+    private var orphanResponses: [UInt64: [UInt8]] = [:]
+    private var receiveLoopRunning = false
 
     init(
         host: String,
@@ -2964,7 +2972,8 @@ actor SMBSession {
         credential: SMBCredential,
         transport: SMBTransport,
         signingKey: [UInt8]? = nil,
-        signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC
+        signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC,
+        initialCredits: UInt32 = 1
     ) {
         self.host = host
         self.port = port
@@ -2972,6 +2981,7 @@ actor SMBSession {
         self.transport = transport
         self.signingKey = signingKey
         self.signingAlgorithm = signingAlgorithm
+        self.creditWindow = SMB2CreditWindow(initialCredits: initialCredits)
     }
 
     func connect() async throws {
@@ -3883,8 +3893,6 @@ actor SMBSession {
     func sendCancel(messageId: UInt64, treeId: UInt32 = 0) async throws {
         let packet = try SMB2Cancel.encodeRequest(messageId: messageId, sessionId: sessionId, treeId: treeId)
         debugDump("CANCEL request", packet)
-        await wireTransactionGate.enter()
-        defer { wireTransactionGate.leave() }
         try await sendSigned(packet)
     }
 
@@ -3909,19 +3917,23 @@ actor SMBSession {
     }
 
     private func unsignedWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
-        await wireTransactionGate.enter()
-        defer { wireTransactionGate.leave() }
-        try await sendUnsigned(packet)
-        return try await receive(label: responseLabel)
+        try await demuxedWireTransaction(
+            packet: packet,
+            responseLabel: responseLabel,
+            longPoll: false,
+            send: sendUnsigned
+        )
     }
 
     private func signedWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
         let requestHeader = try SMB2Header.decode(packet)
-        await wireTransactionGate.enter()
-        defer { wireTransactionGate.leave() }
         let response = try await withTaskCancellationHandler {
-            try await sendSigned(packet)
-            return try await receive(label: responseLabel)
+            try await demuxedWireTransaction(
+                packet: packet,
+                responseLabel: responseLabel,
+                longPoll: false,
+                send: sendSigned
+            )
         } onCancel: {
             Task {
                 await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
@@ -3935,11 +3947,13 @@ actor SMBSession {
 
     private func signedLongPollWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
         let requestHeader = try SMB2Header.decode(packet)
-        await wireTransactionGate.enter()
-        defer { wireTransactionGate.leave() }
         let response = try await withTaskCancellationHandler {
-            try await sendSigned(packet)
-            return try await receiveLongPoll(label: responseLabel)
+            try await demuxedWireTransaction(
+                packet: packet,
+                responseLabel: responseLabel,
+                longPoll: true,
+                send: sendSigned
+            )
         } onCancel: {
             Task {
                 await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
@@ -3949,6 +3963,30 @@ actor SMBSession {
             try verifySigned(response)
         }
         return response
+    }
+
+    private func demuxedWireTransaction(
+        packet: [UInt8],
+        responseLabel: String,
+        longPoll: Bool,
+        send: @escaping ([UInt8]) async throws -> Void
+    ) async throws -> [UInt8] {
+        let requestHeader = try SMB2Header.decode(packet)
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingResponses[requestHeader.messageId] = SMBPendingResponse(
+                label: responseLabel,
+                longPoll: longPoll,
+                continuation: continuation
+            )
+            Task {
+                do {
+                    try await send(packet)
+                    self.markRequestSent(messageId: requestHeader.messageId)
+                } catch {
+                    self.failPendingResponse(messageId: requestHeader.messageId, error: error)
+                }
+            }
+        }
     }
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {
@@ -4054,32 +4092,6 @@ actor SMBSession {
         }
     }
 
-    private func receive(label: String) async throws -> [UInt8] {
-        for pendingCount in 0...SMB2AsyncInterim.maxPendingResponses {
-            try Task.checkCancellation()
-            let packet = try await receiveDecryptedFrame(label: label)
-            guard try SMB2AsyncInterim.shouldDiscard(packet) else {
-                return packet
-            }
-            if pendingCount == SMB2AsyncInterim.maxPendingResponses {
-                break
-            }
-            debugLine("\(label) ignored interim STATUS_PENDING async response")
-        }
-        throw SMBCodecError.invalidValue("too many interim SMB2 STATUS_PENDING responses")
-    }
-
-    private func receiveLongPoll(label: String) async throws -> [UInt8] {
-        while true {
-            try Task.checkCancellation()
-            let packet = try await receiveDecryptedFrame(label: label)
-            guard try SMB2AsyncInterim.shouldDiscard(packet) else {
-                return packet
-            }
-            debugLine("\(label) ignored interim STATUS_PENDING async response")
-        }
-    }
-
     private func receiveDecryptedFrame(label: String) async throws -> [UInt8] {
         let header = try await receiveExactly(4)
         let length = try DirectTCPFraming.length(from: header)
@@ -4089,6 +4101,80 @@ actor SMBSession {
         let packet = body.starts(with: SMB3TransformHeader.protocolId) ? try decryptTransform(body) : body
         await recordCreditGrant(packet, label: label)
         return packet
+    }
+
+    private func startReceiveLoopIfNeeded() {
+        guard !receiveLoopRunning else { return }
+        receiveLoopRunning = true
+        Task { await self.receiveLoop() }
+    }
+
+    private func receiveLoop() async {
+        while !sentResponseMessageIds.isEmpty {
+            do {
+                try Task.checkCancellation()
+                let packet = try await receiveDecryptedFrame(label: "SMB response")
+                try dispatchReceivedPacket(packet)
+            } catch {
+                failAllPendingResponses(error: error)
+                receiveLoopRunning = false
+                return
+            }
+        }
+        receiveLoopRunning = false
+    }
+
+    private func dispatchReceivedPacket(_ packet: [UInt8]) throws {
+        let header = try SMB2Header.decode(packet)
+        guard var pending = pendingResponses[header.messageId] else {
+            orphanResponses[header.messageId] = packet
+            debugLine("SMB response queued for future message id \(header.messageId)")
+            return
+        }
+        if try SMB2AsyncInterim.shouldDiscard(packet) {
+            pending.pendingCount += 1
+            if !pending.longPoll && pending.pendingCount > SMB2AsyncInterim.maxPendingResponses {
+                pendingResponses.removeValue(forKey: header.messageId)
+                pending.continuation.resume(throwing: SMBCodecError.invalidValue("too many interim SMB2 STATUS_PENDING responses"))
+                return
+            }
+            pendingResponses[header.messageId] = pending
+            debugLine("\(pending.label) ignored interim STATUS_PENDING async response")
+            return
+        }
+        pendingResponses.removeValue(forKey: header.messageId)
+        sentResponseMessageIds.remove(header.messageId)
+        pending.continuation.resume(returning: packet)
+    }
+
+    private func markRequestSent(messageId: UInt64) {
+        guard pendingResponses[messageId] != nil else { return }
+        sentResponseMessageIds.insert(messageId)
+        if let orphan = orphanResponses.removeValue(forKey: messageId) {
+            do {
+                try dispatchReceivedPacket(orphan)
+            } catch {
+                failPendingResponse(messageId: messageId, error: error)
+                return
+            }
+        }
+        startReceiveLoopIfNeeded()
+    }
+
+    private func failPendingResponse(messageId: UInt64, error: Error) {
+        guard let pending = pendingResponses.removeValue(forKey: messageId) else { return }
+        sentResponseMessageIds.remove(messageId)
+        pending.continuation.resume(throwing: error)
+    }
+
+    private func failAllPendingResponses(error: Error) {
+        let pending = pendingResponses
+        pendingResponses.removeAll()
+        sentResponseMessageIds.removeAll()
+        orphanResponses.removeAll()
+        for waiter in pending.values {
+            waiter.continuation.resume(throwing: error)
+        }
     }
 
     private func reserveCredit(_ packet: [UInt8]) async -> UInt16 {

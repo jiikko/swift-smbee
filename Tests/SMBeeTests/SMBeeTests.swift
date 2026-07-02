@@ -1287,9 +1287,9 @@ final class SMBeeTests: XCTestCase {
 
         let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
-            smb2QueryInfoResponse(payload: fullSize.bytes),
-            smb2QueryInfoResponse(payload: attribute.bytes),
-            smb2QueryInfoResponse(payload: volume.bytes),
+            smb2QueryInfoResponse(payload: fullSize.bytes, messageId: 5),
+            smb2QueryInfoResponse(payload: attribute.bytes, messageId: 6),
+            smb2QueryInfoResponse(payload: volume.bytes, messageId: 7),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 8, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 9, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 10, treeId: 0),
@@ -1363,7 +1363,7 @@ final class SMBeeTests: XCTestCase {
 
         let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
-            smb2QueryInfoResponse(payload: sd.bytes),
+            smb2QueryInfoResponse(payload: sd.bytes, messageId: 5),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0),
@@ -2999,7 +2999,14 @@ final class SMBeeTests: XCTestCase {
     func testClientSessionWithTreeUsesAdditionalTreeAndDisconnectsIt() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([
-            try smb2TreeConnectResponse(treeId: 0x7788, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff),
+            try smb2TreeConnectResponse(
+                treeId: 0x7788,
+                shareType: 1,
+                shareFlags: 0,
+                capabilities: 0,
+                maximalAccess: 0x001f_01ff,
+                messageId: 0
+            ),
             try smb2CreateResponse(fileId: fileId, messageId: 1, treeId: 0x7788),
             try smb2QueryDirectoryResponse(
                 entries: [
@@ -3903,7 +3910,7 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
-    func testConcurrentReadChunksSerializeWireTransactions() async throws {
+    func testConcurrentReadChunksDemuxOutOfOrderResponses() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let transport = ControlledReceiveTransport()
         let session = SMBSession(
@@ -3911,35 +3918,30 @@ final class SMBeeTests: XCTestCase {
             port: 445,
             credential: SMBCredential(username: "user", password: "pass"),
             transport: transport,
-            signingKey: Array(repeating: UInt8(0x11), count: 16)
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            initialCredits: 2
         )
 
         let first = Task {
             try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
         }
-
-        try await waitForOutboundFrameCount(1, transport: transport)
-        var requests = try unframed(transport.outbound)
-        XCTAssertEqual(requests.count, 1)
-        XCTAssertEqual(readUInt64LE(requests[0], at: 72), 0)
-
         let second = Task {
             try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 3, length: 2)
         }
 
-        XCTAssertEqual(try unframed(transport.outbound).count, 1)
-        transport.enqueueInbound(try framed([smb2ReadResponse(Array("hel".utf8), messageId: 0, treeId: 0x3344)]))
-        let firstData = try await awaitWithTimeout("first.readChunk") { try await first.value }
-        XCTAssertEqual(firstData, Array("hel".utf8))
-
         try await waitForOutboundFrameCount(2, transport: transport)
-        requests = try unframed(transport.outbound)
+        let requests = try unframed(transport.outbound)
         XCTAssertEqual(requests.count, 2)
         XCTAssertEqual(readUInt64LE(requests[0], at: 72), 0)
         XCTAssertEqual(readUInt64LE(requests[1], at: 72), 3)
+
         transport.enqueueInbound(try framed([smb2ReadResponse(Array("lo".utf8), messageId: 1, treeId: 0x3344)]))
         let secondData = try await awaitWithTimeout("second.readChunk") { try await second.value }
         XCTAssertEqual(secondData, Array("lo".utf8))
+
+        transport.enqueueInbound(try framed([smb2ReadResponse(Array("hel".utf8), messageId: 0, treeId: 0x3344)]))
+        let firstData = try await awaitWithTimeout("first.readChunk") { try await first.value }
+        XCTAssertEqual(firstData, Array("hel".utf8))
     }
 
     func testSessionCopyFileFallsBackToReadWriteWhenServerSideCopyIsUnsupported() async throws {
@@ -6038,8 +6040,8 @@ final class SMBeeTests: XCTestCase {
         return response
     }
 
-    private func smb2QueryInfoResponse(payload: [UInt8]) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.queryInfo, messageId: 12, treeId: 0x3344).encode()
+    private func smb2QueryInfoResponse(payload: [UInt8], messageId: UInt64 = 12) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: 0x3344).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
         writeUInt16LE(9, to: &response, at: 64)
         writeUInt16LE(72, to: &response, at: 66)
@@ -6080,9 +6082,10 @@ final class SMBeeTests: XCTestCase {
         shareType: UInt8,
         shareFlags: UInt32,
         capabilities: UInt32,
-        maximalAccess: UInt32
+        maximalAccess: UInt32,
+        messageId: UInt64 = 3
     ) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.treeConnect, messageId: 1, treeId: treeId).encode()
+        var response = try SMB2Header(command: SMB2Commands.treeConnect, messageId: messageId, treeId: treeId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
         writeUInt16LE(16, to: &response, at: 64)
         response[66] = shareType

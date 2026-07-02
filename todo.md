@@ -432,12 +432,13 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-06-30 実装レビュー追加: read/write chunk size は negotiated MaxRead/WriteSize と transform overhead
     で抑えているが、CreditCharge / CreditRequest / CreditResponse を管理していない。大きな IO や
     multi-credit server での挙動を MS-SMB2 と実 packet で確認し、必要なら messageId/credit allocator を
-    `SMBWireTransactionGate` の後継として設計する。
+    設計する。
   - 2026-07-02: READ/WRITE の CreditCharge / CreditRequest、response grant tracking、credit-aware
     chunk planner は実装済み。
   - 2026-07-02: `SMB2CreditWindow` actor を追加し、READ/WRITE 送信前に CreditCharge を reserve、
-    response の Credits を grant、send 失敗時は refund する blocking allocator に移行。真の
-    multi-flight demux は未実装。
+    response の Credits を grant、send 失敗時は refund する blocking allocator に移行。
+  - 2026-07-03: `SMBWireTransactionGate` を廃止し、`SMBSession` response 待機を messageId keyed
+    demux に変更。複数 request を in-flight にし、out-of-order response を正しい呼び出し元へ配送する。
 - [ ] resume / sparse file / integrity verification
   - 2026-07-02: `get` / `SMBee.download` / `SMBClient.download` に byte-level download resume を追加。
     `--resume` は既存 local file size から range read で追記する。upload resume、remote/local size と
@@ -543,7 +544,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
 - [x] `SMBSession`（actor）化 / 切断検出→再接続 / cancellation（Task.checkCancellation を READ/WRITE ループに）
   - 2026-06-30: `SMBWireTransactionGate` で request/response pair を FIFO 直列化。actor reentrancy があっても
     同一 session 上の並行 wire 操作で応答取り違えが起きないことを unit test 済み。
-    真の messageId/credit multi-flight demux は未実装（必要になったら別 issue）。
+  - 2026-07-03: 直列 gate を messageId/credit multi-flight demux に置き換え。out-of-order response が
+    正しい `readChunk` task に返る unit test を追加。
 - [x] retry 粒度: stat=透過 / list=全体再実行 / read=stream 未 yield なら先頭再試行 / write・delete・rename=原則 retry しない
 - [x] secret（password / NT hash / session key / signing key）を log に出さない
 - [x] SMB1 を一切提示しない

@@ -115,11 +115,13 @@ final class SMBCLIHelperTests: XCTestCase {
         let options = try TransportOptions.parse([])
         XCTAssertNil(options.duration)
         XCTAssertNil(options.operationDuration)
+        XCTAssertNil(options.perFileDuration)
     }
 
     func testTransportDurationConvertsSeconds() throws {
-        let options = try TransportOptions.parse(["--timeout", "2", "--operation-timeout", "2.5"])
+        let options = try TransportOptions.parse(["--timeout", "2", "--operation-timeout", "2.5", "--per-file-timeout", "1.25"])
         XCTAssertEqual(options.duration, .seconds(2))
         XCTAssertEqual(options.operationDuration, .seconds(2) + .milliseconds(500))
+        XCTAssertEqual(options.perFileDuration, .seconds(1) + .milliseconds(250))
     }
 }

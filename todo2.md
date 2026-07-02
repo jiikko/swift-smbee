@@ -609,11 +609,11 @@ Linux/macOS smbclient として必要な理由:
 - `todo.md` に全操作 deadline は未対応と記録されている。
 - 2026-07-02: `SMBOperationDeadline.run(timeout:)` と CLI `--operation-timeout` を追加。まず `probe` / `ls` / `ping` に配線し、共通 timeout helper の unit と option parse test を追加。
 - 2026-07-02: `smbcli` 全コマンドを `--operation-timeout` で wrap。batch (`mget` / `mput`) も全体 deadline として扱う。
+- 2026-07-02: recursive directory transfer (`get -r` / `put -r` / `cp -r`) に public API `perFileTimeout` と CLI `--per-file-timeout` を追加。全体 timeout と per-file timeout を分離。
 
 やること:
 
 - `operationTimeout` / `deadline` を public API に広げるか決める。
-- recursive transfer では per-file timeout と全体 timeout を分ける。
 
 完了条件:
 

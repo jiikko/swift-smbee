@@ -759,7 +759,8 @@ struct Get: AsyncParsableCommand {
                     dryRun: dryRun,
                     timeout: transport.duration,
                     include: include,
-                    exclude: exclude
+                    exclude: exclude,
+                    perFileTimeout: transport.perFileDuration
                 ) { action in writeRecursiveAction(action) }
             }
             return
@@ -885,7 +886,8 @@ struct Put: AsyncParsableCommand {
                     dryRun: dryRun,
                     timeout: transport.duration,
                     include: include,
-                    exclude: exclude
+                    exclude: exclude,
+                    perFileTimeout: transport.perFileDuration
                 ) { action in writeRecursiveAction(action) }
             }
             return
@@ -1025,7 +1027,8 @@ struct Copy: AsyncParsableCommand {
                     dryRun: dryRun,
                     timeout: transport.duration,
                     include: include,
-                    exclude: exclude
+                    exclude: exclude,
+                    perFileTimeout: transport.perFileDuration
                 ) { action in writeRecursiveAction(action) }
             }
             return
@@ -1099,12 +1102,19 @@ struct TransportOptions: ParsableArguments {
     @Option(name: .long, help: "Overall operation timeout in seconds")
     var operationTimeout: Double?
 
+    @Option(name: .long, help: "Per-file timeout for recursive transfers in seconds")
+    var perFileTimeout: Double?
+
     var duration: Duration? {
         Self.duration(from: timeout)
     }
 
     var operationDuration: Duration? {
         Self.duration(from: operationTimeout)
+    }
+
+    var perFileDuration: Duration? {
+        Self.duration(from: perFileTimeout)
     }
 
     func withOperationDeadline<T: Sendable>(

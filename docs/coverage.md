@@ -38,7 +38,7 @@ Status labels:
 | CreditCharge / CreditRequest | MS-SMB2 3.2.4.1 | `SMB2Credit`, `SMB2Read`, `SMB2Write`, `SMBSession`, `SMBTransferLimits` | yes | no | no | no | partial | READ/WRITE charge, response grant tracking, and credit-capped chunk planning are implemented. Credit-window blocking and multi-flight allocator are not implemented. |
 | byte-range lock | MS-SMB2 LOCK | unsupported | no | no | no | no | unsupported | Explicit lock/unlock API is not implemented. |
 | mkdir / rename / delete | MS-SMB2 CREATE, SET_INFO | `SMBClient.swift` | yes | yes | smoke | no | covered | Mutation retry is intentionally conservative. |
-| recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | `get -r` / `put -r` / `cp -r` support include/exclude globs. No true transactional directory atomicity; directory resume is size-based skip and checksum verify is unsupported. |
+| recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | `get -r` / `put -r` / `cp -r` support include/exclude globs and per-file timeout. No true transactional directory atomicity; directory resume is size-based skip and checksum verify is unsupported. |
 | server-side copychunk | MS-FSCC FSCTL_SRV_COPYCHUNK | `SMBClient.swift` | yes | fallback observed | no | no | underverified | Samba test FS returns unsupported and exercises fallback; offload-capable server smoke is missing. |
 | change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications`, `SMBChangeNotifyEvent.requiresRescan`, `smbcli watch --json` | yes | yes | no | no | underverified | Reconnect/resubscribe is not implemented. |
 | cancel | MS-SMB2 CANCEL | `SMB2Cancel`, `SMBSession.sendCancel`, CHANGE_NOTIFY cancellation | yes | no | no | no | partial | Watch/CHANGE_NOTIFY cancellation sends SMB2 CANCEL without closing the transport. General outstanding request tracking and long-read integration are future work. |
@@ -64,7 +64,7 @@ Status labels:
 | JSON output | CLI | `SMBCLIOutput.swift`, `smbcli`, `docs/smbcli-json.md` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands use exit status as their stable success/failure signal. |
 | exit codes | CLI | `SMBCLI.swift`, `docs/smbcli-exit-codes.md` | yes | yes | no | no | covered | Keep exhaustive mapping as `SMBError` evolves. |
 | debug redaction | operational | `SMBDebug.swift`, `smbcli --debug/--trace-wire` | yes | yes | no | no | covered | Raw wire trace remains explicitly opt-in. |
-| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift`, `SMB2Cancel` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. `smbcli --operation-timeout` wraps all commands. Public API operation deadline parameters and per-file recursive timeout policy are future work. SMB CANCEL has a codec/send primitive, but high-level cancellation still mostly closes transport. |
+| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift`, `SMB2Cancel` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. `smbcli --operation-timeout` wraps all commands, and recursive transfers have per-file timeout. Public API operation deadline parameters are not broadly implemented. CHANGE_NOTIFY cancellation sends SMB2 CANCEL. |
 
 ## Release Blockers
 

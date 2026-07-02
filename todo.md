@@ -440,6 +440,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     remote が local より大きい場合は拒否。CLI smoke に `put --resume` round-trip を追加。
   - 2026-07-02: `get -r` / `put -r` / `cp -r` に `--include` / `--exclude` を追加。recursive file は
     basename または relative path glob で選別し、directory は exclude で枝刈りする。
+  - 2026-07-02: recursive directory transfer に public API `perFileTimeout` と CLI
+    `--per-file-timeout` を追加。`--operation-timeout` は全体、`--per-file-timeout` は各 file 転送を bound する。
   - sparse file / allocation size / zero range の扱いも未実装。巨大 VM image や backup 用途では
     通信量と local disk 使用量に影響するため、`FSCTL_SET_ZERO_DATA` 等を調査する。
   - 暗号化 transport の integrity とは別に、consumer visible な transfer verification (size / optional hash)

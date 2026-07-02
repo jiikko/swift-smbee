@@ -832,6 +832,7 @@ public actor SMBClientSession {
         dryRun: Bool = false,
         include: [String] = [],
         exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try ensureOpen()
@@ -846,6 +847,7 @@ public actor SMBClientSession {
             dryRun: dryRun,
             include: include,
             exclude: exclude,
+            perFileTimeout: perFileTimeout,
             onAction: onAction
         )
     }
@@ -1841,6 +1843,7 @@ public enum SMBClient {
         atomic: Bool = false,
         include: [String] = [],
         exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
@@ -1880,6 +1883,7 @@ public enum SMBClient {
                 dryRun: dryRun,
                 include: include,
                 exclude: exclude,
+                perFileTimeout: perFileTimeout,
                 credential: credential,
                 timeout: timeout,
                 makeTransport: makeTransport,
@@ -1967,6 +1971,7 @@ public enum SMBClient {
         dryRun: Bool,
         include: [String],
         exclude: [String],
+        perFileTimeout: Duration?,
         credential: SMBCredential,
         timeout: Duration?,
         makeTransport: (@Sendable () -> SMBTransport)?,
@@ -2027,6 +2032,7 @@ public enum SMBClient {
                         dryRun: dryRun,
                         include: include,
                         exclude: exclude,
+                        perFileTimeout: perFileTimeout,
                         credential: credential,
                         timeout: timeout,
                         makeTransport: makeTransport,
@@ -2047,17 +2053,19 @@ public enum SMBClient {
                     if dryRun {
                         onAction?(SMBRecursiveAction(kind: .download, path: actionChild.path))
                     } else {
-                        try await download(
-                            host: host,
-                            port: port,
-                            share: share,
-                            path: remoteChild,
-                            localFile: localChild,
-                            overwrite: resume ? true : overwrite,
-                            credential: credential,
-                            timeout: timeout,
-                            makeTransport: makeTransport
-                        )
+                        try await SMBOperationDeadline.run(timeout: perFileTimeout) {
+                            try await download(
+                                host: host,
+                                port: port,
+                                share: share,
+                                path: remoteChild,
+                                localFile: localChild,
+                                overwrite: resume ? true : overwrite,
+                                credential: credential,
+                                timeout: timeout,
+                                makeTransport: makeTransport
+                            )
+                        }
                         onAction?(SMBRecursiveAction(kind: .download, path: actionChild.path))
                     }
                 } catch {
@@ -2090,6 +2098,7 @@ public enum SMBClient {
         atomic: Bool = false,
         include: [String] = [],
         exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -2108,6 +2117,7 @@ public enum SMBClient {
             atomic: atomic,
             include: include,
             exclude: exclude,
+            perFileTimeout: perFileTimeout,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
             onAction: onAction
@@ -2329,6 +2339,7 @@ public enum SMBClient {
         dryRun: Bool = false,
         include: [String] = [],
         exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
@@ -2348,6 +2359,7 @@ public enum SMBClient {
             dryRun: dryRun,
             include: include,
             exclude: exclude,
+            perFileTimeout: perFileTimeout,
             credential: credential,
             timeout: timeout,
             makeTransport: makeTransport,
@@ -2372,6 +2384,7 @@ public enum SMBClient {
         dryRun: Bool,
         include: [String],
         exclude: [String],
+        perFileTimeout: Duration?,
         credential: SMBCredential,
         timeout: Duration?,
         makeTransport: (@Sendable () -> SMBTransport)?,
@@ -2432,6 +2445,7 @@ public enum SMBClient {
                         dryRun: dryRun,
                         include: include,
                         exclude: exclude,
+                        perFileTimeout: perFileTimeout,
                         credential: credential,
                         timeout: timeout,
                         makeTransport: makeTransport,
@@ -2468,17 +2482,19 @@ public enum SMBClient {
                     if dryRun {
                         onAction?(SMBRecursiveAction(kind: .upload, path: remoteChild))
                     } else {
-                        try await upload(
-                            host: host,
-                            port: port,
-                            share: share,
-                            path: remoteChild,
-                            localFile: localChild,
-                            overwrite: resume ? true : overwrite,
-                            credential: credential,
-                            timeout: timeout,
-                            makeTransport: makeTransport
-                        )
+                        try await SMBOperationDeadline.run(timeout: perFileTimeout) {
+                            try await upload(
+                                host: host,
+                                port: port,
+                                share: share,
+                                path: remoteChild,
+                                localFile: localChild,
+                                overwrite: resume ? true : overwrite,
+                                credential: credential,
+                                timeout: timeout,
+                                makeTransport: makeTransport
+                            )
+                        }
                         onAction?(SMBRecursiveAction(kind: .upload, path: remoteChild))
                     }
                 } catch SMBError.nameCollision where skipExisting && !resume {
@@ -2508,6 +2524,7 @@ public enum SMBClient {
         dryRun: Bool = false,
         include: [String] = [],
         exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -2525,6 +2542,7 @@ public enum SMBClient {
             dryRun: dryRun,
             include: include,
             exclude: exclude,
+            perFileTimeout: perFileTimeout,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
             onAction: onAction
@@ -2634,6 +2652,7 @@ public enum SMBClient {
         dryRun: Bool = false,
         include: [String] = [],
         exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
@@ -2651,6 +2670,7 @@ public enum SMBClient {
                 dryRun: dryRun,
                 include: include,
                 exclude: exclude,
+                perFileTimeout: perFileTimeout,
                 onAction: onAction
             )
         }
@@ -2668,6 +2688,7 @@ public enum SMBClient {
         dryRun: Bool = false,
         include: [String] = [],
         exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
@@ -2684,6 +2705,7 @@ public enum SMBClient {
             dryRun: dryRun,
             include: include,
             exclude: exclude,
+            perFileTimeout: perFileTimeout,
             credential: try await credentialProvider(),
             makeTransport: makeTransport,
             onAction: onAction
@@ -3501,6 +3523,7 @@ actor SMBSession {
         dryRun: Bool = false,
         include: [String] = [],
         exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
         depth: Int = 0,
         relativePath: String = "",
@@ -3554,6 +3577,7 @@ actor SMBSession {
                             dryRun: dryRun,
                             include: include,
                             exclude: exclude,
+                            perFileTimeout: perFileTimeout,
                             onAction: onAction,
                             depth: depth + 1,
                             relativePath: relativeChild,
@@ -3571,7 +3595,9 @@ actor SMBSession {
                         if dryRun {
                             onAction?(SMBRecursiveAction(kind: .copy, path: destinationChild))
                         } else {
-                            try await self.copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+                            try await SMBOperationDeadline.run(timeout: perFileTimeout) {
+                                try await self.copyFile(treeId: treeId, fromPath: sourceChild, toPath: destinationChild, overwrite: overwrite)
+                            }
                             onAction?(SMBRecursiveAction(kind: .copy, path: destinationChild))
                         }
                     } catch SMBError.nameCollision where skipExisting {

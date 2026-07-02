@@ -181,12 +181,13 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(get.progress)
         XCTAssertTrue(get.resume)
 
-        let put = try Put.parse(["/tmp/in", "smb://user@host/share/file.txt", "--recursive", "--no-overwrite", "--progress"])
+        let put = try Put.parse(["/tmp/in", "smb://user@host/share/file.txt", "--recursive", "--no-overwrite", "--progress", "--resume"])
         XCTAssertEqual(put.source, "/tmp/in")
         XCTAssertEqual(put.destination, "smb://user@host/share/file.txt")
         XCTAssertTrue(put.recursive)
         XCTAssertTrue(put.noOverwrite)
         XCTAssertTrue(put.progress)
+        XCTAssertTrue(put.resume)
 
         let mkdir = try MakeDirectory.parse(["smb://user@host/share/new"])
         XCTAssertEqual(mkdir.url, "smb://user@host/share/new")

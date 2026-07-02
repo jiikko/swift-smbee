@@ -833,6 +833,9 @@ struct Put: AsyncParsableCommand {
     @Flag(help: "Skip recursive items whose destination already exists")
     var skipExisting = false
 
+    @Flag(help: "Resume partial uploads when possible")
+    var resume = false
+
     @Flag(help: "Show planned recursive actions without modifying destinations")
     var dryRun = false
 
@@ -864,6 +867,7 @@ struct Put: AsyncParsableCommand {
                     overwrite: !noOverwrite,
                     continueOnError: continueOnError,
                     skipExisting: skipExisting,
+                    resume: resume,
                     dryRun: dryRun,
                     timeout: transport.duration
                 ) { action in writeRecursiveAction(action) }
@@ -872,7 +876,6 @@ struct Put: AsyncParsableCommand {
         }
         if progress {
             let progressWriter = TransferProgressWriter()
-            let data = try Data(contentsOf: URL(fileURLWithPath: source))
             try await transport.withOperationDeadline {
                 try await SMBee.upload(
                     host: endpoint.host,
@@ -880,8 +883,9 @@ struct Put: AsyncParsableCommand {
                     credential: credential,
                     share: endpoint.share,
                     path: endpoint.path,
-                    data: [UInt8](data),
+                    fileURL: URL(fileURLWithPath: source),
                     overwrite: !noOverwrite,
+                    resume: resume,
                     timeout: transport.duration,
                     onProgress: { progress in progressWriter.emit(progress) }
                 )
@@ -898,6 +902,7 @@ struct Put: AsyncParsableCommand {
                 path: endpoint.path,
                 localFile: URL(fileURLWithPath: source),
                 overwrite: !noOverwrite,
+                resume: resume,
                 timeout: transport.duration
             )
         }

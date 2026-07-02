@@ -315,6 +315,15 @@ struct SMB2CreateRequest {
         )
     }
 
+    static func uploadResume(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0002 | 0x0000_0080,
+            createDisposition: 0x0000_0001,
+            createOptions: 0x0000_0040
+        )
+    }
+
     static func delete(path: String, directory: Bool) -> SMB2CreateRequest {
         SMB2CreateRequest(
             path: path,

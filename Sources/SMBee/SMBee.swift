@@ -659,6 +659,7 @@ public enum SMBee {
         path: String,
         fileURL: URL,
         overwrite: Bool = true,
+        resume: Bool = false,
         timeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
@@ -669,6 +670,7 @@ public enum SMBee {
             path: path,
             fileURL: fileURL,
             overwrite: overwrite,
+            resume: resume,
             credential: credential,
             timeout: timeout,
             onProgress: onProgress
@@ -683,6 +685,7 @@ public enum SMBee {
         path: String,
         fileURL: URL,
         overwrite: Bool = true,
+        resume: Bool = false,
         timeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
@@ -693,6 +696,7 @@ public enum SMBee {
             path: path,
             fileURL: fileURL,
             overwrite: overwrite,
+            resume: resume,
             credential: try await credentialProvider(),
             timeout: timeout,
             onProgress: onProgress
@@ -779,6 +783,7 @@ public enum SMBee {
         path: String,
         localFile: URL,
         overwrite: Bool = true,
+        resume: Bool = false,
         timeout: Duration? = nil
     ) async throws {
         try await SMBClient.upload(
@@ -788,6 +793,7 @@ public enum SMBee {
             path: path,
             localFile: localFile,
             overwrite: overwrite,
+            resume: resume,
             credential: credential,
             timeout: timeout
         )
@@ -800,7 +806,8 @@ public enum SMBee {
         share: String,
         path: String,
         localFile: URL,
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        resume: Bool = false
     ) async throws {
         try await SMBClient.upload(
             host: host,
@@ -809,6 +816,7 @@ public enum SMBee {
             path: path,
             localFile: localFile,
             overwrite: overwrite,
+            resume: resume,
             credentialProvider: credentialProvider
         )
     }

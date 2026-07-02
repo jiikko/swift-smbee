@@ -52,6 +52,10 @@ cmp "${local_dir}/file.txt" "${local_dir}/downloaded.txt"
 printf "hello " > "${local_dir}/resumed.txt"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" get --resume "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt" "${local_dir}/resumed.txt"
 cmp "${local_dir}/file.txt" "${local_dir}/resumed.txt"
+printf "hello " > "${local_dir}/upload-resumed.txt"
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" put "${local_dir}/upload-resumed.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/upload-resumed.txt"
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" put --resume "${local_dir}/file.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/upload-resumed.txt"
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cat "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/upload-resumed.txt" | cmp "${local_dir}/file.txt" -
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cp "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/copied.txt"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cat "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/copied.txt" | cmp "${local_dir}/file.txt" -
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mv "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/copied.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/moved.txt"

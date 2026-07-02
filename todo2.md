@@ -438,6 +438,8 @@ Linux/macOS smbclient として必要な理由:
 - `downloadDirectory` / `uploadDirectory` の `resume` は size一致なら skip するだけ。
 - 2026-07-02: 単一 file download は `resume` / `smbcli get --resume` で local partial size から
   range read を再開できる。単一 file upload の byte-level resume は未実装。
+- 2026-07-02: 単一 file upload は `resume` / `smbcli put --resume` で remote partial size から
+  local file を seek して WRITE 再開できる。
 - checksum verification はない。
 - sparse file / zero range は未実装。
 
@@ -449,7 +451,6 @@ Linux/macOS smbclient として必要な理由:
 
 やること:
 
-- 単一 file upload に byte-level `resume` を追加するか決める。
 - local partial file の扱いを決める:
   - download: existing destination に direct append
   - upload: `.part` staging / range write policy

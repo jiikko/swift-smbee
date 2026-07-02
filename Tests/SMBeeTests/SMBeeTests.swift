@@ -2997,6 +2997,47 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try writePayload(from: requests[1]) + writePayload(from: requests[2]), payload)
     }
 
+    func testClientSessionStreamingUploadResumeWritesFromRemoteSize() async throws {
+        let statFileId = hexBytes("00112233445566778899aabbccddeeff")
+        let uploadFileId = hexBytes("ffeeddccbbaa99887766554433221100")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: statFileId, messageId: 0, treeId: 0x3344),
+            try smb2QueryInfoResponse(size: 6, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344),
+            try smb2CreateResponse(fileId: uploadFileId, messageId: 3, treeId: 0x3344),
+            try smb2WriteResponse(count: 5, messageId: 4, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 5, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let fileURL = try writeTemporaryFile(bytes: Array("hello world".utf8))
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+
+        try await clientSession.upload(path: "file.bin", fileURL: fileURL, overwrite: false, resume: true)
+
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.queryInfo,
+            SMB2Commands.close,
+            SMB2Commands.create,
+            SMB2Commands.write,
+            SMB2Commands.flush,
+            SMB2Commands.close,
+        ])
+        XCTAssertEqual(readUInt32LE(requests[3], at: 100), 0x0000_0001)
+        XCTAssertEqual(readUInt64LE(requests[4], at: 72), 6)
+        XCTAssertEqual(try writePayload(from: requests[4]), Array("world".utf8))
+    }
+
     func testClientSessionStreamingUploadEmptyTempFileSendsNoWrite() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([

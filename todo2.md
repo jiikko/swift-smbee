@@ -238,7 +238,9 @@ Linux/macOS smbclient として必要な理由:
 - `SMB2Header` は `creditCharge` / `credits` field を持つが、default は `creditCharge = 0`, `credits = 1`。
 - `todo.md` にも CreditCharge / CreditRequest / CreditResponse を管理していないと記録されている。
 - read/write は negotiated MaxRead/MaxWriteSize と transform overhead で chunk を抑えているが、credit window を allocator として扱っていない。
-- 2026-07-02: 最小 credit accounting を追加。READ/WRITE request は payload length から `CreditCharge` を計算し、`CreditRequest` も同値に設定する。`SMBSession` は送信時に charge を消費し、response header の `credits` grant を balance に加算して debug trace できる。まだ credit-window blocking / multi-flight allocator は未実装。
+- 2026-07-02: 最小 credit accounting を追加。READ/WRITE request は payload length から `CreditCharge` を計算し、`CreditRequest` も同値に設定する。`SMBSession` は送信時に charge を消費し、response header の `credits` grant を balance に加算して debug trace できる。
+- 2026-07-02: read/write chunk planner を current credit balance で cap する helper を追加。直列 I/O の範囲では credit window を超える chunk を選ばない。
+- credit-window blocking / multi-flight allocator は未実装。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -249,7 +251,7 @@ Linux/macOS smbclient として必要な理由:
 
 - credit-window が足りない時に待つ allocator を実装する。
 - multi-flight 化する場合は messageId/async response demux と合わせて設計する。
-- large read/write/copychunk と encryption overhead を含む chunk planner を作る。
+- copychunk と encryption overhead を含む chunk planner の E2E 検証を広げる。
 - unit: allocator。
 - E2E: large file read/write を 1MiB 超、4GiB 境界、encrypted session で実行。
 

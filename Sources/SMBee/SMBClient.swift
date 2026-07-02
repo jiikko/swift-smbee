@@ -277,6 +277,22 @@ enum SMBTransferLimits {
         let usableNegotiatedLimit = max(0, Int(negotiatedLimit) - transformOverhead)
         return max(1, min(localLimit, usableNegotiatedLimit))
     }
+
+    static func creditWindowChunkSize(
+        localLimit: Int,
+        negotiatedLimit: UInt32,
+        transformOverhead: Int = 0,
+        availableCredits: UInt32
+    ) -> Int {
+        let negotiated = negotiatedChunkSize(
+            localLimit: localLimit,
+            negotiatedLimit: negotiatedLimit,
+            transformOverhead: transformOverhead
+        )
+        let usableCredits = max(1, availableCredits)
+        let creditLimit = UInt64(usableCredits) * UInt64(SMB2Credit.unitSize)
+        return max(1, min(negotiated, Int(min(creditLimit, UInt64(Int.max)))))
+    }
 }
 
 enum SMBChunkedTransfer {
@@ -2892,7 +2908,7 @@ actor SMBSession {
     func readChunk(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
         guard length > 0 else { return [] }
         try Task.checkCancellation()
-        let requestLength = UInt32(min(UInt64(negotiatedReadChunkSize()), length))
+        let requestLength = UInt32(min(UInt64(creditAwareReadChunkSize()), length))
         let packet = try SMB2Read.encodeRequest(
             messageId: nextMessageId(),
             sessionId: sessionId,
@@ -2922,23 +2938,24 @@ actor SMBSession {
         data: [UInt8],
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
-        let chunkSize = negotiatedWriteChunkSize()
         let progress = SMBTransferProgressEmitter(totalBytes: UInt64(data.count), onProgress: onProgress)
         var cursor = 0
+        var chunkSize = creditAwareWriteChunkSize()
         while let range = try SMBChunkedTransfer.nextWriteRange(cursor: cursor, dataCount: data.count, chunkSize: chunkSize) {
             try Task.checkCancellation()
             let chunk = Array(data[range])
             try await writeChunk(treeId: treeId, fileId: fileId, offset: UInt64(cursor), data: chunk)
             cursor = range.upperBound
             progress.emit(bytesTransferred: UInt64(cursor))
+            chunkSize = creditAwareWriteChunkSize()
         }
     }
 
     func write(treeId: UInt32, fileId: [UInt8], nextChunk: (Int) throws -> [UInt8]) async throws {
-        let chunkSize = negotiatedWriteChunkSize()
         var offset: UInt64 = 0
         while true {
             try Task.checkCancellation()
+            let chunkSize = creditAwareWriteChunkSize()
             let chunk = try nextChunk(chunkSize)
             if chunk.isEmpty { break }
             try await writeChunk(treeId: treeId, fileId: fileId, offset: offset, data: chunk)
@@ -3677,14 +3694,29 @@ actor SMBSession {
         return bytes + Array(repeating: 0, count: length - bytes.count)
     }
 
-    private func negotiatedWriteChunkSize() -> Int {
-        let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
-        return SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: maxWriteSize, transformOverhead: transformOverhead)
-    }
-
     private func negotiatedReadChunkSize() -> Int {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
         return SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: maxReadSize, transformOverhead: transformOverhead)
+    }
+
+    private func creditAwareWriteChunkSize() -> Int {
+        let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
+        return SMBTransferLimits.creditWindowChunkSize(
+            localLimit: 64 * 1024,
+            negotiatedLimit: maxWriteSize,
+            transformOverhead: transformOverhead,
+            availableCredits: creditBalance
+        )
+    }
+
+    private func creditAwareReadChunkSize() -> Int {
+        let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
+        return SMBTransferLimits.creditWindowChunkSize(
+            localLimit: 64 * 1024,
+            negotiatedLimit: maxReadSize,
+            transformOverhead: transformOverhead,
+            availableCredits: creditBalance
+        )
     }
 
     private nonisolated func joinSMBPath(_ parent: String, _ child: String) -> String {

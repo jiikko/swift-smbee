@@ -4748,6 +4748,31 @@ final class SMBeeTests: XCTestCase {
             ),
             1
         )
+        XCTAssertEqual(
+            SMBTransferLimits.creditWindowChunkSize(
+                localLimit: 512 * 1024,
+                negotiatedLimit: 1_048_576,
+                availableCredits: 2
+            ),
+            128 * 1024
+        )
+        XCTAssertEqual(
+            SMBTransferLimits.creditWindowChunkSize(
+                localLimit: 512 * 1024,
+                negotiatedLimit: 1_048_576,
+                transformOverhead: SMB3TransformHeader.encodedSize,
+                availableCredits: 1
+            ),
+            64 * 1024
+        )
+        XCTAssertEqual(
+            SMBTransferLimits.creditWindowChunkSize(
+                localLimit: 512 * 1024,
+                negotiatedLimit: 1_048_576,
+                availableCredits: 0
+            ),
+            64 * 1024
+        )
     }
 
     func testSetInfoRenameRequestUsesFileRenameInformationBuffer() throws {

@@ -96,3 +96,25 @@ public struct SMB2Header: Equatable, Sendable {
         )
     }
 }
+
+enum SMB2Credit {
+    static let unitSize = 65_536
+
+    static func charge(forPayloadLength length: UInt64) -> UInt16 {
+        let charge = max(1, (length + UInt64(unitSize) - 1) / UInt64(unitSize))
+        return UInt16(min(charge, UInt64(UInt16.max)))
+    }
+
+    static func charge(forPayloadLength length: Int) -> UInt16 {
+        charge(forPayloadLength: UInt64(max(0, length)))
+    }
+
+    static func balanceAfterSending(current: UInt32, charge: UInt16) -> UInt32 {
+        current > UInt32(charge) ? current - UInt32(charge) : 0
+    }
+
+    static func balanceAfterReceiving(current: UInt32, granted: UInt16) -> UInt32 {
+        let (sum, overflow) = current.addingReportingOverflow(UInt32(granted))
+        return overflow ? UInt32.max : sum
+    }
+}

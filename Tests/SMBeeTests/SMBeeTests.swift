@@ -1332,6 +1332,16 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try SMB2Header.decode(encoded), header)
     }
 
+    func testSMB2CreditChargeAndBalanceHelpers() {
+        XCTAssertEqual(SMB2Credit.charge(forPayloadLength: 0), 1)
+        XCTAssertEqual(SMB2Credit.charge(forPayloadLength: 65_536), 1)
+        XCTAssertEqual(SMB2Credit.charge(forPayloadLength: 65_537), 2)
+        XCTAssertEqual(SMB2Credit.charge(forPayloadLength: 131_072), 2)
+        XCTAssertEqual(SMB2Credit.balanceAfterSending(current: 3, charge: 2), 1)
+        XCTAssertEqual(SMB2Credit.balanceAfterSending(current: 1, charge: 2), 0)
+        XCTAssertEqual(SMB2Credit.balanceAfterReceiving(current: 1, granted: 4), 5)
+    }
+
     func testMD4RFC1320Vectors() {
         XCTAssertEqual(hex(MD4.hash([])), "31d6cfe0d16ae931b73c59d7e0c089c0")
         XCTAssertEqual(hex(MD4.hash(Array("a".utf8))), "bde52cb31de33e46245e05fbdbd6fb24")
@@ -3367,6 +3377,8 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(header.messageId, 13)
         XCTAssertEqual(header.treeId, 0x5566_7788)
         XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(header.creditCharge, 1)
+        XCTAssertEqual(header.credits, 1)
         XCTAssertEqual(request.count, 113)
         XCTAssertEqual(readUInt16LE(request, at: 64), 49)
         XCTAssertEqual(request[66], 0x50)
@@ -3380,6 +3392,21 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(request, at: 108), 0)
         XCTAssertEqual(readUInt16LE(request, at: 110), 0)
         XCTAssertEqual(request[112], 0)
+    }
+
+    func testReadRequestUsesMultiCreditChargeForLargeLength() throws {
+        let request = try SMB2Read.encodeRequest(
+            messageId: 13,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: (0..<16).map(UInt8.init),
+            offset: 0,
+            length: 65_537
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.creditCharge, 2)
+        XCTAssertEqual(header.credits, 2)
     }
 
     func testReadResponseDecodesDataOffsetAndLength() throws {
@@ -4077,6 +4104,8 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(header.messageId, 15)
         XCTAssertEqual(header.treeId, 0x5566_7788)
         XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(header.creditCharge, 1)
+        XCTAssertEqual(header.credits, 1)
         XCTAssertEqual(readUInt16LE(request, at: 64), 49)
         XCTAssertEqual(readUInt16LE(request, at: 66), 112)
         XCTAssertEqual(readUInt32LE(request, at: 68), UInt32(payload.count))
@@ -4088,6 +4117,21 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(request, at: 106), 0)
         XCTAssertEqual(readUInt32LE(request, at: 108), 0)
         XCTAssertEqual(Array(request[112..<request.count]), payload)
+    }
+
+    func testWriteRequestUsesMultiCreditChargeForLargePayload() throws {
+        let request = try SMB2Write.encodeRequest(
+            messageId: 15,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: (0..<16).map(UInt8.init),
+            offset: 0,
+            data: Array(repeating: 0xab, count: 65_537)
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.creditCharge, 2)
+        XCTAssertEqual(header.credits, 2)
     }
 
     func testWriteResponseDecodesCount() throws {

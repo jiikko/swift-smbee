@@ -2467,7 +2467,8 @@ extension Error {
 /// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
 /// actor reentrancy により `sendSigned` → `receive` 間で別の wire 操作が入り得るため、各 request/response
 /// pair は `SMBWireTransactionGate` で直列化する。これにより同一 `SMBSession` への並行呼び出しでも
-/// 応答取り違えは起きないが、SMB2 本来の multi-credit / multi-flight 並行化はまだ行わない。
+/// 応答取り違えは起きない。READ/WRITE の CreditCharge と server grant は記録するが、SMB2 本来の
+/// credit-window blocking / multi-flight 並行化はまだ行わない。
 ///
 /// 真の multi-flight が必要になったら MS-SMB2 の messageId/credit ベース応答多重分離へ置き換える
 /// (背景と対応案は issues/done/002-design-smbsession-concurrent-multiflight.md)。
@@ -2487,6 +2488,7 @@ actor SMBSession {
     private var transformNonceCounter: UInt64 = 0
     private var maxReadSize: UInt32 = UInt32.max
     private var maxWriteSize: UInt32 = UInt32.max
+    private var creditBalance: UInt32 = 1
 
     init(
         host: String,
@@ -3416,6 +3418,7 @@ actor SMBSession {
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {
         try Task.checkCancellation()
+        recordCreditCharge(packet)
         try await transport.send(DirectTCPFraming.frame(packet))
         try Task.checkCancellation()
     }
@@ -3443,6 +3446,7 @@ actor SMBSession {
             sender: .client
         )
         signed.replaceSubrange(48..<64, with: signature)
+        recordCreditCharge(signed)
         try await transport.send(DirectTCPFraming.frame(signed))
         try Task.checkCancellation()
     }
@@ -3479,6 +3483,7 @@ actor SMBSession {
         }
         header.signature = sealed.tag
         try Task.checkCancellation()
+        recordCreditCharge(packet)
         try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
         try Task.checkCancellation()
     }
@@ -3531,10 +3536,21 @@ actor SMBSession {
         debugDump("\(label) direct-TCP header length=\(length)", header)
         let body = try await receiveExactly(length)
         debugDump(label, body)
-        if body.starts(with: SMB3TransformHeader.protocolId) {
-            return try decryptTransform(body)
-        }
-        return body
+        let packet = body.starts(with: SMB3TransformHeader.protocolId) ? try decryptTransform(body) : body
+        recordCreditGrant(packet, label: label)
+        return packet
+    }
+
+    private func recordCreditCharge(_ packet: [UInt8]) {
+        guard let header = try? SMB2Header.decode(packet) else { return }
+        creditBalance = SMB2Credit.balanceAfterSending(current: creditBalance, charge: header.creditCharge)
+        debugLine("SMB credit charge=\(header.creditCharge) balance=\(creditBalance)")
+    }
+
+    private func recordCreditGrant(_ packet: [UInt8], label: String) {
+        guard let header = try? SMB2Header.decode(packet) else { return }
+        creditBalance = SMB2Credit.balanceAfterReceiving(current: creditBalance, granted: header.credits)
+        debugLine("\(label) credit grant=\(header.credits) balance=\(creditBalance)")
     }
 
     private func decryptTransform(_ packet: [UInt8]) throws -> [UInt8] {

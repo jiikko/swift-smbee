@@ -557,7 +557,15 @@ enum SMB2Read {
         length: UInt32
     ) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
-        let header = try SMB2Header(command: SMB2Commands.read, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        let creditCharge = SMB2Credit.charge(forPayloadLength: UInt64(length))
+        let header = try SMB2Header(
+            creditCharge: creditCharge,
+            command: SMB2Commands.read,
+            credits: creditCharge,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(49)
@@ -603,7 +611,15 @@ enum SMB2Write {
         data: [UInt8]
     ) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
-        let header = try SMB2Header(command: SMB2Commands.write, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        let creditCharge = SMB2Credit.charge(forPayloadLength: data.count)
+        let header = try SMB2Header(
+            creditCharge: creditCharge,
+            command: SMB2Commands.write,
+            credits: creditCharge,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(49)

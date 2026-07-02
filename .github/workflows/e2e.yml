@@ -52,27 +52,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v3
-        with:
-          swift-version: ${{ matrix.swift_version }}
-      - run: swift --version
-
+      # Samba runs via host Docker (binds host :445). Swift runs inside the official
+      # swift image with --network host so it reaches Samba on 127.0.0.1:445. This
+      # replaces swift-actions/setup-swift@v3, whose Swiftly install currently fails
+      # GPG verification ("Can't check signature: No public key") and breaks the job.
       - name: Start Samba
         run: bash test/e2e/start-samba-ci.sh
 
-      - name: Probe negotiated parameters
+      - name: Probe + API E2E tests (Swift in container)
         env:
-          SMBEE_DEBUG: "1"
-        run: swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
-
-      - name: Samba-backed API E2E tests
-        env:
-          SMBEE_E2E: "1"
-          SMBEE_DEBUG: "1"
+          TEST_FILTER: ${{ matrix.test_filter }}
         run: |
           set -euxo pipefail
-          swift test --filter "${{ matrix.test_filter }}"
+          docker run --rm --network host \
+            -e SMBEE_E2E=1 -e SMBEE_DEBUG=1 -e TEST_FILTER \
+            -e SMBEE_E2E_PROFILE -e SMBEE_E2E_HOST -e SMBEE_E2E_PORT \
+            -v "${PWD}:/work" -w /work \
+            "swift:${{ matrix.swift_version }}" \
+            bash -euxo pipefail -c '
+              swift --version
+              swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
+              swift test --filter "${TEST_FILTER}"
+            '
 
       - name: Samba logs (debug)
         if: always()
@@ -101,23 +102,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v3
-        with:
-          swift-version: ${{ matrix.swift_version }}
-      - run: swift --version
-
+      # See e2e-api: Samba via host Docker, Swift via the official image with
+      # --network host (replaces the broken swift-actions/setup-swift@v3).
       - name: Start Samba
         run: bash test/e2e/start-samba-ci.sh
 
-      - name: Build smbcli
-        run: swift build --product smbcli
-
-      - name: smbcli command smoke
+      - name: Build smbcli + command smoke (Swift in container)
         env:
-          SMB_PASSWORD: smbee
           SMBEE_E2E_SMOKE_ROOT: smbee-gha-cli-${{ github.run_id }}-${{ github.run_attempt }}
-        run: bin/e2e/smbcli-smoke.sh
+        run: |
+          set -euxo pipefail
+          docker run --rm --network host \
+            -e SMB_PASSWORD=smbee -e SMBEE_E2E_SMOKE_ROOT \
+            -e SMBEE_E2E_PROFILE -e SMBEE_E2E_HOST -e SMBEE_E2E_PORT \
+            -v "${PWD}:/work" -w /work \
+            "swift:${{ matrix.swift_version }}" \
+            bash -euxo pipefail -c '
+              swift --version
+              swift build --product smbcli
+              bin/e2e/smbcli-smoke.sh
+            '
 
       - name: Samba logs (debug)
         if: always()

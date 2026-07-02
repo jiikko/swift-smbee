@@ -3379,7 +3379,7 @@ actor SMBSession {
         try Task.checkCancellation()
         let requestLength = UInt32(min(UInt64(await creditAwareReadChunkSize()), length))
         let packet = try SMB2Read.encodeRequest(
-            messageId: nextMessageId(),
+            messageId: nextMessageId(charge: SMB2Credit.charge(forPayloadLength: UInt64(requestLength))),
             sessionId: sessionId,
             treeId: treeId,
             fileId: fileId,
@@ -3701,7 +3701,7 @@ actor SMBSession {
 
     private func writeChunk(treeId: UInt32, fileId: [UInt8], offset: UInt64, data: [UInt8]) async throws {
         let packet = try SMB2Write.encodeRequest(
-            messageId: nextMessageId(),
+            messageId: nextMessageId(charge: SMB2Credit.charge(forPayloadLength: data.count)),
             sessionId: sessionId,
             treeId: treeId,
             fileId: fileId,
@@ -4315,8 +4315,10 @@ actor SMBSession {
         return bytes
     }
 
-    private func nextMessageId() -> UInt64 {
-        defer { messageId += 1 }
+    /// MS-SMB2 §3.2.4.1.6: the next MessageId must advance by the CreditCharge of the
+    /// request being sent, so a multi-credit READ/WRITE consumes `charge` sequence numbers.
+    private func nextMessageId(charge: UInt16 = 1) -> UInt64 {
+        defer { messageId += UInt64(max(1, charge)) }
         return messageId
     }
 

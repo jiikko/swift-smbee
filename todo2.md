@@ -241,6 +241,10 @@ Linux/macOS smbclient として必要な理由:
 - 2026-07-02: read/write chunk planner を current credit balance で cap する helper を追加。直列 I/O の範囲では credit window を超える chunk を選ばない。
 - 2026-07-02: `SMB2CreditWindow` actor を追加。READ/WRITE 送信前に CreditCharge を reserve し、不足時は grant まで待つ。response Credits で grant、send 失敗時は refund する。
 - 2026-07-03: `SMBSession` の response 待機を `messageId` keyed demux に変更。複数 request を in-flight にし、out-of-order response を正しい呼び出し元へ配送できる。
+- 2026-07-03: **bug fix**: multi-credit READ/WRITE で messageId が 1 しか進まなかったのを、
+  CreditCharge 分進める (`nextMessageId(charge:)`, MS-SMB2 §3.2.4.1.6) よう修正。現状は
+  local chunk cap 64KiB のため latent だったが、cap を上げると strict server で破綻していた。
+  残件は `issues/012-credit-window-followups.md`。
 
 Linux/macOS smbclient として必要な理由:
 

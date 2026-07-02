@@ -624,7 +624,8 @@ Linux/macOS smbclient として必要な理由:
 - 2026-07-02: `SMB2Commands.echo` / `SMB2Echo` codec を追加。
 - 2026-07-02: `SMBClientSession.echo()` / `SMBee.echo(...)` / `smbcli ping` を追加。
 - 2026-07-02: codec shape、facade teardown、CLI parse の unit coverage を追加。
-- persistent session の automatic / periodic keepalive は未実装。
+- 2026-07-02: `SMBClientSession.startKeepAlive(interval:)` / `stopKeepAlive()` を追加。
+  persistent session で opt-in periodic ECHO を送れる。ECHO 失敗時は transport を閉じて loop を止める。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -632,14 +633,13 @@ Linux/macOS smbclient として必要な理由:
 
 やること:
 
-- persistent session に optional keepalive を追加。
-- keepalive 間隔、失敗時の session state、API surface を決める。
+- reconnect policy と組み合わせるかは別途決める。
 
 完了条件:
 
 - authenticated ECHO を明示的に送れる。
 - idle session で periodic ECHO を送れる。
-- server切断を bounded に検出できる。
+- server切断を bounded に検出できる。再接続まではしない。
 
 ### P2-8. SMB CANCEL command
 

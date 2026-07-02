@@ -477,6 +477,7 @@ public actor SMBClientSession {
 
     private let session: SMBSession
     private let treeId: UInt32
+    private var keepAliveTask: Task<Void, Never>?
     private var isClosed = false
 
     init(session: SMBSession, treeId: UInt32) {
@@ -487,12 +488,41 @@ public actor SMBClientSession {
     public func close() async {
         guard !isClosed else { return }
         isClosed = true
+        stopKeepAlive()
         await session.disconnect(treeId: treeId)
     }
 
     public func echo() async throws {
         try ensureOpen()
         try await session.echo()
+    }
+
+    /// Start sending periodic authenticated SMB2 ECHO requests for this persistent session.
+    /// If an ECHO fails, the underlying transport is closed and the keepalive loop stops.
+    public func startKeepAlive(interval: Duration = .seconds(60)) throws {
+        try ensureOpen()
+        keepAliveTask?.cancel()
+        let session = session
+        keepAliveTask = Task {
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: interval)
+                    try Task.checkCancellation()
+                    try await session.echo()
+                } catch is CancellationError {
+                    break
+                } catch {
+                    await session.closeTransport()
+                    break
+                }
+            }
+        }
+    }
+
+    /// Stop the periodic keepalive task if one is active.
+    public func stopKeepAlive() {
+        keepAliveTask?.cancel()
+        keepAliveTask = nil
     }
 
     public func withTree<T: Sendable>(

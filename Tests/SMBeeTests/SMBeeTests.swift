@@ -3015,6 +3015,34 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(requests[1], at: 64), 4)
     }
 
+    func testClientSessionKeepAliveSendsPeriodicEchoUntilClose() async throws {
+        let inbound = try framed([
+            try smb2EchoResponse(messageId: 0),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 2, treeId: 0),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        try await clientSession.startKeepAlive(interval: .milliseconds(50))
+        try await waitForOutboundFrameCount(1, transport: transport)
+        await clientSession.close()
+
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
+            SMB2Commands.echo,
+            SMB2Commands.treeDisconnect,
+            SMB2Commands.logoff,
+        ])
+    }
+
     func testQueryDirectoryResponseDropsDotEntriesForRecursiveDeleteWalks() throws {
         var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: 11).encode()
         let payload = makeDirectoryEntry(name: ".", isDirectory: true, nextOffset: 112)
@@ -5477,6 +5505,16 @@ final class SMBeeTests: XCTestCase {
     }
 
     private func waitForOutboundFrameCount(_ expectedCount: Int, transport: ControlledReceiveTransport) async throws {
+        for _ in 0..<100 {
+            if try unframed(transport.outbound).count >= expectedCount {
+                return
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("timed out waiting for \(expectedCount) outbound SMB frames")
+    }
+
+    private func waitForOutboundFrameCount(_ expectedCount: Int, transport: InMemoryTransport) async throws {
         for _ in 0..<100 {
             if try unframed(transport.outbound).count >= expectedCount {
                 return

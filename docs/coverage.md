@@ -23,7 +23,7 @@ Status labels:
 | NTLMv2 + SPNEGO | MS-NLMP, MS-SPNG | `NTLM.swift`, `SMBClient.swift` | yes | yes | smoke | no | covered | Kerberos/GSS is unsupported. |
 | Anonymous/guest NTLM | MS-NLMP | `NTLM.swift`, `SMBClient.swift`, `smbcli` | yes | yes | no | no | underverified | Samba guest path covered only. |
 | SESSION_SETUP / TREE_CONNECT | MS-SMB2 3.2.4.3, 3.2.4.4 | `SMBClient.swift`, `SMBClientSession.withTree` | yes | yes | smoke | no | covered | Primary `SMBClientSession` remains one-tree oriented, with scoped additional tree access via `withTree`. Full server/tree session split is future work. |
-| ECHO | MS-SMB2 3.2.4.25 | `SMB2ReadCodecs.swift`, `SMBClient.echo`, `smbcli ping` | yes | yes | no | no | partial | Manual authenticated ECHO has Samba smoke coverage. Automatic periodic keepalive is missing. |
+| ECHO | MS-SMB2 3.2.4.25 | `SMB2ReadCodecs.swift`, `SMBClient.echo`, `SMBClientSession.startKeepAlive`, `smbcli ping` | yes | yes | no | no | partial | Manual authenticated ECHO has Samba smoke coverage. Persistent-session keepalive is opt-in and closes the transport on ECHO failure; reconnect policy is future work. |
 | TREE_DISCONNECT / LOGOFF | MS-SMB2 3.2.4.23, 3.2.4.24 | `SMBClient.swift` | yes | yes | no | no | covered | Best-effort on clean close. |
 
 ## File Operations

@@ -744,7 +744,7 @@ struct Get: AsyncParsableCommand {
     @Flag(help: "Create local parent directories before downloading")
     var createDirs = false
 
-    @Option(help: "Verify completed single-file transfer: none or size")
+    @Option(help: "Verify completed transfer: none, size, or hash (hash reads content back)")
     var verify: TransferVerifyMode = .none
 
     @Flag(help: "Output a JSON success object")
@@ -796,8 +796,9 @@ struct Get: AsyncParsableCommand {
                 )
             }
             progressWriter?.finish()
-            if verify == .size {
-                try await verifyRecursiveDownloadSizes(
+            if verify != .none {
+                try await verifyRecursiveDownloads(
+                    mode: verify,
                     actions: verifier.actions,
                     endpoint: endpoint,
                     credential: credential,
@@ -832,9 +833,7 @@ struct Get: AsyncParsableCommand {
                 onProgress: onProgress
             )
         }
-        if verify == .size {
-            try await verifyDownloadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: destination), transport: transport)
-        }
+        try await verifyTransfer(mode: verify, download: true, endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: destination), transport: transport)
         if json {
             print(try successJSONString(command: "get", path: endpoint.path))
         }
@@ -918,7 +917,7 @@ struct Put: AsyncParsableCommand {
     @Flag(help: "Create remote parent directories before uploading")
     var createDirs = false
 
-    @Option(help: "Verify completed single-file transfer: none or size")
+    @Option(help: "Verify completed transfer: none, size, or hash (hash reads content back)")
     var verify: TransferVerifyMode = .none
 
     @Flag(help: "Output a JSON success object")
@@ -970,8 +969,9 @@ struct Put: AsyncParsableCommand {
                 )
             }
             progressWriter?.finish()
-            if verify == .size {
-                try await verifyRecursiveUploadSizes(
+            if verify != .none {
+                try await verifyRecursiveUploads(
+                    mode: verify,
                     actions: verifier.actions,
                     endpoint: endpoint,
                     credential: credential,
@@ -1000,9 +1000,7 @@ struct Put: AsyncParsableCommand {
                     onProgress: { progress in progressWriter.emit(progress) }
                 )
             }
-            if verify == .size {
-                try await verifyUploadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: source), transport: transport)
-            }
+            try await verifyTransfer(mode: verify, download: false, endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: source), transport: transport)
             if json {
                 print(try successJSONString(command: "put", path: endpoint.path))
             }
@@ -1025,9 +1023,7 @@ struct Put: AsyncParsableCommand {
                 timeout: transport.duration
             )
         }
-        if verify == .size {
-            try await verifyUploadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: source), transport: transport)
-        }
+        try await verifyTransfer(mode: verify, download: false, endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: source), transport: transport)
         if json {
             print(try successJSONString(command: "put", path: endpoint.path))
         }
@@ -1114,7 +1110,7 @@ struct Copy: AsyncParsableCommand {
     @Flag(help: "Output a JSON success object")
     var json = false
 
-    @Option(help: "Verify completed recursive copy: none or size")
+    @Option(help: "Verify completed copy: none, size, or hash (hash reads content back)")
     var verify: TransferVerifyMode = .none
 
     @OptionGroup
@@ -1157,8 +1153,8 @@ struct Copy: AsyncParsableCommand {
                     verifier.record(action)
                 }
             }
-            if verify == .size {
-                try await verifyRecursiveCopySizes(actions: verifier.actions, source: from, destination: to, credential: credential, transport: transport)
+            if verify != .none {
+                try await verifyRecursiveCopies(mode: verify, actions: verifier.actions, source: from, destination: to, credential: credential, transport: transport)
             }
             if json && !dryRun {
                 print(try successJSONString(command: "cp", path: to.path))
@@ -1177,6 +1173,7 @@ struct Copy: AsyncParsableCommand {
                 timeout: transport.duration
             )
         }
+        try await verifyRemoteCopyPair(mode: verify, source: from, destination: to, credential: credential, transport: transport)
         if json {
             print(try successJSONString(command: "cp", path: to.path))
         }
@@ -1275,6 +1272,7 @@ struct TransportOptions: ParsableArguments {
 enum TransferVerifyMode: String, ExpressibleByArgument {
     case none
     case size
+    case hash
 }
 
 private func verifyDownloadedSize(
@@ -1283,16 +1281,7 @@ private func verifyDownloadedSize(
     localFile: URL,
     transport: TransportOptions
 ) async throws {
-    let stat = try await transport.withOperationDeadline {
-        try await SMBee.stat(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            timeout: transport.duration
-        )
-    }
+    let stat = try await statForVerify(endpoint: endpoint, credential: credential, transport: transport)
     let localSize = try localFileSize(localFile)
     guard stat.size == localSize else {
         throw ValidationError("size verification failed: remote=\(stat.size) local=\(localSize)")
@@ -1306,8 +1295,22 @@ private func verifyUploadedSize(
     transport: TransportOptions
 ) async throws {
     let localSize = try localFileSize(localFile)
-    let stat = try await transport.withOperationDeadline {
-        try await SMBee.stat(
+    let stat = try await statForVerify(endpoint: endpoint, credential: credential, transport: transport)
+    guard stat.size == localSize else {
+        throw ValidationError("size verification failed: local=\(localSize) remote=\(stat.size)")
+    }
+}
+
+/// Compare SHA-256 of the local file with a full read-back of the remote file.
+private func verifyLocalRemoteHash(
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    localFile: URL,
+    transport: TransportOptions
+) async throws {
+    let localHash = try SMBTransferVerification.localSHA256Hex(fileURL: localFile)
+    let remoteHash = try await transport.withOperationDeadline {
+        try await SMBTransferVerification.remoteSHA256Hex(
             host: endpoint.host,
             port: endpoint.port,
             credential: credential,
@@ -1316,8 +1319,31 @@ private func verifyUploadedSize(
             timeout: transport.duration
         )
     }
-    guard stat.size == localSize else {
-        throw ValidationError("size verification failed: local=\(localSize) remote=\(stat.size)")
+    guard localHash == remoteHash else {
+        throw ValidationError("hash verification failed: local=\(localHash) remote=\(remoteHash)")
+    }
+}
+
+/// Single local⇄remote file verification dispatched by mode. `.none` is a no-op.
+private func verifyTransfer(
+    mode: TransferVerifyMode,
+    download: Bool,
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    localFile: URL,
+    transport: TransportOptions
+) async throws {
+    switch mode {
+    case .none:
+        return
+    case .size:
+        if download {
+            try await verifyDownloadedSize(endpoint: endpoint, credential: credential, localFile: localFile, transport: transport)
+        } else {
+            try await verifyUploadedSize(endpoint: endpoint, credential: credential, localFile: localFile, transport: transport)
+        }
+    case .hash:
+        try await verifyLocalRemoteHash(endpoint: endpoint, credential: credential, localFile: localFile, transport: transport)
     }
 }
 
@@ -1354,7 +1380,8 @@ private final class RecursiveTransferVerifier: @unchecked Sendable {
     }
 }
 
-private func verifyRecursiveDownloadSizes(
+private func verifyRecursiveDownloads(
+    mode: TransferVerifyMode,
     actions: [SMBRecursiveAction],
     endpoint: SMBURLParser.ReadURL,
     credential: SMBCredential,
@@ -1365,7 +1392,9 @@ private func verifyRecursiveDownloadSizes(
         let localFile = URL(fileURLWithPath: action.path).standardizedFileURL
         let relativePath = try localRelativePath(file: localFile, directory: localDirectory)
         let remotePath = try SMBPath.join(endpoint.path, relativePath)
-        try await verifyDownloadedSize(
+        try await verifyTransfer(
+            mode: mode,
+            download: true,
             endpoint: endpoint.withPath(remotePath),
             credential: credential,
             localFile: localFile,
@@ -1374,7 +1403,8 @@ private func verifyRecursiveDownloadSizes(
     }
 }
 
-private func verifyRecursiveUploadSizes(
+private func verifyRecursiveUploads(
+    mode: TransferVerifyMode,
     actions: [SMBRecursiveAction],
     endpoint: SMBURLParser.ReadURL,
     credential: SMBCredential,
@@ -1384,7 +1414,9 @@ private func verifyRecursiveUploadSizes(
     for action in actions where action.kind == .upload {
         let relativePath = try remoteRelativePath(path: action.path, root: endpoint.path)
         let localFile = localDirectory.appendingPathComponent(relativePath.replacingOccurrences(of: "\\", with: "/"))
-        try await verifyUploadedSize(
+        try await verifyTransfer(
+            mode: mode,
+            download: false,
             endpoint: endpoint.withPath(action.path),
             credential: credential,
             localFile: localFile,
@@ -1393,7 +1425,33 @@ private func verifyRecursiveUploadSizes(
     }
 }
 
-private func verifyRecursiveCopySizes(
+private func verifyRemoteCopyPair(
+    mode: TransferVerifyMode,
+    source: SMBURLParser.ReadURL,
+    destination: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    transport: TransportOptions
+) async throws {
+    switch mode {
+    case .none:
+        return
+    case .size:
+        let sourceStat = try await statForVerify(endpoint: source, credential: credential, transport: transport)
+        let destinationStat = try await statForVerify(endpoint: destination, credential: credential, transport: transport)
+        guard sourceStat.size == destinationStat.size else {
+            throw ValidationError("size verification failed: source=\(sourceStat.size) destination=\(destinationStat.size)")
+        }
+    case .hash:
+        let sourceHash = try await remoteHashForVerify(endpoint: source, credential: credential, transport: transport)
+        let destinationHash = try await remoteHashForVerify(endpoint: destination, credential: credential, transport: transport)
+        guard sourceHash == destinationHash else {
+            throw ValidationError("hash verification failed: source=\(sourceHash) destination=\(destinationHash)")
+        }
+    }
+}
+
+private func verifyRecursiveCopies(
+    mode: TransferVerifyMode,
     actions: [SMBRecursiveAction],
     source: SMBURLParser.ReadURL,
     destination: SMBURLParser.ReadURL,
@@ -1403,11 +1461,30 @@ private func verifyRecursiveCopySizes(
     for action in actions where action.kind == .copy {
         let relativePath = try remoteRelativePath(path: action.path, root: destination.path)
         let sourcePath = try SMBPath.join(source.path, relativePath)
-        let sourceStat = try await statForVerify(endpoint: source.withPath(sourcePath), credential: credential, transport: transport)
-        let destinationStat = try await statForVerify(endpoint: destination.withPath(action.path), credential: credential, transport: transport)
-        guard sourceStat.size == destinationStat.size else {
-            throw ValidationError("size verification failed: source=\(sourceStat.size) destination=\(destinationStat.size)")
-        }
+        try await verifyRemoteCopyPair(
+            mode: mode,
+            source: source.withPath(sourcePath),
+            destination: destination.withPath(action.path),
+            credential: credential,
+            transport: transport
+        )
+    }
+}
+
+private func remoteHashForVerify(
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    transport: TransportOptions
+) async throws -> String {
+    try await transport.withOperationDeadline {
+        try await SMBTransferVerification.remoteSHA256Hex(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            timeout: transport.duration
+        )
     }
 }
 

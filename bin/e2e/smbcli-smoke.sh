@@ -49,6 +49,8 @@ SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cat "${SMB_URL}/${SMBEE_E2E_SMO
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" cat --range 6-10 "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt" | cmp <(printf "smbee") -
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" get "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt" "${local_dir}/downloaded.txt"
 cmp "${local_dir}/file.txt" "${local_dir}/downloaded.txt"
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" get --verify hash "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt" "${local_dir}/hash-verified.txt"
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" put --verify hash "${local_dir}/file.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/hash-verified-upload.txt"
 printf "hello " > "${local_dir}/resumed.txt"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" get --resume "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt" "${local_dir}/resumed.txt"
 cmp "${local_dir}/file.txt" "${local_dir}/resumed.txt"

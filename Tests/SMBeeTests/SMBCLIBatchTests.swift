@@ -167,6 +167,24 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(watch.json)
     }
 
+    func testVerifyHashModeParsesAndLocalHashMatchesKnownVector() throws {
+        let get = try Get.parse(["smb://user@host/share/f", "/tmp/out", "--verify", "hash"])
+        XCTAssertEqual(get.verify, .hash)
+        let put = try Put.parse(["/tmp/in", "smb://user@host/share/f", "--verify", "hash"])
+        XCTAssertEqual(put.verify, .hash)
+        let copy = try Copy.parse(["smb://user@host/share/a", "smb://user@host/share/b", "--verify", "hash"])
+        XCTAssertEqual(copy.verify, .hash)
+
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-hash-\(UUID().uuidString).txt")
+        try Data("abc".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        // NIST FIPS 180-2 test vector for SHA-256("abc").
+        XCTAssertEqual(
+            try SMBTransferVerification.localSHA256Hex(fileURL: file),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        )
+    }
+
     func testCatGetPutMkdirMoveCopyRemoveParsePositionalsAndFlags() throws {
         let cat = try Cat.parse(["smb://user@host/share/file.txt", "--range", "2-9", "--trace-wire"])
         XCTAssertEqual(cat.url, "smb://user@host/share/file.txt")

@@ -419,10 +419,13 @@ Linux/macOS smbclient として必要な理由:
 - 2026-07-02: 単一 file upload は `resume` / `smbcli put --resume` で remote partial size から
   local file を seek して WRITE 再開できる。
 - 2026-07-02: `smbcli get --verify size` / `smbcli put --verify size` を追加。単一 file 転送後に
-  local/remote size を照合できる。recursive verify と hash verify は未実装。
+  local/remote size を照合できる。2026-07-03: `--verify hash` (SHA-256 read-back) を追加。
 - 2026-07-02: recursive `get -r` / `put -r` / `cp -r --verify size` を追加。成功した file action だけを
-  local/remote または source/destination stat で照合する。hash verify は未実装。
-- checksum verification はない。
+  local/remote または source/destination stat で照合する。2026-07-03: hash verify も対応。
+- 2026-07-03: `--verify hash` を追加。`SMBTransferVerification.localSHA256Hex` /
+  `remoteSHA256Hex` (withReadStream の streaming read-back) で get / put / cp
+  (単一 + recursive) の SHA-256 照合ができる。単一 `cp --verify` が silent no-op だったのも修正。
+  CLI smoke (`bin/e2e/smbcli-smoke.sh`) に get/put `--verify hash` を追加。
 - sparse file / zero range は未実装。
 
 Linux/macOS smbclient として必要な理由:
@@ -743,7 +746,7 @@ File browser / backup / macOS metadata preservation を本格的にやるなら�
 - durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) のみ (CLI 非対応)。
 - DFS referral は metadata 取得のみ。auto-follow と実 msdfs E2E は未完了。
 - symlink / reparse point は tag 取得のみ。target 解決は未対応。
-- byte-level resume / checksum verify / sparse file preservation は未対応。
+- byte-level resume (download/upload) と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file preservation は未対応。
 - macOS resource fork / xattr / named stream preservation は未対応または方針未決。
 - SMB1 / NetBIOS / port 139 / printer / RDMA / QUIC / multichannel / compression は未対応。
 

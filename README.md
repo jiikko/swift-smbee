@@ -43,7 +43,7 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 - durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) のみ (CLI 非対応)。
 - DFS referral は metadata 取得のみ。target への auto-follow は未対応。
 - reparse point / symlink target は `readlink` API で扱えるが、DFS reparse data decode と実サーバ smoke は未完了。
-- single-file download resume は対応済み。single-file upload byte-level resume、checksum verify、sparse file preservation は未対応。
+- single-file download/upload の byte-level resume と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file preservation は未対応。
 - macOS resource fork / xattr / named stream preservation は未対応。通常の data fork 転送を対象にする。
 - SMB1 / NetBIOS port 139 / printer share / SMB Direct(RDMA) / SMB over QUIC / multichannel / compression は未対応。
 

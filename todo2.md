@@ -67,9 +67,9 @@
 | volume / filesystem info | implemented | `SMBee.volumeInfo` / `smbcli df`。FileFsFullSizeInformation / FileFsAttributeInformation / FileFsVolumeInformation。 |
 | metadata read/write | implemented | file attributes、creation/access/modified/change time、`SMBFileMetadataUpdate`、`updateMetadata`。 |
 | security descriptor read / DACL write | partial | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。DACL は read-modify-write あり。ただし owner/group/SACL 書き換えと SID 名解決は未実装。 |
-| change notification | implemented-but-underverified | `withChangeNotifications` / `smbcli watch`。Samba E2E はある。再接続時の再購読と JSON 出力は未実装。 |
+| change notification | implemented-but-underverified | `withChangeNotifications` / `smbcli watch --json` (NDJSON)。Samba E2E はある。再接続時の再購読は未実装。 |
 | DFS referral metadata | implemented-but-underverified | `SMBee.dfsReferral` / `smbcli dfs`。unit fixture + 仕様精読あり。実 msdfs サーバ E2E は未実施。 |
-| reparse tag metadata | partial | `SMBFileStat.reparseTag` / `reparseKind`。target 解決は未実装。 |
+| reparse tag metadata | implemented | `SMBFileStat.reparseTag` / `reparseKind` / `readlink` (symlink・mount point・LX symlink target decode)。DFS/NFS data は MS-FSCC 準拠で opaque。 |
 
 ## P0: Linux/macOS smbclient と名乗る前の release blocker
 
@@ -426,7 +426,7 @@ Linux/macOS smbclient として必要な理由:
 
 - `downloadDirectory` / `uploadDirectory` の `resume` は size一致なら skip するだけ。
 - 2026-07-02: 単一 file download は `resume` / `smbcli get --resume` で local partial size から
-  range read を再開できる。単一 file upload の byte-level resume は未実装。
+  range read を再開できる。
 - 2026-07-02: 単一 file upload は `resume` / `smbcli put --resume` で remote partial size から
   local file を seek して WRITE 再開できる。
 - 2026-07-02: `smbcli get --verify size` / `smbcli put --verify size` を追加。単一 file 転送後に
@@ -755,7 +755,7 @@ File browser / backup / macOS metadata preservation を本格的にやるなら�
 - Windows SMB Server / NAS は smoke 未完了。
 - durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) のみ (CLI 非対応)。
 - DFS referral は metadata 取得のみ。auto-follow と実 msdfs E2E は未完了。
-- symlink / reparse point は tag 取得のみ。target 解決は未対応。
+- symlink / mount point / LX symlink は `readlink` で target 解決可。DFS/NFS reparse data は opaque (MS-FSCC 準拠)。
 - byte-level resume (download/upload) と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file preservation は未対応。
 - macOS resource fork / xattr / named stream preservation は未対応または方針未決。
 - SMB1 / NetBIOS / port 139 / printer / RDMA / QUIC / multichannel / compression は未対応。

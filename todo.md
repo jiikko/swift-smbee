@@ -266,7 +266,7 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
       `#if canImport(Darwin)` で macOS=replaceItemAt / Linux=remove+move 分岐。
     - macOS 215 / Linux 212 unit green。
   - **残 (defer)**: directory 単位の真の transactional atomicity (SMB プロトコル上不可)、byte-level partial-file
-    resume、verify (checksum) は範囲外。upload の atomicity は SMB rename 非信頼のため未対応。
+    resume は範囲外。upload の atomicity は SMB rename 非信頼のため未対応。verify は 2026-07-03 に `--verify size|hash` として対応済み。
 - [x] directory pagination: `list` の全件メモリ集約を避ける streaming / pageToken API
   - 2026-06-30: `SMBee.withDirectoryStream` / `SMBClient.withDirectoryStream` を追加。`SMBSession`
     は同一 directory handle へ `QUERY_DIRECTORY` を初回 restart scan、以後 continuation で
@@ -351,7 +351,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     symlink target 解決 (FSCTL_GET_REPARSE_POINT) と DFS を辿った先の path 再解決は defer (この項目としては
     reparse tag + referral 取得で [x])。
   - 2026-07-02: `FSCTL_GET_REPARSE_POINT` と `SMBee.readlink` / `smbcli readlink` を追加。
-    symlink / mount point target decode は unit coverage あり。DFS reparse data decode と実サーバ readlink smoke は残。
+    symlink / mount point target decode は unit coverage あり。
+  - 2026-07-03: DFS/NFS reparse data は MS-FSCC が "server-side interpretation only" と定めるため
+    **opaque 扱いで確定** (decode branch に根拠コメント)。LX symlink (0xA000001D) の target decode を
+    追加、`SMBReparseTags.nfs` の誤値 (0x80000027→0x80000014) を修正。残: 実サーバ readlink smoke。
 - [x] filesystem / volume information
   - `smbcli df` / API として share の total/free/available capacity、filesystem name、volume label、
     filesystem attributes / max component length を取得する。`QUERY_INFO(FileFsSizeInformation /
@@ -405,8 +408,13 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     Everyone / BUILTIN groups などは human-readable に表示できる。domain SID の LSARPC lookup は残。
   - **残 (defer)**: SACL は特権要求のため対象外 (AdditionalInformation に SACL bit を立てていない)。
     owner/group の書き換えも今回対象外 (DACL のみ)。
-- [ ] locking / durable handle / lease / oplock の扱い
+- [x] locking / durable handle / lease / oplock の扱い
   - concurrent clients や大ファイル操作の堅牢性向け。最初は明示的に unsupported としてエラーを設計する。
+  - 2026-07-03: **byte-range lock を実装** (`SMB2Lock` codec + `SMBClientSession.withFileLock` +
+    `SMBError.lockConflict`)。unit fixture + 実 Samba E2E green。CLI surface は未提供。
+  - 2026-07-03: lease/oplock は **policy = 要求しない** で確定 (CREATE の oplock level は常に NONE)。
+    server 発の unsolicited OPLOCK_BREAK 通知は demux が drop する (unit coverage あり)。
+    durable handle は引き続き未対応 (todo2 P1-4)。
 - [ ] multi-share / multi-tree session reuse
   - 現在の persistent `SMBClientSession` は 1 share = 1 TREE_CONNECT 前提。汎用 smbclient では同一
     authenticated session 上で複数 share / IPC$ / DFS target を扱いたい場面がある。
@@ -433,6 +441,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     で抑えているが、CreditCharge / CreditRequest / CreditResponse を管理していない。大きな IO や
     multi-credit server での挙動を MS-SMB2 と実 packet で確認し、必要なら messageId/credit allocator を
     設計する。
+  - 2026-07-03: multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグを修正
+    (`nextMessageId(charge:)`, MS-SMB2 §3.2.4.1.6)。orphan response queue 上限 (64)、
+    `reserveCredit` の decode 失敗 throw 化、`SMB2CreditWindow.reserve` の cancellation 対応も実装
+    (issues/done/012)。残: local chunk cap 64KiB 超の大 IO E2E (P1-3)。
   - 2026-07-02: READ/WRITE の CreditCharge / CreditRequest、response grant tracking、credit-aware
     chunk planner は実装済み。
   - 2026-07-02: `SMB2CreditWindow` actor を追加し、READ/WRITE 送信前に CreditCharge を reserve、
@@ -451,9 +463,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-07-02: recursive directory transfer に public API `perFileTimeout` と CLI
     `--per-file-timeout` を追加。`--operation-timeout` は全体、`--per-file-timeout` は各 file 転送を bound する。
   - 2026-07-02: `smbcli get --verify size` / `smbcli put --verify size` を追加。単一 file 転送後に
-    local/remote size を照合する。hash verify と recursive verify は未実装。
+    local/remote size を照合する。2026-07-03: `--verify hash` (SHA-256 read-back) を単一/recursive とも追加。
   - 2026-07-02: recursive `get -r` / `put -r` / `cp -r --verify size` を追加。成功した file action だけを
-    local/remote または source/destination stat で照合する。hash verify は未実装。
+    local/remote または source/destination stat で照合する。2026-07-03: hash verify も対応。
   - 2026-07-02: single-file `get` / `put` に `--create-dirs` を追加。`get` は local parent、
     `put` は remote parent を作成する。
   - 2026-07-02: mutating commands (`get` / `put` / `cp` / `mv` / `rm` / `mkdir` / `setacl`) に

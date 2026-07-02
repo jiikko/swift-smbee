@@ -65,12 +65,30 @@ watch_pid="$!"
 sleep 2
 printf "watch payload\n" > "${local_dir}/watched.txt"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" put "${local_dir}/watched.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/watched.txt"
-for _ in $(seq 1 40); do
+watch_observed=0
+for _ in $(seq 1 80); do
   if grep -F '"type":"changes"' "${watch_output}" | grep -F '"name":"watched.txt"' >/dev/null; then
+    watch_observed=1
     break
   fi
   sleep 0.25
 done
+if [ "${watch_observed}" -ne 1 ]; then
+  printf "watch payload retry\n" > "${local_dir}/watched.txt"
+  SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" put "${local_dir}/watched.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/watched.txt"
+  for _ in $(seq 1 80); do
+    if grep -F '"type":"changes"' "${watch_output}" | grep -F '"name":"watched.txt"' >/dev/null; then
+      watch_observed=1
+      break
+    fi
+    sleep 0.25
+  done
+fi
+if [ "${watch_observed}" -ne 1 ]; then
+  echo "watch --json did not report watched.txt" >&2
+  cat "${watch_output}" >&2 || true
+  exit 1
+fi
 grep -F '"type":"changes"' "${watch_output}" | grep -F '"name":"watched.txt"'
 kill "${watch_pid}" >/dev/null 2>&1 || true
 wait "${watch_pid}" >/dev/null 2>&1 || true

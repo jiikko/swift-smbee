@@ -13,6 +13,7 @@ public enum SMBError: Error, Equatable, Sendable {
     case logonFailure(status: UInt32, operation: String)
     case objectNameInvalid(status: UInt32, operation: String)
     case endOfFile(status: UInt32, operation: String)
+    case cancelled(status: UInt32, operation: String)
     case unsupported(status: UInt32, operation: String)
     case connectionLost(operation: String)
     case transport(String)
@@ -48,12 +49,17 @@ enum SMBErrorMapper {
             .objectNameInvalid(status: status, operation: operation)
         case SMB2Status.endOfFile:
             .endOfFile(status: status, operation: operation)
+        case SMB2Status.cancelled:
+            .cancelled(status: status, operation: operation)
         default:
             .unsupported(status: status, operation: operation)
         }
     }
 
     static func throwIfFailure(status: UInt32, operation: String) throws {
+        if status == SMB2Status.cancelled {
+            throw CancellationError()
+        }
         guard status == SMB2Status.success else {
             throw map(status: status, operation: operation)
         }

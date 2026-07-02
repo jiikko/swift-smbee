@@ -797,6 +797,13 @@ final class SMBeeTests: XCTestCase {
             .endOfFile(status: SMB2Status.endOfFile, operation: "READ")
         )
         XCTAssertEqual(
+            SMBErrorMapper.map(status: SMB2Status.cancelled, operation: "CHANGE_NOTIFY"),
+            .cancelled(status: SMB2Status.cancelled, operation: "CHANGE_NOTIFY")
+        )
+        XCTAssertThrowsError(try SMBErrorMapper.throwIfFailure(status: SMB2Status.cancelled, operation: "CHANGE_NOTIFY")) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertEqual(
             SMBErrorMapper.map(status: 0xc000_000d, operation: "QUERY_INFO"),
             .unsupported(status: 0xc000_000d, operation: "QUERY_INFO")
         )
@@ -2779,7 +2786,12 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(cancelHeader.treeId, changeHeader.treeId)
 
         transport.enqueueInbound(try framed([
-            try smb2ChangeNotifyResponse(entries: [], messageId: changeHeader.messageId, treeId: changeHeader.treeId),
+            try smb2StatusResponse(
+                status: SMB2Status.cancelled,
+                command: SMB2Commands.changeNotify,
+                messageId: changeHeader.messageId,
+                treeId: changeHeader.treeId
+            ),
         ]))
 
         do {

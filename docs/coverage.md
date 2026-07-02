@@ -41,7 +41,7 @@ Status labels:
 | recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | `get -r` / `put -r` / `cp -r` support include/exclude globs and per-file timeout. No true transactional directory atomicity; directory resume is size-based skip and checksum verify is unsupported. |
 | server-side copychunk | MS-FSCC FSCTL_SRV_COPYCHUNK | `SMBClient.swift` | yes | fallback observed | no | no | underverified | Samba test FS returns unsupported and exercises fallback; offload-capable server smoke is missing. |
 | change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications`, `SMBChangeNotifyEvent.requiresRescan`, `smbcli watch --json` | yes | yes | no | no | underverified | Reconnect/resubscribe is not implemented. |
-| cancel | MS-SMB2 CANCEL | `SMB2Cancel`, `SMBSession.sendCancel`, CHANGE_NOTIFY cancellation | yes | no | no | no | partial | Watch/CHANGE_NOTIFY cancellation sends SMB2 CANCEL without closing the transport. General outstanding request tracking and long-read integration are future work. |
+| cancel | MS-SMB2 CANCEL | `SMB2Cancel`, `SMBSession.sendCancel`, CHANGE_NOTIFY cancellation | yes | no | no | no | partial | Watch/CHANGE_NOTIFY cancellation sends SMB2 CANCEL without closing the transport. `STATUS_CANCELLED` maps to cancellation. General outstanding request tracking and long-read integration are future work. |
 
 ## Metadata And Admin Operations
 

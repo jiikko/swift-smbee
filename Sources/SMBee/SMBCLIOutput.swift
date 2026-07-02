@@ -14,7 +14,7 @@ public enum SMBCLIExitCode {
             authentication
         case .notFound:
             notFound
-        case .connectionLost, .transport, .networkNameDeleted:
+        case .connectionLost, .transport, .networkNameDeleted, .cancelled:
             connection
         case .sharingViolation, .nameCollision, .directoryNotEmpty, .fileIsADirectory,
              .notADirectory, .diskFull, .objectNameInvalid, .endOfFile, .unsupported,

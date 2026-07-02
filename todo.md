@@ -377,6 +377,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     残: 再接続時の再購読は同一 session 前提 (自動再接続は未配線)。
   - 2026-07-02: `CHANGE_NOTIFY` の task cancellation で、transport close ではなく SMB2 CANCEL を送る。
     元 request の MessageId/TreeId を使う unit coverage あり。long read / IOCTL への一般化は P2-8 側に残す。
+  - 2026-07-02: `STATUS_CANCELLED` (`0xc0000120`) を追加し、通常 decode path では `CancellationError`
+    として扱う。CHANGE_NOTIFY cancel response の unit coverage あり。
   - 2026-07-02: `smbcli watch --json` を追加。CHANGE_NOTIFY events は NDJSON で `changes` / `overflow`
     を出せる。残: reconnect時の再購読。
 - [x] ACL / owner / SID metadata

@@ -4186,6 +4186,7 @@ enum SMB2Status {
     static let invalidParameter: UInt32 = 0xc000_000d
     static let invalidDeviceRequest: UInt32 = 0xc000_0010
     static let endOfFile: UInt32 = 0xc000_0011
+    static let cancelled: UInt32 = 0xc000_0120
     static let moreProcessingRequired: UInt32 = 0xc000_0016
     static let accessDenied: UInt32 = 0xc000_0022
     static let objectNameInvalid: UInt32 = 0xc000_0033

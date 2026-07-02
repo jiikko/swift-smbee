@@ -171,6 +171,28 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(watch.json)
     }
 
+    func testSparseCommandParsesActionsAndValidates() throws {
+        let cmd = try Sparse.parse([
+            "smb://user@host/share/vm.img",
+            "--set-sparse",
+            "--zero-offset", "65536",
+            "--length", "65536",
+            "--query",
+            "--json",
+        ])
+        XCTAssertEqual(cmd.url, "smb://user@host/share/vm.img")
+        XCTAssertTrue(cmd.setSparse)
+        XCTAssertEqual(cmd.zeroOffset, 65536)
+        XCTAssertEqual(cmd.length, 65536)
+        XCTAssertTrue(cmd.query)
+        XCTAssertTrue(cmd.json)
+
+        // zero-offset without length is a usage error (surfaced in run()); no action at all too.
+        let noAction = try Sparse.parse(["smb://user@host/share/f"])
+        XCTAssertFalse(noAction.setSparse)
+        XCTAssertNil(noAction.zeroOffset)
+    }
+
     func testRecursiveActionLineFormats() throws {
         let action = SMBRecursiveAction(kind: .download, path: "dir\\file.txt")
         XCTAssertEqual(recursiveActionLine(action, json: false), "download dir\\file.txt")

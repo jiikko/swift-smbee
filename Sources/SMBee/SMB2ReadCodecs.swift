@@ -327,6 +327,17 @@ struct SMB2CreateRequest {
         )
     }
 
+    /// Open an existing file with read+write data access for sparse FSCTLs
+    /// (SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES).
+    static func sparse(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0001 | 0x0000_0002 | 0x0000_0080,
+            createDisposition: 0x0000_0001,
+            createOptions: 0x0000_0040
+        )
+    }
+
     static func uploadResume(path: String) -> SMB2CreateRequest {
         SMB2CreateRequest(
             path: path,
@@ -729,6 +740,9 @@ enum SMB2Ioctl {
     static let fsctlGetReparsePoint: UInt32 = 0x0009_00a8
     static let fsctlSrvRequestResumeKey: UInt32 = 0x0014_0078
     static let fsctlSrvCopychunkWrite: UInt32 = 0x0014_40f4
+    static let fsctlSetSparse: UInt32 = 0x0009_00c4
+    static let fsctlSetZeroData: UInt32 = 0x0009_80c8
+    static let fsctlQueryAllocatedRanges: UInt32 = 0x0009_40cf
 
     private static let fixedPartSize = 56
     private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
@@ -801,6 +815,63 @@ enum SMB2Ioctl {
 struct SMB2IoctlResponse {
     var status: UInt32
     var output: [UInt8]
+}
+
+/// A byte range reported as allocated (non-hole) by FSCTL_QUERY_ALLOCATED_RANGES (MS-FSCC 2.3.x).
+public struct SMBAllocatedRange: Equatable, Sendable {
+    public let offset: UInt64
+    public let length: UInt64
+
+    public init(offset: UInt64, length: UInt64) {
+        self.offset = offset
+        self.length = length
+    }
+}
+
+enum SMB2SparseFile {
+    /// FSCTL_SET_SPARSE input: a single SetSparse BOOLEAN (MS-FSCC 2.3.68). Empty input
+    /// also sets sparse, but sending the explicit byte lets callers clear the flag too.
+    static func encodeSetSparseInput(_ sparse: Bool) -> [UInt8] {
+        [sparse ? 1 : 0]
+    }
+
+    /// FSCTL_SET_ZERO_DATA input: FILE_ZERO_DATA_INFORMATION { FileOffset, BeyondFinalZero }
+    /// (MS-FSCC 2.3.79). Zeroes (punches a hole in) `[offset, offset+length)`.
+    static func encodeSetZeroDataInput(offset: UInt64, length: UInt64) throws -> [UInt8] {
+        let end = offset.addingReportingOverflow(length)
+        guard !end.overflow else {
+            throw SMBCodecError.invalidValue("zero-data range overflows UInt64")
+        }
+        var writer = SMBByteWriter()
+        writer.writeUInt64LE(offset)
+        writer.writeUInt64LE(end.partialValue)
+        return writer.bytes
+    }
+
+    /// FSCTL_QUERY_ALLOCATED_RANGES input: FILE_ALLOCATED_RANGE_BUFFER { FileOffset, Length }
+    /// describing the region to probe (MS-FSCC 2.3.64).
+    static func encodeQueryAllocatedRangesInput(offset: UInt64, length: UInt64) -> [UInt8] {
+        var writer = SMBByteWriter()
+        writer.writeUInt64LE(offset)
+        writer.writeUInt64LE(length)
+        return writer.bytes
+    }
+
+    /// Decode the FILE_ALLOCATED_RANGE_BUFFER array returned by FSCTL_QUERY_ALLOCATED_RANGES.
+    /// An empty output means the whole probed region is a hole (fully sparse).
+    static func decodeAllocatedRanges(_ output: [UInt8]) throws -> [SMBAllocatedRange] {
+        guard output.count % 16 == 0 else {
+            throw SMBCodecError.invalidValue("allocated-range buffer is not a multiple of 16 bytes")
+        }
+        var reader = SMBByteReader(bytes: output)
+        var ranges: [SMBAllocatedRange] = []
+        for _ in 0..<(output.count / 16) {
+            let offset = try reader.readUInt64LE()
+            let length = try reader.readUInt64LE()
+            ranges.append(SMBAllocatedRange(offset: offset, length: length))
+        }
+        return ranges
+    }
 }
 
 enum SMB2ReparsePoint {

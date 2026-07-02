@@ -838,6 +838,50 @@ public actor SMBClientSession {
         }
     }
 
+    /// Mark `path` as a sparse file (FSCTL_SET_SPARSE). Idempotent on servers that
+    /// already treat the file as sparse.
+    public func setSparse(path: String, sparse: Bool = true) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .sparse(path: path))
+        do {
+            try await session.setSparse(treeId: treeId, fileId: fileId, sparse: sparse)
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    /// Zero (punch a hole in) `[offset, offset+length)` via FSCTL_SET_ZERO_DATA. On a sparse
+    /// file this deallocates whole clusters; otherwise it writes zeroes. Call `setSparse`
+    /// first to reclaim space.
+    public func zeroRange(path: String, offset: UInt64, length: UInt64) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .sparse(path: path))
+        do {
+            try await session.setZeroData(treeId: treeId, fileId: fileId, offset: offset, length: length)
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    /// Query the allocated (non-hole) byte ranges within `[offset, offset+length)` via
+    /// FSCTL_QUERY_ALLOCATED_RANGES. An empty result means the region is fully sparse.
+    public func allocatedRanges(path: String, offset: UInt64 = 0, length: UInt64) async throws -> [SMBAllocatedRange] {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .sparse(path: path))
+        do {
+            let ranges = try await session.queryAllocatedRanges(treeId: treeId, fileId: fileId, offset: offset, length: length)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return ranges
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     public func volumeInfo() async throws -> SMBVolumeInfo {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, path: "", directory: true)
@@ -3737,6 +3781,48 @@ actor SMBSession {
         debugDump("IOCTL request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "IOCTL response")
         return try SMB2Ioctl.decodeResponseWithStatus(response, allowedStatuses: allowedStatuses.union([SMB2Status.success]))
+    }
+
+    func setSparse(treeId: UInt32, fileId: [UInt8], sparse: Bool) async throws {
+        _ = try await ioctl(
+            treeId: treeId,
+            fileId: fileId,
+            ctlCode: SMB2Ioctl.fsctlSetSparse,
+            input: SMB2SparseFile.encodeSetSparseInput(sparse),
+            maxOutputResponse: 0,
+            allowedStatuses: []
+        )
+    }
+
+    func setZeroData(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws {
+        _ = try await ioctl(
+            treeId: treeId,
+            fileId: fileId,
+            ctlCode: SMB2Ioctl.fsctlSetZeroData,
+            input: try SMB2SparseFile.encodeSetZeroDataInput(offset: offset, length: length),
+            maxOutputResponse: 0,
+            allowedStatuses: []
+        )
+    }
+
+    func queryAllocatedRanges(
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset: UInt64,
+        length: UInt64
+    ) async throws -> [SMBAllocatedRange] {
+        // STATUS_BUFFER_OVERFLOW: the range list is larger than our buffer; the returned
+        // prefix is still valid. A sparse file with many fragments could hit this, but the
+        // 64 KiB buffer holds 4096 ranges, which is plenty for typical files.
+        let response = try await ioctl(
+            treeId: treeId,
+            fileId: fileId,
+            ctlCode: SMB2Ioctl.fsctlQueryAllocatedRanges,
+            input: SMB2SparseFile.encodeQueryAllocatedRangesInput(offset: offset, length: length),
+            maxOutputResponse: 64 * 1024,
+            allowedStatuses: [SMB2Status.bufferOverflow]
+        )
+        return try SMB2SparseFile.decodeAllocatedRanges(response.output)
     }
 
     private func makeCopyChunks(offset: UInt64, remaining: UInt64, limits: SMB2CopyChunkLimits) throws -> [SMB2CopyChunkRange] {

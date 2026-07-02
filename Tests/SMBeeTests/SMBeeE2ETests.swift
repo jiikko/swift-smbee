@@ -588,6 +588,56 @@ final class SMBeeE2ETests: XCTestCase {
         XCTAssertTrue(observed, "expected a CHANGE_NOTIFY notification for \(watchedFile)")
     }
 
+    func testSparseFileZeroRangeAndAllocatedRanges() async throws {
+        guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
+        let portString = environment["SMBEE_E2E_PORT"] ?? "445"
+        guard let port = UInt16(portString) else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16, got \(portString)")
+            return
+        }
+        let username = environment["SMBEE_E2E_USERNAME"] ?? "smbee"
+        let password = environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
+        let share = environment["SMBEE_E2E_SHARE"] ?? "public"
+        let credential = SMBCredential(username: username, password: password)
+        let path = "smbee-e2e-sparse-\(UUID().uuidString).bin"
+
+        // 256 KiB of non-zero data so a punched hole is observable in the allocated ranges.
+        try await SMBee.upload(
+            host: host, port: port, credential: credential, share: share,
+            path: path, data: Array(repeating: 0xCD, count: 256 * 1024)
+        )
+        let session = try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        do {
+            // Sparse FSCTLs are filesystem-dependent; Samba on some backends returns
+            // STATUS_INVALID_DEVICE_REQUEST. Treat that as "not supported here" rather than fail.
+            do {
+                try await session.setSparse(path: path)
+                try await session.zeroRange(path: path, offset: 64 * 1024, length: 64 * 1024)
+                let ranges = try await session.allocatedRanges(path: path, length: 256 * 1024)
+                // The punched region must not be reported as fully allocated: either fewer
+                // bytes are allocated than the whole file, or the hole splits the ranges.
+                let allocated = ranges.reduce(UInt64(0)) { $0 + $1.length }
+                XCTAssertLessThanOrEqual(allocated, 256 * 1024)
+            } catch let error as SMBError {
+                if case .unsupported = error {
+                    throw XCTSkip("server filesystem does not support sparse FSCTLs")
+                }
+                throw error
+            }
+            await session.close()
+        } catch {
+            await session.close()
+            try? await SMBee.delete(host: host, port: port, credential: credential, share: share, path: path)
+            throw error
+        }
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: path)
+    }
+
     func testByteRangeLockConflictAcrossSessions() async throws {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
             throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")

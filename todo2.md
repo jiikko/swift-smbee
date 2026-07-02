@@ -263,7 +263,14 @@ Linux/macOS smbclient として必要な理由:
 
 ### P1-4. durable handle / persistent handle / reconnect policy
 
-状態: `missing`
+状態: `explicitly-unsupported` (2026-07-03 判断)
+
+判断 (2026-07-03): durable/persistent handle は「接続断をまたいでファイルハンドルを復元する
+状態機械」であり、実サーバでの切断シミュレーション E2E なしには検証しきれない大タスク。
+現時点では **明示的に unsupported** とし (CREATE は durable/lease/oplock context を送らない)、
+README / docs/coverage.md の limitations に記載済み。ファイル未満の粒度の回復は
+`SMBClientSession(autoReconnect:)` の watch 再購読 (P2-3) と one-shot idempotent operation の
+再接続で部分的にカバー。durable handle 本体は実サーバ要件が出た時点で再評価する。
 
 実装確認:
 
@@ -437,7 +444,10 @@ Linux/macOS smbclient として必要な理由:
   `remoteSHA256Hex` (withReadStream の streaming read-back) で get / put / cp
   (単一 + recursive) の SHA-256 照合ができる。単一 `cp --verify` が silent no-op だったのも修正。
   CLI smoke (`bin/e2e/smbcli-smoke.sh`) に get/put `--verify hash` を追加。
-- sparse file / zero range は未実装。
+- 2026-07-03: **sparse file 対応を実装**。FSCTL_SET_SPARSE / FSCTL_SET_ZERO_DATA (hole punch) /
+  FSCTL_QUERY_ALLOCATED_RANGES を codec 化し、`SMBClientSession.setSparse/zeroRange/allocatedRanges`
+  + `smbcli sparse` を追加。fixture unit + 実 Samba E2E (FS 非対応時は STATUS_INVALID_DEVICE_REQUEST を
+  skip 扱い)。残: allocation size を stat に出す拡張は未実施。
 
 Linux/macOS smbclient として必要な理由:
 

@@ -1760,6 +1760,36 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNil(names[1])
     }
 
+    func testSparseFileFsctlCodecs() throws {
+        XCTAssertEqual(SMB2SparseFile.encodeSetSparseInput(true), [1])
+        XCTAssertEqual(SMB2SparseFile.encodeSetSparseInput(false), [0])
+
+        let zero = try SMB2SparseFile.encodeSetZeroDataInput(offset: 0x10, length: 0x20)
+        XCTAssertEqual(readUInt64LE(zero, at: 0), 0x10) // FileOffset
+        XCTAssertEqual(readUInt64LE(zero, at: 8), 0x30) // BeyondFinalZero = offset + length
+        XCTAssertThrowsError(try SMB2SparseFile.encodeSetZeroDataInput(offset: .max, length: 1))
+
+        let query = SMB2SparseFile.encodeQueryAllocatedRangesInput(offset: 0, length: 0x1000)
+        XCTAssertEqual(readUInt64LE(query, at: 0), 0)
+        XCTAssertEqual(readUInt64LE(query, at: 8), 0x1000)
+    }
+
+    func testSparseFileAllocatedRangesDecode() throws {
+        XCTAssertEqual(try SMB2SparseFile.decodeAllocatedRanges([]), [])
+
+        var writer = SMBByteWriter()
+        writer.writeUInt64LE(0)
+        writer.writeUInt64LE(4096)
+        writer.writeUInt64LE(8192)
+        writer.writeUInt64LE(4096)
+        XCTAssertEqual(try SMB2SparseFile.decodeAllocatedRanges(writer.bytes), [
+            SMBAllocatedRange(offset: 0, length: 4096),
+            SMBAllocatedRange(offset: 8192, length: 4096),
+        ])
+
+        XCTAssertThrowsError(try SMB2SparseFile.decodeAllocatedRanges([0, 1, 2]))
+    }
+
     func testLSARPCOpenPolicyAndCloseCodecs() throws {
         let stub = LSARPC.encodeOpenPolicy2Request()
         XCTAssertEqual(stub.count, 32)

@@ -17,7 +17,7 @@ struct SMBCLI: AsyncParsableCommand {
         subcommands: [
             Probe.self, Ping.self, Shares.self, List.self, Stat.self, Readlink.self, ACL.self, DiskFree.self, Cat.self, Get.self,
             MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Watch.self, Dfs.self,
-            SetACL.self
+            SetACL.self, Sparse.self
         ]
     )
 }
@@ -573,6 +573,87 @@ struct DiskFree: AsyncParsableCommand {
         print("available: \(formatByteCount(info.availableBytes)) (\(info.availableBytes))")
         print("label: \(info.volumeLabel)")
         print("filesystem: \(info.filesystemName)")
+    }
+}
+
+struct Sparse: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "sparse",
+        abstract: "Mark a file sparse, punch a hole, or query allocated ranges"
+    )
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var url: String
+
+    @Flag(help: "Mark the file as sparse (FSCTL_SET_SPARSE) before other actions")
+    var setSparse = false
+
+    @Option(help: "Punch a hole: byte offset to start zeroing (requires --length)")
+    var zeroOffset: UInt64?
+
+    @Option(help: "Punch a hole: number of bytes to zero from --zero-offset")
+    var length: UInt64?
+
+    @Flag(help: "Print the allocated (non-hole) ranges after any changes")
+    var query = false
+
+    @Flag(help: "Print JSON output")
+    var json = false
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    func run() async throws {
+        debug.apply()
+        if (zeroOffset == nil) != (length == nil), !query {
+            throw ValidationError("--zero-offset and --length must be used together")
+        }
+        guard setSparse || zeroOffset != nil || query else {
+            throw ValidationError("sparse requires --set-sparse, --zero-offset/--length, or --query")
+        }
+        let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        try await transport.withOperationDeadline {
+            let session = try await SMBee.connect(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                timeout: transport.duration
+            )
+            do {
+                if setSparse {
+                    try await session.setSparse(path: endpoint.path)
+                }
+                if let zeroOffset, let length {
+                    try await session.zeroRange(path: endpoint.path, offset: zeroOffset, length: length)
+                }
+                if query {
+                    let stat = try await session.stat(path: endpoint.path)
+                    let ranges = try await session.allocatedRanges(path: endpoint.path, length: stat.size)
+                    if json {
+                        let objects = ranges.map { ["offset": $0.offset, "length": $0.length] }
+                        let data = try JSONSerialization.data(withJSONObject: objects, options: [.sortedKeys])
+                        print(String(decoding: data, as: UTF8.self))
+                    } else {
+                        for range in ranges {
+                            print("offset=\(range.offset) length=\(range.length)")
+                        }
+                    }
+                } else if json {
+                    print(try successJSONString(command: "sparse", path: endpoint.path))
+                }
+                await session.close()
+            } catch {
+                await session.close()
+                throw error
+            }
+        }
     }
 }
 

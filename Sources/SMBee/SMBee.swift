@@ -26,7 +26,7 @@ public enum SMBee {
     public static func connect(
         host: String,
         port: UInt16 = 445,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         timeout: Duration? = nil
     ) async throws -> SMBClientSession {

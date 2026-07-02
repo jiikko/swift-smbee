@@ -67,7 +67,7 @@
 | volume / filesystem info | implemented | `SMBee.volumeInfo` / `smbcli df`。FileFsFullSizeInformation / FileFsAttributeInformation / FileFsVolumeInformation。 |
 | metadata read/write | implemented | file attributes、creation/access/modified/change time、`SMBFileMetadataUpdate`、`updateMetadata`。 |
 | security descriptor read / DACL write | partial | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。DACL は read-modify-write あり。ただし owner/group/SACL 書き換えと SID 名解決は未実装。 |
-| change notification | implemented-but-underverified | `withChangeNotifications` / `smbcli watch --json` (NDJSON)。Samba E2E はある。再接続時の再購読は未実装。 |
+| change notification | implemented | `withChangeNotifications(autoReconnect:)` / `smbcli watch --json --reconnect`。Samba E2E + reconnect resubscribe unit あり。 |
 | DFS referral metadata | implemented-but-underverified | `SMBee.dfsReferral` / `smbcli dfs`。unit fixture + 仕様精読あり。実 msdfs サーバ E2E は未実施。 |
 | reparse tag metadata | implemented | `SMBFileStat.reparseTag` / `reparseKind` / `readlink` (symlink・mount point・LX symlink target decode)。DFS/NFS data は MS-FSCC 準拠で opaque。 |
 
@@ -559,13 +559,17 @@ Linux/macOS smbclient として必要な理由:
 - 2026-07-02: `SMBChangeNotifyEvent.changes` / `requiresRescan` を追加し、overflow を machine-readable な full-rescan signal として扱えるようにした。
 - 再接続時の再購読は未配線。
 
-やること:
-
-- reconnect時の resubscribe。
+- 2026-07-03: **reconnect 再購読を実装**。`SMBClientSession` が `connect(...)` 由来のとき
+  接続パラメータ (host/port/share/credentialProvider/makeTransport) を保持し、
+  `withChangeNotifications(autoReconnect:maxReconnectAttempts:)` で接続断
+  (connectionLost / transport error / networkNameDeleted) 時に新 session を張り直して
+  再購読する。購読断中の変更は取りこぼすため、再購読成功ごとに `.overflow` を callback へ
+  流して full-rescan を促す。cancellation / 非接続断エラーは伝播。`smbcli watch --reconnect`。
+  fixture unit (transport #1 drop → reconnect → transport #2 の ADDED + overflow) を追加。
 
 完了条件:
 
-- watch中に接続断 -> reconnect -> 再購読できる。
+- [x] watch中に接続断 -> reconnect -> 再購読できる (unit で検証)。
 
 ### P2-4. CLI batch / wildcard の拡張
 

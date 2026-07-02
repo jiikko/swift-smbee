@@ -510,14 +510,52 @@ private final class SMBReadAccumulator: @unchecked Sendable {
 public actor SMBClientSession {
     private static let localWriteChunkLimit = 64 * 1024
 
-    private let session: SMBSession
-    private let treeId: UInt32
+    /// Everything needed to rebuild a dropped connection for opt-in watch resubscribe.
+    /// Only sessions created via `connect(...)` carry this; `withTree`-derived sessions do not.
+    struct ReconnectInfo: Sendable {
+        let host: String
+        let port: UInt16
+        let share: String
+        let credentialProvider: SMBCredentialProvider
+        let makeTransport: @Sendable () -> SMBTransport
+    }
+
+    private var session: SMBSession
+    private var treeId: UInt32
+    private let reconnectInfo: ReconnectInfo?
     private var keepAliveTask: Task<Void, Never>?
     private var isClosed = false
 
-    init(session: SMBSession, treeId: UInt32) {
+    init(session: SMBSession, treeId: UInt32, reconnectInfo: ReconnectInfo? = nil) {
         self.session = session
         self.treeId = treeId
+        self.reconnectInfo = reconnectInfo
+    }
+
+    /// Tear down the current connection and establish a fresh session + tree from the
+    /// stored reconnect info. Throws `SMBError.connectionLost` if this session was not
+    /// created with reconnect support.
+    private func reconnect() async throws {
+        guard let info = reconnectInfo else {
+            throw SMBError.connectionLost(operation: "RECONNECT")
+        }
+        await session.closeTransport()
+        let credential = try await info.credentialProvider()
+        let newSession = SMBSession(
+            host: info.host,
+            port: info.port,
+            credential: credential,
+            transport: info.makeTransport()
+        )
+        do {
+            try await newSession.connect()
+            let newTreeId = try await newSession.treeConnect(share: info.share)
+            session = newSession
+            treeId = newTreeId
+        } catch {
+            await newSession.closeTransport()
+            throw error
+        }
     }
 
     public func close() async {
@@ -645,26 +683,81 @@ public actor SMBClientSession {
         }
     }
 
+    /// Watch `path` for changes, delivering each event to `onChange` until the task is
+    /// cancelled.
+    ///
+    /// - Parameter autoReconnect: when true and this session was created via `connect(...)`,
+    ///   a dropped connection (transport failure / connection lost) triggers a reconnect and
+    ///   the watch resubscribes, rather than propagating the error. Because CHANGE_NOTIFY only
+    ///   reports changes while a subscription is registered, events that occur during the
+    ///   reconnect gap are missed; a `.overflow` (full rescan) event is delivered after each
+    ///   successful resubscribe so callers can reconcile. Cancellation and non-connection
+    ///   errors always propagate.
+    /// - Parameter maxReconnectAttempts: consecutive reconnect failures tolerated before the
+    ///   last error propagates. Reset to zero after any successful resubscribe.
     public func withChangeNotifications(
         path: String = "",
         filter: SMBChangeNotifyFilter = .default,
         watchTree: Bool = false,
+        autoReconnect: Bool = false,
+        maxReconnectAttempts: Int = 5,
         onChange: @escaping @Sendable (SMBChangeNotifyEvent) async throws -> Void
     ) async throws {
         try ensureOpen()
-        let fileId = try await session.create(treeId: treeId, request: .changeNotify(path: path))
-        do {
-            try await session.changeNotify(
-                treeId: treeId,
-                fileId: fileId,
-                filter: filter,
-                watchTree: watchTree,
-                onChange: onChange
-            )
-            try? await session.close(treeId: treeId, fileId: fileId)
-        } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
-            throw error
+        var reconnectAttempts = 0
+        while true {
+            try Task.checkCancellation()
+            do {
+                let fileId = try await session.create(treeId: treeId, request: .changeNotify(path: path))
+                do {
+                    try await session.changeNotify(
+                        treeId: treeId,
+                        fileId: fileId,
+                        filter: filter,
+                        watchTree: watchTree,
+                        onChange: onChange
+                    )
+                    try? await session.close(treeId: treeId, fileId: fileId)
+                    return
+                } catch {
+                    try? await session.close(treeId: treeId, fileId: fileId)
+                    throw error
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                guard autoReconnect, reconnectInfo != nil, Self.isReconnectable(error) else {
+                    throw error
+                }
+                try Task.checkCancellation()
+                do {
+                    try await reconnect()
+                } catch {
+                    reconnectAttempts += 1
+                    if reconnectAttempts >= maxReconnectAttempts {
+                        throw error
+                    }
+                    continue
+                }
+                reconnectAttempts = 0
+                // The subscription lapsed during the reconnect; signal a full rescan before
+                // resubscribing so the caller can reconcile any changes missed in the gap.
+                try await onChange(.overflow)
+            }
+        }
+    }
+
+    /// Connection-loss errors that justify a watch reconnect (vs. propagating).
+    private static func isReconnectable(_ error: Error) -> Bool {
+        switch error {
+        case SMBError.connectionLost, SMBError.transport, SMBError.networkNameDeleted:
+            return true
+        case SMBTransportError.connectionClosed, SMBTransportError.timedOut:
+            return true
+        case SMBTransportError.socketFailure:
+            return true
+        default:
+            return false
         }
     }
 
@@ -1154,7 +1247,7 @@ public enum SMBClient {
         host: String,
         port: UInt16 = 445,
         share: String,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
@@ -1164,7 +1257,14 @@ public enum SMBClient {
         do {
             try await session.connect()
             let treeId = try await session.treeConnect(share: share)
-            return SMBClientSession(session: session, treeId: treeId)
+            let reconnectInfo = SMBClientSession.ReconnectInfo(
+                host: host,
+                port: port,
+                share: share,
+                credentialProvider: credentialProvider,
+                makeTransport: makeTransport
+            )
+            return SMBClientSession(session: session, treeId: treeId, reconnectInfo: reconnectInfo)
         } catch {
             await session.closeTransport()
             throw error

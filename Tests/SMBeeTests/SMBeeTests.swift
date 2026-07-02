@@ -255,6 +255,24 @@ private final class FailingConnectTransport: SMBTransport, @unchecked Sendable {
     func close() {}
 }
 
+private actor ChangeNotifyEventAccumulator {
+    private(set) var sawOverflow = false
+    private var changeNames: [String] = []
+
+    func record(_ event: SMBChangeNotifyEvent) {
+        switch event {
+        case .overflow:
+            sawOverflow = true
+        case .changes(let changes):
+            changeNames.append(contentsOf: changes.map(\.name))
+        }
+    }
+
+    func containsChange(named name: String) -> Bool {
+        changeNames.contains(name)
+    }
+}
+
 private final class TransportFactorySequence: @unchecked Sendable {
     private let lock = NSLock()
     private var transports: [SMBTransport]
@@ -1116,6 +1134,60 @@ final class SMBeeTests: XCTestCase {
         )
 
         XCTAssertEqual(entries, [SMBDirectoryEntry(name: "a.txt", fileSize: 1, isDirectory: false, attributes: 0x80)])
+    }
+
+    func testWatchAutoReconnectResubscribesAfterConnectionDropAndEmitsOverflow() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        // Transport #1: auth + tree + CREATE for the watch, then drains — the CHANGE_NOTIFY
+        // long-poll receive hits connectionClosed, triggering reconnect.
+        // Transport #2: fresh auth + tree + CREATE + a real ADDED notification.
+        // Transport #2 parks after delivering the notification (rather than draining) so the
+        // resubscribed watch stays blocked on its next long-poll until the test cancels,
+        // instead of looping into another reconnect.
+        let secondTransport = ControlledReceiveTransport()
+        secondTransport.enqueueInbound(try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2ChangeNotifyResponse(
+                entries: [makeFileNotifyEntry(action: 1, name: "created.txt", nextOffset: 0)],
+                messageId: 5,
+                treeId: 0x3344
+            ),
+        ]))
+        let factory = TransportFactorySequence([
+            InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+                smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            ])),
+            secondTransport,
+        ])
+        SMBTransportTestOverride.factory = factory.make
+        defer { SMBTransportTestOverride.factory = nil }
+
+        let session = try await SMBee.connect(host: "server", credential: .anonymous, share: "share")
+        let events = ChangeNotifyEventAccumulator()
+        let watcher = Task {
+            try await session.withChangeNotifications(path: "dir", autoReconnect: true) { event in
+                await events.record(event)
+            }
+        }
+
+        var sawAdded = false
+        for _ in 0..<80 {
+            if await events.containsChange(named: "created.txt") {
+                sawAdded = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        watcher.cancel()
+        // Not calling session.close(): graceful teardown would await TREE_DISCONNECT/LOGOFF
+        // replies that the parked mock transport never sends. The watcher task is cancelled;
+        // its leaked parked receive is acceptable in a unit test.
+
+        XCTAssertTrue(sawAdded, "expected the ADDED notification after reconnect")
+        // Reconnect built a second transport, and an overflow was emitted before resubscribe.
+        XCTAssertEqual(factory.makeCount, 2)
+        let sawOverflow = await events.sawOverflow
+        XCTAssertTrue(sawOverflow, "expected an overflow (full rescan) signal after reconnect")
     }
 
     func testSMBeeFacadeMutatingOperationsUseTransportOverride() async throws {

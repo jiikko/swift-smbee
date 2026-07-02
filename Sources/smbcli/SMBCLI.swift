@@ -242,10 +242,57 @@ struct Watch: AsyncParsableCommand {
     @Flag(help: "Print newline-delimited JSON events")
     var json = false
 
+    @Flag(help: "Reconnect and resubscribe if the connection drops (emits an overflow after each reconnect)")
+    var reconnect = false
+
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
+        let json = json
+        let recursive = recursive
+        let emit: @Sendable (SMBChangeNotifyEvent) throws -> Void = { event in
+            if json {
+                print(try SMBCLIOutput.jsonString(for: event))
+            } else {
+                switch event {
+                case .overflow:
+                    print("overflow: rescan needed")
+                case .changes(let changes):
+                    for change in changes {
+                        print("\(formatChangeAction(change.action)) \(change.name)")
+                    }
+                }
+            }
+            // stdout is fully buffered when redirected to a file/pipe (e.g. `watch --json > out.jsonl`),
+            // so streamed events would not surface until the process exits. Flush after each event.
+            // fflush(nil) flushes all open output streams and avoids referencing the mutable global
+            // `stdout` (which is not Sendable under Swift 6 strict concurrency on Linux/Glibc).
+            fflush(nil)
+        }
         let task = Task {
+            if reconnect {
+                // Reconnect/resubscribe requires the persistent session that carries the
+                // connection parameters; the one-shot facade cannot rebuild a dropped link.
+                let session = try await SMBee.connect(
+                    host: endpoint.host,
+                    port: endpoint.port,
+                    credential: credential,
+                    share: endpoint.share,
+                    timeout: transport.duration
+                )
+                do {
+                    try await session.withChangeNotifications(
+                        path: endpoint.path,
+                        watchTree: recursive,
+                        autoReconnect: true
+                    ) { event in try emit(event) }
+                    await session.close()
+                } catch {
+                    await session.close()
+                    throw error
+                }
+                return
+            }
             try await transport.withOperationDeadline {
                 try await SMBee.withChangeNotifications(
                     host: endpoint.host,
@@ -255,25 +302,7 @@ struct Watch: AsyncParsableCommand {
                     path: endpoint.path,
                     watchTree: recursive,
                     timeout: transport.duration
-                ) { event in
-                    if json {
-                        print(try SMBCLIOutput.jsonString(for: event))
-                    } else {
-                        switch event {
-                        case .overflow:
-                            print("overflow: rescan needed")
-                        case .changes(let changes):
-                            for change in changes {
-                                print("\(formatChangeAction(change.action)) \(change.name)")
-                            }
-                        }
-                    }
-                    // stdout is fully buffered when redirected to a file/pipe (e.g. `watch --json > out.jsonl`),
-                    // so streamed events would not surface until the process exits. Flush after each event.
-                    // fflush(nil) flushes all open output streams and avoids referencing the mutable global
-                    // `stdout` (which is not Sendable under Swift 6 strict concurrency on Linux/Glibc).
-                    fflush(nil)
-                }
+                ) { event in try emit(event) }
             }
         }
         let sigint = makeSIGINTSource {

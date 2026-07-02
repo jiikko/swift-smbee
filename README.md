@@ -41,6 +41,7 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 - Kerberos / GSS は未対応。現状は NTLMv2 password / NT hash / anonymous を対象にする。
 - Windows SMB Server / NAS の実サーバ smoke は未完了。Samba と一部 macOS SMBX の確認が中心。
 - durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) のみ (CLI 非対応)。
+- CHANGE_NOTIFY は `--reconnect` で接続断時の再購読に対応 (取りこぼし分は overflow で通知)。
 - DFS referral は metadata 取得のみ。target への auto-follow は未対応。
 - reparse point / symlink / mount point / LX symlink の target は `readlink` API で扱える。DFS/NFS の reparse data は MS-FSCC 上 opaque (client 解釈対象外) で、DFS link の解決は `smbcli dfs` (FSCTL_DFS_GET_REFERRALS)。実サーバ readlink smoke は未完了。
 - single-file download/upload の byte-level resume と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file preservation は未対応。

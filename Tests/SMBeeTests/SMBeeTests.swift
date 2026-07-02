@@ -2803,6 +2803,51 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testReadCancellationSendsSMB2Cancel() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let task = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 1024)
+        }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        task.cancel()
+        try await waitForOutboundFrameCount(2, transport: transport)
+
+        let requests = try unframed(transport.outbound)
+        let readHeader = try SMB2Header.decode(requests[0])
+        let cancelHeader = try SMB2Header.decode(requests[1])
+        XCTAssertEqual(readHeader.command, SMB2Commands.read)
+        XCTAssertEqual(cancelHeader.command, SMB2Commands.cancel)
+        XCTAssertEqual(cancelHeader.messageId, readHeader.messageId)
+        XCTAssertEqual(cancelHeader.treeId, readHeader.treeId)
+
+        transport.enqueueInbound(try framed([
+            try smb2StatusResponse(
+                status: SMB2Status.cancelled,
+                command: SMB2Commands.read,
+                messageId: readHeader.messageId,
+                treeId: readHeader.treeId
+            ),
+        ]))
+
+        do {
+            _ = try await awaitWithTimeout("cancel READ") {
+                try await task.value
+            }
+            XCTFail("cancelled READ unexpectedly completed")
+        } catch is CancellationError {
+        }
+    }
+
     func testChangeNotifyEventConvenienceProperties() {
         let changes = [
             SMBFileChange(action: .added, name: "new.txt"),

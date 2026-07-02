@@ -3898,10 +3898,17 @@ actor SMBSession {
     }
 
     private func signedWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
+        let requestHeader = try SMB2Header.decode(packet)
         await wireTransactionGate.enter()
         defer { wireTransactionGate.leave() }
-        try await sendSigned(packet)
-        let response = try await receive(label: responseLabel)
+        let response = try await withTaskCancellationHandler {
+            try await sendSigned(packet)
+            return try await receive(label: responseLabel)
+        } onCancel: {
+            Task {
+                await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+            }
+        }
         if verifySignature {
             try verifySigned(response)
         }

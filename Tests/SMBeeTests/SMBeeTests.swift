@@ -2749,6 +2749,48 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(collector.events, [.overflow])
     }
 
+    func testChangeNotifyCancellationSendsSMB2Cancel() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        let task = Task {
+            try await session.changeNotify(treeId: 0x3344, fileId: fileId, filter: .default, watchTree: false) { _ in
+                XCTFail("cancelled CHANGE_NOTIFY should not deliver an event")
+            }
+        }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        task.cancel()
+        try await waitForOutboundFrameCount(2, transport: transport)
+
+        let requests = try unframed(transport.outbound)
+        let changeHeader = try SMB2Header.decode(requests[0])
+        let cancelHeader = try SMB2Header.decode(requests[1])
+        XCTAssertEqual(changeHeader.command, SMB2Commands.changeNotify)
+        XCTAssertEqual(cancelHeader.command, SMB2Commands.cancel)
+        XCTAssertEqual(cancelHeader.messageId, changeHeader.messageId)
+        XCTAssertEqual(cancelHeader.treeId, changeHeader.treeId)
+
+        transport.enqueueInbound(try framed([
+            try smb2ChangeNotifyResponse(entries: [], messageId: changeHeader.messageId, treeId: changeHeader.treeId),
+        ]))
+
+        do {
+            try await awaitWithTimeout("cancel CHANGE_NOTIFY") {
+                try await task.value
+            }
+            XCTFail("cancelled CHANGE_NOTIFY unexpectedly completed")
+        } catch is CancellationError {
+        }
+    }
+
     func testChangeNotifyEventConvenienceProperties() {
         let changes = [
             SMBFileChange(action: .added, name: "new.txt"),

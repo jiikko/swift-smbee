@@ -369,12 +369,14 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - CLI では `smbcli watch smb://...` 相当。MVP の copy/read/write には不要なので後回し。
   - 2026-07-02 (codex-drive): **SMB2 CHANGE_NOTIFY (command 15) を実装**。専用 long-poll 受信
     (`signedLongPollWireTransaction`/`receiveLongPoll`) で STATUS_PENDING を打ち切らず実 notification まで
-    待機、cancel は M2 の transport close-on-cancel で解除、resubscribe ループ。overflow
+    待機、cancel は SMB2 CANCEL を送って解除、resubscribe ループ。overflow
     (STATUS_NOTIFY_ENUM_DIR) は `.overflow` として callback へ (full-rescan は呼び出し側)。公開型
     `SMBFileChange`/`SMBFileChangeAction`/`SMBChangeNotifyFilter`(OptionSet)/`SMBChangeNotifyEvent`。
     `SMBClientSession.withChangeNotifications` / `SMBee.withChangeNotifications` (callback) + `smbcli watch`
     (`-r` で watch-tree)。fixture unit + **実 Samba E2E** (dir watch → file 作成 → ADDED 通知を bounded 受信) green。
-    残: `smbcli watch` の `--json` は未実装 (human のみ)。再接続時の再購読は同一 session 前提 (自動再接続は未配線)。
+    残: 再接続時の再購読は同一 session 前提 (自動再接続は未配線)。
+  - 2026-07-02: `CHANGE_NOTIFY` の task cancellation で、transport close ではなく SMB2 CANCEL を送る。
+    元 request の MessageId/TreeId を使う unit coverage あり。long read / IOCTL への一般化は P2-8 側に残す。
   - 2026-07-02: `smbcli watch --json` を追加。CHANGE_NOTIFY events は NDJSON で `changes` / `overflow`
     を出せる。残: reconnect時の再購読。
 - [x] ACL / owner / SID metadata

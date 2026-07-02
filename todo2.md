@@ -652,9 +652,8 @@ Linux/macOS smbclient として必要な理由:
 実装確認:
 
 - `SMB2Commands.cancel` constant はある。
-- `SMB2Cancel` encoder / explicit CANCEL send path は確認できない。
-- 現在の cancellation は close-on-cancel / transport shutdown を中心にしている。
 - 2026-07-02: `SMB2Cancel` encoder と `SMBSession.sendCancel(messageId:treeId:)` を追加。request shape unit coverage あり。
+- 2026-07-02: `CHANGE_NOTIFY` の task cancellation で、元 request の MessageId/TreeId を使った SMB2 CANCEL を送るように変更。transport close-on-cancel は廃止。unit coverage あり。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -665,10 +664,11 @@ Linux/macOS smbclient として必要な理由:
 
 - outstanding request tracking と結びつける。
 - cancel後の response / STATUS_CANCELLED の扱いを決める。
+- long read / IOCTL の cancellation path にも広げる。
 
 完了条件:
 
-- watch / long read を TCP close なしで cancel できる。
+- watch / long read を TCP close なしで cancel できる。watch は対応済み。
 
 ## P3: optional / advanced / 明示的に後回し
 

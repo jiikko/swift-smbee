@@ -3750,6 +3750,16 @@ actor SMBSession {
         try await sendSigned(packet)
     }
 
+    private func sendCancelWithoutGate(messageId: UInt64, treeId: UInt32) async {
+        do {
+            let packet = try SMB2Cancel.encodeRequest(messageId: messageId, sessionId: sessionId, treeId: treeId)
+            debugDump("CANCEL request", packet)
+            try await sendSigned(packet)
+        } catch {
+            debugLine("CANCEL request failed: \(error)")
+        }
+    }
+
     func disconnect(treeId: UInt32) async {
         try? await treeDisconnect(treeId: treeId)
         try? await logoff()
@@ -3779,6 +3789,7 @@ actor SMBSession {
     }
 
     private func signedLongPollWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
+        let requestHeader = try SMB2Header.decode(packet)
         await wireTransactionGate.enter()
         defer { wireTransactionGate.leave() }
         let response = try await withTaskCancellationHandler {
@@ -3786,7 +3797,7 @@ actor SMBSession {
             return try await receiveLongPoll(label: responseLabel)
         } onCancel: {
             Task {
-                await self.closeTransport()
+                await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
             }
         }
         if verifySignature {

@@ -1596,7 +1596,7 @@ func errorJSONString(_ error: Error) throws -> String {
     return string
 }
 
-private final class TransferProgressWriter: @unchecked Sendable {
+final class TransferProgressWriter: @unchecked Sendable {
     private let lock = NSLock()
     private var didEmit = false
 

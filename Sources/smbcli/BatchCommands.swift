@@ -35,6 +35,9 @@ struct MGet: AsyncParsableCommand {
     @Flag(name: .shortAndLong, help: "Recursively match files below the remote directory")
     var recursive = false
 
+    @Flag(help: "Show per-file transfer progress")
+    var progress = false
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -87,6 +90,14 @@ struct MGet: AsyncParsableCommand {
                 continue
             }
             try FileManager.default.createDirectory(at: localFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let progressWriter = progress ? TransferProgressWriter() : nil
+            var onProgress: (@Sendable (SMBTransferProgress) -> Void)?
+            if let progressWriter {
+                onProgress = { progressWriter.emit($0) }
+            }
+            if progressWriter != nil {
+                writeStandardError("\(file.relativePath)\n")
+            }
             try await SMBee.download(
                 host: endpoint.host,
                 port: endpoint.port,
@@ -95,8 +106,10 @@ struct MGet: AsyncParsableCommand {
                 path: remotePath,
                 localFile: localFile,
                 overwrite: !noOverwrite,
-                timeout: transport.duration
+                timeout: transport.duration,
+                onProgress: onProgress
             )
+            progressWriter?.finish()
             transferred += 1
         }
         let count = dryRun ? files.count - skipped : transferred
@@ -131,6 +144,9 @@ struct MPut: AsyncParsableCommand {
 
     @Flag(name: .shortAndLong, help: "Recursively match files below the local directory")
     var recursive = false
+
+    @Flag(help: "Show per-file transfer progress")
+    var progress = false
 
     @OptionGroup
     var auth: AuthOptions
@@ -195,16 +211,26 @@ struct MPut: AsyncParsableCommand {
                 continue
             }
             try await makeRemoteParentDirectories(endpoint: endpoint, credential: credential, remotePath: remotePath)
+            let progressWriter = progress ? TransferProgressWriter() : nil
+            var onProgress: (@Sendable (SMBTransferProgress) -> Void)?
+            if let progressWriter {
+                onProgress = { progressWriter.emit($0) }
+            }
+            if progressWriter != nil {
+                writeStandardError("\(file.name)\n")
+            }
             try await SMBee.upload(
                 host: endpoint.host,
                 port: endpoint.port,
                 credential: credential,
                 share: endpoint.share,
                 path: remotePath,
-                localFile: file.url,
+                fileURL: file.url,
                 overwrite: !noOverwrite,
-                timeout: transport.duration
+                timeout: transport.duration,
+                onProgress: onProgress
             )
+            progressWriter?.finish()
             transferred += 1
         }
         let count = dryRun ? files.count - skipped : transferred

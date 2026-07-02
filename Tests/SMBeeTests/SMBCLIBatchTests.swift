@@ -78,6 +78,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--dry-run",
             "--no-overwrite",
             "--recursive",
+            "--progress",
         ])
 
         XCTAssertEqual(command.remoteDirectory, "smb://user@host/share/dir")
@@ -87,6 +88,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(command.dryRun)
         XCTAssertTrue(command.noOverwrite)
         XCTAssertTrue(command.recursive)
+        XCTAssertTrue(command.progress)
     }
 
     func testMPutParsesPositionalsAndFlags() throws {
@@ -99,6 +101,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--dry-run",
             "--no-overwrite",
             "--recursive",
+            "--progress",
         ])
 
         XCTAssertEqual(command.localDirectory, "/tmp/in")
@@ -108,6 +111,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(command.dryRun)
         XCTAssertTrue(command.noOverwrite)
         XCTAssertTrue(command.recursive)
+        XCTAssertTrue(command.progress)
     }
 
     func testProbeParsesServerUrlAndCommonFlags() throws {

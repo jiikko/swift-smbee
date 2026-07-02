@@ -555,9 +555,8 @@ Linux/macOS smbclient として必要な理由:
 - 2026-07-02: single-file `get` / `put` に `--create-dirs` を追加。`get` は local parent、`put` は remote parent を作成する。CLI parse coverage あり。
 - 2026-07-02: `get -r --progress` / `put -r --progress` を追加。recursive transfer の実ファイル転送ごとに既存 byte progress を stderr に出す。skip/dry-run は progress なし。
 
-やること:
-
-- `mget` / `mput` の per-file `--progress` を追加する。
+- 2026-07-03: `mget` / `mput` に per-file `--progress` を追加 (stderr にファイル名 + 既存 byte progress)。
+  parse unit coverage あり。
 
 完了条件:
 

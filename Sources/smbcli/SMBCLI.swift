@@ -730,6 +730,9 @@ struct Get: AsyncParsableCommand {
     @Flag(help: "Show transfer progress")
     var progress = false
 
+    @Flag(help: "Create local parent directories before downloading")
+    var createDirs = false
+
     @Option(help: "Verify completed single-file transfer: none or size")
     var verify: TransferVerifyMode = .none
 
@@ -778,6 +781,10 @@ struct Get: AsyncParsableCommand {
         } else {
             onProgress = nil
         }
+        let localFile = URL(fileURLWithPath: destination)
+        if createDirs {
+            try FileManager.default.createDirectory(at: localFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        }
         try await transport.withOperationDeadline {
             try await SMBee.download(
                 host: endpoint.host,
@@ -785,7 +792,7 @@ struct Get: AsyncParsableCommand {
                 credential: credential,
                 share: endpoint.share,
                 path: endpoint.path,
-                localFile: URL(fileURLWithPath: destination),
+                localFile: localFile,
                 overwrite: !noOverwrite,
                 resume: resume,
                 timeout: transport.duration,
@@ -866,6 +873,9 @@ struct Put: AsyncParsableCommand {
     @Flag(help: "Show transfer progress")
     var progress = false
 
+    @Flag(help: "Create remote parent directories before uploading")
+    var createDirs = false
+
     @Option(help: "Verify completed single-file transfer: none or size")
     var verify: TransferVerifyMode = .none
 
@@ -910,6 +920,9 @@ struct Put: AsyncParsableCommand {
         if progress {
             let progressWriter = TransferProgressWriter()
             try await transport.withOperationDeadline {
+                if createDirs {
+                    try await makeRemoteParentDirectories(endpoint: endpoint, credential: credential, remotePath: endpoint.path, timeout: transport.duration)
+                }
                 try await SMBee.upload(
                     host: endpoint.host,
                     port: endpoint.port,
@@ -930,6 +943,9 @@ struct Put: AsyncParsableCommand {
             return
         }
         try await transport.withOperationDeadline {
+            if createDirs {
+                try await makeRemoteParentDirectories(endpoint: endpoint, credential: credential, remotePath: endpoint.path, timeout: transport.duration)
+            }
             try await SMBee.upload(
                 host: endpoint.host,
                 port: endpoint.port,
@@ -1210,6 +1226,31 @@ private func localFileSize(_ url: URL) throws -> UInt64 {
     if let value = raw as? UInt64 { return value }
     if let value = raw as? Int, value >= 0 { return UInt64(value) }
     throw ValidationError("local file size unavailable")
+}
+
+private func makeRemoteParentDirectories(
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    remotePath: String,
+    timeout: Duration?
+) async throws {
+    let components = remotePath.split(separator: "\\").map(String.init)
+    guard components.count > 1 else { return }
+    var current = ""
+    for component in components.dropLast() {
+        current = try SMBPath.join(current, component)
+        do {
+            try await SMBee.makeDirectory(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: current,
+                timeout: timeout
+            )
+        } catch SMBError.nameCollision {
+        }
+    }
 }
 
 private final class TransferProgressWriter: @unchecked Sendable {

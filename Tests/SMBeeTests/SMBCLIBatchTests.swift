@@ -182,6 +182,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--resume",
             "--verify",
             "size",
+            "--create-dirs",
             "--include",
             "*.log",
             "--exclude",
@@ -194,6 +195,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(get.progress)
         XCTAssertTrue(get.resume)
         XCTAssertEqual(get.verify, .size)
+        XCTAssertTrue(get.createDirs)
         XCTAssertEqual(get.include, ["*.log"])
         XCTAssertEqual(get.exclude, ["debug*"])
 
@@ -206,6 +208,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--resume",
             "--verify",
             "size",
+            "--create-dirs",
             "--include",
             "*.txt",
             "--exclude",
@@ -218,6 +221,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(put.progress)
         XCTAssertTrue(put.resume)
         XCTAssertEqual(put.verify, .size)
+        XCTAssertTrue(put.createDirs)
         XCTAssertEqual(put.include, ["*.txt"])
         XCTAssertEqual(put.exclude, ["nested/skip*"])
 

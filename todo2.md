@@ -569,10 +569,10 @@ Linux/macOS smbclient として必要な理由:
 - `todo.md` に recursive `mget/mput -r`、`--create-dirs`、個別 progress、確認 prompt は defer と記録されている。
 - 2026-07-02: `mget -r` / `mput -r` を追加。recursive match は basename glob + relative-path exclude を使い、転送時は relative path を保存する。
 - 2026-07-02: `get -r` / `put -r` / `cp -r` に `--include` / `--exclude` を追加。file は include/exclude、directory は exclude による枝刈りを行う。dry-run unit coverage あり。
+- 2026-07-02: single-file `get` / `put` に `--create-dirs` を追加。`get` は local parent、`put` は remote parent を作成する。CLI parse coverage あり。
 
 やること:
 
-- `--create-dirs`。
 - `--progress` を複数ファイル・recursive transfer に対応する。
 
 完了条件:

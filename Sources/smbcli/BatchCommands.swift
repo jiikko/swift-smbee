@@ -49,14 +49,16 @@ struct MGet: AsyncParsableCommand {
         }
 
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: remoteDirectory, auth: auth)
-        let entries = try await remoteDirectoryEntries(endpoint: endpoint, credential: credential, timeout: transport.duration)
-        let files = batchGlobEntries(entries, include: pattern, exclude: exclude)
-        if files.isEmpty {
-            writeStandardError("Warning: no files matched \(pattern)\n")
-            return
-        }
+        try await transport.withOperationDeadline {
+            let entries = try await remoteDirectoryEntries(endpoint: endpoint, credential: credential, timeout: transport.duration)
+            let files = batchGlobEntries(entries, include: pattern, exclude: exclude)
+            if files.isEmpty {
+                writeStandardError("Warning: no files matched \(pattern)\n")
+                return
+            }
 
-        try await download(files: files, endpoint: endpoint, credential: credential)
+            try await download(files: files, endpoint: endpoint, credential: credential)
+        }
     }
 
     private func download(files: [SMBDirectoryEntry], endpoint: SMBURLParser.ReadURL, credential: SMBCredential) async throws {
@@ -139,8 +141,10 @@ struct MPut: AsyncParsableCommand {
         }
 
         let (endpoint, credential) = try makeEndpointAndCredential(url: remoteDirectory, auth: auth)
-        let remoteExisting = try await remoteExistingFileNames(endpoint: endpoint, credential: credential)
-        try await upload(files: files, endpoint: endpoint, credential: credential, remoteExisting: remoteExisting)
+        try await transport.withOperationDeadline {
+            let remoteExisting = try await remoteExistingFileNames(endpoint: endpoint, credential: credential)
+            try await upload(files: files, endpoint: endpoint, credential: credential, remoteExisting: remoteExisting)
+        }
     }
 
     private func remoteExistingFileNames(endpoint: SMBURLParser.ReadURL, credential: SMBCredential) async throws -> Set<String> {

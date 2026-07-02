@@ -64,7 +64,7 @@ Status labels:
 | JSON output | CLI | `SMBCLIOutput.swift`, `smbcli`, `docs/smbcli-json.md` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands use exit status as their stable success/failure signal. |
 | exit codes | CLI | `SMBCLI.swift`, `docs/smbcli-exit-codes.md` | yes | yes | no | no | covered | Keep exhaustive mapping as `SMBError` evolves. |
 | debug redaction | operational | `SMBDebug.swift`, `smbcli --debug/--trace-wire` | yes | yes | no | no | covered | Raw wire trace remains explicitly opt-in. |
-| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift`, `SMB2Cancel` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. Operation deadline helper and `--operation-timeout` exist for probe/ls/ping. SMB CANCEL has a codec/send primitive, but high-level cancellation still mostly closes transport. |
+| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift`, `SMB2Cancel` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. `smbcli --operation-timeout` wraps all commands. Public API operation deadline parameters and per-file recursive timeout policy are future work. SMB CANCEL has a codec/send primitive, but high-level cancellation still mostly closes transport. |
 
 ## Release Blockers
 

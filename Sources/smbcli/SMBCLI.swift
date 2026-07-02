@@ -241,32 +241,34 @@ struct Watch: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         let task = Task {
-            try await SMBee.withChangeNotifications(
-                host: endpoint.host,
-                port: endpoint.port,
-                credential: credential,
-                share: endpoint.share,
-                path: endpoint.path,
-                watchTree: recursive,
-                timeout: transport.duration
-            ) { event in
-                if json {
-                    print(try SMBCLIOutput.jsonString(for: event))
-                } else {
-                    switch event {
-                    case .overflow:
-                        print("overflow: rescan needed")
-                    case .changes(let changes):
-                        for change in changes {
-                            print("\(formatChangeAction(change.action)) \(change.name)")
+            try await transport.withOperationDeadline {
+                try await SMBee.withChangeNotifications(
+                    host: endpoint.host,
+                    port: endpoint.port,
+                    credential: credential,
+                    share: endpoint.share,
+                    path: endpoint.path,
+                    watchTree: recursive,
+                    timeout: transport.duration
+                ) { event in
+                    if json {
+                        print(try SMBCLIOutput.jsonString(for: event))
+                    } else {
+                        switch event {
+                        case .overflow:
+                            print("overflow: rescan needed")
+                        case .changes(let changes):
+                            for change in changes {
+                                print("\(formatChangeAction(change.action)) \(change.name)")
+                            }
                         }
                     }
+                    // stdout is fully buffered when redirected to a file/pipe (e.g. `watch --json > out.jsonl`),
+                    // so streamed events would not surface until the process exits. Flush after each event.
+                    // fflush(nil) flushes all open output streams and avoids referencing the mutable global
+                    // `stdout` (which is not Sendable under Swift 6 strict concurrency on Linux/Glibc).
+                    fflush(nil)
                 }
-                // stdout is fully buffered when redirected to a file/pipe (e.g. `watch --json > out.jsonl`),
-                // so streamed events would not surface until the process exits. Flush after each event.
-                // fflush(nil) flushes all open output streams and avoids referencing the mutable global
-                // `stdout` (which is not Sendable under Swift 6 strict concurrency on Linux/Glibc).
-                fflush(nil)
             }
         }
         let sigint = makeSIGINTSource {
@@ -321,12 +323,14 @@ struct Shares: AsyncParsableCommand {
         debug.apply()
         let endpoint = try SMBURLParser.parseServerURL(url)
         let credential = try makeCredential(username: endpoint.username, password: nil, auth: auth)
-        let shares = try await SMBee.listShares(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            timeout: transport.duration
-        )
+        let shares = try await transport.withOperationDeadline {
+            try await SMBee.listShares(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                timeout: transport.duration
+            )
+        }
         if json {
             print(try SMBCLIOutput.jsonString(for: shares))
             return
@@ -359,13 +363,15 @@ struct Dfs: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         let dfsPath = makeDfsPath(endpoint)
-        let result = try await SMBee.dfsReferral(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            path: dfsPath,
-            timeout: transport.duration
-        )
+        let result = try await transport.withOperationDeadline {
+            try await SMBee.dfsReferral(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                path: dfsPath,
+                timeout: transport.duration
+            )
+        }
         if json {
             print(try SMBCLIOutput.jsonString(for: result))
             return
@@ -405,14 +411,16 @@ struct Stat: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
-        let stat = try await SMBee.stat(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            timeout: transport.duration
-        )
+        let stat = try await transport.withOperationDeadline {
+            try await SMBee.stat(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                timeout: transport.duration
+            )
+        }
         if json {
             print(try SMBCLIOutput.jsonString(for: stat))
             return
@@ -464,14 +472,16 @@ struct Readlink: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
-        let reparsePoint = try await SMBee.readlink(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            timeout: transport.duration
-        )
+        let reparsePoint = try await transport.withOperationDeadline {
+            try await SMBee.readlink(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                timeout: transport.duration
+            )
+        }
         if json {
             print(try SMBCLIOutput.jsonString(for: reparsePoint))
             return
@@ -511,13 +521,15 @@ struct DiskFree: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
-        let info = try await SMBee.volumeInfo(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            timeout: transport.duration
-        )
+        let info = try await transport.withOperationDeadline {
+            try await SMBee.volumeInfo(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                timeout: transport.duration
+            )
+        }
         if json {
             print(try SMBCLIOutput.jsonString(for: info))
             return
@@ -554,14 +566,16 @@ struct ACL: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
-        let info = try await SMBee.securityInfo(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            timeout: transport.duration
-        )
+        let info = try await transport.withOperationDeadline {
+            try await SMBee.securityInfo(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                timeout: transport.duration
+            )
+        }
         if json {
             print(try SMBCLIOutput.jsonString(for: info, resolveSIDs: resolveSids))
             return
@@ -614,16 +628,18 @@ struct SetACL: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         let dacl = try allow.map { try parseACE($0, type: 0) } + deny.map { try parseACE($0, type: 1) }
-        try await SMBee.setSecurityInfo(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            dacl: dacl,
-            force: force,
-            timeout: transport.duration
-        )
+        try await transport.withOperationDeadline {
+            try await SMBee.setSecurityInfo(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                dacl: dacl,
+                force: force,
+                timeout: transport.duration
+            )
+        }
     }
 
     private func parseACE(_ value: String, type: UInt8) throws -> SMBAccessControlEntry {
@@ -662,16 +678,18 @@ struct Cat: AsyncParsableCommand {
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         // ファイル全体をメモリに lift せず streaming で stdout へ流す (大ファイル対応)。
         let stdout = FileHandle.standardOutput
-        try await SMBee.withReadStream(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            range: try range.map(parseRange),
-            timeout: transport.duration
-        ) { chunk in
-            stdout.write(Data(chunk))
+        try await transport.withOperationDeadline {
+            try await SMBee.withReadStream(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                range: try range.map(parseRange),
+                timeout: transport.duration
+            ) { chunk in
+                stdout.write(Data(chunk))
+            }
         }
     }
 }
@@ -720,20 +738,22 @@ struct Get: AsyncParsableCommand {
         let (endpoint, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         if recursive {
             // ⓥ Directory transfer progress is not exposed by the facade yet.
-            try await SMBee.downloadDirectory(
-                host: endpoint.host,
-                port: endpoint.port,
-                credential: credential,
-                share: endpoint.share,
-                path: endpoint.path,
-                localDirectory: URL(fileURLWithPath: destination),
-                overwrite: !noOverwrite,
-                continueOnError: continueOnError,
-                skipExisting: skipExisting,
-                resume: resume,
-                dryRun: dryRun,
-                timeout: transport.duration
-            ) { action in writeRecursiveAction(action) }
+            try await transport.withOperationDeadline {
+                try await SMBee.downloadDirectory(
+                    host: endpoint.host,
+                    port: endpoint.port,
+                    credential: credential,
+                    share: endpoint.share,
+                    path: endpoint.path,
+                    localDirectory: URL(fileURLWithPath: destination),
+                    overwrite: !noOverwrite,
+                    continueOnError: continueOnError,
+                    skipExisting: skipExisting,
+                    resume: resume,
+                    dryRun: dryRun,
+                    timeout: transport.duration
+                ) { action in writeRecursiveAction(action) }
+            }
             return
         }
         let progressWriter = progress ? TransferProgressWriter() : nil
@@ -743,18 +763,20 @@ struct Get: AsyncParsableCommand {
         } else {
             onProgress = nil
         }
-        try await SMBee.download(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            localFile: URL(fileURLWithPath: destination),
-            overwrite: !noOverwrite,
-            resume: resume,
-            timeout: transport.duration,
-            onProgress: onProgress
-        )
+        try await transport.withOperationDeadline {
+            try await SMBee.download(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                localFile: URL(fileURLWithPath: destination),
+                overwrite: !noOverwrite,
+                resume: resume,
+                timeout: transport.duration,
+                onProgress: onProgress
+            )
+        }
         progressWriter?.finish()
     }
 }
@@ -777,14 +799,16 @@ struct MakeDirectory: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
-        try await SMBee.makeDirectory(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            timeout: transport.duration
-        )
+        try await transport.withOperationDeadline {
+            try await SMBee.makeDirectory(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                timeout: transport.duration
+            )
+        }
     }
 }
 
@@ -829,48 +853,54 @@ struct Put: AsyncParsableCommand {
         let (endpoint, credential) = try makeEndpointAndCredential(url: destination, auth: auth)
         if recursive {
             // ⓥ Directory transfer progress is not exposed by the facade yet.
-            try await SMBee.uploadDirectory(
-                host: endpoint.host,
-                port: endpoint.port,
-                credential: credential,
-                share: endpoint.share,
-                path: endpoint.path,
-                localDirectory: URL(fileURLWithPath: source),
-                overwrite: !noOverwrite,
-                continueOnError: continueOnError,
-                skipExisting: skipExisting,
-                dryRun: dryRun,
-                timeout: transport.duration
-            ) { action in writeRecursiveAction(action) }
+            try await transport.withOperationDeadline {
+                try await SMBee.uploadDirectory(
+                    host: endpoint.host,
+                    port: endpoint.port,
+                    credential: credential,
+                    share: endpoint.share,
+                    path: endpoint.path,
+                    localDirectory: URL(fileURLWithPath: source),
+                    overwrite: !noOverwrite,
+                    continueOnError: continueOnError,
+                    skipExisting: skipExisting,
+                    dryRun: dryRun,
+                    timeout: transport.duration
+                ) { action in writeRecursiveAction(action) }
+            }
             return
         }
         if progress {
             let progressWriter = TransferProgressWriter()
             let data = try Data(contentsOf: URL(fileURLWithPath: source))
+            try await transport.withOperationDeadline {
+                try await SMBee.upload(
+                    host: endpoint.host,
+                    port: endpoint.port,
+                    credential: credential,
+                    share: endpoint.share,
+                    path: endpoint.path,
+                    data: [UInt8](data),
+                    overwrite: !noOverwrite,
+                    timeout: transport.duration,
+                    onProgress: { progress in progressWriter.emit(progress) }
+                )
+            }
+            progressWriter.finish()
+            return
+        }
+        try await transport.withOperationDeadline {
             try await SMBee.upload(
                 host: endpoint.host,
                 port: endpoint.port,
                 credential: credential,
                 share: endpoint.share,
                 path: endpoint.path,
-                data: [UInt8](data),
+                localFile: URL(fileURLWithPath: source),
                 overwrite: !noOverwrite,
-                timeout: transport.duration,
-                onProgress: { progress in progressWriter.emit(progress) }
+                timeout: transport.duration
             )
-            progressWriter.finish()
-            return
         }
-        try await SMBee.upload(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            localFile: URL(fileURLWithPath: source),
-            overwrite: !noOverwrite,
-            timeout: transport.duration
-        )
     }
 }
 
@@ -900,16 +930,18 @@ struct Move: AsyncParsableCommand {
         let (from, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         let to = try SMBURLParser.parseReadURL(destination)
         try validateSameShare(source: from, destination: to, commandName: "mv")
-        try await SMBee.rename(
-            host: from.host,
-            port: from.port,
-            credential: credential,
-            share: from.share,
-            fromPath: from.path,
-            toPath: to.path,
-            replaceIfExists: replace,
-            timeout: transport.duration
-        )
+        try await transport.withOperationDeadline {
+            try await SMBee.rename(
+                host: from.host,
+                port: from.port,
+                credential: credential,
+                share: from.share,
+                fromPath: from.path,
+                toPath: to.path,
+                replaceIfExists: replace,
+                timeout: transport.duration
+            )
+        }
     }
 }
 
@@ -952,7 +984,25 @@ struct Copy: AsyncParsableCommand {
         let to = try SMBURLParser.parseReadURL(destination)
         try validateSameShare(source: from, destination: to, commandName: "cp")
         if recursive {
-            try await SMBee.copyDirectory(
+            try await transport.withOperationDeadline {
+                try await SMBee.copyDirectory(
+                    host: from.host,
+                    port: from.port,
+                    credential: credential,
+                    share: from.share,
+                    fromPath: from.path,
+                    toPath: to.path,
+                    overwrite: replace,
+                    continueOnError: continueOnError,
+                    skipExisting: skipExisting,
+                    dryRun: dryRun,
+                    timeout: transport.duration
+                ) { action in writeRecursiveAction(action) }
+            }
+            return
+        }
+        try await transport.withOperationDeadline {
+            try await SMBee.copy(
                 host: from.host,
                 port: from.port,
                 credential: credential,
@@ -960,23 +1010,9 @@ struct Copy: AsyncParsableCommand {
                 fromPath: from.path,
                 toPath: to.path,
                 overwrite: replace,
-                continueOnError: continueOnError,
-                skipExisting: skipExisting,
-                dryRun: dryRun,
                 timeout: transport.duration
-            ) { action in writeRecursiveAction(action) }
-            return
+            )
         }
-        try await SMBee.copy(
-            host: from.host,
-            port: from.port,
-            credential: credential,
-            share: from.share,
-            fromPath: from.path,
-            toPath: to.path,
-            overwrite: replace,
-            timeout: transport.duration
-        )
     }
 }
 
@@ -1010,18 +1046,20 @@ struct Remove: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
-        try await SMBee.delete(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            directory: directory || recursive,
-            recursive: recursive,
-            continueOnError: continueOnError,
-            dryRun: dryRun,
-            timeout: transport.duration
-        ) { action in writeRecursiveAction(action) }
+        try await transport.withOperationDeadline {
+            try await SMBee.delete(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                directory: directory || recursive,
+                recursive: recursive,
+                continueOnError: continueOnError,
+                dryRun: dryRun,
+                timeout: transport.duration
+            ) { action in writeRecursiveAction(action) }
+        }
     }
 }
 

@@ -172,7 +172,7 @@
 
 ### P1-1. Kerberos / GSS / SPNEGO(Kerberos mech)
 
-状態: `missing`
+状態: `partial`
 
 実装確認:
 
@@ -607,10 +607,11 @@ Linux/macOS smbclient として必要な理由:
 - `timeout` は socket-level timeout として配線済み。
 - `todo.md` に全操作 deadline は未対応と記録されている。
 - 2026-07-02: `SMBOperationDeadline.run(timeout:)` と CLI `--operation-timeout` を追加。まず `probe` / `ls` / `ping` に配線し、共通 timeout helper の unit と option parse test を追加。
+- 2026-07-02: `smbcli` 全コマンドを `--operation-timeout` で wrap。batch (`mget` / `mput`) も全体 deadline として扱う。
 
 やること:
 
-- `operationTimeout` / `deadline` を残りの public API / CLI command に広げる。
+- `operationTimeout` / `deadline` を public API に広げるか決める。
 - recursive transfer では per-file timeout と全体 timeout を分ける。
 
 完了条件:

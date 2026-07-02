@@ -48,11 +48,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Swift
-        uses: swift-actions/setup-swift@v3
-        with:
-          swift-version: ${{ matrix.swift_version }}
-
       - name: Print matrix context
         run: |
           set -euxo pipefail
@@ -60,19 +55,25 @@ jobs:
           echo "SMBEE_E2E_PROFILE=${SMBEE_E2E_PROFILE}"
           echo "SAMBA_CONFIG=${SAMBA_CONFIG}"
 
+      # Samba runs via host Docker; Swift runs inside the official swift image with
+      # --network host. This replaces swift-actions/setup-swift@v3, whose Swiftly
+      # install fails GPG verification ("No public key"). See e2e.yml for details.
       - name: Start Samba
         run: bash test/e2e/start-samba-ci.sh
 
-      - name: Probe negotiated parameters
-        env:
-          SMBEE_DEBUG: "1"
-        run: swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
-
-      - name: Samba-backed API E2E tests
-        env:
-          SMBEE_E2E: "1"
-          SMBEE_DEBUG: "1"
-        run: swift test --filter SMBeeE2ETests
+      - name: Probe + API E2E tests (Swift in container)
+        run: |
+          set -euxo pipefail
+          docker run --rm --network host \
+            -e SMBEE_E2E=1 -e SMBEE_DEBUG=1 \
+            -e SMBEE_E2E_PROFILE -e SMBEE_E2E_HOST -e SMBEE_E2E_PORT \
+            -v "${PWD}:/work" -w /work \
+            "swift:${{ matrix.swift_version }}" \
+            bash -euxo pipefail -c '
+              swift --version
+              swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
+              swift test --filter SMBeeE2ETests
+            '
 
       - name: Samba logs
         if: always()

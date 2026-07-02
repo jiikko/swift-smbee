@@ -39,7 +39,7 @@ Status labels:
 | mkdir / rename / delete | MS-SMB2 CREATE, SET_INFO | `SMBClient.swift` | yes | yes | smoke | no | covered | Mutation retry is intentionally conservative. |
 | recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | No true transactional directory atomicity; partial-file byte resume and checksum verify are unsupported. |
 | server-side copychunk | MS-FSCC FSCTL_SRV_COPYCHUNK | `SMBClient.swift` | yes | fallback observed | no | no | underverified | Samba test FS returns unsupported and exercises fallback; offload-capable server smoke is missing. |
-| change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications` | yes | yes | no | no | underverified | Reconnect/resubscribe and CLI JSON output are not implemented. |
+| change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications`, `smbcli watch --json` | yes | yes | no | no | underverified | Reconnect/resubscribe is not implemented. |
 
 ## Metadata And Admin Operations
 
@@ -59,7 +59,7 @@ Status labels:
 | Feature | Spec | Implementation | Unit | Samba E2E | macOS SMBX | Windows/NAS | Status | Limitations |
 |---|---|---|---|---|---|---|---|---|
 | `smbcli` core commands | CLI | `Sources/smbcli` | yes | yes | smoke | no | covered | Interactive shell is out of scope. |
-| JSON output | CLI | `SMBCLIOutput.swift`, `smbcli` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands mostly still use human output only. |
+| JSON output | CLI | `SMBCLIOutput.swift`, `smbcli`, `docs/smbcli-json.md` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands use exit status as their stable success/failure signal. |
 | exit codes | CLI | `SMBCLI.swift`, `docs/smbcli-exit-codes.md` | yes | yes | no | no | covered | Keep exhaustive mapping as `SMBError` evolves. |
 | debug redaction | operational | `SMBDebug.swift`, `smbcli --debug/--trace-wire` | yes | yes | no | no | covered | Raw wire trace remains explicitly opt-in. |
 | timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBTransferProgress.swift` | yes | yes | no | no | partial | Socket-level timeout only; full operation deadline is future work. |

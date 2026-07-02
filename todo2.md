@@ -516,12 +516,19 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-2. owner / group / SACL write
 
-状態: `missing`
+状態: `implemented` (owner/group。SACL は対象外で確定)
 
 実装確認:
 
-- `setSecurityInfo` は DACL write のみ。
-- `todo.md` に SACL は特権要求のため対象外、owner/group 書き換えも対象外と記録されている。
+- 2026-07-03: SET_SECURITY を component 単位に拡張。non-nil の owner/group/DACL だけ
+  AdditionalInformation bit を立てて書く (`SMB2SetInfo.encodeSecurityDescriptorRequest`)。
+  owner/group 書き込み時は open に WRITE_OWNER を追加 (`.setSecurity(includeOwner:)`)。
+  公開 API `setSecurityInfo(path:ownerSID:groupSID:dacl:force:)` (session/facade) と
+  `smbcli setacl --owner/--group` を追加。DACL-only の旧経路は read-modify-write を廃止
+  (AdditionalInformation の semantics 上、選択しない component はサーバが触らない)。
+  fixture unit + 実 Samba E2E (現 owner/group の書き戻し round-trip) を追加。
+- SACL は SeSecurityPrivilege 要求のため **対象外で確定** (docs/coverage.md に明記)。
+  任意 owner への変更は server 側 privilege が必要な旨も doc に明記。
 
 やること:
 

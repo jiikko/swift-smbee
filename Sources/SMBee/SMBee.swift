@@ -298,6 +298,35 @@ public enum SMBee {
         try await SMBClient.setSecurityInfo(host: host, port: port, share: share, path: path, dacl: dacl, force: force, credential: credential, timeout: timeout)
     }
 
+    /// Write the provided security descriptor components: non-nil owner/group/DACL are set,
+    /// nil components are left untouched. Owner/group writes require WRITE_OWNER access;
+    /// setting the caller's own SID is the portable case (arbitrary owners need privilege).
+    public static func setSecurityInfo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        ownerSID: String?,
+        groupSID: String?,
+        dacl: [SMBAccessControlEntry]?,
+        force: Bool = false,
+        credential: SMBCredential,
+        timeout: Duration? = nil
+    ) async throws {
+        try await SMBClient.setSecurityInfo(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            ownerSID: ownerSID,
+            groupSID: groupSID,
+            dacl: dacl,
+            force: force,
+            credential: credential,
+            timeout: timeout
+        )
+    }
+
     public static func setSecurityInfo(
         host: String,
         port: UInt16 = 445,

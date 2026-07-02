@@ -1417,6 +1417,51 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNoThrow(try SMB2Echo.decodeResponse(response))
     }
 
+    func testSetSecurityDescriptorOwnerGroupOnlyRequest() throws {
+        // Owner/group-only write: AdditionalInformation = OWNER|GROUP (no DACL bit) and
+        // the descriptor control flags must not claim DACLPresent.
+        let fileId: [UInt8] = Array(repeating: 0xab, count: 16)
+        let request = try SMB2SetInfo.encodeSecurityDescriptorRequest(
+            messageId: 9,
+            sessionId: 1,
+            treeId: 2,
+            fileId: fileId,
+            ownerSID: "S-1-5-21-1-2-3-1000",
+            groupSID: "S-1-5-21-1-2-3-513",
+            dacl: nil
+        )
+        // AdditionalInformation offset: header(64) + StructureSize(2)+InfoType(1)+Class(1)+
+        // BufferLength(4)+BufferOffset(2)+Reserved(2) = 76.
+        XCTAssertEqual(
+            readUInt32LE(request, at: 64 + 12),
+            SMB2SetInfo.securityOwner | SMB2SetInfo.securityGroup
+        )
+
+        let descriptor = try SMB2SetInfo.encodeSecurityDescriptor(
+            ownerSID: "S-1-5-21-1-2-3-1000",
+            groupSID: nil,
+            dacl: nil
+        )
+        XCTAssertEqual(readUInt16LE(descriptor, at: 2) & 0x0004, 0, "DACLPresent must not be set for owner-only descriptor")
+        XCTAssertNotEqual(readUInt32LE(descriptor, at: 4), 0, "owner offset must be set")
+        XCTAssertEqual(readUInt32LE(descriptor, at: 8), 0, "group offset must be zero")
+        XCTAssertEqual(readUInt32LE(descriptor, at: 16), 0, "DACL offset must be zero")
+
+        XCTAssertThrowsError(
+            try SMB2SetInfo.encodeSecurityDescriptorRequest(
+                messageId: 9, sessionId: 1, treeId: 2, fileId: fileId,
+                ownerSID: nil, groupSID: nil, dacl: nil
+            )
+        )
+    }
+
+    func testSetSecurityCreateRequestAddsWriteOwnerAccess() throws {
+        let daclOnly = SMB2CreateRequest.setSecurity(path: "f")
+        XCTAssertEqual(daclOnly.desiredAccess, 0x0004_0000)
+        let withOwner = SMB2CreateRequest.setSecurity(path: "f", includeOwner: true)
+        XCTAssertEqual(withOwner.desiredAccess, 0x0004_0000 | 0x0008_0000)
+    }
+
     func testEncoderRejectsOversizedVariableLengthFieldsInsteadOfTrapping() throws {
         // Regression for issues/011: a >64KiB name/path used to hit the trapping
         // UInt16(Int) initializer and crash the process instead of throwing.

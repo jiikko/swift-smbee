@@ -708,16 +708,33 @@ public actor SMBClientSession {
     }
 
     public func setSecurityInfo(path: String, dacl: [SMBAccessControlEntry], force: Bool = false) async throws {
+        try await setSecurityInfo(path: path, ownerSID: nil, groupSID: nil, dacl: dacl, force: force)
+    }
+
+    /// Write the provided security descriptor components. Non-nil components are set
+    /// (AdditionalInformation OWNER/GROUP/DACL bits); nil components are left untouched
+    /// by the server. Setting owner/group requires WRITE_OWNER access on the open and,
+    /// for arbitrary owners, server-side privilege — setting the caller's own SID is the
+    /// portable case. SACL is intentionally unsupported (requires SeSecurityPrivilege).
+    public func setSecurityInfo(
+        path: String,
+        ownerSID: String?,
+        groupSID: String?,
+        dacl: [SMBAccessControlEntry]?,
+        force: Bool = false
+    ) async throws {
         try ensureOpen()
-        let current = try await securityInfo(path: path)
-        try SMB2SetInfo.validateWritableDACL(dacl, force: force)
-        let fileId = try await session.create(treeId: treeId, request: .setSecurity(path: path))
+        if let dacl {
+            try SMB2SetInfo.validateWritableDACL(dacl, force: force)
+        }
+        let includeOwner = ownerSID != nil || groupSID != nil
+        let fileId = try await session.create(treeId: treeId, request: .setSecurity(path: path, includeOwner: includeOwner))
         do {
             try await session.setSecurityInfo(
                 treeId: treeId,
                 fileId: fileId,
-                ownerSID: current.ownerSID,
-                groupSID: current.groupSID,
+                ownerSID: ownerSID,
+                groupSID: groupSID,
                 dacl: dacl,
                 force: force
             )
@@ -1489,24 +1506,47 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws {
+        try await setSecurityInfo(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            ownerSID: nil,
+            groupSID: nil,
+            dacl: dacl,
+            force: force,
+            credential: credential,
+            timeout: timeout,
+            makeTransport: makeTransport
+        )
+    }
+
+    /// Write the provided security descriptor components (see `SMBClientSession.setSecurityInfo`).
+    public static func setSecurityInfo(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        ownerSID: String?,
+        groupSID: String?,
+        dacl: [SMBAccessControlEntry]?,
+        force: Bool = false,
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws {
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "SET_SECURITY") { session, treeId in
-            let readFileId = try await session.create(treeId: treeId, request: .querySecurity(path: path))
-            let current: SMBSecurityInfo
-            do {
-                current = try await session.querySecurityInfo(treeId: treeId, fileId: readFileId)
-                try? await session.close(treeId: treeId, fileId: readFileId)
-            } catch {
-                try? await session.close(treeId: treeId, fileId: readFileId)
-                throw error
+            if let dacl {
+                try SMB2SetInfo.validateWritableDACL(dacl, force: force)
             }
-            try SMB2SetInfo.validateWritableDACL(dacl, force: force)
-            let writeFileId = try await session.create(treeId: treeId, request: .setSecurity(path: path))
+            let includeOwner = ownerSID != nil || groupSID != nil
+            let writeFileId = try await session.create(treeId: treeId, request: .setSecurity(path: path, includeOwner: includeOwner))
             do {
                 try await session.setSecurityInfo(
                     treeId: treeId,
                     fileId: writeFileId,
-                    ownerSID: current.ownerSID,
-                    groupSID: current.groupSID,
+                    ownerSID: ownerSID,
+                    groupSID: groupSID,
                     dacl: dacl,
                     force: force
                 )
@@ -3861,7 +3901,7 @@ actor SMBSession {
         fileId: [UInt8],
         ownerSID: String?,
         groupSID: String?,
-        dacl: [SMBAccessControlEntry],
+        dacl: [SMBAccessControlEntry]?,
         force: Bool
     ) async throws {
         let packet = try SMB2SetInfo.encodeSecurityDescriptorRequest(

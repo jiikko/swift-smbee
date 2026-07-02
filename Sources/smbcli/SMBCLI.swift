@@ -617,6 +617,12 @@ struct SetACL: AsyncParsableCommand {
     @Option(name: .long, parsing: .upToNextOption, help: "ACCESS_DENIED ACE as SID:MASK, repeatable")
     var deny: [String] = []
 
+    @Option(name: .long, help: "Set owner SID (S-1-...). Requires WRITE_OWNER access.")
+    var owner: String?
+
+    @Option(name: .long, help: "Set group SID (S-1-...). Requires WRITE_OWNER access.")
+    var group: String?
+
     @Flag(help: "Allow empty or deny-only DACLs")
     var force = false
 
@@ -635,16 +641,23 @@ struct SetACL: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
-        let dacl = try allow.map { try parseACE($0, type: 0) } + deny.map { try parseACE($0, type: 1) }
+        let aces = try allow.map { try parseACE($0, type: 0) } + deny.map { try parseACE($0, type: 1) }
+        guard !aces.isEmpty || owner != nil || group != nil else {
+            throw ValidationError("setacl requires --allow/--deny ACEs, --owner, or --group")
+        }
+        // ACE なしで owner/group だけ更新する場合は DACL を書かない (nil)。
+        let dacl: [SMBAccessControlEntry]? = aces.isEmpty ? nil : aces
         try await transport.withOperationDeadline {
             try await SMBee.setSecurityInfo(
                 host: endpoint.host,
                 port: endpoint.port,
-                credential: credential,
                 share: endpoint.share,
                 path: endpoint.path,
+                ownerSID: owner,
+                groupSID: group,
                 dacl: dacl,
                 force: force,
+                credential: credential,
                 timeout: transport.duration
             )
         }

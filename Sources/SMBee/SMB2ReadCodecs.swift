@@ -381,10 +381,11 @@ struct SMB2CreateRequest {
         )
     }
 
-    static func setSecurity(path: String) -> SMB2CreateRequest {
+    static func setSecurity(path: String, includeOwner: Bool = false) -> SMB2CreateRequest {
+        // WRITE_DAC for DACL writes; WRITE_OWNER additionally required to set owner/group.
         SMB2CreateRequest(
             path: path,
-            desiredAccess: 0x0004_0000,
+            desiredAccess: 0x0004_0000 | (includeOwner ? 0x0008_0000 : 0),
             createDisposition: 0x0000_0001,
             createOptions: 0
         )
@@ -942,6 +943,8 @@ enum SMB2SetInfo {
     private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
     static let infoTypeFile: UInt8 = 0x01
     static let infoTypeSecurity: UInt8 = 0x03
+    static let securityOwner: UInt32 = 0x0000_0001
+    static let securityGroup: UInt32 = 0x0000_0002
     static let securityDACL: UInt32 = 0x0000_0004
     static let accessAllowedAceType: UInt8 = 0x00
     static let accessDeniedAceType: UInt8 = 0x01
@@ -997,6 +1000,8 @@ enum SMB2SetInfo {
         )
     }
 
+    /// Non-nil components are the ones written: AdditionalInformation carries
+    /// OWNER/GROUP/DACL bits for exactly the provided pieces (MS-SMB2 SET_INFO security).
     static func encodeSecurityDescriptorRequest(
         messageId: UInt64,
         sessionId: UInt64,
@@ -1004,9 +1009,16 @@ enum SMB2SetInfo {
         fileId: [UInt8],
         ownerSID: String?,
         groupSID: String?,
-        dacl: [SMBAccessControlEntry],
+        dacl: [SMBAccessControlEntry]?,
         force: Bool = false
     ) throws -> [UInt8] {
+        var additionalInformation: UInt32 = 0
+        if ownerSID != nil { additionalInformation |= securityOwner }
+        if groupSID != nil { additionalInformation |= securityGroup }
+        if dacl != nil { additionalInformation |= securityDACL }
+        guard additionalInformation != 0 else {
+            throw SMBCodecError.invalidValue("SET_SECURITY requires owner, group, or DACL")
+        }
         let descriptor = try encodeSecurityDescriptor(ownerSID: ownerSID, groupSID: groupSID, dacl: dacl, force: force)
         return try encodeRequest(
             messageId: messageId,
@@ -1015,7 +1027,7 @@ enum SMB2SetInfo {
             fileId: fileId,
             infoType: infoTypeSecurity,
             fileInfoClass: 0,
-            additionalInformation: securityDACL,
+            additionalInformation: additionalInformation,
             buffer: descriptor
         )
     }
@@ -1023,13 +1035,16 @@ enum SMB2SetInfo {
     static func encodeSecurityDescriptor(
         ownerSID: String?,
         groupSID: String?,
-        dacl: [SMBAccessControlEntry],
+        dacl: [SMBAccessControlEntry]?,
         force: Bool = false
     ) throws -> [UInt8] {
-        try validateWritableDACL(dacl, force: force)
+        if let dacl {
+            try validateWritableDACL(dacl, force: force)
+        }
         var payload = Array(repeating: UInt8(0), count: 20)
         payload[0] = 1
-        writeUInt16LE(securityDescriptorSelfRelative | securityDescriptorDACLPresent, to: &payload, at: 2)
+        let control: UInt16 = securityDescriptorSelfRelative | (dacl != nil ? securityDescriptorDACLPresent : 0)
+        writeUInt16LE(control, to: &payload, at: 2)
         if let ownerSID {
             writeUInt32LE(UInt32(payload.count), to: &payload, at: 4)
             payload.append(contentsOf: try encodeSID(ownerSID))
@@ -1038,8 +1053,10 @@ enum SMB2SetInfo {
             writeUInt32LE(UInt32(payload.count), to: &payload, at: 8)
             payload.append(contentsOf: try encodeSID(groupSID))
         }
-        writeUInt32LE(UInt32(payload.count), to: &payload, at: 16)
-        payload.append(contentsOf: try encodeACL(dacl))
+        if let dacl {
+            writeUInt32LE(UInt32(payload.count), to: &payload, at: 16)
+            payload.append(contentsOf: try encodeACL(dacl))
+        }
         return payload
     }
 

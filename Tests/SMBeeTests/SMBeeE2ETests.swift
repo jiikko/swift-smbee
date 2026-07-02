@@ -148,6 +148,31 @@ final class SMBeeE2ETests: XCTestCase {
             }
         }
 
+        // Owner/group write: setting the current owner/group back is the portable case
+        // (arbitrary owners need server-side privilege). Exercises the WRITE_OWNER open
+        // and the OWNER|GROUP AdditionalInformation path against a real server.
+        if let ownerSID = securityInfo.ownerSID, let groupSID = securityInfo.groupSID {
+            try await SMBee.setSecurityInfo(
+                host: host,
+                port: port,
+                share: share,
+                path: "known.txt",
+                ownerSID: ownerSID,
+                groupSID: groupSID,
+                dacl: nil,
+                credential: credential
+            )
+            let afterOwnerWrite = try await SMBee.securityInfo(
+                host: host,
+                port: port,
+                credential: credential,
+                share: share,
+                path: "known.txt"
+            )
+            XCTAssertEqual(afterOwnerWrite.ownerSID, ownerSID)
+            XCTAssertEqual(afterOwnerWrite.groupSID, groupSID)
+        }
+
         let volumeInfo = try await SMBee.volumeInfo(
             host: host,
             port: port,

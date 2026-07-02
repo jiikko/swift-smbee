@@ -645,13 +645,14 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-8. SMB CANCEL command
 
-状態: `missing` as protocol command
+状態: `partial`
 
 実装確認:
 
 - `SMB2Commands.cancel` constant はある。
 - `SMB2Cancel` encoder / explicit CANCEL send path は確認できない。
 - 現在の cancellation は close-on-cancel / transport shutdown を中心にしている。
+- 2026-07-02: `SMB2Cancel` encoder と `SMBSession.sendCancel(messageId:treeId:)` を追加。request shape unit coverage あり。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -660,7 +661,6 @@ Linux/macOS smbclient として必要な理由:
 
 やること:
 
-- SMB2 CANCEL request を実装。
 - outstanding request tracking と結びつける。
 - cancel後の response / STATUS_CANCELLED の扱いを決める。
 

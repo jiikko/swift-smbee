@@ -1410,6 +1410,23 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNoThrow(try SMB2Echo.decodeResponse(response))
     }
 
+    func testSMB2CancelRequestShape() throws {
+        let request = try SMB2Cancel.encodeRequest(
+            messageId: 22,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.cancel)
+        XCTAssertEqual(header.messageId, 22)
+        XCTAssertEqual(header.treeId, 0x5566_7788)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        XCTAssertEqual(request.count, 68)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 4)
+        XCTAssertEqual(readUInt16LE(request, at: 66), 0)
+    }
+
     func testSMB2CreditChargeAndBalanceHelpers() {
         XCTAssertEqual(SMB2Credit.charge(forPayloadLength: 0), 1)
         XCTAssertEqual(SMB2Credit.charge(forPayloadLength: 65_536), 1)

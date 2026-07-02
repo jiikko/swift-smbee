@@ -96,6 +96,17 @@ enum SMB2Logoff {
     }
 }
 
+enum SMB2Cancel {
+    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32 = 0) throws -> [UInt8] {
+        let header = try SMB2Header(command: SMB2Commands.cancel, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(4)
+        writer.writeUInt16LE(0)
+        return writer.bytes
+    }
+}
+
 enum SMB2TreeDisconnect {
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32) throws -> [UInt8] {
         let header = try SMB2Header(command: SMB2Commands.treeDisconnect, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()

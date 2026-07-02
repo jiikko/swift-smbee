@@ -3711,6 +3711,14 @@ actor SMBSession {
         try SMB2Echo.decodeResponse(response)
     }
 
+    func sendCancel(messageId: UInt64, treeId: UInt32 = 0) async throws {
+        let packet = try SMB2Cancel.encodeRequest(messageId: messageId, sessionId: sessionId, treeId: treeId)
+        debugDump("CANCEL request", packet)
+        await wireTransactionGate.enter()
+        defer { wireTransactionGate.leave() }
+        try await sendSigned(packet)
+    }
+
     func disconnect(treeId: UInt32) async {
         try? await treeDisconnect(treeId: treeId)
         try? await logoff()

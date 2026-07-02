@@ -41,6 +41,7 @@ Status labels:
 | recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | No true transactional directory atomicity; directory resume is size-based skip and checksum verify is unsupported. |
 | server-side copychunk | MS-FSCC FSCTL_SRV_COPYCHUNK | `SMBClient.swift` | yes | fallback observed | no | no | underverified | Samba test FS returns unsupported and exercises fallback; offload-capable server smoke is missing. |
 | change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications`, `SMBChangeNotifyEvent.requiresRescan`, `smbcli watch --json` | yes | yes | no | no | underverified | Reconnect/resubscribe is not implemented. |
+| cancel | MS-SMB2 CANCEL | `SMB2Cancel`, `SMBSession.sendCancel` | yes | no | no | no | partial | Encoder and explicit send path exist. Outstanding request tracking and watch/long-read integration are future work. |
 
 ## Metadata And Admin Operations
 
@@ -63,7 +64,7 @@ Status labels:
 | JSON output | CLI | `SMBCLIOutput.swift`, `smbcli`, `docs/smbcli-json.md` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands use exit status as their stable success/failure signal. |
 | exit codes | CLI | `SMBCLI.swift`, `docs/smbcli-exit-codes.md` | yes | yes | no | no | covered | Keep exhaustive mapping as `SMBError` evolves. |
 | debug redaction | operational | `SMBDebug.swift`, `smbcli --debug/--trace-wire` | yes | yes | no | no | covered | Raw wire trace remains explicitly opt-in. |
-| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. Operation deadline helper and `--operation-timeout` exist for probe/ls/ping; full API/CLI coverage is future work. |
+| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift`, `SMB2Cancel` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. Operation deadline helper and `--operation-timeout` exist for probe/ls/ping. SMB CANCEL has a codec/send primitive, but high-level cancellation still mostly closes transport. |
 
 ## Release Blockers
 

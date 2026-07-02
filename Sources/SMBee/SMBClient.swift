@@ -2935,8 +2935,8 @@ extension Error {
 /// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
 /// actor reentrancy により `sendSigned` → `receive` 間で別の wire 操作が入り得るため、各 request/response
 /// pair は `SMBWireTransactionGate` で直列化する。これにより同一 `SMBSession` への並行呼び出しでも
-/// 応答取り違えは起きない。READ/WRITE の CreditCharge と server grant は記録するが、SMB2 本来の
-/// credit-window blocking / multi-flight 並行化はまだ行わない。
+/// 応答取り違えは起きない。READ/WRITE の CreditCharge と server grant は `SMB2CreditWindow` で
+/// reserve/grant する。SMB2 本来の multi-flight 並行化はまだ行わない。
 ///
 /// 真の multi-flight が必要になったら MS-SMB2 の messageId/credit ベース応答多重分離へ置き換える
 /// (背景と対応案は issues/done/002-design-smbsession-concurrent-multiflight.md)。
@@ -2956,7 +2956,7 @@ actor SMBSession {
     private var transformNonceCounter: UInt64 = 0
     private var maxReadSize: UInt32 = UInt32.max
     private var maxWriteSize: UInt32 = UInt32.max
-    private var creditBalance: UInt32 = 1
+    private let creditWindow = SMB2CreditWindow(initialCredits: 1)
 
     init(
         host: String,
@@ -3314,7 +3314,7 @@ actor SMBSession {
     func readChunk(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
         guard length > 0 else { return [] }
         try Task.checkCancellation()
-        let requestLength = UInt32(min(UInt64(creditAwareReadChunkSize()), length))
+        let requestLength = UInt32(min(UInt64(await creditAwareReadChunkSize()), length))
         let packet = try SMB2Read.encodeRequest(
             messageId: nextMessageId(),
             sessionId: sessionId,
@@ -3346,14 +3346,14 @@ actor SMBSession {
     ) async throws {
         let progress = SMBTransferProgressEmitter(totalBytes: UInt64(data.count), onProgress: onProgress)
         var cursor = 0
-        var chunkSize = creditAwareWriteChunkSize()
+        var chunkSize = await creditAwareWriteChunkSize()
         while let range = try SMBChunkedTransfer.nextWriteRange(cursor: cursor, dataCount: data.count, chunkSize: chunkSize) {
             try Task.checkCancellation()
             let chunk = Array(data[range])
             try await writeChunk(treeId: treeId, fileId: fileId, offset: UInt64(cursor), data: chunk)
             cursor = range.upperBound
             progress.emit(bytesTransferred: UInt64(cursor))
-            chunkSize = creditAwareWriteChunkSize()
+            chunkSize = await creditAwareWriteChunkSize()
         }
     }
 
@@ -3365,7 +3365,7 @@ actor SMBSession {
         var offset = startOffset
         while true {
             try Task.checkCancellation()
-            let chunkSize = creditAwareWriteChunkSize()
+            let chunkSize = await creditAwareWriteChunkSize()
             let chunk = try nextChunk(chunkSize)
             if chunk.isEmpty { break }
             try await writeChunk(treeId: treeId, fileId: fileId, offset: offset, data: chunk)
@@ -3953,8 +3953,13 @@ actor SMBSession {
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {
         try Task.checkCancellation()
-        recordCreditCharge(packet)
-        try await transport.send(DirectTCPFraming.frame(packet))
+        let reservedCharge = await reserveCredit(packet)
+        do {
+            try await transport.send(DirectTCPFraming.frame(packet))
+        } catch {
+            await refundCredit(charge: reservedCharge)
+            throw error
+        }
         try Task.checkCancellation()
     }
 
@@ -3981,8 +3986,13 @@ actor SMBSession {
             sender: .client
         )
         signed.replaceSubrange(48..<64, with: signature)
-        recordCreditCharge(signed)
-        try await transport.send(DirectTCPFraming.frame(signed))
+        let reservedCharge = await reserveCredit(signed)
+        do {
+            try await transport.send(DirectTCPFraming.frame(signed))
+        } catch {
+            await refundCredit(charge: reservedCharge)
+            throw error
+        }
         try Task.checkCancellation()
     }
 
@@ -4018,8 +4028,13 @@ actor SMBSession {
         }
         header.signature = sealed.tag
         try Task.checkCancellation()
-        recordCreditCharge(packet)
-        try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
+        let reservedCharge = await reserveCredit(packet)
+        do {
+            try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
+        } catch {
+            await refundCredit(charge: reservedCharge)
+            throw error
+        }
         try Task.checkCancellation()
     }
 
@@ -4072,20 +4087,26 @@ actor SMBSession {
         let body = try await receiveExactly(length)
         debugDump(label, body)
         let packet = body.starts(with: SMB3TransformHeader.protocolId) ? try decryptTransform(body) : body
-        recordCreditGrant(packet, label: label)
+        await recordCreditGrant(packet, label: label)
         return packet
     }
 
-    private func recordCreditCharge(_ packet: [UInt8]) {
-        guard let header = try? SMB2Header.decode(packet) else { return }
-        creditBalance = SMB2Credit.balanceAfterSending(current: creditBalance, charge: header.creditCharge)
-        debugLine("SMB credit charge=\(header.creditCharge) balance=\(creditBalance)")
+    private func reserveCredit(_ packet: [UInt8]) async -> UInt16 {
+        guard let header = try? SMB2Header.decode(packet) else { return 1 }
+        let balance = await creditWindow.reserve(charge: header.creditCharge)
+        debugLine("SMB credit charge=\(header.creditCharge) balance=\(balance)")
+        return header.creditCharge
     }
 
-    private func recordCreditGrant(_ packet: [UInt8], label: String) {
+    private func refundCredit(charge: UInt16) async {
+        let balance = await creditWindow.refund(charge: charge)
+        debugLine("SMB credit refund=\(charge) balance=\(balance)")
+    }
+
+    private func recordCreditGrant(_ packet: [UInt8], label: String) async {
         guard let header = try? SMB2Header.decode(packet) else { return }
-        creditBalance = SMB2Credit.balanceAfterReceiving(current: creditBalance, granted: header.credits)
-        debugLine("\(label) credit grant=\(header.credits) balance=\(creditBalance)")
+        let balance = await creditWindow.grant(header.credits)
+        debugLine("\(label) credit grant=\(header.credits) balance=\(balance)")
     }
 
     private func decryptTransform(_ packet: [UInt8]) throws -> [UInt8] {
@@ -4164,23 +4185,25 @@ actor SMBSession {
         return SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: maxReadSize, transformOverhead: transformOverhead)
     }
 
-    private func creditAwareWriteChunkSize() -> Int {
+    private func creditAwareWriteChunkSize() async -> Int {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
+        let availableCredits = await creditWindow.balance
         return SMBTransferLimits.creditWindowChunkSize(
             localLimit: 64 * 1024,
             negotiatedLimit: maxWriteSize,
             transformOverhead: transformOverhead,
-            availableCredits: creditBalance
+            availableCredits: availableCredits
         )
     }
 
-    private func creditAwareReadChunkSize() -> Int {
+    private func creditAwareReadChunkSize() async -> Int {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
+        let availableCredits = await creditWindow.balance
         return SMBTransferLimits.creditWindowChunkSize(
             localLimit: 64 * 1024,
             negotiatedLimit: maxReadSize,
             transformOverhead: transformOverhead,
-            availableCredits: creditBalance
+            availableCredits: availableCredits
         )
     }
 

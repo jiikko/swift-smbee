@@ -434,7 +434,10 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     multi-credit server での挙動を MS-SMB2 と実 packet で確認し、必要なら messageId/credit allocator を
     `SMBWireTransactionGate` の後継として設計する。
   - 2026-07-02: READ/WRITE の CreditCharge / CreditRequest、response grant tracking、credit-aware
-    chunk planner は実装済み。credit-window blocking allocator と真の multi-flight demux は未実装。
+    chunk planner は実装済み。
+  - 2026-07-02: `SMB2CreditWindow` actor を追加し、READ/WRITE 送信前に CreditCharge を reserve、
+    response の Credits を grant、send 失敗時は refund する blocking allocator に移行。真の
+    multi-flight demux は未実装。
 - [ ] resume / sparse file / integrity verification
   - 2026-07-02: `get` / `SMBee.download` / `SMBClient.download` に byte-level download resume を追加。
     `--resume` は既存 local file size から range read で追記する。upload resume、remote/local size と

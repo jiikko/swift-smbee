@@ -118,3 +118,59 @@ enum SMB2Credit {
         return overflow ? UInt32.max : sum
     }
 }
+
+actor SMB2CreditWindow {
+    private struct Waiter {
+        let charge: UInt16
+        let continuation: CheckedContinuation<UInt32, Never>
+    }
+
+    private var available: UInt32
+    private var waiters: [Waiter] = []
+
+    init(initialCredits: UInt32 = 1) {
+        self.available = initialCredits
+    }
+
+    var balance: UInt32 {
+        available
+    }
+
+    var pendingWaiterCount: Int {
+        waiters.count
+    }
+
+    func reserve(charge requestedCharge: UInt16) async -> UInt32 {
+        guard requestedCharge > 0 else { return available }
+        let charge = requestedCharge
+        if available >= UInt32(charge) {
+            available -= UInt32(charge)
+            return available
+        }
+        return await withCheckedContinuation { continuation in
+            waiters.append(Waiter(charge: charge, continuation: continuation))
+            resumeReadyWaiters()
+        }
+    }
+
+    func grant(_ credits: UInt16) -> UInt32 {
+        available = SMB2Credit.balanceAfterReceiving(current: available, granted: credits)
+        resumeReadyWaiters()
+        return available
+    }
+
+    func refund(charge requestedCharge: UInt16) -> UInt32 {
+        guard requestedCharge > 0 else { return available }
+        available = SMB2Credit.balanceAfterReceiving(current: available, granted: requestedCharge)
+        resumeReadyWaiters()
+        return available
+    }
+
+    private func resumeReadyWaiters() {
+        while let waiter = waiters.first, available >= UInt32(waiter.charge) {
+            waiters.removeFirst()
+            available -= UInt32(waiter.charge)
+            waiter.continuation.resume(returning: available)
+        }
+    }
+}

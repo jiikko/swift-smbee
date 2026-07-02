@@ -1444,6 +1444,47 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(SMB2Credit.balanceAfterReceiving(current: 1, granted: 4), 5)
     }
 
+    func testSMB2CreditWindowWaitsForGrant() async {
+        let window = SMB2CreditWindow(initialCredits: 1)
+
+        let firstReserve = await window.reserve(charge: 1)
+        XCTAssertEqual(firstReserve, 0)
+        let task = Task {
+            await window.reserve(charge: 2)
+        }
+        while await window.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+        let balanceBeforeGrant = await window.balance
+        XCTAssertEqual(balanceBeforeGrant, 0)
+
+        let firstGrant = await window.grant(1)
+        XCTAssertEqual(firstGrant, 1)
+        await Task.yield()
+        let balanceAfterPartialGrant = await window.balance
+        XCTAssertEqual(balanceAfterPartialGrant, 1)
+
+        let secondGrant = await window.grant(1)
+        XCTAssertEqual(secondGrant, 0)
+        let balanceAfterReserve = await task.value
+        XCTAssertEqual(balanceAfterReserve, 0)
+        let finalBalance = await window.balance
+        XCTAssertEqual(finalBalance, 0)
+    }
+
+    func testSMB2CreditWindowDoesNotConsumeZeroChargeRequests() async {
+        let window = SMB2CreditWindow(initialCredits: 1)
+
+        let reserve = await window.reserve(charge: 0)
+        XCTAssertEqual(reserve, 1)
+        let balance = await window.balance
+        XCTAssertEqual(balance, 1)
+        let refund = await window.refund(charge: 0)
+        XCTAssertEqual(refund, 1)
+        let grant = await window.grant(2)
+        XCTAssertEqual(grant, 3)
+    }
+
     func testMD4RFC1320Vectors() {
         XCTAssertEqual(hex(MD4.hash([])), "31d6cfe0d16ae931b73c59d7e0c089c0")
         XCTAssertEqual(hex(MD4.hash(Array("a".utf8))), "bde52cb31de33e46245e05fbdbd6fb24")

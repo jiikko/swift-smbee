@@ -246,16 +246,19 @@ struct Watch: AsyncParsableCommand {
             ) { event in
                 if json {
                     print(try SMBCLIOutput.jsonString(for: event))
-                    return
-                }
-                switch event {
-                case .overflow:
-                    print("overflow: rescan needed")
-                case .changes(let changes):
-                    for change in changes {
-                        print("\(formatChangeAction(change.action)) \(change.name)")
+                } else {
+                    switch event {
+                    case .overflow:
+                        print("overflow: rescan needed")
+                    case .changes(let changes):
+                        for change in changes {
+                            print("\(formatChangeAction(change.action)) \(change.name)")
+                        }
                     }
                 }
+                // stdout is fully buffered when redirected to a file/pipe (e.g. `watch --json > out.jsonl`),
+                // so streamed events would not surface until the process exits. Flush after each event.
+                fflush(stdout)
             }
         }
         let sigint = makeSIGINTSource {

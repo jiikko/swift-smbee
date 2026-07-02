@@ -746,6 +746,8 @@ File browser / backup / macOS metadata preservation を本格的にやるなら�
 
 ## README に書くべき limitations
 
+2026-07-02: README に下記 limitations を同期済み。
+
 `smbclient` として過大に見せないため、README には次を明記する。
 
 - SMB 3.x only。SMB 2.1 authenticated fallback は非対応 (probe-only、authenticated connect は診断付き `protocolError`)。

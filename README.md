@@ -35,6 +35,18 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 - [docs/compatibility-matrix.md](docs/compatibility-matrix.md) — Samba / macOS SMBX / Windows / NAS の実サーバ smoke 記録
 - [todo.md](todo.md) — 実装 TODO（Phase 0〜5 のチェックリスト）
 
+## 現時点の制限
+
+- 認証済み操作は SMB 3.x only。SMB 2.0.2 / 2.1 は probe-only で、接続時は診断付きエラーにする。
+- Kerberos / GSS は未対応。現状は NTLMv2 password / NT hash / anonymous を対象にする。
+- Windows SMB Server / NAS の実サーバ smoke は未完了。Samba と一部 macOS SMBX の確認が中心。
+- durable handle / lease / oplock / byte-range lock は未対応。
+- DFS referral は metadata 取得のみ。target への auto-follow は未対応。
+- reparse point / symlink target は `readlink` API で扱えるが、DFS reparse data decode と実サーバ smoke は未完了。
+- single-file download resume は対応済み。single-file upload byte-level resume、checksum verify、sparse file preservation は未対応。
+- macOS resource fork / xattr / named stream preservation は未対応。通常の data fork 転送を対象にする。
+- SMB1 / NetBIOS port 139 / printer share / SMB Direct(RDMA) / SMB over QUIC / multichannel / compression は未対応。
+
 ## 開発状況
 
 設計・実装の進行中。

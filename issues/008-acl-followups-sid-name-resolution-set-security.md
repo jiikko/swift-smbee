@@ -60,3 +60,9 @@ todo 319 では **書き込みを意図的に defer** した。理由:
 
 - 残タスクは A の LSARPC SID lookup。B は DACL write として完了済み。
 - owner/group/SACL write は別 backlog として扱う。
+
+## 2026-07-02 整理
+
+- issue title の SET_SECURITY は歴史的な残り名。現在の未完了スコープは domain/local account SID lookup。
+- DACL write は `smbcli setacl` と Samba round-trip E2E まで完了済み。
+- well-known SID 解決は `smbcli acl --resolve-sids` で完了済み。

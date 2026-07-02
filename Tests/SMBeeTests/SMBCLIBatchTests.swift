@@ -244,6 +244,8 @@ final class SMBCLIBatchTests: XCTestCase {
             "--replace",
             "--recursive",
             "--json",
+            "--verify",
+            "size",
             "--include",
             "*.dat",
             "--exclude",
@@ -254,6 +256,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(copy.replace)
         XCTAssertTrue(copy.recursive)
         XCTAssertTrue(copy.json)
+        XCTAssertEqual(copy.verify, .size)
         XCTAssertEqual(copy.include, ["*.dat"])
         XCTAssertEqual(copy.exclude, ["tmp*"])
 

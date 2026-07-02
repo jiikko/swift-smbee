@@ -758,9 +758,11 @@ struct Get: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         if recursive {
-            guard verify == .none else {
-                throw ValidationError("--verify is currently supported only for single-file get")
+            if verify != .none && dryRun {
+                throw ValidationError("--verify cannot be used with --dry-run")
             }
+            let verifier = RecursiveTransferVerifier()
+            let localDirectory = URL(fileURLWithPath: destination).standardizedFileURL
             // ⓥ Directory transfer progress is not exposed by the facade yet.
             try await transport.withOperationDeadline {
                 try await SMBee.downloadDirectory(
@@ -779,7 +781,19 @@ struct Get: AsyncParsableCommand {
                     include: include,
                     exclude: exclude,
                     perFileTimeout: transport.perFileDuration
-                ) { action in writeRecursiveAction(action) }
+                ) { action in
+                    writeRecursiveAction(action)
+                    verifier.record(action)
+                }
+            }
+            if verify == .size {
+                try await verifyRecursiveDownloadSizes(
+                    actions: verifier.actions,
+                    endpoint: endpoint,
+                    credential: credential,
+                    localDirectory: localDirectory,
+                    transport: transport
+                )
             }
             return
         }
@@ -913,9 +927,11 @@ struct Put: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: destination, auth: auth)
         if recursive {
-            guard verify == .none else {
-                throw ValidationError("--verify is currently supported only for single-file put")
+            if verify != .none && dryRun {
+                throw ValidationError("--verify cannot be used with --dry-run")
             }
+            let verifier = RecursiveTransferVerifier()
+            let localDirectory = URL(fileURLWithPath: source).standardizedFileURL
             // ⓥ Directory transfer progress is not exposed by the facade yet.
             try await transport.withOperationDeadline {
                 try await SMBee.uploadDirectory(
@@ -934,7 +950,19 @@ struct Put: AsyncParsableCommand {
                     include: include,
                     exclude: exclude,
                     perFileTimeout: transport.perFileDuration
-                ) { action in writeRecursiveAction(action) }
+                ) { action in
+                    writeRecursiveAction(action)
+                    verifier.record(action)
+                }
+            }
+            if verify == .size {
+                try await verifyRecursiveUploadSizes(
+                    actions: verifier.actions,
+                    endpoint: endpoint,
+                    credential: credential,
+                    localDirectory: localDirectory,
+                    transport: transport
+                )
             }
             return
         }
@@ -1071,6 +1099,9 @@ struct Copy: AsyncParsableCommand {
     @Flag(help: "Output a JSON success object")
     var json = false
 
+    @Option(help: "Verify completed recursive copy: none or size")
+    var verify: TransferVerifyMode = .none
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -1086,6 +1117,10 @@ struct Copy: AsyncParsableCommand {
         let to = try SMBURLParser.parseReadURL(destination)
         try validateSameShare(source: from, destination: to, commandName: "cp")
         if recursive {
+            if verify != .none && dryRun {
+                throw ValidationError("--verify cannot be used with --dry-run")
+            }
+            let verifier = RecursiveTransferVerifier()
             try await transport.withOperationDeadline {
                 try await SMBee.copyDirectory(
                     host: from.host,
@@ -1102,7 +1137,13 @@ struct Copy: AsyncParsableCommand {
                     include: include,
                     exclude: exclude,
                     perFileTimeout: transport.perFileDuration
-                ) { action in writeRecursiveAction(action) }
+                ) { action in
+                    writeRecursiveAction(action)
+                    verifier.record(action)
+                }
+            }
+            if verify == .size {
+                try await verifyRecursiveCopySizes(actions: verifier.actions, source: from, destination: to, credential: credential, transport: transport)
             }
             if json && !dryRun {
                 print(try successJSONString(command: "cp", path: to.path))
@@ -1274,6 +1315,131 @@ private func localFileSize(_ url: URL) throws -> UInt64 {
     if let value = raw as? UInt64 { return value }
     if let value = raw as? Int, value >= 0 { return UInt64(value) }
     throw ValidationError("local file size unavailable")
+}
+
+private final class RecursiveTransferVerifier: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBRecursiveAction] = []
+
+    var actions: [SMBRecursiveAction] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func record(_ action: SMBRecursiveAction) {
+        switch action.kind {
+        case .download, .upload, .copy:
+            lock.lock()
+            storage.append(action)
+            lock.unlock()
+        case .delete, .mkdir, .skip:
+            break
+        }
+    }
+}
+
+private func verifyRecursiveDownloadSizes(
+    actions: [SMBRecursiveAction],
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    localDirectory: URL,
+    transport: TransportOptions
+) async throws {
+    for action in actions where action.kind == .download {
+        let localFile = URL(fileURLWithPath: action.path).standardizedFileURL
+        let relativePath = try localRelativePath(file: localFile, directory: localDirectory)
+        let remotePath = try SMBPath.join(endpoint.path, relativePath)
+        try await verifyDownloadedSize(
+            endpoint: endpoint.withPath(remotePath),
+            credential: credential,
+            localFile: localFile,
+            transport: transport
+        )
+    }
+}
+
+private func verifyRecursiveUploadSizes(
+    actions: [SMBRecursiveAction],
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    localDirectory: URL,
+    transport: TransportOptions
+) async throws {
+    for action in actions where action.kind == .upload {
+        let relativePath = try remoteRelativePath(path: action.path, root: endpoint.path)
+        let localFile = localDirectory.appendingPathComponent(relativePath.replacingOccurrences(of: "\\", with: "/"))
+        try await verifyUploadedSize(
+            endpoint: endpoint.withPath(action.path),
+            credential: credential,
+            localFile: localFile,
+            transport: transport
+        )
+    }
+}
+
+private func verifyRecursiveCopySizes(
+    actions: [SMBRecursiveAction],
+    source: SMBURLParser.ReadURL,
+    destination: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    transport: TransportOptions
+) async throws {
+    for action in actions where action.kind == .copy {
+        let relativePath = try remoteRelativePath(path: action.path, root: destination.path)
+        let sourcePath = try SMBPath.join(source.path, relativePath)
+        let sourceStat = try await statForVerify(endpoint: source.withPath(sourcePath), credential: credential, transport: transport)
+        let destinationStat = try await statForVerify(endpoint: destination.withPath(action.path), credential: credential, transport: transport)
+        guard sourceStat.size == destinationStat.size else {
+            throw ValidationError("size verification failed: source=\(sourceStat.size) destination=\(destinationStat.size)")
+        }
+    }
+}
+
+private func statForVerify(
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    transport: TransportOptions
+) async throws -> SMBFileStat {
+    try await transport.withOperationDeadline {
+        try await SMBee.stat(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            timeout: transport.duration
+        )
+    }
+}
+
+private func localRelativePath(file: URL, directory: URL) throws -> String {
+    let filePath = file.standardizedFileURL.path
+    let directoryPath = directory.standardizedFileURL.path
+    let prefix = directoryPath.hasSuffix("/") ? directoryPath : directoryPath + "/"
+    guard filePath.hasPrefix(prefix) else {
+        throw ValidationError("downloaded file is outside destination directory: \(filePath)")
+    }
+    return String(filePath.dropFirst(prefix.count)).replacingOccurrences(of: "/", with: "\\")
+}
+
+private func remoteRelativePath(path: String, root: String) throws -> String {
+    let normalizedPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+    let normalizedRoot = root.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+    guard !normalizedRoot.isEmpty else { return normalizedPath }
+    guard normalizedPath == normalizedRoot || normalizedPath.hasPrefix(normalizedRoot + "\\") else {
+        throw ValidationError("recursive action path is outside destination root: \(path)")
+    }
+    if normalizedPath == normalizedRoot { return "" }
+    return String(normalizedPath.dropFirst(normalizedRoot.count + 1))
+}
+
+private extension SMBURLParser.ReadURL {
+    func withPath(_ path: String) -> SMBURLParser.ReadURL {
+        var copy = self
+        copy.path = path
+        return copy
+    }
 }
 
 private func makeRemoteParentDirectories(

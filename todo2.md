@@ -442,6 +442,8 @@ Linux/macOS smbclient として必要な理由:
   local file を seek して WRITE 再開できる。
 - 2026-07-02: `smbcli get --verify size` / `smbcli put --verify size` を追加。単一 file 転送後に
   local/remote size を照合できる。recursive verify と hash verify は未実装。
+- 2026-07-02: recursive `get -r` / `put -r` / `cp -r --verify size` を追加。成功した file action だけを
+  local/remote または source/destination stat で照合する。hash verify は未実装。
 - checksum verification はない。
 - sparse file / zero range は未実装。
 

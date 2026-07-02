@@ -448,6 +448,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `--per-file-timeout` を追加。`--operation-timeout` は全体、`--per-file-timeout` は各 file 転送を bound する。
   - 2026-07-02: `smbcli get --verify size` / `smbcli put --verify size` を追加。単一 file 転送後に
     local/remote size を照合する。hash verify と recursive verify は未実装。
+  - 2026-07-02: recursive `get -r` / `put -r` / `cp -r --verify size` を追加。成功した file action だけを
+    local/remote または source/destination stat で照合する。hash verify は未実装。
   - 2026-07-02: single-file `get` / `put` に `--create-dirs` を追加。`get` は local parent、
     `put` は remote parent を作成する。
   - 2026-07-02: mutating commands (`get` / `put` / `cp` / `mv` / `rm` / `mkdir` / `setacl`) に

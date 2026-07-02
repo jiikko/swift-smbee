@@ -1675,6 +1675,7 @@ public enum SMBClient {
         path: String,
         localFile: URL,
         overwrite: Bool = true,
+        resume: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
@@ -1685,10 +1686,35 @@ public enum SMBClient {
         let directory = destination.deletingLastPathComponent()
         let temporary = directory.appendingPathComponent(".\(destination.lastPathComponent).smbee-\(UUID().uuidString).tmp")
 
-        guard overwrite || !fileManager.fileExists(atPath: destination.path) else {
+        guard overwrite || resume || !fileManager.fileExists(atPath: destination.path) else {
             throw SMBCodecError.invalidValue("local destination already exists")
         }
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        if resume, fileManager.fileExists(atPath: destination.path) {
+            let existingSize = try localFileSize(at: destination, fileManager: fileManager)
+            let handle = try FileHandle(forWritingTo: destination)
+            do {
+                try handle.seekToEnd()
+                try await withReadStream(
+                    host: host,
+                    port: port,
+                    share: share,
+                    path: path,
+                    range: SMBReadRange(offset: existingSize, length: UInt64.max),
+                    credential: credential,
+                    timeout: timeout,
+                    makeTransport: makeTransport,
+                    onProgress: onProgress
+                ) { chunk in
+                    try handle.write(contentsOf: Data(chunk))
+                }
+                try handle.close()
+            } catch {
+                try? handle.close()
+                throw error
+            }
+            return
+        }
         fileManager.createFile(atPath: temporary.path, contents: nil)
         let handle = try FileHandle(forWritingTo: temporary)
         do {
@@ -1724,6 +1750,7 @@ public enum SMBClient {
         path: String,
         localFile: URL,
         overwrite: Bool = true,
+        resume: Bool = false,
         credentialProvider: SMBCredentialProvider,
         makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
     ) async throws {
@@ -1734,6 +1761,7 @@ public enum SMBClient {
             path: path,
             localFile: localFile,
             overwrite: overwrite,
+            resume: resume,
             credential: try await credentialProvider(),
             makeTransport: makeTransport
         )

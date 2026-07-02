@@ -460,6 +460,7 @@ public enum SMBee {
         path: String,
         localFile: URL,
         overwrite: Bool = true,
+        resume: Bool = false,
         timeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
@@ -470,6 +471,7 @@ public enum SMBee {
             path: path,
             localFile: localFile,
             overwrite: overwrite,
+            resume: resume,
             credential: credential,
             timeout: timeout,
             onProgress: onProgress
@@ -483,7 +485,8 @@ public enum SMBee {
         share: String,
         path: String,
         localFile: URL,
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        resume: Bool = false
     ) async throws {
         try await SMBClient.download(
             host: host,
@@ -492,6 +495,7 @@ public enum SMBee {
             path: path,
             localFile: localFile,
             overwrite: overwrite,
+            resume: resume,
             credentialProvider: credentialProvider
         )
     }

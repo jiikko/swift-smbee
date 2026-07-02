@@ -4386,6 +4386,38 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testDownloadResumeAppendsFromExistingLocalSize() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
+        let destination = directory.appendingPathComponent("download.txt")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("hello ".utf8).write(to: destination)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2QueryInfoResponse(size: 11, messageId: 5, treeId: 0x3344),
+            smb2ReadResponse(Array("world".utf8), messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        try await SMBee.download(
+            host: "server",
+            credential: SMBCredential(username: "user", password: "pass"),
+            share: "share",
+            path: "remote.txt",
+            localFile: destination,
+            overwrite: false,
+            resume: true
+        )
+
+        XCTAssertEqual(try Data(contentsOf: destination), Data("hello world".utf8))
+    }
+
     func testDownloadDirectoryAtomicSuccessReplacesFromStagingAndCleansUp() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-unit-\(UUID().uuidString)")
         let destination = root.appendingPathComponent("downloaded")

@@ -430,8 +430,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
   - 2026-07-02: READ/WRITE の CreditCharge / CreditRequest、response grant tracking、credit-aware
     chunk planner は実装済み。credit-window blocking allocator と真の multi-flight demux は未実装。
 - [ ] resume / sparse file / integrity verification
-  - `get` / `put` / `cp` は streaming だが中断後 resume は未実装。remote/local size と mtime/hash
-    照合、range read/write による resume、既存 partial file の扱いを設計する。
+  - 2026-07-02: `get` / `SMBee.download` / `SMBClient.download` に byte-level download resume を追加。
+    `--resume` は既存 local file size から range read で追記する。upload resume、remote/local size と
+    mtime/hash 照合、verify は未実装。
   - sparse file / allocation size / zero range の扱いも未実装。巨大 VM image や backup 用途では
     通信量と local disk 使用量に影響するため、`FSCTL_SET_ZERO_DATA` 等を調査する。
   - 暗号化 transport の integrity とは別に、consumer visible な transfer verification (size / optional hash)

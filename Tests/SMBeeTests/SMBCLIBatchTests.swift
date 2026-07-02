@@ -153,12 +153,13 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(cat.range, "2-9")
         XCTAssertTrue(cat.debug.traceWire)
 
-        let get = try Get.parse(["smb://user@host/share/dir", "/tmp/out", "--recursive", "--no-overwrite", "--progress"])
+        let get = try Get.parse(["smb://user@host/share/dir", "/tmp/out", "--recursive", "--no-overwrite", "--progress", "--resume"])
         XCTAssertEqual(get.source, "smb://user@host/share/dir")
         XCTAssertEqual(get.destination, "/tmp/out")
         XCTAssertTrue(get.recursive)
         XCTAssertTrue(get.noOverwrite)
         XCTAssertTrue(get.progress)
+        XCTAssertTrue(get.resume)
 
         let put = try Put.parse(["/tmp/in", "smb://user@host/share/file.txt", "--recursive", "--no-overwrite", "--progress"])
         XCTAssertEqual(put.source, "/tmp/in")

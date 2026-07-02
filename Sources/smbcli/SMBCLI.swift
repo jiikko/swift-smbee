@@ -686,6 +686,9 @@ struct Get: AsyncParsableCommand {
     @Flag(help: "Skip recursive items whose destination already exists")
     var skipExisting = false
 
+    @Flag(help: "Resume partial downloads when possible")
+    var resume = false
+
     @Flag(help: "Show planned recursive actions without modifying destinations")
     var dryRun = false
 
@@ -716,6 +719,7 @@ struct Get: AsyncParsableCommand {
                 overwrite: !noOverwrite,
                 continueOnError: continueOnError,
                 skipExisting: skipExisting,
+                resume: resume,
                 dryRun: dryRun,
                 timeout: transport.duration
             ) { action in writeRecursiveAction(action) }
@@ -736,6 +740,7 @@ struct Get: AsyncParsableCommand {
             path: endpoint.path,
             localFile: URL(fileURLWithPath: destination),
             overwrite: !noOverwrite,
+            resume: resume,
             timeout: transport.duration,
             onProgress: onProgress
         )

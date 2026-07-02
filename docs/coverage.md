@@ -34,10 +34,10 @@ Status labels:
 | QUERY_DIRECTORY streaming | MS-SMB2 3.2.4.18 | `SMBClient.swift`, `SMBee.withDirectoryStream` | yes | yes | smoke | no | covered | Existing `list` collector remains for compatibility. |
 | QUERY_INFO stat | MS-SMB2, MS-FSCC | `SMB2ReadCodecs.swift`, `SMBClient.swift` | yes | yes | smoke | no | covered | Reparse target data is not decoded. |
 | READ full/range/streaming | MS-SMB2 3.2.4.6 | `SMBClient.swift`, `SMBee.withReadStream` | yes | yes | smoke | no | covered | >4GiB E2E is gated/manual. |
-| WRITE upload/streaming | MS-SMB2 3.2.4.8 | `SMBClient.swift` | yes | yes | smoke | no | covered | Single-file byte-level resume is unsupported. |
+| WRITE upload/streaming | MS-SMB2 3.2.4.8 | `SMBClient.swift` | yes | yes | smoke | no | covered | Single-file upload byte-level resume is unsupported. |
 | CreditCharge / CreditRequest | MS-SMB2 3.2.4.1 | `SMB2Credit`, `SMB2Read`, `SMB2Write`, `SMBSession`, `SMBTransferLimits` | yes | no | no | no | partial | READ/WRITE charge, response grant tracking, and credit-capped chunk planning are implemented. Credit-window blocking and multi-flight allocator are not implemented. |
 | mkdir / rename / delete | MS-SMB2 CREATE, SET_INFO | `SMBClient.swift` | yes | yes | smoke | no | covered | Mutation retry is intentionally conservative. |
-| recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | No true transactional directory atomicity; partial-file byte resume and checksum verify are unsupported. |
+| recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | No true transactional directory atomicity; directory resume is size-based skip and checksum verify is unsupported. |
 | server-side copychunk | MS-FSCC FSCTL_SRV_COPYCHUNK | `SMBClient.swift` | yes | fallback observed | no | no | underverified | Samba test FS returns unsupported and exercises fallback; offload-capable server smoke is missing. |
 | change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications`, `smbcli watch --json` | yes | yes | no | no | underverified | Reconnect/resubscribe is not implemented. |
 

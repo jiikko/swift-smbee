@@ -1,0 +1,15 @@
+name: Samba logs and teardown
+description: "Dump the Samba container logs (debug) and force-remove it. Use with if-always."
+inputs:
+  container:
+    description: Samba container name
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Samba logs (debug)
+      shell: bash
+      run: docker logs "${{ inputs.container }}" || true
+    - name: Teardown
+      shell: bash
+      run: docker rm -f "${{ inputs.container }}" || true

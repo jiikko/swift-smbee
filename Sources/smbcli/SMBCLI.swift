@@ -91,11 +91,13 @@ struct Probe: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let endpoint = try SMBURLParser.parseServerURL(url)
-        let result = try await SMBProbe.probe(
-            host: endpoint.host,
-            port: endpoint.port,
-            makeTransport: { POSIXSocketTransport(timeout: transport.duration) }
-        )
+        let result = try await transport.withOperationDeadline {
+            try await SMBProbe.probe(
+                host: endpoint.host,
+                port: endpoint.port,
+                makeTransport: { POSIXSocketTransport(timeout: transport.duration) }
+            )
+        }
         if json {
             print(try SMBCLIOutput.jsonString(for: result))
             return
@@ -143,20 +145,22 @@ struct List: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
         let collector = DirectoryEntryCollector()
-        try await SMBee.withDirectoryStream(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            path: endpoint.path,
-            timeout: transport.duration
-        ) { entry in
-            if json {
-                collector.append(entry)
-                return
+        try await transport.withOperationDeadline {
+            try await SMBee.withDirectoryStream(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                path: endpoint.path,
+                timeout: transport.duration
+            ) { entry in
+                if json {
+                    collector.append(entry)
+                    return
+                }
+                let kind = entry.isDirectory ? "d" : "-"
+                print("\(kind) \(entry.fileSize) \(entry.name)")
             }
-            let kind = entry.isDirectory ? "d" : "-"
-            print("\(kind) \(entry.fileSize) \(entry.name)")
         }
         if json {
             print(try SMBCLIOutput.jsonString(for: collector.entries))
@@ -182,13 +186,15 @@ struct Ping: AsyncParsableCommand {
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
-        try await SMBee.echo(
-            host: endpoint.host,
-            port: endpoint.port,
-            credential: credential,
-            share: endpoint.share,
-            timeout: transport.duration
-        )
+        try await transport.withOperationDeadline {
+            try await SMBee.echo(
+                host: endpoint.host,
+                port: endpoint.port,
+                credential: credential,
+                share: endpoint.share,
+                timeout: transport.duration
+            )
+        }
         print("ok")
     }
 }
@@ -1023,10 +1029,27 @@ struct TransportOptions: ParsableArguments {
     @Option(name: .long, help: "Socket I/O timeout in seconds (connect and each recv/send)")
     var timeout: Double?
 
+    @Option(name: .long, help: "Overall operation timeout in seconds")
+    var operationTimeout: Double?
+
     var duration: Duration? {
-        guard let timeout else { return nil }
-        let wholeSeconds = timeout.rounded(.towardZero)
-        let fractionalSeconds = timeout - wholeSeconds
+        Self.duration(from: timeout)
+    }
+
+    var operationDuration: Duration? {
+        Self.duration(from: operationTimeout)
+    }
+
+    func withOperationDeadline<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await SMBOperationDeadline.run(timeout: operationDuration, operation: operation)
+    }
+
+    private static func duration(from seconds: Double?) -> Duration? {
+        guard let seconds else { return nil }
+        let wholeSeconds = seconds.rounded(.towardZero)
+        let fractionalSeconds = seconds - wholeSeconds
         return .seconds(Int64(wholeSeconds)) + .nanoseconds(Int64((fractionalSeconds * 1_000_000_000).rounded()))
     }
 }

@@ -63,7 +63,7 @@ Status labels:
 | JSON output | CLI | `SMBCLIOutput.swift`, `smbcli`, `docs/smbcli-json.md` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands use exit status as their stable success/failure signal. |
 | exit codes | CLI | `SMBCLI.swift`, `docs/smbcli-exit-codes.md` | yes | yes | no | no | covered | Keep exhaustive mapping as `SMBError` evolves. |
 | debug redaction | operational | `SMBDebug.swift`, `smbcli --debug/--trace-wire` | yes | yes | no | no | covered | Raw wire trace remains explicitly opt-in. |
-| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBTransferProgress.swift` | yes | yes | no | no | partial | Socket-level timeout only; full operation deadline is future work. |
+| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. Operation deadline helper and `--operation-timeout` exist for probe/ls/ping; full API/CLI coverage is future work. |
 
 ## Release Blockers
 

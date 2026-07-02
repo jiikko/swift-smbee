@@ -1760,6 +1760,46 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNil(names[1])
     }
 
+    func testSparseSessionOperationsDriveFsctlsOverTransport() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        var allocated = SMBByteWriter()
+        allocated.writeUInt64LE(0)
+        allocated.writeUInt64LE(64 * 1024)
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            // setSparse: create, ioctl(SET_SPARSE), close
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2IoctlResponse(output: [], status: SMB2Status.success, messageId: 5, treeId: 0x3344, fileId: fileId, ctlCode: SMB2Ioctl.fsctlSetSparse),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
+            // zeroRange: create, ioctl(SET_ZERO_DATA), close
+            smb2CreateResponse(fileId: fileId, messageId: 7, treeId: 0x3344),
+            smb2IoctlResponse(output: [], status: SMB2Status.success, messageId: 8, treeId: 0x3344, fileId: fileId, ctlCode: SMB2Ioctl.fsctlSetZeroData),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 9, treeId: 0x3344),
+            // allocatedRanges: create, ioctl(QUERY_ALLOCATED_RANGES), close
+            smb2CreateResponse(fileId: fileId, messageId: 10, treeId: 0x3344),
+            smb2IoctlResponse(output: allocated.bytes, status: SMB2Status.success, messageId: 11, treeId: 0x3344, fileId: fileId, ctlCode: SMB2Ioctl.fsctlQueryAllocatedRanges),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 12, treeId: 0x3344),
+        ]))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        let session = try await SMBee.connect(host: "server", credential: .anonymous, share: "share")
+        try await session.setSparse(path: "vm.img")
+        try await session.zeroRange(path: "vm.img", offset: 64 * 1024, length: 64 * 1024)
+        let ranges = try await session.allocatedRanges(path: "vm.img", length: 256 * 1024)
+        XCTAssertEqual(ranges, [SMBAllocatedRange(offset: 0, length: 64 * 1024)])
+
+        let requests = try unframed(transport.outbound)
+        let ioctlCodes = requests.compactMap { request -> UInt32? in
+            guard (try? SMB2Header.decode(request))?.command == SMB2Commands.ioctl else { return nil }
+            return readUInt32LE(request, at: 68)
+        }
+        XCTAssertEqual(ioctlCodes, [
+            SMB2Ioctl.fsctlSetSparse,
+            SMB2Ioctl.fsctlSetZeroData,
+            SMB2Ioctl.fsctlQueryAllocatedRanges,
+        ])
+    }
+
     func testSparseFileFsctlCodecs() throws {
         XCTAssertEqual(SMB2SparseFile.encodeSetSparseInput(true), [1])
         XCTAssertEqual(SMB2SparseFile.encodeSetSparseInput(false), [0])

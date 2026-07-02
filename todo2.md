@@ -52,13 +52,13 @@
 |---|---|---|
 | direct TCP 445 transport | implemented | `docs/smb-protocol.md` は direct TCP 445 + 4 byte length framing を MVP として定義。`SMBClient` は default factory で `POSIXSocketTransport` を使う。 |
 | SMB 3.0 / 3.0.2 / 3.1.1 authenticated dialect | implemented | `SMBNegotiateCodec.authenticatedDialects = [0x0300, 0x0302, 0x0311]`。 |
-| SMB 2.0.2 / 2.1 probe | implemented | `SMBNegotiateCodec.probeDialects` には 0x0202 / 0x0210 も含まれる。ただし authenticated path では未対応。 |
+| SMB 2.0.2 / 2.1 probe | implemented | `SMBNegotiateCodec.probeDialects` には 0x0202 / 0x0210 も含まれる。authenticated path は SMB 3.x only とし、2.1 以下は診断付き `protocolError`。 |
 | NTLMv2 password auth | implemented | `NTLM.makeType1` / `NTLM.makeType3`。MIC、KEY_EXCH、NT hash 派生あり。 |
 | NT hash credential | implemented | `SMBCredential(username:ntHash:domain:)`、CLI `--nt-hash` / `SMB_NT_HASH`。 |
 | anonymous / guest auth | implemented | `SMBCredential.anonymous`、CLI `--anonymous` / `--guest`。Samba guest E2E 記録あり。 |
 | SPNEGO NTLM wrapping | implemented | NTLM OID 前提。Kerberos mech は未実装。 |
 | SMB 3.0.2 signing/encryption | implemented | AES-CMAC / AES-128-CCM。Samba encrypted-required E2E + macOS SMBX smoke 記録あり。 |
-| SMB 3.1.1 signing/encryption | implemented-but-underverified | AES-GMAC / AES-128-GCM 実装あり。`samba-compat.yml` では 3.1.1 signing/encrypted profile を full E2E で回すが、PR/push の `e2e.yml` は 3.1.1 encrypted を negotiate scope に留めている。 |
+| SMB 3.1.1 signing/encryption | implemented-but-underverified | AES-GMAC / AES-128-GCM 実装あり。`samba-compat.yml` では 3.1.1 signing/encrypted profile を full E2E、PR/push の `e2e.yml` では 3.1.1 signing-only / encrypted の authenticated fast smoke を回す。Windows/NAS 実サーバ smoke は未実施。 |
 | NEGOTIATE / SESSION_SETUP / TREE_CONNECT / CREATE / CLOSE / FLUSH / READ / WRITE / QUERY_DIRECTORY / QUERY_INFO / SET_INFO / IOCTL / CHANGE_NOTIFY / TREE_DISCONNECT / LOGOFF | implemented | `SMB2Commands` と codec / session / facade に実装あり。 |
 | ls / stat / cat / range read / streaming read | implemented | `SMBee.list` / `stat` / `read` / `withReadStream`、`smbcli ls/stat/cat`。 |
 | put / get / mkdir / mv / rm / cp | implemented | `SMBee.upload` / `download` / `makeDirectory` / `rename` / `delete` / `copy`、CLI サブコマンド。 |
@@ -75,7 +75,7 @@
 
 ### P0-1. 互換 matrix を実サーバで埋める
 
-状態: `missing` / `implemented-but-underverified`
+状態: `partial` / `implemented-but-underverified`
 
 現状:
 
@@ -83,6 +83,7 @@
 - macOS SMBX は 3.0.2 の基本 smoke 記録あり。
 - Windows SMB Server / Windows Pro / NAS は未実測。
 - `docs/testing.md` でも「Samba green は macOS SMBX / Windows SMB Server の保証ではない」として Tier 3 smoke を要求している。
+- 2026-07-02: `docs/compatibility-matrix.md` と `bin/e2e/smoke-real-server.sh` を追加。実サーバ smoke の記録先と共通手順はできた。残は Windows / NAS / macOS SMBX の再実行結果を埋めること。
 
 やること:
 
@@ -111,13 +112,13 @@
 
 ### P0-2. SMB 3.1.1 authenticated full E2E を PR/push gate に昇格する
 
-状態: `implemented-but-underverified`
+状態: `implemented`
 
 現状:
 
 - `todo.md` 上は SMB 3.1.1 GMAC signing-only / GCM encrypted session が実 Samba E2E green と記録されている。
 - `.github/workflows/samba-compat.yml` は `smb311-signing-required` と `smb311-encrypted-required` を full `SMBeeE2ETests` で回す。
-- ただし `.github/workflows/e2e.yml` の PR/push matrix は `smb311-encrypted-required` を `testProbeNegotiatesExpectedProfile` の negotiate-only にしている。
+- 2026-07-02: `.github/workflows/e2e.yml` の PR/push matrix に `smb311-signing-required` / `smb311-encrypted-required` の authenticated fast smoke (`SMBeeE2ETests.testAuthenticatedFastSmoke`) を追加。push run `28559961166` で E2E success。
 
 やること:
 
@@ -138,13 +139,14 @@
 
 ### P0-3. coverage matrix を仕様ID単位で固定する
 
-状態: `missing`
+状態: `implemented`
 
 現状:
 
 - `docs/smb-protocol.md` は仕様の地図。
 - `todo.md` は時系列の進捗台帳。
 - ただし、MS-SMB2 / MS-FSCC / MS-NLMP のどの節をどこまで実装したかを一覧できる doc がない。
+- 2026-07-02: `docs/coverage.md` を追加し、README からリンク。feature / spec / implementation / unit / Samba E2E / macOS smoke / Windows-NAS / status / limitation を一覧化。
 
 やること:
 
@@ -202,43 +204,41 @@ Linux/macOS smbclient として必要な理由:
 
 ### P1-2. SMB 2.1 authenticated fallback の方針決定
 
-状態: `missing` for authenticated path / `implemented` for probe only
+状態: `implemented` policy / `implemented` diagnostic / `implemented` for probe only
 
 実装確認:
 
 - `SMBNegotiateCodec.probeDialects` は 0x0202 / 0x0210 / 0x0300 / 0x0302 / 0x0311。
 - `SMBNegotiateCodec.authenticatedDialects` は 0x0300 / 0x0302 / 0x0311 のみ。
 - `docs/smb-protocol.md` の MVP は SMB 3.x サーバ。
+- 2026-07-02: 方針確定。SMBee authenticated operations は SMB 3.x only を維持する。SMB 2.0.2 / 2.1 は probe-only。authenticated NEGOTIATE response が 2.1 以下なら `SMBError.protocolError(SMBNegotiateCodec.authenticatedUnsupportedMessage)` で SESSION_SETUP 前に停止する unit を追加。
 
 Linux/macOS smbclient として必要な理由:
 
 - 古いNASや古いWindows/Sambaでは SMB 2.1 までの構成が残る。
 - ただし SMB 2.1 は encryption がなく、security policy を下げることになる。
 
-やること:
+やったこと:
 
-- 決める:
-  - SMBee は SMB 3.x only として明示し続ける。
-  - それとも `--allow-smb21` 的な opt-in で SMB 2.1 authenticated path を実装する。
-- 実装する場合:
-  - SMB 2.1 signing path を MS-SMB2 で再確認する。
-  - encryption unavailable を API/CLI で明示する。
-  - connect policy に minimum dialect / maximum dialect を追加する。
+- README / `docs/smb-protocol.md` / `docs/coverage.md` に SMB 3.x only と SMB 2.1 probe-only を明記。
+- `SMBNegotiateCodec.supportsAuthenticatedConnection(dialect:)` と診断文字列を追加。
+- SMB 2.1 response で SESSION_SETUP に進まない unit を追加。
 
 完了条件:
 
-- README / coverage matrix に「SMB 2.1 は非対応」または「opt-in 対応」と明記される。
-- 非対応なら、2.1 only server へ接続した時に診断しやすい error を返す。
+- [x] README / coverage matrix に「SMB 2.1 は非対応」または「opt-in 対応」と明記される。
+- [x] 非対応なら、2.1 only server へ接続した時に診断しやすい error を返す。
 
 ### P1-3. SMB2 credit accounting / multi-credit IO
 
-状態: `missing`
+状態: `partial`
 
 実装確認:
 
 - `SMB2Header` は `creditCharge` / `credits` field を持つが、default は `creditCharge = 0`, `credits = 1`。
 - `todo.md` にも CreditCharge / CreditRequest / CreditResponse を管理していないと記録されている。
 - read/write は negotiated MaxRead/MaxWriteSize と transform overhead で chunk を抑えているが、credit window を allocator として扱っていない。
+- 2026-07-02: 最小 credit accounting を追加。READ/WRITE request は payload length から `CreditCharge` を計算し、`CreditRequest` も同値に設定する。`SMBSession` は送信時に charge を消費し、response header の `credits` grant を balance に加算して debug trace できる。まだ credit-window blocking / multi-flight allocator は未実装。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -247,11 +247,10 @@ Linux/macOS smbclient として必要な理由:
 
 やること:
 
-- response の Credits granted を session state に保持する。
-- payload size から CreditCharge を計算する。
-- CreditRequest を適切に設定する。
+- credit-window が足りない時に待つ allocator を実装する。
+- multi-flight 化する場合は messageId/async response demux と合わせて設計する。
 - large read/write/copychunk と encryption overhead を含む chunk planner を作る。
-- unit: header credit fields / allocator。
+- unit: allocator。
 - E2E: large file read/write を 1MiB 超、4GiB 境界、encrypted session で実行。
 
 完了条件:
@@ -738,21 +737,11 @@ File browser / backup / macOS metadata preservation を本格的にやるなら�
 - issue 008 を更新し、SET_SECURITY 部分を done にする。
 - SID lookup だけを新 issue に分離する。
 
-### `docs/testing.md` と `.github/workflows/e2e.yml` の 3.1.1 記述
-
-- `docs/testing.md` / `e2e.yml` には「3.1.1 full authenticated E2E は compat / 修正対象」という古い文脈が残っている可能性がある。
-- `samba-compat.yml` では full `SMBeeE2ETests` を 3.1.1 profiles に対して回している。
-
-対応:
-
-- 3.1.1 の正しい現状を1つに揃える。
-- PR/push gate と scheduled compat の役割を明文化する。
-
 ## README に書くべき limitations
 
 `smbclient` として過大に見せないため、README には次を明記する。
 
-- SMB 3.x first。SMB 2.1 authenticated fallback は未対応または opt-in 方針未決。
+- SMB 3.x only。SMB 2.1 authenticated fallback は非対応 (probe-only、authenticated connect は診断付き `protocolError`)。
 - Kerberos / GSS は未対応。現状は NTLMv2 / NT hash / anonymous。
 - Windows SMB Server / NAS は smoke 未完了。
 - durable handle / lease / oplock / byte-range lock は未対応。
@@ -764,16 +753,13 @@ File browser / backup / macOS metadata preservation を本格的にやるなら�
 
 ## 推奨実装順
 
-1. P0-1 compatibility matrix + real server smoke
-2. P0-2 3.1.1 authenticated PR/push gate
-3. P0-3 docs/coverage.md
-4. P1-3 credit accounting / multi-credit
-5. P1-2 SMB 2.1 policy decision
-6. P1-7 multi-tree session model
-7. P1-8 DFS real E2E + optional auto-follow
-8. P1-9 reparse target resolution
-9. P1-10 byte-level resume / verification
-10. P1-1 Kerberos/GSS only if real user/server requirements demand it
+1. P0-1 compatibility matrix の実サーバ結果埋め (Windows / NAS / macOS SMBX re-run)
+2. P1-3 credit accounting / multi-credit
+3. P1-7 multi-tree session model
+4. P1-8 DFS real E2E + optional auto-follow
+5. P1-9 reparse target resolution
+6. P1-10 byte-level resume / verification
+7. P1-1 Kerberos/GSS only if real user/server requirements demand it
 
 ## 完了の定義
 

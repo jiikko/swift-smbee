@@ -223,10 +223,18 @@ final class SMBeeE2ETests: XCTestCase {
         let file = "\(directory)\\roundtrip.txt"
         let payload = Array("fast smoke \(suffix)\n".utf8)
 
+        try await SMBee.echo(host: host, port: port, credential: credential, share: share)
         try await SMBee.makeDirectory(host: host, port: port, credential: credential, share: share, path: directory)
         do {
             let rootEntries = try await SMBee.list(host: host, port: port, credential: credential, share: share)
             XCTAssertTrue(rootEntries.contains { $0.name == "known.txt" && !$0.isDirectory })
+
+            let session = try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+            let scopedEntries = try await session.withTree(share: share) { tree in
+                try await tree.list()
+            }
+            await session.close()
+            XCTAssertTrue(scopedEntries.contains { $0.name == "known.txt" && !$0.isDirectory })
 
             try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: file, data: payload)
             let stat = try await SMBee.stat(host: host, port: port, credential: credential, share: share, path: file)

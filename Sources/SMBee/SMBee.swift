@@ -51,6 +51,18 @@ public enum SMBee {
         try await SMBClient.listShares(host: host, port: port, credentialProvider: credentialProvider)
     }
 
+    /// Resolve SIDs to account names over `IPC$` + `lsarpc` (MS-LSAT LsarLookupSids).
+    /// The result matches `sids` positionally; unmapped SIDs are nil.
+    public static func lookupSIDs(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        sids: [String],
+        timeout: Duration? = nil
+    ) async throws -> [SMBResolvedSIDName?] {
+        try await SMBClient.lookupSIDs(host: host, port: port, sids: sids, credential: credential, timeout: timeout)
+    }
+
     /// Send an authenticated SMB2 ECHO and return when the server replies.
     ///
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.

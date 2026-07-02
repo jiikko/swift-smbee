@@ -1,6 +1,6 @@
 # 008 feat: ACL follow-ups — SID 名前解決 と SET_SECURITY (write)
 
-状態: **partial** (LSARPC SID lookup remaining)
+状態: **done** (2026-07-03 に A の LSARPC lookup も実装。issues/done へ移動)
 起票: 2026-07-01
 関連: [todo.md](../todo.md) 「ACL / owner / SID metadata」/ `Sources/SMBee/SMB2ReadCodecs.swift`
 (`decodeSecurityDescriptor` / `decodeSID`) / `Sources/smbcli/SMBCLI.swift` (`acl` サブコマンド)
@@ -24,7 +24,9 @@ SID → 人間可読なアカウント名 (`DOMAIN\user`) の解決が欲しく�
 
 - 2026-07-02: 軽量版として `SMBWellKnownSID` と `smbcli acl --resolve-sids` を追加。JSON は opt-in で
   owner/group/trustee の name field を出す。
-- 残: domain SID / local account SID を解決する MS-LSAT `LsarLookupSids` over `\lsarpc`。
+- 2026-07-03: MS-LSAT `LsarLookupSids` over `\lsarpc` を実装 (`LSARPC.swift` /
+  `SMBee.lookupSIDs` / `smbcli acl --resolve-sids` の best-effort fallback)。fixture unit +
+  実 Samba E2E あり。AD domain controller での実測は互換 matrix (todo2 P0-1) 側に残る。
 
 ## B. SET_SECURITY (write)
 

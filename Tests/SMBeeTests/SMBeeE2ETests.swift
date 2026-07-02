@@ -179,6 +179,22 @@ final class SMBeeE2ETests: XCTestCase {
             }
         }
 
+        // LSARPC SID name resolution: the file owner's SID should resolve to an account
+        // name on a standalone Samba (local SAM). Unmapped is tolerated (server policy);
+        // the call itself must succeed.
+        if let ownerSID = securityInfo.ownerSID {
+            let resolved = try await SMBee.lookupSIDs(
+                host: host,
+                port: port,
+                credential: credential,
+                sids: [ownerSID, "S-1-1-0"]
+            )
+            XCTAssertEqual(resolved.count, 2)
+            if let ownerName = resolved[0] {
+                XCTAssertFalse(ownerName.name.isEmpty)
+            }
+        }
+
         let volumeInfo = try await SMBee.volumeInfo(
             host: host,
             port: port,

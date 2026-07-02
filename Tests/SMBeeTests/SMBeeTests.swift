@@ -1613,6 +1613,81 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(waiters, 0)
     }
 
+    func testLSARPCLookupSidsRequestShape() throws {
+        let handle = Array(repeating: UInt8(0x11), count: 20)
+        let stub = try LSARPC.encodeLookupSidsRequest(handle: handle, sids: ["S-1-1-0"])
+        XCTAssertEqual(Array(stub[0..<20]), handle)
+        XCTAssertEqual(readUInt32LE(stub, at: 20), 1) // Entries
+        XCTAssertNotEqual(readUInt32LE(stub, at: 24), 0) // SidInfo pointer
+        XCTAssertEqual(readUInt32LE(stub, at: 28), 1) // conformant count
+        XCTAssertNotEqual(readUInt32LE(stub, at: 32), 0) // per-SID pointer
+        XCTAssertEqual(readUInt32LE(stub, at: 36), 1) // SID conformant count = sub-authority count
+        XCTAssertEqual(Array(stub[40..<52]), try SMB2SetInfo.encodeSID("S-1-1-0"))
+        // trailer: TranslatedNames {0, NULL}, LookupLevel=1 (+pad), MappedCount=0
+        XCTAssertEqual(readUInt32LE(stub, at: 52), 0)
+        XCTAssertEqual(readUInt32LE(stub, at: 56), 0)
+        XCTAssertEqual(readUInt16LE(stub, at: 60), 1)
+        XCTAssertEqual(readUInt32LE(stub, at: 64), 0)
+        XCTAssertEqual(stub.count, 68)
+    }
+
+    func testLSARPCLookupSidsResponseDecode() throws {
+        // Handcrafted MS-LSAT response: one referenced domain ("WORKGROUP"),
+        // two translated names: mapped user "alice" (use=1) and unmapped (use=8).
+        var writer = NDRWriter()
+        writer.writeUInt32(0x0002_0000) // ReferencedDomains pointer
+        writer.writeUInt32(1) // Entries
+        writer.writeUInt32(0x0002_0004) // Domains array pointer
+        writer.writeUInt32(32) // MaxEntries
+        writer.writeUInt32(1) // conformant count
+        let domain = Array("WORKGROUP".utf16)
+        writer.writeUInt16(UInt16(domain.count * 2)) // Name.Length
+        writer.writeUInt16(UInt16(domain.count * 2)) // Name.MaximumLength
+        writer.writeUInt32(0x0002_0008) // Name.Buffer pointer
+        writer.writeUInt32(0x0002_000c) // Sid pointer
+        // deferred: domain name buffer
+        writer.writeUInt32(UInt32(domain.count))
+        writer.writeUInt32(0)
+        writer.writeUInt32(UInt32(domain.count))
+        for unit in domain { writer.writeUInt16(unit) }
+        if domain.count % 2 != 0 { writer.writeUInt16(0) } // align to 4
+        // deferred: domain SID S-1-5-21-1-2-3 (3 sub-authorities... use 4 to stay aligned)
+        let domainSid = try SMB2SetInfo.encodeSID("S-1-5-21-1-2-3")
+        writer.writeUInt32(UInt32(domainSid[1]))
+        writer.writeBytes(domainSid)
+        // TranslatedNames
+        writer.writeUInt32(2) // Entries
+        writer.writeUInt32(0x0002_0010) // Names pointer
+        writer.writeUInt32(2) // conformant count
+        let alice = Array("alice".utf16)
+        writer.writeUInt16(1) // Use = SidTypeUser
+        writer.writeUInt16(0) // struct padding
+        writer.writeUInt16(UInt16(alice.count * 2))
+        writer.writeUInt16(UInt16(alice.count * 2))
+        writer.writeUInt32(0x0002_0014)
+        writer.writeUInt32(0) // DomainIndex
+        writer.writeUInt16(8) // Use = SidTypeUnknown
+        writer.writeUInt16(0)
+        writer.writeUInt16(0)
+        writer.writeUInt16(0)
+        writer.writeUInt32(0) // Name.Buffer NULL
+        writer.writeUInt32(0xffff_ffff) // DomainIndex -1
+        // deferred: alice buffer
+        writer.writeUInt32(UInt32(alice.count))
+        writer.writeUInt32(0)
+        writer.writeUInt32(UInt32(alice.count))
+        for unit in alice { writer.writeUInt16(unit) }
+        if alice.count % 2 != 0 { writer.writeUInt16(0) }
+        writer.writeUInt32(1) // MappedCount
+        writer.writeUInt32(LSARPC.statusSomeNotMapped)
+
+        let names = try LSARPC.decodeLookupSidsResponse(writer.bytes)
+        XCTAssertEqual(names.count, 2)
+        XCTAssertEqual(names[0], SMBResolvedSIDName(use: 1, domain: "WORKGROUP", name: "alice"))
+        XCTAssertEqual(names[0]?.qualifiedName, "WORKGROUP\\alice")
+        XCTAssertNil(names[1])
+    }
+
     func testSMB2CreditWindowFailAllWaitersDrainsParkedReserves() async throws {
         let window = SMB2CreditWindow(initialCredits: 0)
         let task = Task {

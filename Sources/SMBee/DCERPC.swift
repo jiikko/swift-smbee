@@ -229,11 +229,20 @@ enum SRVSVC {
 struct NDRWriter {
     private(set) var bytes: [UInt8] = []
 
+    mutating func writeUInt16(_ value: UInt16) {
+        bytes.append(UInt8(value & 0xff))
+        bytes.append(UInt8((value >> 8) & 0xff))
+    }
+
     mutating func writeUInt32(_ value: UInt32) {
         bytes.append(UInt8(value & 0xff))
         bytes.append(UInt8((value >> 8) & 0xff))
         bytes.append(UInt8((value >> 16) & 0xff))
         bytes.append(UInt8((value >> 24) & 0xff))
+    }
+
+    mutating func writeBytes(_ value: [UInt8]) {
+        bytes.append(contentsOf: value)
     }
 }
 
@@ -273,6 +282,56 @@ struct NDRReader {
             units.removeLast()
         }
         return String(decoding: units, as: UTF16.self)
+    }
+
+    mutating func readUInt16() throws -> UInt16 {
+        try align(to: 2)
+        guard cursor + 2 <= bytes.count else { throw SMBCodecError.truncated }
+        defer { cursor += 2 }
+        return UInt16(bytes[cursor]) | (UInt16(bytes[cursor + 1]) << 8)
+    }
+
+    /// RPC_UNICODE_STRING header: Length (bytes), MaximumLength (bytes), Buffer pointer.
+    /// The buffer contents are deferred (read later with `readRPCUnicodeStringBuffer`).
+    mutating func readRPCUnicodeStringHeader() throws -> (length: UInt16, referent: UInt32) {
+        let length = try readUInt16()
+        _ = try readUInt16() // MaximumLength
+        let referent = try readUInt32()
+        return (length, referent)
+    }
+
+    /// Deferred RPC_UNICODE_STRING buffer: conformant varying UInt16 array. Counts are in
+    /// characters; `lengthInBytes` (from the header) bounds the significant characters
+    /// because the buffer is not guaranteed to be null-terminated.
+    mutating func readRPCUnicodeStringBuffer(lengthInBytes: UInt16) throws -> String {
+        _ = try readUInt32() // maxCount
+        let offset = try readUInt32()
+        let actualCount = try readUInt32()
+        guard offset == 0 else { throw SMBCodecError.invalidValue("unsupported non-zero NDR string offset") }
+        let byteCount = Int(actualCount) * 2
+        guard cursor + byteCount <= bytes.count else { throw SMBCodecError.truncated }
+        let significant = min(byteCount, Int(lengthInBytes))
+        let raw = Array(bytes[cursor..<cursor + significant])
+        cursor += byteCount
+        try align(to: 4)
+        let units = stride(from: 0, to: max(raw.count - 1, 0), by: 2).map {
+            UInt16(raw[$0]) | (UInt16(raw[$0 + 1]) << 8)
+        }
+        return String(decoding: units, as: UTF16.self)
+    }
+
+    /// Deferred SID: conformant count (sub-authority count) followed by the SID body.
+    mutating func skipConformantSID() throws {
+        let conformantCount = try readUInt32()
+        guard cursor + 2 <= bytes.count else { throw SMBCodecError.truncated }
+        let subAuthorityCount = Int(bytes[cursor + 1])
+        guard subAuthorityCount == Int(conformantCount) else {
+            throw SMBCodecError.invalidValue("SID sub-authority count mismatch")
+        }
+        let size = 8 + subAuthorityCount * 4
+        guard cursor + size <= bytes.count else { throw SMBCodecError.truncated }
+        cursor += size
+        try align(to: 4)
     }
 
     private mutating func align(to alignment: Int) throws {

@@ -1207,6 +1207,31 @@ public enum SMBClient {
         )
     }
 
+    /// Resolve SIDs to account names over `IPC$` + `lsarpc` (MS-LSAT). Positional result;
+    /// unmapped SIDs are nil.
+    public static func lookupSIDs(
+        host: String,
+        port: UInt16 = 445,
+        sids: [String],
+        credential: SMBCredential,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws -> [SMBResolvedSIDName?] {
+        guard !sids.isEmpty else { return [] }
+        let makeTransport = resolvedTransportFactory(makeTransport, timeout: timeout)
+        let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
+        do {
+            try await session.connect()
+            let treeId = try await session.treeConnect(share: "IPC$")
+            let names = try await session.lookupSIDs(treeId: treeId, sids: sids)
+            await session.disconnect(treeId: treeId)
+            return names
+        } catch {
+            await session.closeTransport()
+            throw error
+        }
+    }
+
     /// Send an authenticated SMB2 ECHO on a connected tree and return when the server replies.
     ///
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
@@ -3937,6 +3962,54 @@ actor SMBSession {
             let shares = try SRVSVC.decodeNetrShareEnumResponse(try DCERPC.decodeResponseStub(response))
             try? await close(treeId: treeId, fileId: fileId)
             return shares
+        } catch {
+            try? await close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    /// Resolve SIDs to account names via the `lsarpc` pipe (MS-LSAT LsarLookupSids).
+    /// Returned array matches `sids` positionally; unmapped SIDs are nil.
+    func lookupSIDs(treeId: UInt32, sids: [String]) async throws -> [SMBResolvedSIDName?] {
+        guard !sids.isEmpty else { return [] }
+        let fileId = try await create(treeId: treeId, request: .namedPipe(path: "lsarpc"))
+        do {
+            let bind = try DCERPC.encodeBind(callId: 1, abstractSyntax: LSARPC.interfaceUUID, abstractVersion: LSARPC.interfaceVersion)
+            try await write(treeId: treeId, fileId: fileId, data: bind)
+            let bindAck = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: 4_280)
+            try DCERPC.decodeBindAck(bindAck)
+
+            let openRequest = try DCERPC.encodeRequest(
+                callId: 2,
+                opnum: LSARPC.opnumOpenPolicy2,
+                stub: LSARPC.encodeOpenPolicy2Request()
+            )
+            let openResponse = try await pipeTransceive(treeId: treeId, fileId: fileId, input: openRequest)
+            let handle = try LSARPC.decodePolicyHandleResponse(
+                try DCERPC.decodeResponseStub(openResponse),
+                operation: "LsarOpenPolicy2"
+            )
+
+            let lookupRequest = try DCERPC.encodeRequest(
+                callId: 3,
+                opnum: LSARPC.opnumLookupSids,
+                stub: try LSARPC.encodeLookupSidsRequest(handle: handle, sids: sids)
+            )
+            let lookupResponse = try await pipeTransceive(treeId: treeId, fileId: fileId, input: lookupRequest)
+            let names = try LSARPC.decodeLookupSidsResponse(try DCERPC.decodeResponseStub(lookupResponse))
+
+            let closeRequest = try DCERPC.encodeRequest(
+                callId: 4,
+                opnum: LSARPC.opnumClose,
+                stub: try LSARPC.encodeCloseRequest(handle: handle)
+            )
+            _ = try? await pipeTransceive(treeId: treeId, fileId: fileId, input: closeRequest)
+            try? await close(treeId: treeId, fileId: fileId)
+            // Positional guarantee: pad if the server returned fewer entries than requested.
+            if names.count < sids.count {
+                return names + Array(repeating: nil, count: sids.count - names.count)
+            }
+            return Array(names.prefix(sids.count))
         } catch {
             try? await close(treeId: treeId, fileId: fileId)
             throw error

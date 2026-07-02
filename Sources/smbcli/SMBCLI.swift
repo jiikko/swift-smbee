@@ -565,7 +565,7 @@ struct ACL: AsyncParsableCommand {
     @Flag(help: "Print JSON output")
     var json = false
 
-    @Flag(help: "Resolve well-known SIDs to names")
+    @Flag(help: "Resolve SIDs to names (well-known table + LSARPC lookup)")
     var resolveSids = false
 
     func run() async throws {
@@ -581,12 +581,15 @@ struct ACL: AsyncParsableCommand {
                 timeout: transport.duration
             )
         }
+        let resolvedNames = resolveSids
+            ? await lookupUnknownSIDs(info: info, endpoint: endpoint, credential: credential)
+            : [:]
         if json {
-            print(try SMBCLIOutput.jsonString(for: info, resolveSIDs: resolveSids))
+            print(try SMBCLIOutput.jsonString(for: info, resolveSIDs: resolveSids, resolvedNames: resolvedNames))
             return
         }
-        print("owner: \(formatSID(info.ownerSID))")
-        print("group: \(formatSID(info.groupSID))")
+        print("owner: \(formatSID(info.ownerSID, resolvedNames: resolvedNames))")
+        print("group: \(formatSID(info.groupSID, resolvedNames: resolvedNames))")
         print("control: 0x\(String(format: "%04x", info.controlFlags))")
         guard let dacl = info.dacl else {
             print("dacl: null")
@@ -594,13 +597,45 @@ struct ACL: AsyncParsableCommand {
         }
         print("dacl:")
         for ace in dacl {
-            print("  type=\(ace.type) flags=0x\(String(format: "%02x", ace.flags)) mask=0x\(String(format: "%08x", ace.accessMask)) sid=\(formatSID(ace.trusteeSID))")
+            print("  type=\(ace.type) flags=0x\(String(format: "%02x", ace.flags)) mask=0x\(String(format: "%08x", ace.accessMask)) sid=\(formatSID(ace.trusteeSID, resolvedNames: resolvedNames))")
         }
     }
 
-    private func formatSID(_ sid: String?) -> String {
+    /// Best-effort LSARPC lookup for SIDs the well-known table cannot resolve.
+    /// Lookup failures degrade to plain SIDs rather than failing the command.
+    private func lookupUnknownSIDs(
+        info: SMBSecurityInfo,
+        endpoint: SMBURLParser.ReadURL,
+        credential: SMBCredential
+    ) async -> [String: String] {
+        var candidates: [String] = []
+        for sid in [info.ownerSID, info.groupSID] + (info.dacl ?? []).map(\.trusteeSID) {
+            if let sid, SMBWellKnownSID.name(for: sid) == nil, !candidates.contains(sid) {
+                candidates.append(sid)
+            }
+        }
+        guard !candidates.isEmpty else { return [:] }
+        guard let names = try? await SMBee.lookupSIDs(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            sids: candidates,
+            timeout: transport.duration
+        ) else {
+            return [:]
+        }
+        var map: [String: String] = [:]
+        for (sid, name) in zip(candidates, names) {
+            if let name {
+                map[sid] = name.qualifiedName
+            }
+        }
+        return map
+    }
+
+    private func formatSID(_ sid: String?, resolvedNames: [String: String]) -> String {
         guard let sid else { return "none" }
-        guard resolveSids, let name = SMBWellKnownSID.name(for: sid) else { return sid }
+        guard resolveSids, let name = resolvedNames[sid] ?? SMBWellKnownSID.name(for: sid) else { return sid }
         return "\(sid) (\(name))"
     }
 }

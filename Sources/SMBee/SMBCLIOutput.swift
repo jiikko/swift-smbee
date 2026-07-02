@@ -45,8 +45,8 @@ public enum SMBCLIOutput {
         try encoder.encode(VolumeInfoJSON(volumeInfo))
     }
 
-    public static func jsonData(for securityInfo: SMBSecurityInfo, resolveSIDs: Bool = false) throws -> Data {
-        try encoder.encode(SecurityInfoJSON(securityInfo, resolveSIDs: resolveSIDs))
+    public static func jsonData(for securityInfo: SMBSecurityInfo, resolveSIDs: Bool = false, resolvedNames: [String: String] = [:]) throws -> Data {
+        try encoder.encode(SecurityInfoJSON(securityInfo, resolveSIDs: resolveSIDs, resolvedNames: resolvedNames))
     }
 
     public static func jsonData(for shares: [SMBShareInfo]) throws -> Data {
@@ -81,8 +81,8 @@ public enum SMBCLIOutput {
         try string(from: jsonData(for: volumeInfo))
     }
 
-    public static func jsonString(for securityInfo: SMBSecurityInfo, resolveSIDs: Bool = false) throws -> String {
-        try string(from: jsonData(for: securityInfo, resolveSIDs: resolveSIDs))
+    public static func jsonString(for securityInfo: SMBSecurityInfo, resolveSIDs: Bool = false, resolvedNames: [String: String] = [:]) throws -> String {
+        try string(from: jsonData(for: securityInfo, resolveSIDs: resolveSIDs, resolvedNames: resolvedNames))
     }
 
     public static func jsonString(for shares: [SMBShareInfo]) throws -> String {
@@ -241,12 +241,16 @@ private struct SecurityInfoJSON: Encodable {
     var dacl: [AccessControlEntryJSON]?
     var controlFlags: String
 
-    init(_ info: SMBSecurityInfo, resolveSIDs: Bool = false) {
+    init(_ info: SMBSecurityInfo, resolveSIDs: Bool = false, resolvedNames: [String: String] = [:]) {
+        func resolve(_ sid: String?) -> String? {
+            guard resolveSIDs, let sid else { return nil }
+            return resolvedNames[sid] ?? SMBWellKnownSID.name(for: sid)
+        }
         ownerSID = info.ownerSID
-        ownerName = resolveSIDs ? info.ownerSID.flatMap(SMBWellKnownSID.name(for:)) : nil
+        ownerName = resolve(info.ownerSID)
         groupSID = info.groupSID
-        groupName = resolveSIDs ? info.groupSID.flatMap(SMBWellKnownSID.name(for:)) : nil
-        dacl = info.dacl?.map { AccessControlEntryJSON($0, resolveSIDs: resolveSIDs) }
+        groupName = resolve(info.groupSID)
+        dacl = info.dacl?.map { AccessControlEntryJSON($0, resolveSIDs: resolveSIDs, resolvedNames: resolvedNames) }
         controlFlags = SMBCLIOutput.hex(info.controlFlags, width: 4)
     }
 }
@@ -258,12 +262,14 @@ private struct AccessControlEntryJSON: Encodable {
     var trusteeSID: String?
     var trusteeName: String?
 
-    init(_ ace: SMBAccessControlEntry, resolveSIDs: Bool = false) {
+    init(_ ace: SMBAccessControlEntry, resolveSIDs: Bool = false, resolvedNames: [String: String] = [:]) {
         type = ace.type
         flags = SMBCLIOutput.hex(ace.flags, width: 2)
         accessMask = SMBCLIOutput.hex(ace.accessMask, width: 8)
         trusteeSID = ace.trusteeSID
-        trusteeName = resolveSIDs ? ace.trusteeSID.flatMap(SMBWellKnownSID.name(for:)) : nil
+        trusteeName = resolveSIDs
+            ? ace.trusteeSID.flatMap { resolvedNames[$0] ?? SMBWellKnownSID.name(for: $0) }
+            : nil
     }
 }
 

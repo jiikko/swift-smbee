@@ -504,10 +504,17 @@ Linux/macOS smbclient として必要な理由:
 - `issues/008-acl-followups-sid-name-resolution-set-security.md` に MS-LSAT `LsarLookupSids` が未実装と記録されている。
 - `setSecurityInfo` は後から実装済みになったため、issue 008 の B は stale。A の domain SID 名解決はまだ未実装。
 
-やること:
+- 2026-07-03: **LSARPC lookup を実装**。`lsarpc` pipe に bind → LsarOpenPolicy2
+  (POLICY_LOOKUP_NAMES) → LsarLookupSids (level 1) → LsarClose。公開 API
+  `SMBee.lookupSIDs(host:port:credential:sids:)` (`SMBResolvedSIDName` 位置対応・未解決 nil、
+  STATUS_SOME_NOT_MAPPED / NONE_MAPPED 許容)。`smbcli acl --resolve-sids` は well-known table で
+  引けない SID を LSARPC で best-effort 解決 (失敗時は SID 表示に degrade)。
+  request/response の NDR fixture unit + 実 Samba E2E (owner SID lookup) を追加。
 
-- 完全版: `\lsarpc` named pipe + MS-LSAT `LsarLookupSids` を実装する。
-- `issues/008` を well-known done / LSARPC remaining に更新する。
+残:
+
+- AD / Samba AD の domain SID での実測 (互換 matrix 側)。
+- `issues/008` の A を done に更新する。
 
 完了条件:
 

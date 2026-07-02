@@ -3263,6 +3263,12 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNil(SMBFileStat(size: 0, modifiedTime: nil, isDirectory: false).reparseKind)
     }
 
+    func testWellKnownSIDResolverMapsCommonSIDs() {
+        XCTAssertEqual(SMBWellKnownSID.name(for: "S-1-1-0"), "Everyone")
+        XCTAssertEqual(SMBWellKnownSID.name(for: "S-1-5-32-544"), "BUILTIN\\Administrators")
+        XCTAssertNil(SMBWellKnownSID.name(for: "S-1-5-21-1000-1001-1002"))
+    }
+
     func testFileFsFullSizeInformationDecodesByteCountsFromFixture() throws {
         var payload = Array(repeating: UInt8(0), count: 32)
         writeUInt64LE(100, to: &payload, at: 0)

@@ -1,6 +1,6 @@
 # 008 feat: ACL follow-ups — SID 名前解決 と SET_SECURITY (write)
 
-状態: **open** (backlog)
+状態: **partial** (LSARPC SID lookup remaining)
 起票: 2026-07-01
 関連: [todo.md](../todo.md) 「ACL / owner / SID metadata」/ `Sources/SMBee/SMB2ReadCodecs.swift`
 (`decodeSecurityDescriptor` / `decodeSID`) / `Sources/smbcli/SMBCLI.swift` (`acl` サブコマンド)
@@ -20,7 +20,15 @@ SID → 人間可読なアカウント名 (`DOMAIN\user`) の解決が欲しく�
 - スコープが大きいので独立タスク。まず「よく知られた SID (well-known: `S-1-5-32-544`=Administrators,
   `S-1-1-0`=Everyone 等)」の静的テーブルだけ持つ軽量版から始める案もある (RPC 不要で ACE 表示が読みやすくなる)。
 
+進捗:
+
+- 2026-07-02: 軽量版として `SMBWellKnownSID` と `smbcli acl --resolve-sids` を追加。JSON は opt-in で
+  owner/group/trustee の name field を出す。
+- 残: domain SID / local account SID を解決する MS-LSAT `LsarLookupSids` over `\lsarpc`。
+
 ## B. SET_SECURITY (write)
+
+状態: **done** (DACL write only)
 
 todo 319 では **書き込みを意図的に defer** した。理由:
 
@@ -37,6 +45,11 @@ todo 319 では **書き込みを意図的に defer** した。理由:
 - SET_INFO InfoType=0x03 SECURITY + AdditionalInformation で書き込む。SACL は特権が要るため対象外のまま。
 - E2E は「ACE を 1 件足して read で往復一致」を Samba で確認。破壊確認のため bounded / 専用 share で。
 
+進捗:
+
+- 2026-07-02: DACL read-modify-write を実装。owner/group は保持、SACL は対象外。
+- `smbcli setacl`、self-relative security descriptor encode、lockout guard、Samba E2E round-trip あり。
+
 ## C. SID の 6-byte authority を UInt64 48bit 扱い (対応不要見込み)
 
 `decodeSID` は IdentifierAuthority (6 byte BE) を `UInt64` に畳んでいる。既知の authority は小さい値
@@ -45,6 +58,5 @@ todo 319 では **書き込みを意図的に defer** した。理由:
 
 ## 優先度
 
-- A/B とも管理系 smbclient 向けで、browse/GUI (obaket) の MVP には不要。
-- B (write) の需要が出た時に read-modify-write + 自ロックアウト guard の設計から着手する。
-- A は well-known SID 静的テーブルの軽量版だけ先行する余地あり (低コスト)。
+- 残タスクは A の LSARPC SID lookup。B は DACL write として完了済み。
+- owner/group/SACL write は別 backlog として扱う。

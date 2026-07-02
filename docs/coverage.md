@@ -50,7 +50,7 @@ Status labels:
 | attributes/timestamps read/write | MS-FSCC FileBasicInformation | `SMB2ReadCodecs.swift`, `SMBClient.updateMetadata` | yes | yes | no | no | covered | chmod/POSIX mode mapping is not provided. |
 | security descriptor read | MS-SMB2 QUERY_INFO security, MS-DTYP | `SMB2ReadCodecs.swift`, `SMBClient.securityInfo` | yes | yes | no | no | covered | Unknown/object ACEs are preserved at mask level only. |
 | DACL write | MS-SMB2 SET_INFO security, MS-DTYP | `SMBClient.setSecurityInfo` | yes | yes | no | no | partial | Owner/group/SACL write is unsupported. Samba may normalize masks. |
-| SID name resolution | MS-LSAT | none | no | no | no | no | unsupported | Well-known SID table and LSARPC lookup are future work. |
+| SID name resolution | MS-DTYP well-known SIDs, MS-LSAT | `SMBWellKnownSID`, `smbcli acl --resolve-sids` | yes | no | no | no | partial | Well-known SID table is implemented. Domain SID lookup via LSARPC is future work. |
 | DFS referral metadata | MS-DFSC, MS-FSCC FSCTL_DFS_GET_REFERRALS | `SMB2DfsReferral.swift`, `SMBClient.dfsReferral` | yes | no | no | no | underverified | Real msdfs server E2E and auto-follow are missing. |
 | reparse point metadata / target | MS-FSCC FileAttributeTagInformation, FSCTL_GET_REPARSE_POINT | `SMB2ReadCodecs.swift`, `SMBFileStat`, `SMBee.readlink`, `smbcli readlink` | yes | yes | no | no | partial | Tag metadata is covered by Samba E2E. Target decode has unit coverage; real-server readlink smoke and DFS reparse-data decode are missing. |
 

@@ -530,6 +530,9 @@ struct ACL: AsyncParsableCommand {
     @Flag(help: "Print JSON output")
     var json = false
 
+    @Flag(help: "Resolve well-known SIDs to names")
+    var resolveSids = false
+
     func run() async throws {
         debug.apply()
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: url, auth: auth)
@@ -542,11 +545,11 @@ struct ACL: AsyncParsableCommand {
             timeout: transport.duration
         )
         if json {
-            print(try SMBCLIOutput.jsonString(for: info))
+            print(try SMBCLIOutput.jsonString(for: info, resolveSIDs: resolveSids))
             return
         }
-        print("owner: \(info.ownerSID ?? "none")")
-        print("group: \(info.groupSID ?? "none")")
+        print("owner: \(formatSID(info.ownerSID))")
+        print("group: \(formatSID(info.groupSID))")
         print("control: 0x\(String(format: "%04x", info.controlFlags))")
         guard let dacl = info.dacl else {
             print("dacl: null")
@@ -554,8 +557,14 @@ struct ACL: AsyncParsableCommand {
         }
         print("dacl:")
         for ace in dacl {
-            print("  type=\(ace.type) flags=0x\(String(format: "%02x", ace.flags)) mask=0x\(String(format: "%08x", ace.accessMask)) sid=\(ace.trusteeSID ?? "none")")
+            print("  type=\(ace.type) flags=0x\(String(format: "%02x", ace.flags)) mask=0x\(String(format: "%08x", ace.accessMask)) sid=\(formatSID(ace.trusteeSID))")
         }
+    }
+
+    private func formatSID(_ sid: String?) -> String {
+        guard let sid else { return "none" }
+        guard resolveSids, let name = SMBWellKnownSID.name(for: sid) else { return sid }
+        return "\(sid) (\(name))"
     }
 }
 

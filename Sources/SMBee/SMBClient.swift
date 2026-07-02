@@ -216,6 +216,36 @@ public struct SMBAccessControlEntry: Equatable, Sendable {
     }
 }
 
+public enum SMBWellKnownSID {
+    private static let names: [String: String] = [
+        "S-1-0-0": "Null Authority",
+        "S-1-1-0": "Everyone",
+        "S-1-2-0": "Local",
+        "S-1-2-1": "Console Logon",
+        "S-1-3-0": "Creator Owner",
+        "S-1-3-1": "Creator Group",
+        "S-1-5-7": "Anonymous Logon",
+        "S-1-5-11": "Authenticated Users",
+        "S-1-5-18": "Local System",
+        "S-1-5-19": "Local Service",
+        "S-1-5-20": "Network Service",
+        "S-1-5-32-544": "BUILTIN\\Administrators",
+        "S-1-5-32-545": "BUILTIN\\Users",
+        "S-1-5-32-546": "BUILTIN\\Guests",
+        "S-1-5-32-547": "BUILTIN\\Power Users",
+        "S-1-5-32-548": "BUILTIN\\Account Operators",
+        "S-1-5-32-549": "BUILTIN\\Server Operators",
+        "S-1-5-32-550": "BUILTIN\\Print Operators",
+        "S-1-5-32-551": "BUILTIN\\Backup Operators",
+        "S-1-5-32-552": "BUILTIN\\Replicators",
+        "S-1-5-32-555": "BUILTIN\\Remote Desktop Users",
+    ]
+
+    public static func name(for sid: String) -> String? {
+        names[sid]
+    }
+}
+
 public enum SMBFileAttributes {
     public static let readOnly: UInt32 = 0x0000_0001
     public static let hidden: UInt32 = 0x0000_0002

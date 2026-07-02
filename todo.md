@@ -393,6 +393,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     `SMBee.setSecurityInfo` + `smbcli setacl`。fixture unit + **実 Samba round-trip E2E** green。
     観測: **Samba は POSIX-ACL backing のため access mask を正規化** (要求 0x00020000 → read-back 0x00120089)。
     write 自体は成功 (追加 SID の ACE が反映) を実測確認、round-trip は mask-exact ではない旨を doc に明記。
+  - 2026-07-02: 軽量 SID 名解決として `SMBWellKnownSID` table と `smbcli acl --resolve-sids` を追加。
+    Everyone / BUILTIN groups などは human-readable に表示できる。domain SID の LSARPC lookup は残。
   - **残 (defer)**: SACL は特権要求のため対象外 (AdditionalInformation に SACL bit を立てていない)。
     owner/group の書き換えも今回対象外 (DACL のみ)。
 - [ ] locking / durable handle / lease / oplock の扱い

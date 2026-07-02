@@ -497,19 +497,19 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-1. SID -> account name resolution
 
-状態: `missing`
+状態: `partial`
 
 実装確認:
 
 - `securityInfo` は SID 文字列を返す。
+- 2026-07-02: `SMBWellKnownSID` table と `smbcli acl --resolve-sids` を追加。JSON は `resolveSIDs` 指定時に owner/group/trustee の name field を追加する。
 - `issues/008-acl-followups-sid-name-resolution-set-security.md` に MS-LSAT `LsarLookupSids` が未実装と記録されている。
-- `setSecurityInfo` は後から実装済みになったため、issue 008 の B は stale。A の SID 名解決はまだ未実装。
+- `setSecurityInfo` は後から実装済みになったため、issue 008 の B は stale。A の domain SID 名解決はまだ未実装。
 
 やること:
 
-- 軽量版: well-known SID table を持つ。
 - 完全版: `\lsarpc` named pipe + MS-LSAT `LsarLookupSids` を実装する。
-- `smbcli acl` に `--resolve-sids` を追加する。
+- `issues/008` を well-known done / LSARPC remaining に更新する。
 
 完了条件:
 

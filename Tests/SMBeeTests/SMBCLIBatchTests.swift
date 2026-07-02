@@ -132,9 +132,10 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(df.url, "smb://user@host/share")
         XCTAssertTrue(df.json)
 
-        let acl = try ACL.parse(["smb://user@host/share/file.txt", "--json"])
+        let acl = try ACL.parse(["smb://user@host/share/file.txt", "--json", "--resolve-sids"])
         XCTAssertEqual(acl.url, "smb://user@host/share/file.txt")
         XCTAssertTrue(acl.json)
+        XCTAssertTrue(acl.resolveSids)
 
         let dfs = try Dfs.parse(["smb://user@host/dfsroot/link", "--json"])
         XCTAssertEqual(dfs.url, "smb://user@host/dfsroot/link")

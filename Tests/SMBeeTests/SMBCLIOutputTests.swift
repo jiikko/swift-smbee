@@ -181,6 +181,24 @@ final class SMBCLIOutputTests: XCTestCase {
         XCTAssertEqual(dacl[0]["trusteeSID"] as? String, "S-1-1-0")
     }
 
+    func testSecurityInfoJSONCanResolveWellKnownSIDs() throws {
+        let info = SMBSecurityInfo(
+            ownerSID: "S-1-5-32-544",
+            groupSID: "S-1-5-21-1000",
+            dacl: [
+                SMBAccessControlEntry(type: 0, flags: 0, accessMask: 0x001f_01ff, trusteeSID: "S-1-1-0")
+            ],
+            controlFlags: 0x8004
+        )
+
+        let object = try jsonObject(SMBCLIOutput.jsonData(for: info, resolveSIDs: true))
+
+        XCTAssertEqual(object["ownerName"] as? String, "BUILTIN\\Administrators")
+        XCTAssertNil(object["groupName"] as? String)
+        let dacl = try XCTUnwrap(object["dacl"] as? [[String: Any]])
+        XCTAssertEqual(dacl[0]["trusteeName"] as? String, "Everyone")
+    }
+
     func testSMBErrorExitCodeMapping() {
         XCTAssertEqual(SMBCLIExitCode.code(for: .logonFailure(status: 0, operation: "SESSION_SETUP")), 3)
         XCTAssertEqual(SMBCLIExitCode.code(for: .accessDenied(status: 0, operation: "CREATE")), 3)

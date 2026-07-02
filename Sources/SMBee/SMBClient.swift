@@ -465,6 +465,23 @@ public actor SMBClientSession {
         try await session.echo()
     }
 
+    public func withTree<T: Sendable>(
+        share: String,
+        operation: @Sendable (SMBClientTreeSession) async throws -> T
+    ) async throws -> T {
+        try ensureOpen()
+        let childTreeId = try await session.treeConnect(share: share)
+        let child = SMBClientTreeSession(session: session, treeId: childTreeId)
+        do {
+            let result = try await operation(child)
+            await child.close()
+            return result
+        } catch {
+            await child.close()
+            throw error
+        }
+    }
+
     public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
         let collector = SMBDirectoryEntryCollector()
         try await withDirectoryStream(path: path) { entry in
@@ -786,6 +803,78 @@ public actor SMBClientSession {
         }
         let available = stat.size - start
         return (start, range.map { min($0.length, available) } ?? available)
+    }
+}
+
+public actor SMBClientTreeSession {
+    private let session: SMBSession
+    private let treeId: UInt32
+    private var isClosed = false
+
+    init(session: SMBSession, treeId: UInt32) {
+        self.session = session
+        self.treeId = treeId
+    }
+
+    public func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        try? await session.treeDisconnect(treeId: treeId)
+    }
+
+    public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
+        let collector = SMBDirectoryEntryCollector()
+        try await withDirectoryStream(path: path) { entry in
+            collector.append(entry)
+        }
+        return collector.entries
+    }
+
+    public func withDirectoryStream(
+        path: String = "",
+        onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
+    ) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, path: path, directory: true)
+        do {
+            try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
+            try? await session.close(treeId: treeId, fileId: fileId)
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func stat(path: String) async throws -> SMBFileStat {
+        try ensureOpen()
+        let fileId = try await session.createForMetadata(treeId: treeId, path: path)
+        do {
+            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return stat
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    public func readlink(path: String) async throws -> SMBReparsePoint {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .reparsePoint(path: path))
+        do {
+            let reparsePoint = try await session.reparsePoint(treeId: treeId, fileId: fileId)
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return reparsePoint
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    private func ensureOpen() throws {
+        if isClosed {
+            throw SMBError.connectionLost(operation: "TREE")
+        }
     }
 }
 

@@ -2815,6 +2815,50 @@ final class SMBeeTests: XCTestCase {
         XCTAssertTrue(requests.allSatisfy { (try? SMB2Header.decode($0).treeId) == 0x3344 })
     }
 
+    func testClientSessionWithTreeUsesAdditionalTreeAndDisconnectsIt() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2TreeConnectResponse(treeId: 0x7788, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff),
+            try smb2CreateResponse(fileId: fileId, messageId: 1, treeId: 0x7788),
+            try smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(name: "b.txt", isDirectory: false, fileSize: 9, nextOffset: 0),
+                ],
+                messageId: 2,
+                treeId: 0x7788
+            ),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 3, treeId: 0x7788),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x7788),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 5, treeId: 0x7788),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        let entries = try await clientSession.withTree(share: "other") { tree in
+            try await tree.list(path: "")
+        }
+
+        XCTAssertEqual(entries, [SMBDirectoryEntry(name: "b.txt", fileSize: 9, isDirectory: false, attributes: 0x80)])
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
+            SMB2Commands.treeConnect,
+            SMB2Commands.create,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.close,
+            SMB2Commands.treeDisconnect,
+        ])
+        XCTAssertEqual(try SMB2Header.decode(requests[0]).treeId, 0)
+        XCTAssertTrue(requests.dropFirst().allSatisfy { (try? SMB2Header.decode($0).treeId) == 0x7788 })
+    }
+
     func testClientSessionReadEmitsTransferProgressPerChunk() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([

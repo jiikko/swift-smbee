@@ -342,13 +342,14 @@ Linux/macOS smbclient として必要な理由:
 
 ### P1-7. multi-share / multi-tree session reuse
 
-状態: `missing`
+状態: `partial`
 
 実装確認:
 
-- `SMBClientSession` は 1 `treeId` を保持する 1 share 前提。
+- 2026-07-02: `SMBClientSession.withTree(share:)` と `SMBClientTreeSession` を追加。同じ authenticated session 上で追加 TREE_CONNECT し、closure 終了時に tree 単位で disconnect できる。
+- 2026-07-02: 追加 tree で `list` / `stat` / `readlink` を実行できる unit coverage を追加。
 - `listShares` / `dfsReferral` は `IPC$` に別途 one-shot 接続する。
-- `todo.md` にも multi-share / multi-tree session reuse が未実装として残っている。
+- full `SMBServerSession` / `SMBTreeSession` 分離と session close 時の複数 tree tracking は未実装。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -358,7 +359,7 @@ Linux/macOS smbclient として必要な理由:
 やること:
 
 - `SMBServerSession` と `SMBTreeSession` に分ける。
-- 1 authenticated session から複数 TREE_CONNECT できる API にする。
+- IPC$ / data share helper を `withTree` ベースで統合する。
 - graceful teardown を tree単位 / session単位に分ける。
 
 完了条件:

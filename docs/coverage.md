@@ -22,7 +22,7 @@ Status labels:
 | SMB 3.1.1 signing/encryption | MS-SMB2 3.1.4.1, 3.1.4.2 | `SMBSessionCrypto.swift`, `SMB3TransformHeader.swift`, `SMBCrypto.swift` | yes | yes | no | no | underverified | Samba is covered; Windows/NAS SMB 3.1.1 smoke is still missing. |
 | NTLMv2 + SPNEGO | MS-NLMP, MS-SPNG | `NTLM.swift`, `SMBClient.swift` | yes | yes | smoke | no | covered | Kerberos/GSS is unsupported. |
 | Anonymous/guest NTLM | MS-NLMP | `NTLM.swift`, `SMBClient.swift`, `smbcli` | yes | yes | no | no | underverified | Samba guest path covered only. |
-| SESSION_SETUP / TREE_CONNECT | MS-SMB2 3.2.4.3, 3.2.4.4 | `SMBClient.swift` | yes | yes | smoke | no | covered | Authenticated session is tied to one tree in `SMBClientSession`. |
+| SESSION_SETUP / TREE_CONNECT | MS-SMB2 3.2.4.3, 3.2.4.4 | `SMBClient.swift`, `SMBClientSession.withTree` | yes | yes | smoke | no | covered | Primary `SMBClientSession` remains one-tree oriented, with scoped additional tree access via `withTree`. Full server/tree session split is future work. |
 | ECHO | MS-SMB2 3.2.4.25 | `SMB2ReadCodecs.swift`, `SMBClient.echo`, `smbcli ping` | yes | no | no | no | partial | Manual authenticated ECHO is implemented. Automatic periodic keepalive and real-server smoke are missing. |
 | TREE_DISCONNECT / LOGOFF | MS-SMB2 3.2.4.23, 3.2.4.24 | `SMBClient.swift` | yes | yes | no | no | covered | Best-effort on clean close. |
 

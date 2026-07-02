@@ -402,6 +402,9 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     authenticated session 上で複数 share / IPC$ / DFS target を扱いたい場面がある。
   - API は `SMBServerSession` (session-level) と `SMBTreeSession` (tree-level) に分けるか、
     既存 `SMBClientSession` を維持して one-shot API だけで複数 share を扱うかを設計する。
+  - 2026-07-02: 既存 `SMBClientSession` を維持し、scoped `withTree(share:)` + `SMBClientTreeSession`
+    を追加。同じ authenticated session 上で追加 TREE_CONNECT し、closure 終了時に tree 単位で
+    disconnect する。full server/tree session split と IPC$ helper 統合は残。
 - [x] dialect / encryption policy の整理
   - 2026-06-30 実装レビュー追加: NEGOTIATE は 2.0.2 / 2.1 も提示するが authenticated path は
     3.0+ だけを受ける。probe 専用 dialect と authenticated dialect policy を分けるか、

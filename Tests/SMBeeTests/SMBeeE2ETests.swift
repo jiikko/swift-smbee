@@ -540,6 +540,70 @@ final class SMBeeE2ETests: XCTestCase {
 
         XCTAssertTrue(observed, "expected a CHANGE_NOTIFY notification for \(watchedFile)")
     }
+
+    func testByteRangeLockConflictAcrossSessions() async throws {
+        guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+
+        let environment = ProcessInfo.processInfo.environment
+        let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
+        let portString = environment["SMBEE_E2E_PORT"] ?? "445"
+        guard let port = UInt16(portString) else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16, got \(portString)")
+            return
+        }
+        let username = environment["SMBEE_E2E_USERNAME"] ?? "smbee"
+        let password = environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
+        let share = environment["SMBEE_E2E_SHARE"] ?? "public"
+        let credential = SMBCredential(username: username, password: password)
+        let path = "smbee-e2e-lock-\(UUID().uuidString).bin"
+
+        try await SMBee.upload(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: path,
+            data: Array(repeating: 0xAB, count: 256)
+        )
+        defer {
+            let cleanupCredential = credential
+            Task {
+                try? await SMBee.delete(host: host, port: port, credential: cleanupCredential, share: share, path: path)
+            }
+        }
+
+        let holder = try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        let contender = try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        do {
+            try await holder.withFileLock(path: path, offset: 0, length: 128) {
+                // Exclusive lock held: a second session must fail immediately on the same range.
+                do {
+                    _ = try await contender.withFileLock(path: path, offset: 0, length: 128) { true }
+                    XCTFail("expected SMBError.lockConflict while the range is exclusively locked")
+                } catch let error as SMBError {
+                    guard case .lockConflict = error else {
+                        XCTFail("expected lockConflict, got \(error)")
+                        return
+                    }
+                }
+                // A non-overlapping range must still be lockable.
+                let disjoint = try await contender.withFileLock(path: path, offset: 128, length: 64) { true }
+                XCTAssertTrue(disjoint)
+            }
+            // After release the same range must be lockable again.
+            let relocked = try await contender.withFileLock(path: path, offset: 0, length: 128) { true }
+            XCTAssertTrue(relocked)
+        } catch {
+            await holder.close()
+            await contender.close()
+            throw error
+        }
+        await holder.close()
+        await contender.close()
+        try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: path)
+    }
 }
 
 private actor LargeReadAccumulator {

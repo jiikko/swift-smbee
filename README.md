@@ -40,7 +40,7 @@ SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing �
 - 認証済み操作は SMB 3.x only。SMB 2.0.2 / 2.1 は probe-only で、接続時は診断付きエラーにする。
 - Kerberos / GSS は未対応。現状は NTLMv2 password / NT hash / anonymous を対象にする。
 - Windows SMB Server / NAS の実サーバ smoke は未完了。Samba と一部 macOS SMBX の確認が中心。
-- durable handle / lease / oplock / byte-range lock は未対応。
+- durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) のみ (CLI 非対応)。
 - DFS referral は metadata 取得のみ。target への auto-follow は未対応。
 - reparse point / symlink target は `readlink` API で扱えるが、DFS reparse data decode と実サーバ smoke は未完了。
 - single-file download resume は対応済み。single-file upload byte-level resume、checksum verify、sparse file preservation は未対応。

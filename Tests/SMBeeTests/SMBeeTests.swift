@@ -1417,6 +1417,61 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNoThrow(try SMB2Echo.decodeResponse(response))
     }
 
+    func testSMB2LockRequestShape() throws {
+        let fileId: [UInt8] = Array(1...16)
+        let request = try SMB2Lock.encodeRequest(
+            messageId: 30,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            elements: [
+                .lock(offset: 0x10, length: 0x20, shared: false, failImmediately: true),
+                .unlock(offset: 0x30, length: 0x40),
+            ]
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.lock)
+        XCTAssertEqual(header.messageId, 30)
+        XCTAssertEqual(header.treeId, 0x5566_7788)
+        XCTAssertEqual(header.sessionId, 0x1122_3344)
+        // header(64) + fixed(24) + 2 lock elements(24 each)
+        XCTAssertEqual(request.count, 64 + 24 + 48)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 48)
+        XCTAssertEqual(readUInt16LE(request, at: 66), 2)
+        XCTAssertEqual(readUInt32LE(request, at: 68), 0)
+        XCTAssertEqual(Array(request[72..<88]), fileId)
+        XCTAssertEqual(readUInt64LE(request, at: 88), 0x10)
+        XCTAssertEqual(readUInt64LE(request, at: 96), 0x20)
+        XCTAssertEqual(
+            readUInt32LE(request, at: 104),
+            SMB2LockElement.exclusiveLock | SMB2LockElement.failImmediately
+        )
+        XCTAssertEqual(readUInt32LE(request, at: 108), 0)
+        XCTAssertEqual(readUInt64LE(request, at: 112), 0x30)
+        XCTAssertEqual(readUInt64LE(request, at: 120), 0x40)
+        XCTAssertEqual(readUInt32LE(request, at: 128), SMB2LockElement.unlock)
+    }
+
+    func testSMB2LockRequestRejectsEmptyElements() {
+        XCTAssertThrowsError(
+            try SMB2Lock.encodeRequest(
+                messageId: 1, sessionId: 1, treeId: 1, fileId: Array(repeating: 0, count: 16), elements: []
+            )
+        )
+    }
+
+    func testSMB2LockResponseDecodeAndConflictMapping() throws {
+        var response = try SMB2Header(command: SMB2Commands.lock, messageId: 30, sessionId: 1).encode()
+        response.append(contentsOf: [4, 0, 0, 0])
+        XCTAssertNoThrow(try SMB2Lock.decodeResponse(response))
+
+        for status in [SMB2Status.fileLockConflict, SMB2Status.lockNotGranted, SMB2Status.rangeNotLocked] {
+            let error = SMBErrorMapper.map(status: status, operation: "LOCK")
+            XCTAssertEqual(error, .lockConflict(status: status, operation: "LOCK"))
+        }
+    }
+
     func testSMB2CancelRequestShape() throws {
         let request = try SMB2Cancel.encodeRequest(
             messageId: 22,

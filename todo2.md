@@ -314,28 +314,22 @@ Linux/macOS smbclient として必要な理由:
 
 ### P1-6. SMB2 LOCK / byte-range locking
 
-状態: `missing`
+状態: `implemented` (library API のみ)
 
 実装確認:
 
-- `SMB2Commands` に `lock` command 定数がない。
-- `SMB2Lock` codec / public API / CLI は確認できない。
+- 2026-07-03: `SMB2Commands.lock` / `SMB2Lock` codec / `SMB2LockElement` を追加。
+  `SMBClientSession.withFileLock(path:offset:length:shared:failImmediately:)` で scoped に
+  lock → body → unlock → close する。conflict は `SMBError.lockConflict`
+  (STATUS_FILE_LOCK_CONFLICT / LOCK_NOT_GRANTED / RANGE_NOT_LOCKED) に map。
+  request shape / conflict mapping の unit fixture と、実 Samba E2E
+  (2 session 間の exclusive conflict / disjoint range 成功 / release 後の再取得) を追加。
 
-Linux/macOS smbclient として必要な理由:
+残:
 
-- アプリケーションが同一ファイルを協調更新する場合に必要。
-- 汎用 smbclient のファイル操作互換性として、最低限 explicit lock/unlock または unsupported policy が必要。
-
-やること:
-
-- SMB2 LOCK request/response codec を実装する。
-- API: `lock(path:range:shared/exclusive:)` / `unlock(...)` を検討。
-- CLI に入れるかは後回し。ライブラリ API 先行でよい。
-
-完了条件:
-
-- LOCK / UNLOCK の unit fixture。
-- Samba + Windows で conflict / unlock / close-on-disconnect の挙動を確認。
+- CLI surface は未提供 (ライブラリ API 先行の方針どおり)。
+- lock sequence tracking (resilient/durable handle reconnect 用) は未対応。
+- Windows での conflict / close-on-disconnect 挙動確認は互換 matrix (P0-1) 側。
 
 ### P1-7. multi-share / multi-tree session reuse
 
@@ -759,7 +753,7 @@ File browser / backup / macOS metadata preservation を本格的にやるなら�
 - SMB 3.x only。SMB 2.1 authenticated fallback は非対応 (probe-only、authenticated connect は診断付き `protocolError`)。
 - Kerberos / GSS は未対応。現状は NTLMv2 / NT hash / anonymous。
 - Windows SMB Server / NAS は smoke 未完了。
-- durable handle / lease / oplock / byte-range lock は未対応。
+- durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) のみ (CLI 非対応)。
 - DFS referral は metadata 取得のみ。auto-follow と実 msdfs E2E は未完了。
 - symlink / reparse point は tag 取得のみ。target 解決は未対応。
 - byte-level resume / checksum verify / sparse file preservation は未対応。

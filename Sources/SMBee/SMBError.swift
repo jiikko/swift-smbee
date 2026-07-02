@@ -13,6 +13,7 @@ public enum SMBError: Error, Equatable, Sendable {
     case logonFailure(status: UInt32, operation: String)
     case objectNameInvalid(status: UInt32, operation: String)
     case endOfFile(status: UInt32, operation: String)
+    case lockConflict(status: UInt32, operation: String)
     case cancelled(status: UInt32, operation: String)
     case unsupported(status: UInt32, operation: String)
     case connectionLost(operation: String)
@@ -51,6 +52,8 @@ enum SMBErrorMapper {
             .endOfFile(status: status, operation: operation)
         case SMB2Status.cancelled:
             .cancelled(status: status, operation: operation)
+        case SMB2Status.fileLockConflict, SMB2Status.lockNotGranted, SMB2Status.rangeNotLocked:
+            .lockConflict(status: status, operation: operation)
         default:
             .unsupported(status: status, operation: operation)
         }

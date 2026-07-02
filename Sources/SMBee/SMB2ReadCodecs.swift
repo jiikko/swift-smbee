@@ -11,6 +11,7 @@ enum SMB2Commands {
     static let flush: UInt16 = 7
     static let read: UInt16 = 8
     static let write: UInt16 = 9
+    static let lock: UInt16 = 10
     static let ioctl: UInt16 = 11
     static let cancel: UInt16 = 12
     static let echo: UInt16 = 13
@@ -294,6 +295,16 @@ struct SMB2CreateRequest {
             desiredAccess: 0x0000_0001,
             createDisposition: 0x0000_0001,
             createOptions: 0x0000_0001
+        )
+    }
+
+    static func byteRangeLock(path: String) -> SMB2CreateRequest {
+        // Byte-range locks require an open with read or write data access (MS-SMB2 §3.3.5.14).
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0001 | 0x0000_0002 | 0x0000_0080,
+            createDisposition: 0x0000_0001,
+            createOptions: 0x0000_0040
         )
     }
 
@@ -1289,6 +1300,68 @@ enum SMB2Close {
         writer.writeUInt32LE(0)
         writer.writeBytes(fileId)
         return writer.bytes
+    }
+}
+
+struct SMB2LockElement: Equatable, Sendable {
+    static let sharedLock: UInt32 = 0x0000_0001
+    static let exclusiveLock: UInt32 = 0x0000_0002
+    static let unlock: UInt32 = 0x0000_0004
+    static let failImmediately: UInt32 = 0x0000_0010
+
+    var offset: UInt64
+    var length: UInt64
+    var flags: UInt32
+
+    static func lock(offset: UInt64, length: UInt64, shared: Bool, failImmediately: Bool) -> SMB2LockElement {
+        SMB2LockElement(
+            offset: offset,
+            length: length,
+            flags: (shared ? sharedLock : exclusiveLock) | (failImmediately ? SMB2LockElement.failImmediately : 0)
+        )
+    }
+
+    static func unlock(offset: UInt64, length: UInt64) -> SMB2LockElement {
+        SMB2LockElement(offset: offset, length: length, flags: unlock)
+    }
+}
+
+enum SMB2Lock {
+    static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        elements: [SMB2LockElement]
+    ) throws -> [UInt8] {
+        guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        guard !elements.isEmpty, elements.count <= Int(UInt16.max) else {
+            throw SMBCodecError.invalidValue("SMB LOCK requires 1...65535 lock elements")
+        }
+        let header = try SMB2Header(command: SMB2Commands.lock, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(48)
+        writer.writeUInt16LE(UInt16(elements.count))
+        writer.writeUInt32LE(0)
+        writer.writeBytes(fileId)
+        for element in elements {
+            writer.writeUInt64LE(element.offset)
+            writer.writeUInt64LE(element.length)
+            writer.writeUInt32LE(element.flags)
+            writer.writeUInt32LE(0)
+        }
+        return writer.bytes
+    }
+
+    static func decodeResponse(_ bytes: [UInt8]) throws {
+        let header = try SMB2Header.decode(bytes)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "LOCK")
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 4 else {
+            throw SMBCodecError.invalidValue("invalid LOCK response structure size")
+        }
+        try reader.skip(count: 2)
     }
 }
 

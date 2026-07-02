@@ -524,6 +524,51 @@ public actor SMBClientSession {
         try await session.echo()
     }
 
+    /// Hold an SMB2 byte-range lock on `path` while `body` runs.
+    ///
+    /// The lock is taken on a dedicated open handle and released (UNLOCK + CLOSE) when `body`
+    /// returns or throws. SMB byte-range locks are per-open-handle: an exclusive lock taken here
+    /// also blocks this session's own read/write operations on the locked range, because those
+    /// operations open their own handles. Use `shared: true` to coordinate readers.
+    ///
+    /// - Parameters:
+    ///   - offset: Byte offset of the locked range.
+    ///   - length: Byte length of the locked range.
+    ///   - shared: `true` for a shared (read) lock, `false` for an exclusive lock.
+    ///   - failImmediately: `true` to fail with `SMBError.lockConflict` instead of blocking
+    ///     when the range is already locked by another open.
+    public func withFileLock<T: Sendable>(
+        path: String,
+        offset: UInt64,
+        length: UInt64,
+        shared: Bool = false,
+        failImmediately: Bool = true,
+        _ body: @Sendable () async throws -> T
+    ) async throws -> T {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .byteRangeLock(path: path))
+        do {
+            try await session.lock(
+                treeId: treeId,
+                fileId: fileId,
+                elements: [.lock(offset: offset, length: length, shared: shared, failImmediately: failImmediately)]
+            )
+        } catch {
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+        do {
+            let result = try await body()
+            try? await session.lock(treeId: treeId, fileId: fileId, elements: [.unlock(offset: offset, length: length)])
+            try? await session.close(treeId: treeId, fileId: fileId)
+            return result
+        } catch {
+            try? await session.lock(treeId: treeId, fileId: fileId, elements: [.unlock(offset: offset, length: length)])
+            try? await session.close(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     /// Start sending periodic authenticated SMB2 ECHO requests for this persistent session.
     /// If an ECHO fails, the underlying transport is closed and the keepalive loop stops.
     public func startKeepAlive(interval: Duration = .seconds(60)) throws {
@@ -3694,6 +3739,19 @@ actor SMBSession {
         return output
     }
 
+    func lock(treeId: UInt32, fileId: [UInt8], elements: [SMB2LockElement]) async throws {
+        let packet = try SMB2Lock.encodeRequest(
+            messageId: nextMessageId(),
+            sessionId: sessionId,
+            treeId: treeId,
+            fileId: fileId,
+            elements: elements
+        )
+        debugDump("LOCK request", packet)
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "LOCK response")
+        try SMB2Lock.decodeResponse(response)
+    }
+
     func flush(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Flush.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("FLUSH request", packet)
@@ -4328,6 +4386,9 @@ enum SMB2Status {
     static let objectNameCollision: UInt32 = 0xc000_0035
     static let objectPathNotFound: UInt32 = 0xc000_003a
     static let sharingViolation: UInt32 = 0xc000_0043
+    static let fileLockConflict: UInt32 = 0xc000_0054
+    static let lockNotGranted: UInt32 = 0xc000_0055
+    static let rangeNotLocked: UInt32 = 0xc000_007e
     static let logonFailure: UInt32 = 0xc000_006d
     static let diskFull: UInt32 = 0xc000_007f
     static let fileIsADirectory: UInt32 = 0xc000_00ba

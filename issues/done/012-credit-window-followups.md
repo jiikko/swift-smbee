@@ -5,6 +5,15 @@
 - 前提: messageId が CreditCharge 分進まないバグは 2026-07-03 に修正済み
   (`SMBSession.nextMessageId(charge:)`)。本 issue はその残件。
 
+## 対応 (2026-07-03 完了)
+
+1. orphan queue に上限 64 を追加。超過時は最古 messageId を drop して debug log。
+2. `reserveCredit` は decode 失敗時に fallback せず throw（自作 packet の decode 失敗 = 内部バグ）。
+3. FIFO head-of-line は「大 request の飢餓防止のため意図的」と rationale コメントを
+   `SMB2CreditWindow.resumeReadyWaiters` に明記。
+併せて issues/013 の残件だった `reserve` の cancellation 対応
+(withTaskCancellationHandler + waiter 除去) も実装。unit coverage あり。
+
 ## 1. `orphanResponses` の無制限蓄積
 
 `SMBSession.dispatchReceivedPacket` は pending に無い messageId の packet を

@@ -1522,13 +1522,13 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(SMB2Credit.balanceAfterReceiving(current: 1, granted: 4), 5)
     }
 
-    func testSMB2CreditWindowWaitsForGrant() async {
+    func testSMB2CreditWindowWaitsForGrant() async throws {
         let window = SMB2CreditWindow(initialCredits: 1)
 
-        let firstReserve = await window.reserve(charge: 1)
+        let firstReserve = try await window.reserve(charge: 1)
         XCTAssertEqual(firstReserve, 0)
         let task = Task {
-            await window.reserve(charge: 2)
+            try await window.reserve(charge: 2)
         }
         while await window.pendingWaiterCount == 0 {
             await Task.yield()
@@ -1544,16 +1544,34 @@ final class SMBeeTests: XCTestCase {
 
         let secondGrant = await window.grant(1)
         XCTAssertEqual(secondGrant, 0)
-        let balanceAfterReserve = await task.value
+        let balanceAfterReserve = try await task.value
         XCTAssertEqual(balanceAfterReserve, 0)
         let finalBalance = await window.balance
         XCTAssertEqual(finalBalance, 0)
     }
 
-    func testSMB2CreditWindowDoesNotConsumeZeroChargeRequests() async {
+    func testSMB2CreditWindowReserveIsCancellable() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0)
+        let task = Task {
+            try await window.reserve(charge: 1)
+        }
+        while await window.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+        task.cancel()
+        do {
+            _ = try await awaitWithTimeout("cancelled reserve") { try await task.value }
+            XCTFail("cancelled reserve unexpectedly returned")
+        } catch is CancellationError {
+        }
+        let waiters = await window.pendingWaiterCount
+        XCTAssertEqual(waiters, 0)
+    }
+
+    func testSMB2CreditWindowDoesNotConsumeZeroChargeRequests() async throws {
         let window = SMB2CreditWindow(initialCredits: 1)
 
-        let reserve = await window.reserve(charge: 0)
+        let reserve = try await window.reserve(charge: 0)
         XCTAssertEqual(reserve, 1)
         let balance = await window.balance
         XCTAssertEqual(balance, 1)

@@ -42,8 +42,8 @@
 - CI (Linux) で `swift test --parallel` ではなく verbose + 各 test の timeout を付け、
   hang するテスト名を特定する（`SMBTestTimeoutError` の仕組みを session await 系の
   全テストに広げる）。
-- `SMB2CreditWindow.reserve` に Task cancellation 対応（withTaskCancellationHandler で
-  waiter を除去して CancellationError throw）を入れる — hang 原因でなくても正しい改善。
+- ✅ 2026-07-03: `SMB2CreditWindow.reserve` の Task cancellation 対応を実装（waiter 除去 +
+  CancellationError throw、unit coverage あり）。hang 再発時はこの経路を容疑から除外できる。
 
 ## 関連
 

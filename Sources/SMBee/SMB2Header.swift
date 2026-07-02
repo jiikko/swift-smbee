@@ -122,11 +122,13 @@ enum SMB2Credit {
 actor SMB2CreditWindow {
     private struct Waiter {
         let charge: UInt16
-        let continuation: CheckedContinuation<UInt32, Never>
+        let id: UInt64
+        let continuation: CheckedContinuation<UInt32, Error>
     }
 
     private var available: UInt32
     private var waiters: [Waiter] = []
+    private var nextWaiterId: UInt64 = 0
 
     init(initialCredits: UInt32 = 1) {
         self.available = initialCredits
@@ -140,17 +142,37 @@ actor SMB2CreditWindow {
         waiters.count
     }
 
-    func reserve(charge requestedCharge: UInt16) async -> UInt32 {
+    func reserve(charge requestedCharge: UInt16) async throws -> UInt32 {
         guard requestedCharge > 0 else { return available }
         let charge = requestedCharge
         if available >= UInt32(charge) {
             available -= UInt32(charge)
             return available
         }
-        return await withCheckedContinuation { continuation in
-            waiters.append(Waiter(charge: charge, continuation: continuation))
-            resumeReadyWaiters()
+        let id = nextWaiterId
+        nextWaiterId += 1
+        // A waiter blocks until the server grants credits; if no response is coming
+        // (cancelled operation, dead session) that wait must not outlive the task
+        // (issues/013). Cancellation removes the waiter and throws.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                waiters.append(Waiter(charge: charge, id: id, continuation: continuation))
+                resumeReadyWaiters()
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id: id) }
         }
+    }
+
+    private func cancelWaiter(id: UInt64) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
+        resumeReadyWaiters()
     }
 
     func grant(_ credits: UInt16) -> UInt32 {
@@ -167,6 +189,10 @@ actor SMB2CreditWindow {
     }
 
     private func resumeReadyWaiters() {
+        // FIFO on purpose: only the head waiter is considered, even when a later waiter's
+        // smaller charge would fit the current balance. First-fit would let a stream of
+        // small requests starve a large multi-credit READ/WRITE indefinitely; the cost is
+        // head-of-line blocking while the window refills (issues/012 §3).
         while let waiter = waiters.first, available >= UInt32(waiter.charge) {
             waiters.removeFirst()
             available -= UInt32(waiter.charge)

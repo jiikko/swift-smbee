@@ -3017,6 +3017,7 @@ actor SMBSession {
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
     private var sentResponseMessageIds: Set<UInt64> = []
     private var orphanResponses: [UInt64: [UInt8]] = [:]
+    private static let maxOrphanResponses = 64
     private var receiveLoopRunning = false
 
     init(
@@ -4057,7 +4058,7 @@ actor SMBSession {
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {
         try Task.checkCancellation()
-        let reservedCharge = await reserveCredit(packet)
+        let reservedCharge = try await reserveCredit(packet)
         do {
             try await transport.send(DirectTCPFraming.frame(packet))
         } catch {
@@ -4090,7 +4091,7 @@ actor SMBSession {
             sender: .client
         )
         signed.replaceSubrange(48..<64, with: signature)
-        let reservedCharge = await reserveCredit(signed)
+        let reservedCharge = try await reserveCredit(signed)
         do {
             try await transport.send(DirectTCPFraming.frame(signed))
         } catch {
@@ -4132,7 +4133,7 @@ actor SMBSession {
         }
         header.signature = sealed.tag
         try Task.checkCancellation()
-        let reservedCharge = await reserveCredit(packet)
+        let reservedCharge = try await reserveCredit(packet)
         do {
             try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
         } catch {
@@ -4201,6 +4202,15 @@ actor SMBSession {
             return
         }
         guard var pending = pendingResponses[header.messageId] else {
+            // Bound the orphan queue: spurious/duplicate server responses whose messageId is
+            // never claimed by markRequestSent would otherwise accumulate for the whole
+            // session lifetime (issues/012). Dropping the oldest is safe — a legitimate
+            // pre-send response arrives within the current in-flight window.
+            if orphanResponses.count >= Self.maxOrphanResponses,
+               let oldestId = orphanResponses.keys.min() {
+                orphanResponses.removeValue(forKey: oldestId)
+                debugLine("SMB orphan response queue full; dropped message id \(oldestId)")
+            }
             orphanResponses[header.messageId] = packet
             debugLine("SMB response queued for future message id \(header.messageId)")
             return
@@ -4251,9 +4261,13 @@ actor SMBSession {
         }
     }
 
-    private func reserveCredit(_ packet: [UInt8]) async -> UInt16 {
-        guard let header = try? SMB2Header.decode(packet) else { return 1 }
-        let balance = await creditWindow.reserve(charge: header.creditCharge)
+    private func reserveCredit(_ packet: [UInt8]) async throws -> UInt16 {
+        // The packet was produced by our own encoders; a decode failure means an internal
+        // bug. Failing here keeps the credit window in sync with what is actually sent —
+        // a silent charge=1 fallback would drift the window against the embedded
+        // CreditCharge (issues/012).
+        let header = try SMB2Header.decode(packet)
+        let balance = try await creditWindow.reserve(charge: header.creditCharge)
         debugLine("SMB credit charge=\(header.creditCharge) balance=\(balance)")
         return header.creditCharge
     }

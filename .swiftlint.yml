@@ -9,3 +9,12 @@ disabled_rules:
   - identifier_name
 
 analyzer_rules: []
+
+custom_rules:
+  no_trapping_uint16_length_cast:
+    name: "No trapping UInt16 length cast"
+    # UInt16(<expr>.count) / UInt16(<expr>Size) は overflow で fatalError する。
+    # 入力由来の可変長は `writer.writeUInt16LE(count:of:)` (throw) を使う (issues/011)。
+    regex: 'writeUInt16LE\(UInt16\([^)]*(\.count|[sS]ize)\)'
+    message: "Use writeUInt16LE(count:of:) for variable-length fields; UInt16(Int) traps on overflow (issues/011)"
+    severity: error

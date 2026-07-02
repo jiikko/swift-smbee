@@ -77,7 +77,7 @@ enum NTLM {
         | negotiateKeyExchange
         | negotiate56
 
-    static func makeType1(domain: String = "", workstation: String = "") -> [UInt8] {
+    static func makeType1(domain: String = "", workstation: String = "") throws -> [UInt8] {
         let domainBytes = Array(domain.uppercased().utf8)
         let workstationBytes = Array(workstation.uppercased().utf8)
         var writer = SMBByteWriter()
@@ -86,8 +86,8 @@ enum NTLM {
         writer.writeUInt32LE(negotiateFlags)
         let domainOffset = UInt32(40)
         let workstationOffset = domainOffset + UInt32(domainBytes.count)
-        writeSecurityBuffer(&writer, length: domainBytes.count, offset: domainOffset)
-        writeSecurityBuffer(&writer, length: workstationBytes.count, offset: workstationOffset)
+        try writeSecurityBuffer(&writer, length: domainBytes.count, offset: domainOffset)
+        try writeSecurityBuffer(&writer, length: workstationBytes.count, offset: workstationOffset)
         writer.writeBytes([0x06, 0x01, 0xb1, 0x1d, 0, 0, 0, 0x0f])
         writer.writeBytes(domainBytes)
         writer.writeBytes(workstationBytes)
@@ -119,7 +119,7 @@ enum NTLM {
         exportedSessionKey: [UInt8] = randomBytes(count: 16)
     ) throws -> (message: [UInt8], sessionBaseKey: [UInt8], exportedSessionKey: [UInt8]) {
         if credential.isAnonymous {
-            return makeAnonymousType3(challenge: challenge)
+            return try makeAnonymousType3(challenge: challenge)
         }
         guard clientChallenge.count == 8 else {
             throw SMBCodecError.invalidValue("NTLMv2 client challenge must be 8 bytes")
@@ -191,12 +191,12 @@ enum NTLM {
         var writer = SMBByteWriter()
         writer.writeBytes(signature)
         writer.writeUInt32LE(3)
-        writeSecurityBuffer(&writer, length: lm.0, offset: lm.1)
-        writeSecurityBuffer(&writer, length: nt.0, offset: nt.1)
-        writeSecurityBuffer(&writer, length: domain.0, offset: domain.1)
-        writeSecurityBuffer(&writer, length: user.0, offset: user.1)
-        writeSecurityBuffer(&writer, length: workstation.0, offset: workstation.1)
-        writeSecurityBuffer(&writer, length: sessionKey.0, offset: sessionKey.1)
+        try writeSecurityBuffer(&writer, length: lm.0, offset: lm.1)
+        try writeSecurityBuffer(&writer, length: nt.0, offset: nt.1)
+        try writeSecurityBuffer(&writer, length: domain.0, offset: domain.1)
+        try writeSecurityBuffer(&writer, length: user.0, offset: user.1)
+        try writeSecurityBuffer(&writer, length: workstation.0, offset: workstation.1)
+        try writeSecurityBuffer(&writer, length: sessionKey.0, offset: sessionKey.1)
         writer.writeUInt32LE(flags)
         writer.writeBytes([0x06, 0x01, 0xb1, 0x1d, 0, 0, 0, 0x0f])
         if includeMIC {
@@ -213,7 +213,7 @@ enum NTLM {
 
     private static func makeAnonymousType3(
         challenge: NTLMChallenge
-    ) -> (message: [UInt8], sessionBaseKey: [UInt8], exportedSessionKey: [UInt8]) {
+    ) throws -> (message: [UInt8], sessionBaseKey: [UInt8], exportedSessionKey: [UInt8]) {
         let lmChallengeResponse: [UInt8] = [0x00]
         let ntChallengeResponse: [UInt8] = []
         let domainBytes: [UInt8] = []
@@ -248,12 +248,12 @@ enum NTLM {
         var writer = SMBByteWriter()
         writer.writeBytes(signature)
         writer.writeUInt32LE(3)
-        writeSecurityBuffer(&writer, length: lm.0, offset: lm.1)
-        writeSecurityBuffer(&writer, length: nt.0, offset: nt.1)
-        writeSecurityBuffer(&writer, length: domain.0, offset: domain.1)
-        writeSecurityBuffer(&writer, length: user.0, offset: user.1)
-        writeSecurityBuffer(&writer, length: workstation.0, offset: workstation.1)
-        writeSecurityBuffer(&writer, length: key.0, offset: key.1)
+        try writeSecurityBuffer(&writer, length: lm.0, offset: lm.1)
+        try writeSecurityBuffer(&writer, length: nt.0, offset: nt.1)
+        try writeSecurityBuffer(&writer, length: domain.0, offset: domain.1)
+        try writeSecurityBuffer(&writer, length: user.0, offset: user.1)
+        try writeSecurityBuffer(&writer, length: workstation.0, offset: workstation.1)
+        try writeSecurityBuffer(&writer, length: key.0, offset: key.1)
         writer.writeUInt32LE(flags)
         writer.writeBytes([0x06, 0x01, 0xb1, 0x1d, 0, 0, 0, 0x0f])
         writer.writeBytes(payload)
@@ -309,9 +309,9 @@ enum NTLM {
         string.utf16.flatMap { [UInt8($0 & 0xff), UInt8(($0 >> 8) & 0xff)] }
     }
 
-    private static func writeSecurityBuffer(_ writer: inout SMBByteWriter, length: Int, offset: UInt32) {
-        writer.writeUInt16LE(UInt16(length))
-        writer.writeUInt16LE(UInt16(length))
+    private static func writeSecurityBuffer(_ writer: inout SMBByteWriter, length: Int, offset: UInt32) throws {
+        try writer.writeUInt16LE(count: length, of: "NTLM security buffer")
+        try writer.writeUInt16LE(count: length, of: "NTLM security buffer")
         writer.writeUInt32LE(offset)
     }
 

@@ -17,6 +17,16 @@ struct SMBByteWriter {
         bytes.append(UInt8((value >> 8) & 0xff))
     }
 
+    /// Range-checked UInt16 write for variable-length counts derived from input data.
+    /// The plain `UInt16(Int)` initializer traps at runtime on overflow, turning an
+    /// oversized path/blob/ACL into a process crash instead of a thrown codec error.
+    mutating func writeUInt16LE(count: Int, of label: String) throws {
+        guard let value = UInt16(exactly: count) else {
+            throw SMBCodecError.invalidValue("\(label) length \(count) exceeds UInt16 range")
+        }
+        writeUInt16LE(value)
+    }
+
     mutating func writeUInt32LE(_ value: UInt32) {
         bytes.append(UInt8(value & 0xff))
         bytes.append(UInt8((value >> 8) & 0xff))

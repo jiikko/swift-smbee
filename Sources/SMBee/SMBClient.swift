@@ -3068,7 +3068,7 @@ actor SMBSession {
             }
         }
 
-        let type1Message = NTLM.makeType1(domain: credential.domain)
+        let type1Message = try NTLM.makeType1(domain: credential.domain)
         let type1 = SPNEGO.wrapNegTokenInit(type1Message)
         let challengePacket = try SMB2SessionSetup.encodeRequest(
             messageId: nextMessageId(),

@@ -1417,6 +1417,29 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNoThrow(try SMB2Echo.decodeResponse(response))
     }
 
+    func testEncoderRejectsOversizedVariableLengthFieldsInsteadOfTrapping() throws {
+        // Regression for issues/011: a >64KiB name/path used to hit the trapping
+        // UInt16(Int) initializer and crash the process instead of throwing.
+        let hugeName = String(repeating: "a", count: 40_000)
+        XCTAssertThrowsError(
+            try SMB2Create.encodeRequest(
+                messageId: 1,
+                sessionId: 1,
+                treeId: 1,
+                request: .read(path: hugeName, directory: false)
+            )
+        ) { error in
+            guard case SMBCodecError.invalidValue = error else {
+                return XCTFail("expected SMBCodecError.invalidValue, got \(error)")
+            }
+        }
+
+        var writer = SMBByteWriter()
+        XCTAssertThrowsError(try writer.writeUInt16LE(count: 65_536, of: "test"))
+        XCTAssertThrowsError(try writer.writeUInt16LE(count: -1, of: "test"))
+        XCTAssertNoThrow(try writer.writeUInt16LE(count: 65_535, of: "test"))
+    }
+
     func testSMB2LockRequestShape() throws {
         let fileId: [UInt8] = Array(1...16)
         let request = try SMB2Lock.encodeRequest(
@@ -2295,7 +2318,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testNTLMMICUsesExportedSessionKeyAndZeroedMICField() throws {
-        let type1 = NTLM.makeType1()
+        let type1 = try NTLM.makeType1()
         let type2 = makeNTLMChallengeMessage(targetInfo: hexBytes("070008000090d336b734c30100000000"))
         let challenge = try NTLM.parseChallenge(type2)
         let exportedSessionKey = hexBytes("00112233445566778899aabbccddeeff")
@@ -2322,7 +2345,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testNTLMType3MICPathAddsRequiredAVPairs() throws {
-        let type1 = NTLM.makeType1()
+        let type1 = try NTLM.makeType1()
         var targetInfo: [UInt8] = []
         appendAVPair(id: 1, value: NTLM.utf16le("SERVER"), to: &targetInfo)
         appendAVPair(id: 2, value: NTLM.utf16le("DOMAIN"), to: &targetInfo)
@@ -2353,7 +2376,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testNTLMType3MICPathUpdatesExistingRequiredAVPairsWithoutDuplicates() throws {
-        let type1 = NTLM.makeType1()
+        let type1 = try NTLM.makeType1()
         var targetInfo: [UInt8] = []
         appendAVPair(id: 1, value: NTLM.utf16le("SERVER"), to: &targetInfo)
         appendAVPair(id: 6, value: [0x01, 0x00, 0x00, 0x00], to: &targetInfo)
@@ -2398,8 +2421,8 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(hex(mic), "01000000549d70fe51ab6ebd00000000")
     }
 
-    func testNTLMType1FixedBytesAndSecurityBuffers() {
-        let type1 = NTLM.makeType1()
+    func testNTLMType1FixedBytesAndSecurityBuffers() throws {
+        let type1 = try NTLM.makeType1()
 
         XCTAssertEqual(type1.count, 40)
         XCTAssertEqual(Array(type1[0..<8]), Array("NTLMSSP\0".utf8))
@@ -2415,8 +2438,8 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(hex(Array(type1[32..<40])), "0601b11d0000000f")
     }
 
-    func testNTLMType1DomainAndWorkstationSecurityBuffers() {
-        let type1 = NTLM.makeType1(domain: "dom", workstation: "wkst")
+    func testNTLMType1DomainAndWorkstationSecurityBuffers() throws {
+        let type1 = try NTLM.makeType1(domain: "dom", workstation: "wkst")
 
         XCTAssertEqual(readUInt16LE(type1, at: 16), 3)
         XCTAssertEqual(readUInt16LE(type1, at: 18), 3)
@@ -2429,7 +2452,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSPNEGONegTokenInitDERStructure() throws {
-        let type1 = NTLM.makeType1()
+        let type1 = try NTLM.makeType1()
         let token = SPNEGO.wrapNegTokenInit(type1)
 
         var cursor = 0
@@ -2531,7 +2554,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSessionSetupRequestFixedFieldsAndSecurityBuffer() throws {
-        let blob = SPNEGO.wrapNegTokenInit(NTLM.makeType1())
+        let blob = SPNEGO.wrapNegTokenInit(try NTLM.makeType1())
         let request = try SMB2SessionSetup.encodeRequest(
             messageId: 7,
             sessionId: 0,

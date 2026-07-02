@@ -158,7 +158,7 @@ enum SMB2SessionSetup {
         writer.writeUInt32LE(0)
         writer.writeUInt32LE(0)
         writer.writeUInt16LE(UInt16(securityOffset))
-        writer.writeUInt16LE(UInt16(securityBlob.count))
+        try writer.writeUInt16LE(count: securityBlob.count, of: "SESSION_SETUP security blob")
         writer.writeUInt64LE(0)
         writer.writeBytes(securityBlob)
         return writer.bytes
@@ -187,7 +187,7 @@ enum SMB2TreeConnect {
         writer.writeUInt16LE(9)
         writer.writeUInt16LE(0)
         writer.writeUInt16LE(UInt16(pathOffset))
-        writer.writeUInt16LE(UInt16(pathBytes.count))
+        try writer.writeUInt16LE(count: pathBytes.count, of: "TREE_CONNECT path")
         writer.writeBytes(pathBytes)
         return writer.bytes
     }
@@ -254,7 +254,7 @@ enum SMB2Create {
         writer.writeUInt32LE(request.createDisposition)
         writer.writeUInt32LE(request.createOptions)
         writer.writeUInt16LE(UInt16(nameOffset))
-        writer.writeUInt16LE(UInt16(nameBytes.count))
+        try writer.writeUInt16LE(count: nameBytes.count, of: "CREATE name")
         writer.writeUInt32LE(0)
         writer.writeUInt32LE(0)
         writer.writeBytes(nameBytes.isEmpty ? [0] : nameBytes)
@@ -1100,8 +1100,8 @@ enum SMB2SetInfo {
         var writer = SMBByteWriter()
         writer.writeUInt8(2)
         writer.writeUInt8(0)
-        writer.writeUInt16LE(UInt16(aclSize))
-        writer.writeUInt16LE(UInt16(dacl.count))
+        try writer.writeUInt16LE(count: aclSize, of: "ACL")
+        try writer.writeUInt16LE(count: dacl.count, of: "DACL ACE count")
         writer.writeUInt16LE(0)
         writer.writeBytes(aces)
         return writer.bytes
@@ -1122,7 +1122,7 @@ enum SMB2SetInfo {
         var writer = SMBByteWriter()
         writer.writeUInt8(ace.type)
         writer.writeUInt8(ace.flags)
-        writer.writeUInt16LE(UInt16(aceSize))
+        try writer.writeUInt16LE(count: aceSize, of: "ACE")
         writer.writeUInt32LE(ace.accessMask)
         writer.writeBytes(sid)
         return writer.bytes
@@ -1359,7 +1359,7 @@ enum SMB2Lock {
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(48)
-        writer.writeUInt16LE(UInt16(elements.count))
+        try writer.writeUInt16LE(count: elements.count, of: "LOCK element list")
         writer.writeUInt32LE(0)
         writer.writeBytes(fileId)
         for element in elements {

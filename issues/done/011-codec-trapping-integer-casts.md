@@ -18,7 +18,17 @@ encoder が `Int` 長を `UInt16(...)` の trapping initializer で直接 cast �
 `Sources/SMBee/DCERPC.swift` にも同類の `UInt16(16 + body.count)` があるが、
 現用途 (share enum) では 64KB 超 stub に到達しにくい。
 
-## 対応方針（案）
+## 対応 (2026-07-03 完了)
+
+- `SMBByteWriter.writeUInt16LE(count:of:)` (range-checked, `SMBCodecError.invalidValue` を throw)
+  を追加し、可変長 count の全 call site (CREATE name / TREE_CONNECT path / SESSION_SETUP blob /
+  ACL・ACE / DCE/RPC fragment / NTLM security buffer / NEGOTIATE dialect・salt・context /
+  LOCK element) を置換。
+- SwiftLint custom rule `no_trapping_uint16_length_cast` (error) を追加し再発を build 時に阻止。
+- 回帰 unit: `testEncoderRejectsOversizedVariableLengthFieldsInsteadOfTrapping`
+  (>32K 文字 path の CREATE encode が throw する)。
+
+## 対応方針（案・当初）
 
 - 共通ヘルパー（例: `SMBByteWriter.writeUInt16LE(checked: Int) throws`）を導入し、
   範囲超過は `SMBCodecError.invalidValue` として throw する。

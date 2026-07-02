@@ -25,7 +25,7 @@ enum DCERPC {
         body.writeUInt8(0)
         body.writeBytes(encodeSyntax(uuid: abstractSyntax, version: abstractVersion))
         body.writeBytes(encodeSyntax(uuid: ndrTransferSyntax, version: 2))
-        return encodeHeader(type: pduTypeBind, callId: callId, body: body.bytes)
+        return try encodeHeader(type: pduTypeBind, callId: callId, body: body.bytes)
     }
 
     static func decodeBindAck(_ bytes: [UInt8]) throws {
@@ -57,7 +57,7 @@ enum DCERPC {
         body.writeUInt16LE(contextId)
         body.writeUInt16LE(opnum)
         body.writeBytes(stub)
-        return encodeHeader(type: pduTypeRequest, callId: callId, body: body.bytes)
+        return try encodeHeader(type: pduTypeRequest, callId: callId, body: body.bytes)
     }
 
     static func decodeResponseStub(_ bytes: [UInt8]) throws -> [UInt8] {
@@ -101,14 +101,14 @@ enum DCERPC {
         }
     }
 
-    private static func encodeHeader(type: UInt8, callId: UInt32, body: [UInt8]) -> [UInt8] {
+    private static func encodeHeader(type: UInt8, callId: UInt32, body: [UInt8]) throws -> [UInt8] {
         var writer = SMBByteWriter()
         writer.writeUInt8(5)
         writer.writeUInt8(0)
         writer.writeUInt8(type)
         writer.writeUInt8(firstFragLastFrag)
         writer.writeBytes(dataRepresentation)
-        writer.writeUInt16LE(UInt16(16 + body.count))
+        try writer.writeUInt16LE(count: 16 + body.count, of: "DCE/RPC fragment")
         writer.writeUInt16LE(0)
         writer.writeUInt32LE(callId)
         writer.writeBytes(body)

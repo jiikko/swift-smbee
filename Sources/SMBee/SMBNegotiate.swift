@@ -62,7 +62,7 @@ public enum SMBNegotiateCodec {
         guard !offeredDialects.isEmpty else {
             throw SMBCodecError.invalidValue("NEGOTIATE requires at least one dialect")
         }
-        let contexts = encodeNegotiateContexts(salt: salt)
+        let contexts = try encodeNegotiateContexts(salt: salt)
         let header = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
         let dialectBytes = MemoryLayout<UInt16>.size * offeredDialects.count
         let fixedBodySize = 36
@@ -72,7 +72,7 @@ public enum SMBNegotiateCodec {
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(36)
-        writer.writeUInt16LE(UInt16(offeredDialects.count))
+        try writer.writeUInt16LE(count: offeredDialects.count, of: "NEGOTIATE dialect list")
         writer.writeUInt16LE(SMBNegotiateConstants.signingEnabled)
         writer.writeUInt16LE(0)
         writer.writeUInt32LE(SMBNegotiateConstants.globalCapEncryption)
@@ -187,18 +187,18 @@ public enum SMBNegotiateCodec {
         )
     }
 
-    private static func encodeNegotiateContexts(salt: [UInt8]) -> [UInt8] {
+    private static func encodeNegotiateContexts(salt: [UInt8]) throws -> [UInt8] {
         var bytes: [UInt8] = []
-        appendContext(type: SMBNegotiateConstants.preauthContext, data: encodePreauthData(salt: salt), padTo8: true, to: &bytes)
-        appendContext(type: SMBNegotiateConstants.encryptionContext, data: encodeEncryptionData(), padTo8: true, to: &bytes)
-        appendContext(type: SMBNegotiateConstants.signingContext, data: encodeSigningData(), padTo8: false, to: &bytes)
+        try appendContext(type: SMBNegotiateConstants.preauthContext, data: encodePreauthData(salt: salt), padTo8: true, to: &bytes)
+        try appendContext(type: SMBNegotiateConstants.encryptionContext, data: encodeEncryptionData(), padTo8: true, to: &bytes)
+        try appendContext(type: SMBNegotiateConstants.signingContext, data: encodeSigningData(), padTo8: false, to: &bytes)
         return bytes
     }
 
-    private static func encodePreauthData(salt: [UInt8]) -> [UInt8] {
+    private static func encodePreauthData(salt: [UInt8]) throws -> [UInt8] {
         var writer = SMBByteWriter()
         writer.writeUInt16LE(1)
-        writer.writeUInt16LE(UInt16(salt.count))
+        try writer.writeUInt16LE(count: salt.count, of: "NEGOTIATE preauth salt")
         writer.writeUInt16LE(SMBNegotiateConstants.sha512)
         writer.writeBytes(salt)
         return writer.bytes
@@ -219,10 +219,10 @@ public enum SMBNegotiateCodec {
         return writer.bytes
     }
 
-    private static func appendContext(type: UInt16, data: [UInt8], padTo8: Bool, to bytes: inout [UInt8]) {
+    private static func appendContext(type: UInt16, data: [UInt8], padTo8: Bool, to bytes: inout [UInt8]) throws {
         var writer = SMBByteWriter()
         writer.writeUInt16LE(type)
-        writer.writeUInt16LE(UInt16(data.count))
+        try writer.writeUInt16LE(count: data.count, of: "NEGOTIATE context data")
         writer.writeUInt32LE(0)
         writer.writeBytes(data)
         if padTo8 {

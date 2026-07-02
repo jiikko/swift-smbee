@@ -180,6 +180,8 @@ final class SMBCLIBatchTests: XCTestCase {
             "--no-overwrite",
             "--progress",
             "--resume",
+            "--verify",
+            "size",
             "--include",
             "*.log",
             "--exclude",
@@ -191,6 +193,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(get.noOverwrite)
         XCTAssertTrue(get.progress)
         XCTAssertTrue(get.resume)
+        XCTAssertEqual(get.verify, .size)
         XCTAssertEqual(get.include, ["*.log"])
         XCTAssertEqual(get.exclude, ["debug*"])
 
@@ -201,6 +204,8 @@ final class SMBCLIBatchTests: XCTestCase {
             "--no-overwrite",
             "--progress",
             "--resume",
+            "--verify",
+            "size",
             "--include",
             "*.txt",
             "--exclude",
@@ -212,6 +217,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertTrue(put.noOverwrite)
         XCTAssertTrue(put.progress)
         XCTAssertTrue(put.resume)
+        XCTAssertEqual(put.verify, .size)
         XCTAssertEqual(put.include, ["*.txt"])
         XCTAssertEqual(put.exclude, ["nested/skip*"])
 

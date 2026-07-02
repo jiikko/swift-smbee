@@ -730,6 +730,9 @@ struct Get: AsyncParsableCommand {
     @Flag(help: "Show transfer progress")
     var progress = false
 
+    @Option(help: "Verify completed single-file transfer: none or size")
+    var verify: TransferVerifyMode = .none
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -743,6 +746,9 @@ struct Get: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: source, auth: auth)
         if recursive {
+            guard verify == .none else {
+                throw ValidationError("--verify is currently supported only for single-file get")
+            }
             // ⓥ Directory transfer progress is not exposed by the facade yet.
             try await transport.withOperationDeadline {
                 try await SMBee.downloadDirectory(
@@ -785,6 +791,9 @@ struct Get: AsyncParsableCommand {
                 timeout: transport.duration,
                 onProgress: onProgress
             )
+        }
+        if verify == .size {
+            try await verifyDownloadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: destination), transport: transport)
         }
         progressWriter?.finish()
     }
@@ -857,6 +866,9 @@ struct Put: AsyncParsableCommand {
     @Flag(help: "Show transfer progress")
     var progress = false
 
+    @Option(help: "Verify completed single-file transfer: none or size")
+    var verify: TransferVerifyMode = .none
+
     @OptionGroup
     var auth: AuthOptions
 
@@ -870,6 +882,9 @@ struct Put: AsyncParsableCommand {
         debug.apply()
         let (endpoint, credential) = try makeEndpointAndCredential(url: destination, auth: auth)
         if recursive {
+            guard verify == .none else {
+                throw ValidationError("--verify is currently supported only for single-file put")
+            }
             // ⓥ Directory transfer progress is not exposed by the facade yet.
             try await transport.withOperationDeadline {
                 try await SMBee.uploadDirectory(
@@ -908,6 +923,9 @@ struct Put: AsyncParsableCommand {
                     onProgress: { progress in progressWriter.emit(progress) }
                 )
             }
+            if verify == .size {
+                try await verifyUploadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: source), transport: transport)
+            }
             progressWriter.finish()
             return
         }
@@ -923,6 +941,9 @@ struct Put: AsyncParsableCommand {
                 resume: resume,
                 timeout: transport.duration
             )
+        }
+        if verify == .size {
+            try await verifyUploadedSize(endpoint: endpoint, credential: credential, localFile: URL(fileURLWithPath: source), transport: transport)
         }
     }
 }
@@ -1129,6 +1150,66 @@ struct TransportOptions: ParsableArguments {
         let fractionalSeconds = seconds - wholeSeconds
         return .seconds(Int64(wholeSeconds)) + .nanoseconds(Int64((fractionalSeconds * 1_000_000_000).rounded()))
     }
+}
+
+enum TransferVerifyMode: String, ExpressibleByArgument {
+    case none
+    case size
+}
+
+private func verifyDownloadedSize(
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    localFile: URL,
+    transport: TransportOptions
+) async throws {
+    let stat = try await transport.withOperationDeadline {
+        try await SMBee.stat(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            timeout: transport.duration
+        )
+    }
+    let localSize = try localFileSize(localFile)
+    guard stat.size == localSize else {
+        throw ValidationError("size verification failed: remote=\(stat.size) local=\(localSize)")
+    }
+}
+
+private func verifyUploadedSize(
+    endpoint: SMBURLParser.ReadURL,
+    credential: SMBCredential,
+    localFile: URL,
+    transport: TransportOptions
+) async throws {
+    let localSize = try localFileSize(localFile)
+    let stat = try await transport.withOperationDeadline {
+        try await SMBee.stat(
+            host: endpoint.host,
+            port: endpoint.port,
+            credential: credential,
+            share: endpoint.share,
+            path: endpoint.path,
+            timeout: transport.duration
+        )
+    }
+    guard stat.size == localSize else {
+        throw ValidationError("size verification failed: local=\(localSize) remote=\(stat.size)")
+    }
+}
+
+private func localFileSize(_ url: URL) throws -> UInt64 {
+    let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+    guard let raw = attributes[.size] else {
+        throw ValidationError("local file size unavailable")
+    }
+    if let number = raw as? NSNumber { return number.uint64Value }
+    if let value = raw as? UInt64 { return value }
+    if let value = raw as? Int, value >= 0 { return UInt64(value) }
+    throw ValidationError("local file size unavailable")
 }
 
 private final class TransferProgressWriter: @unchecked Sendable {

@@ -442,6 +442,8 @@ read 先行 → write。**read 成功を理由に write へ自動 GO しない**
     basename または relative path glob で選別し、directory は exclude で枝刈りする。
   - 2026-07-02: recursive directory transfer に public API `perFileTimeout` と CLI
     `--per-file-timeout` を追加。`--operation-timeout` は全体、`--per-file-timeout` は各 file 転送を bound する。
+  - 2026-07-02: `smbcli get --verify size` / `smbcli put --verify size` を追加。単一 file 転送後に
+    local/remote size を照合する。hash verify と recursive verify は未実装。
   - sparse file / allocation size / zero range の扱いも未実装。巨大 VM image や backup 用途では
     通信量と local disk 使用量に影響するため、`FSCTL_SET_ZERO_DATA` 等を調査する。
   - 暗号化 transport の integrity とは別に、consumer visible な transfer verification (size / optional hash)

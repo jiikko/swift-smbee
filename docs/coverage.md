@@ -33,8 +33,8 @@ Status labels:
 | CREATE / CLOSE / FLUSH | MS-SMB2 3.2.4.5, 3.2.4.17, 3.2.4.7 | `SMBClient.swift`, `SMB2ReadCodecs.swift` | yes | yes | smoke | no | covered | Durable handles, leases, and oplocks are unsupported. |
 | QUERY_DIRECTORY streaming | MS-SMB2 3.2.4.18 | `SMBClient.swift`, `SMBee.withDirectoryStream` | yes | yes | smoke | no | covered | Existing `list` collector remains for compatibility. |
 | QUERY_INFO stat | MS-SMB2, MS-FSCC | `SMB2ReadCodecs.swift`, `SMBClient.swift` | yes | yes | smoke | no | covered | Reparse target data is not decoded. |
-| READ full/range/streaming | MS-SMB2 3.2.4.6 | `SMBClient.swift`, `SMBee.withReadStream` | yes | yes | smoke | no | covered | >4GiB E2E is gated/manual. |
-| WRITE upload/streaming | MS-SMB2 3.2.4.8 | `SMBClient.swift` | yes | yes | smoke | no | covered | Single-file upload byte-level resume is implemented. Checksum verification and sparse file preservation are unsupported. |
+| READ full/range/streaming | MS-SMB2 3.2.4.6 | `SMBClient.swift`, `SMBee.withReadStream` | yes | yes | smoke | no | covered | CLI size verification exists for single-file get. >4GiB E2E is gated/manual. |
+| WRITE upload/streaming | MS-SMB2 3.2.4.8 | `SMBClient.swift` | yes | yes | smoke | no | covered | Single-file upload byte-level resume and CLI size verification are implemented. Checksum verification and sparse file preservation are unsupported. |
 | CreditCharge / CreditRequest | MS-SMB2 3.2.4.1 | `SMB2Credit`, `SMB2Read`, `SMB2Write`, `SMBSession`, `SMBTransferLimits` | yes | no | no | no | partial | READ/WRITE charge, response grant tracking, and credit-capped chunk planning are implemented. Credit-window blocking and multi-flight allocator are not implemented. |
 | byte-range lock | MS-SMB2 LOCK | unsupported | no | no | no | no | unsupported | Explicit lock/unlock API is not implemented. |
 | mkdir / rename / delete | MS-SMB2 CREATE, SET_INFO | `SMBClient.swift` | yes | yes | smoke | no | covered | Mutation retry is intentionally conservative. |

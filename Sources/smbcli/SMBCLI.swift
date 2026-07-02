@@ -258,7 +258,9 @@ struct Watch: AsyncParsableCommand {
                 }
                 // stdout is fully buffered when redirected to a file/pipe (e.g. `watch --json > out.jsonl`),
                 // so streamed events would not surface until the process exits. Flush after each event.
-                fflush(stdout)
+                // fflush(nil) flushes all open output streams and avoids referencing the mutable global
+                // `stdout` (which is not Sendable under Swift 6 strict concurrency on Linux/Glibc).
+                fflush(nil)
             }
         }
         let sigint = makeSIGINTSource {

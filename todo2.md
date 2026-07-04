@@ -1,77 +1,63 @@
-# todo2: Linux/macOS smbclient coverage backlog
+# todo2: current Linux/macOS smbclient backlog
 
-この文書は、SMBee を **Linux / macOS で使う smbclient 相当の SMB2/3 クライアント**として育てるための未実装・未検証 backlog である。
+この文書は、SMBee を **Linux / macOS で使う smbclient 相当の SMB2/3 クライアント**として育てるための、現在の未解決 backlog である。
 
-`todo.md` は実装進捗の時系列ログになっているため、本書では「Linux/macOS smbclient として何をカバーすべきか」「いま本当に未実装なのか」「完了条件は何か」に絞る。
+`todo.md` は実装進捗の時系列ログではなく、現在の状態が分かる要約に整理する。詳細な調査ログや履歴は issue / commit / docs に寄せる。
 
 ## 監査時点
 
-- 監査日: 2026-07-02
-- 監査対象 branch: `master`
+- 最終更新: 2026-07-04
+- 対象 branch: `master`
 - 正本仕様:
-  - MS-SMB2: <https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/5606ad47-5ee0-437a-817e-70c366052962>
-  - MS-FSCC: FileInformation / FileSystemInformation / FSCTL / reparse point / security descriptor 周辺
+  - MS-SMB2: SMB2/3 command、dialect、signing/encryption、credit、durable handle、CHANGE_NOTIFY
+  - MS-FSCC: file info / filesystem info / FSCTL / reparse point / security descriptor
   - MS-NLMP: NTLM / NTLMv2
   - MS-SPNG: SPNEGO
   - MS-DFSC: DFS referral
   - MS-SRVS / MS-RPCE / MS-DTYP / MS-ERREF: share enum、DCE/RPC、SID/FILETIME、NTSTATUS
-- 実装確認に使った主なファイル:
-  - `README.md`
-  - `docs/smb-protocol.md`
-  - `docs/testing.md`
-  - `todo.md`
-  - `Sources/SMBee/SMBee.swift`
-  - `Sources/SMBee/SMBClient.swift`
-  - `Sources/SMBee/SMBNegotiate.swift`
-  - `Sources/SMBee/SMB2Header.swift`
-  - `Sources/SMBee/SMB2ReadCodecs.swift`
-  - `Sources/SMBee/SMB2DfsReferral.swift`
-  - `Sources/SMBee/NTLM.swift`
-  - `Sources/smbcli/SMBCLI.swift`
-  - `Tests/SMBeeTests/SMBeeE2ETests.swift`
-  - `.github/workflows/test.yml`
-  - `.github/workflows/e2e.yml`
-  - `.github/workflows/samba-compat.yml`
-  - `issues/005-auth-macos-finder-equivalent-smb-auth.md`
-  - `issues/008-acl-followups-sid-name-resolution-set-security.md`
-  - `issues/009-dfs-referral-real-server-e2e.md`
 
 ## 状態ラベル
 
-- `implemented`: 実装があり、unit または E2E の証拠がある。
-- `implemented-but-underverified`: 実装はあるが、実サーバ・CI・互換 matrix の裏取りが足りない。
-- `partial`: 一部 API / codec はあるが、smbclient として期待される挙動には足りない。
-- `missing`: 実装が見つからない。コード検索でも対応する codec / public API / CLI が確認できない。
-- `explicitly-out-of-scope`: 現時点ではやらない。README/docs にも明示する。
+- `implemented`: 実装済み。unit または E2E の証拠がある。
+- `implemented-but-underverified`: 実装済みだが、実サーバ・CI・互換 matrix の裏取りが足りない。
+- `partial`: 一部実装済み。smbclient として期待される挙動にはまだ足りない。
+- `missing`: 実装がない、または public API / CLI として露出していない。
+- `explicitly-unsupported`: 現時点では対応しない。README / docs に制限として明記する。
 
 ## 既にカバーしている範囲
 
 ここは再実装しない。追加作業がある場合も「互換確認」「API安定化」「CI昇格」として扱う。
 
-| 領域 | 状態 | 実装根拠 |
+| 領域 | 状態 | メモ |
 |---|---|---|
-| direct TCP 445 transport | implemented | `docs/smb-protocol.md` は direct TCP 445 + 4 byte length framing を MVP として定義。`SMBClient` は default factory で `POSIXSocketTransport` を使う。 |
-| SMB 3.0 / 3.0.2 / 3.1.1 authenticated dialect | implemented | `SMBNegotiateCodec.authenticatedDialects = [0x0300, 0x0302, 0x0311]`。 |
-| SMB 2.0.2 / 2.1 probe | implemented | `SMBNegotiateCodec.probeDialects` には 0x0202 / 0x0210 も含まれる。authenticated path は SMB 3.x only とし、2.1 以下は診断付き `protocolError`。 |
-| NTLMv2 password auth | implemented | `NTLM.makeType1` / `NTLM.makeType3`。MIC、KEY_EXCH、NT hash 派生あり。 |
+| direct TCP 445 transport | implemented | direct TCP 445 + 4 byte length framing。SMB1 / NetBIOS は出さない。 |
+| SMB 3.0 / 3.0.2 / 3.1.1 authenticated dialect | implemented | authenticated path は SMB 3.x only。SMB 2.0.2 / 2.1 は probe-only。 |
+| NTLMv2 password auth | implemented | MIC、KEY_EXCH、NT hash 派生あり。 |
 | NT hash credential | implemented | `SMBCredential(username:ntHash:domain:)`、CLI `--nt-hash` / `SMB_NT_HASH`。 |
-| anonymous / guest auth | implemented | `SMBCredential.anonymous`、CLI `--anonymous` / `--guest`。Samba guest E2E 記録あり。 |
+| anonymous / guest auth | implemented | `SMBCredential.anonymous`、CLI `--anonymous` / `--guest`。 |
 | SPNEGO NTLM wrapping | implemented | NTLM OID 前提。Kerberos mech は未実装。 |
 | SMB 3.0.2 signing/encryption | implemented | AES-CMAC / AES-128-CCM。Samba encrypted-required E2E + macOS SMBX smoke 記録あり。 |
-| SMB 3.1.1 signing/encryption | implemented-but-underverified | AES-GMAC / AES-128-GCM 実装あり。`samba-compat.yml` では 3.1.1 signing/encrypted profile を full E2E、PR/push の `e2e.yml` では 3.1.1 signing-only / encrypted の authenticated fast smoke を回す。Windows/NAS 実サーバ smoke は未実施。 |
-| NEGOTIATE / SESSION_SETUP / TREE_CONNECT / CREATE / CLOSE / FLUSH / READ / WRITE / QUERY_DIRECTORY / QUERY_INFO / SET_INFO / IOCTL / CHANGE_NOTIFY / TREE_DISCONNECT / LOGOFF | implemented | `SMB2Commands` と codec / session / facade に実装あり。 |
+| SMB 3.1.1 signing/encryption | implemented-but-underverified | AES-GMAC / AES-128-GCM。Samba 3.1.1 signing/encrypted profile は green。Windows/NAS 実サーバ smoke は未実施。 |
+| 基本 SMB operations | implemented | NEGOTIATE / SESSION_SETUP / TREE_CONNECT / CREATE / CLOSE / FLUSH / READ / WRITE / QUERY_DIRECTORY / QUERY_INFO / SET_INFO / IOCTL / CHANGE_NOTIFY / TREE_DISCONNECT / LOGOFF。 |
 | ls / stat / cat / range read / streaming read | implemented | `SMBee.list` / `stat` / `read` / `withReadStream`、`smbcli ls/stat/cat`。 |
 | put / get / mkdir / mv / rm / cp | implemented | `SMBee.upload` / `download` / `makeDirectory` / `rename` / `delete` / `copy`、CLI サブコマンド。 |
-| recursive get / put / cp / rm | implemented | `downloadDirectory` / `uploadDirectory` / `copyDirectory` / recursive delete。`continueOnError` / `skipExisting` / `dryRun` / size-based resume あり。 |
-| share discovery | implemented | `IPC$` + SRVSVC `NetrShareEnum`。`SMBee.listShares` / `smbcli shares`。 |
-| volume / filesystem info | implemented | `SMBee.volumeInfo` / `smbcli df`。FileFsFullSizeInformation / FileFsAttributeInformation / FileFsVolumeInformation。 |
+| recursive get / put / cp / rm | implemented | `continueOnError` / `skipExisting` / `dryRun` / resume / verify / include-exclude / per-file-timeout あり。 |
+| share discovery | implemented-but-underverified | IPC$ + SRVSVC `NetrShareEnum`。Samba では実測済み。macOS SMBX / Windows / NAS smoke が残る。 |
+| volume / filesystem info | implemented-but-underverified | `SMBee.volumeInfo` / `smbcli df`。Samba E2E 済み。macOS SMBX / Windows / NAS smoke が残る。 |
+| path validation | implemented-but-underverified | `SMBPath` / `SMBShareName` で validation 済み。Unicode normalization の実測が残る。 |
 | metadata read/write | implemented | file attributes、creation/access/modified/change time、`SMBFileMetadataUpdate`、`updateMetadata`。 |
-| security descriptor read / DACL write | partial | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。DACL は read-modify-write あり。ただし owner/group/SACL 書き換えと SID 名解決は未実装。 |
-| change notification | implemented | `withChangeNotifications(autoReconnect:)` / `smbcli watch --json --reconnect`。Samba E2E + reconnect resubscribe unit あり。 |
-| DFS referral metadata | implemented-but-underverified | `SMBee.dfsReferral` / `smbcli dfs`。unit fixture + 仕様精読あり。実 msdfs サーバ E2E は未実施。 |
-| reparse tag metadata | implemented | `SMBFileStat.reparseTag` / `reparseKind` / `readlink` (symlink・mount point・LX symlink target decode)。DFS/NFS data は MS-FSCC 準拠で opaque。 |
+| security descriptor read / DACL / owner / group write | implemented-but-underverified | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。SACL は scope 外。AD / Samba AD 実測が残る。 |
+| SID name resolution | implemented-but-underverified | well-known SID table + LSARPC `LsarLookupSids`。AD / Samba AD 実測と issue 整理が残る。 |
+| change notification | implemented-but-underverified | `withChangeNotifications(autoReconnect:)` / `smbcli watch --json --reconnect`。Samba E2E + reconnect unit あり。Windows/NAS 実測が残る。 |
+| DFS referral metadata | partial | `SMBee.dfsReferral` / `smbcli dfs`。unit fixture + 仕様精読あり。実 msdfs E2E と auto-follow は未実装。 |
+| reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。実サーバ smoke が残る。 |
+| byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
+| sparse file operations | partial | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse` は実装済み。allocation size stat 表示と preservation policy が残る。 |
+| ECHO / keepalive | implemented | `echo` / `smbcli ping` / opt-in keepalive 実装済み。reconnect policy との統合は未決。 |
+| SMB CANCEL | implemented | watch / READ / IOCTL 等の通常 transaction cancellation で SMB2 CANCEL を送る。 |
+| byte-range lock | implemented-but-underverified | library API `SMBClientSession.withFileLock`。CLI surface は未提供。Windows 実測は matrix 側。 |
 
-## P0: Linux/macOS smbclient と名乗る前の release blocker
+## P0: 0.1.0 前の release blocker
 
 ### P0-1. 互換 matrix を実サーバで埋める
 
@@ -81,18 +67,16 @@
 
 - Samba は CI / compat workflow でかなり確認済み。
 - macOS SMBX は 3.0.2 の基本 smoke 記録あり。
-- Windows SMB Server / Windows Pro / NAS は未実測。
-- `docs/testing.md` でも「Samba green は macOS SMBX / Windows SMB Server の保証ではない」として Tier 3 smoke を要求している。
-- 2026-07-02: `docs/compatibility-matrix.md` と `bin/e2e/smoke-real-server.sh` を追加。実サーバ smoke の記録先と共通手順はできた。残は Windows / NAS / macOS SMBX の再実行結果を埋めること。
+- Windows SMB Server / Windows Pro / Synology / QNAP / 古い Samba 系 NAS は未実測。
+- `docs/compatibility-matrix.md` と `bin/e2e/smoke-real-server.sh` は追加済み。
+- SMBee を `smbclient` 相当と名乗る前に、Samba green だけでは不足。
 
 やること:
 
-- `docs/compatibility-matrix.md` を作る。
-- `bin/e2e/smoke-real-server.sh` を作る。最低限のコマンドを同じ順番で実行できるようにする。
-- 対象を分ける:
+- `docs/compatibility-matrix.md` に次を埋める:
   - Linux client -> Samba
   - Linux client -> Windows SMB Server
-  - Linux client -> Synology/QNAP/古いSamba系NAS
+  - Linux client -> Synology/QNAP/古い Samba 系 NAS
   - macOS client -> macOS SMBX
   - macOS client -> Samba
   - macOS client -> Windows SMB Server
@@ -103,273 +87,92 @@
   - encryption required / cipher
   - auth method: password / NT hash / anonymous / Kerberos if implemented
   - path encoding / Unicode normalization behavior
-  - file / directory / ACL / metadata / recursive transfer / share discovery の可否
+  - file / directory / ACL / metadata / recursive transfer / share discovery / watch / sparse / lock の可否
 
 完了条件:
 
 - `smbcli probe/shares/ls/stat/cat/get/put/mkdir/mv/cp/rm/df/acl/watch` の representative smoke が、少なくとも Samba / macOS SMBX / Windows SMB Server で通る。
 - Windows / NAS で失敗する項目は `known-issues` として matrix に残す。
 
-### P0-2. SMB 3.1.1 authenticated full E2E を PR/push gate に昇格する
-
-状態: `implemented`
-
-現状:
-
-- `todo.md` 上は SMB 3.1.1 GMAC signing-only / GCM encrypted session が実 Samba E2E green と記録されている。
-- `.github/workflows/samba-compat.yml` は `smb311-signing-required` と `smb311-encrypted-required` を full `SMBeeE2ETests` で回す。
-- 2026-07-02: `.github/workflows/e2e.yml` の PR/push matrix に `smb311-signing-required` / `smb311-encrypted-required` の authenticated fast smoke (`SMBeeE2ETests.testAuthenticatedFastSmoke`) を追加。push run `28559961166` で E2E success。
-
-やること:
-
-- PR/push の fast E2E に、3.1.1 signing-only と encrypted の authenticated smoke を足す。
-- すべての full E2E が重い場合は、3.1.1 fast subset を作る:
-  - connect
-  - tree connect
-  - list
-  - read known file
-  - write small file
-  - delete
-- コメントを最新状態に同期する。
-
-完了条件:
-
-- PR/push で 3.0.2 encrypted-required と 3.1.1 signing/encrypted authenticated path が最低1本ずつ通る。
-- `e2e.yml` に古い「3.1.1 full は未完」コメントが残らない。
-
-### P0-3. coverage matrix を仕様ID単位で固定する
-
-状態: `implemented`
-
-現状:
-
-- `docs/smb-protocol.md` は仕様の地図。
-- `todo.md` は時系列の進捗台帳。
-- ただし、MS-SMB2 / MS-FSCC / MS-NLMP のどの節をどこまで実装したかを一覧できる doc がない。
-- 2026-07-02: `docs/coverage.md` を追加し、README からリンク。feature / spec / implementation / unit / Samba E2E / macOS smoke / Windows-NAS / status / limitation を一覧化。
-
-やること:
-
-- `docs/coverage.md` を作る。
-- 行単位で管理する:
-  - feature
-  - spec ID
-  - spec section
-  - implementation file/function
-  - unit test
-  - Samba E2E
-  - macOS smoke
-  - Windows smoke
-  - status
-  - known limitations
-
-完了条件:
-
-- 「SMBee は SMB 全体対応ではなく、どこまで対応か」を README から辿れる。
-- 未実装の仕様が `todo.md` の時系列ログに埋もれない。
-
-## P1: smbclient として実装すべき中核未実装
-
-### P1-1. Kerberos / GSS / SPNEGO(Kerberos mech)
+### P0-2. API stability / packaging
 
 状態: `partial`
 
-実装確認:
+現状:
 
-- `NTLM.swift` は password / NT hash / anonymous の NTLM path を持つ。
-- `issues/005-auth-macos-finder-equivalent-smb-auth.md` に、SPNEGO は NTLM OID だけを広告し、Kerberos mech は未実装と記録されている。
-- `SMBAuthenticator` のような抽象化も未実装。
-
-Linux/macOS smbclient として必要な理由:
-
-- Active Directory / enterprise NAS / macOS Finder 相当認証では Kerberos / GSS が必要になる場面がある。
-- Linux の `smbclient` 相当を名乗るなら、少なくとも Kerberos 非対応を明示する必要がある。
+- SwiftPM library と CLI は動く。
+- SemVer、public API の source compatibility、deprecated credential surface、DocC/API examples、binary/release artifact の方針は未整理。
+- consumer が依存し始める前に public 型の命名、Sendable、error taxonomy、cancellation / timeout semantics を凍結する必要がある。
 
 やること:
 
-- `SMBAuthenticator` protocol を設計する。
-- NTLM backend を既存実装から切り出す。
-- GSS backend を別実装にする:
-  - macOS: GSS.framework / Security.framework
-  - Linux: GSSAPI / krb5。SwiftPM optional feature または別 target にする。
-- SPNEGO mech list を NTLM only から NTLM / Kerberos 切替へ拡張する。
-- GSS token exchange 後に SMB signing/encryption 用 session key material を得られるか検証する。
-- AD / Samba AD / macOS SMBX で実測する。
+- `SMBCredential.password` 露出の deprecation plan を決める。
+- public 型と error taxonomy をレビューする。
+- `Sendable` / actor isolation / cancellation semantics を doc に固定する。
+- DocC/API examples を追加する。
+- release artifact 方針を決める。
 
 完了条件:
 
-- `smbcli --kerberos` または同等の auth mode で `SESSION_SETUP` が通る。
-- Kerberos session でも signing/encryption が動く。
-- 失敗時は NTLM fallback するか、明示エラーにするかを documented policy にする。
+- `0.1.0` 用の public API freeze note が README / docs にある。
+- breaking change 予定が issue 化されている。
+- consumer が依存しても migration path を説明できる。
 
-### P1-2. SMB 2.1 authenticated fallback の方針決定
+## P1: smbclient として実装すべき中核残件
 
-状態: `implemented` policy / `implemented` diagnostic / `implemented` for probe only
-
-実装確認:
-
-- `SMBNegotiateCodec.probeDialects` は 0x0202 / 0x0210 / 0x0300 / 0x0302 / 0x0311。
-- `SMBNegotiateCodec.authenticatedDialects` は 0x0300 / 0x0302 / 0x0311 のみ。
-- `docs/smb-protocol.md` の MVP は SMB 3.x サーバ。
-- 2026-07-02: 方針確定。SMBee authenticated operations は SMB 3.x only を維持する。SMB 2.0.2 / 2.1 は probe-only。authenticated NEGOTIATE response が 2.1 以下なら `SMBError.protocolError(SMBNegotiateCodec.authenticatedUnsupportedMessage)` で SESSION_SETUP 前に停止する unit を追加。
-
-Linux/macOS smbclient として必要な理由:
-
-- 古いNASや古いWindows/Sambaでは SMB 2.1 までの構成が残る。
-- ただし SMB 2.1 は encryption がなく、security policy を下げることになる。
-
-やったこと:
-
-- README / `docs/smb-protocol.md` / `docs/coverage.md` に SMB 3.x only と SMB 2.1 probe-only を明記。
-- `SMBNegotiateCodec.supportsAuthenticatedConnection(dialect:)` と診断文字列を追加。
-- SMB 2.1 response で SESSION_SETUP に進まない unit を追加。
-
-完了条件:
-
-- [x] README / coverage matrix に「SMB 2.1 は非対応」または「opt-in 対応」と明記される。
-- [x] 非対応なら、2.1 only server へ接続した時に診断しやすい error を返す。
-
-### P1-3. SMB2 credit accounting / multi-credit IO
+### P1-1. SMB2 credit accounting / multi-credit large IO E2E
 
 状態: `partial`
 
-実装確認:
+現状:
 
-- `SMB2Header` は `creditCharge` / `credits` field を持つが、default は `creditCharge = 0`, `credits = 1`。
-- `todo.md` にも CreditCharge / CreditRequest / CreditResponse を管理していないと記録されている。
-- 2026-07-02: 最小 credit accounting を追加。READ/WRITE request は payload length から `CreditCharge` を計算し、`CreditRequest` も同値に設定する。`SMBSession` は送信時に charge を消費し、response header の `credits` grant を balance に加算して debug trace できる。
-- 2026-07-02: read/write chunk planner を current credit balance で cap する helper を追加。直列 I/O の範囲では credit window を超える chunk を選ばない。
-- 2026-07-02: `SMB2CreditWindow` actor を追加。READ/WRITE 送信前に CreditCharge を reserve し、不足時は grant まで待つ。response Credits で grant、send 失敗時は refund する。
-- 2026-07-03: `SMBSession` の response 待機を `messageId` keyed demux に変更。複数 request を in-flight にし、out-of-order response を正しい呼び出し元へ配送できる。
-- 2026-07-03: **bug fix**: multi-credit READ/WRITE で messageId が 1 しか進まなかったのを、
-  CreditCharge 分進める (`nextMessageId(charge:)`, MS-SMB2 §3.2.4.1.6) よう修正。現状は
-  local chunk cap 64KiB のため latent だったが、cap を上げると strict server で破綻していた。
-  残件は `issues/012-credit-window-followups.md`。
-
-Linux/macOS smbclient として必要な理由:
-
-- 大きな read/write、暗号化 session、WAN / NAS / Windows Server でのスループットと互換性に影響する。
-- multi-credit server では CreditCharge が不正だと server が拒否する可能性がある。
+- READ/WRITE の CreditCharge / CreditRequest、response grant tracking、credit-aware chunk planner は実装済み。
+- `SMB2CreditWindow` actor と messageId keyed demux は実装済み。
+- multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグは修正済み。
+- 残件は `issues/done/012` の後続相当: local chunk cap 64KiB 超の大 IO E2E。
 
 やること:
 
 - copychunk と encryption overhead を含む chunk planner の E2E 検証を広げる。
-- E2E: large file read/write を 1MiB 超、4GiB 境界、encrypted session で実行。
+- 1MiB 超、4GiB 境界、encrypted session で large file read/write を実行する。
+- throughput regression を command count / byte count / chunk count で監視する。
 
 完了条件:
 
-- large transfer で credit不足・不正CreditChargeが出ない。
-- throughput regression test が command count / byte count / chunk count で監視される。
+- large transfer で credit 不足・不正 CreditCharge が出ない。
+- encrypted session でも large IO が安定する。
 
-### P1-4. durable handle / persistent handle / reconnect policy
-
-状態: `explicitly-unsupported` (2026-07-03 判断)
-
-判断 (2026-07-03): durable/persistent handle は「接続断をまたいでファイルハンドルを復元する
-状態機械」であり、実サーバでの切断シミュレーション E2E なしには検証しきれない大タスク。
-現時点では **明示的に unsupported** とし (CREATE は durable/lease/oplock context を送らない)、
-README / docs/coverage.md の limitations に記載済み。ファイル未満の粒度の回復は
-`SMBClientSession(autoReconnect:)` の watch 再購読 (P2-3) と one-shot idempotent operation の
-再接続で部分的にカバー。durable handle 本体は実サーバ要件が出た時点で再評価する。
-
-実装確認:
-
-- `CREATE` request は create contexts を送っていない。
-- `durable` / `persistent` / `lease` / `oplock` の実装ファイル・public API は確認できない。
-- 現在の自動再接続は one-shot idempotent operation の再試行に限定される。
-
-Linux/macOS smbclient として必要な理由:
-
-- 大ファイル転送中の一時切断、Wi-Fi sleep/resume、NAS再起動、VPN切断で差が出る。
-- durable handle がないと、途中再開はアプリ側でやり直すしかない。
-
-やること:
-
-- SMB2 CREATE durable handle request / reconnect context を調査・実装する。
-- durable v1/v2 / persistent handle のうち、Linux/macOS clientとして必要な最小範囲を決める。
-- reconnect 時に session/tree/file handle をどう復元するかを `SMBClientSession` より下の層で設計する。
-- 現時点では「durable handle unsupported」と明示し、該当 recoverability を過大に宣伝しない。
-
-完了条件:
-
-- durable handle 非対応のままなら、docs/coverage.md と README の limitations に載る。
-- 対応するなら、transfer中の接続断 simulation で再開できる。
-
-### P1-5. lease / oplock break handling
-
-状態: `implemented` (policy = 要求しない + unsolicited break の安全処理)
-
-実装確認 / 決定 (2026-07-03):
-
-- 方針確定: **cache しないので lease/oplock を要求しない**。CREATE の RequestedOplockLevel は
-  常に NONE (`SMB2Create.encodeRequest` の該当 byte は 0 固定)。lease create context も送らない。
-- それでも server から届きうる unsolicited notification (OPLOCK_BREAK command 18 /
-  MessageId 0xFFFFFFFFFFFFFFFF) は、response demux が orphan queue に溜め込まず drop する
-  (`SMBSession.dispatchReceivedPacket`)。unit coverage あり
-  (`testUnsolicitedOplockBreakNotificationIsIgnoredByDemux`)。
-- break の ack / callback API は非対応 (oplock を要求しない限り ack 義務は発生しない)。
-  将来 lease を要求する場合はこの drop policy を再設計すること。
-
-### P1-6. SMB2 LOCK / byte-range locking
-
-状態: `implemented` (library API のみ)
-
-実装確認:
-
-- 2026-07-03: `SMB2Commands.lock` / `SMB2Lock` codec / `SMB2LockElement` を追加。
-  `SMBClientSession.withFileLock(path:offset:length:shared:failImmediately:)` で scoped に
-  lock → body → unlock → close する。conflict は `SMBError.lockConflict`
-  (STATUS_FILE_LOCK_CONFLICT / LOCK_NOT_GRANTED / RANGE_NOT_LOCKED) に map。
-  request shape / conflict mapping の unit fixture と、実 Samba E2E
-  (2 session 間の exclusive conflict / disjoint range 成功 / release 後の再取得) を追加。
-
-残:
-
-- CLI surface は未提供 (ライブラリ API 先行の方針どおり)。
-- lock sequence tracking (resilient/durable handle reconnect 用) は未対応。
-- Windows での conflict / close-on-disconnect 挙動確認は互換 matrix (P0-1) 側。
-
-### P1-7. multi-share / multi-tree session reuse
+### P1-2. multi-share / multi-tree session model
 
 状態: `partial`
 
-実装確認:
+現状:
 
-- 2026-07-02: `SMBClientSession.withTree(share:)` と `SMBClientTreeSession` を追加。同じ authenticated session 上で追加 TREE_CONNECT し、closure 終了時に tree 単位で disconnect できる。
-- 2026-07-02: 追加 tree で `list` / `stat` / `readlink` を実行できる unit coverage を追加。
-- `listShares` / `dfsReferral` は `IPC$` に別途 one-shot 接続する。
+- `SMBClientSession.withTree(share:)` と `SMBClientTreeSession` は実装済み。
+- 同じ authenticated session 上で追加 TREE_CONNECT し、closure 終了時に tree 単位で disconnect できる。
+- `listShares` / `dfsReferral` はまだ IPC$ へ別途 one-shot 接続する箇所が残る。
 - full `SMBServerSession` / `SMBTreeSession` 分離と session close 時の複数 tree tracking は未実装。
 
-Linux/macOS smbclient として必要な理由:
-
-- `IPC$` で share discovery / DFS / LSA をしつつ、同じ authenticated session で通常 share も扱いたい。
-- DFS auto-follow や SID lookup をやるなら必要になる。
-
 やること:
 
-- `SMBServerSession` と `SMBTreeSession` に分ける。
-- IPC$ / data share helper を `withTree` ベースで統合する。
-- graceful teardown を tree単位 / session単位に分ける。
+- `SMBServerSession` と `SMBTreeSession` に分けるか、既存 API のまま scoped tree を強化するか決める。
+- IPC$ / data share / DFS / LSA helper を `withTree` ベースで統合する。
+- graceful teardown を tree 単位 / session 単位に分ける。
 
 完了条件:
 
-- 同じ session 上で `IPC$` + `public` + 別 share を同時に扱える。
+- 同じ session 上で `IPC$` + `public` + 別 share を扱える。
 - session close 時に全 tree を best-effort disconnect する。
 
-### P1-8. DFS referral の実サーバE2Eと auto-follow
+### P1-3. DFS referral の実サーバ E2E と auto-follow
 
 状態: `partial`
 
-実装確認:
+現状:
 
 - `SMBee.dfsReferral` / `smbcli dfs` はある。
-- `issues/009-dfs-referral-real-server-e2e.md` に、実 msdfs サーバ未検証と記録されている。
+- 実 msdfs サーバ E2E は未実施。
 - 現在の API は referral metadata を返すだけで、target へ reconnect して path を辿る処理は呼び出し側責務。
-
-Linux/macOS smbclient として必要な理由:
-
-- 企業ファイルサーバでは DFS namespace が普通に使われる。
-- smbclient として `smb://domain/root/link/path` を開いた時に referral を辿れないと、実用上「アクセス不可」に見える。
 
 やること:
 
@@ -388,103 +191,67 @@ Linux/macOS smbclient として必要な理由:
 - msdfs Samba / Windows DFS で referral metadata が実 wire で decode できる。
 - auto-follow を入れる場合、DFS link 配下の `ls/stat/read` が通る。
 
-### P1-9. reparse point target resolution / symlink policy
+### P1-4. Kerberos / GSS / SPNEGO(Kerberos mech)
 
 状態: `partial`
 
-実装確認:
+現状:
 
-- `SMBFileStat.reparseTag` と `SMBReparseKind` はある。
-- 2026-07-02: `FSCTL_GET_REPARSE_POINT` / `SMB2ReparsePoint` decoder を追加。symlink / mount point は target 名を decode し、未知 tag は raw data として返す。
-- 2026-07-02: `SMBClientSession.readlink()` / `SMBee.readlink(...)` / `smbcli readlink` を追加。codec / facade / CLI parse / JSON の unit coverage あり。
-- recursive copy/delete/download は reparse point を directory として辿らない安全側 policy になっている。
-
-Linux/macOS smbclient として必要な理由:
-
-- symlink / junction / mount point / DFS link はファイルブラウザで必ず問題になる。
-- targetを表示できないと、UI/CLIで「何があるか」は分かっても「どこへ向いているか」が分からない。
-
-- 2026-07-03: DFS reparse data の扱いを確定。MS-FSCC の reparse tag 表は DFS (0x8000000A) /
-  NFS (0x80000014) の reparse data を "server-side interpretation only, not meaningful over the
-  wire" と定めており、クライアントは opaque として扱うのが正。decode branch にその旨を明記し、
-  DFS link の解決は FSCTL_DFS_GET_REFERRALS (`smbcli dfs`) を使う。**bug fix**: `SMBReparseTags.nfs`
-  が 0x80000027 (存在しない値) だったのを MS-FSCC 正値 0x80000014 に修正。
-  加えて LX symlink (0xA000001D, MS-FSCC §2.1.2.7 で公開レイアウト) の target decode を追加
-  (`SMBReparseKind.lxSymlink`)。unit fixture あり。
-
-やること:
-
-- Samba / Windows / macOS SMBX で `smbcli readlink` smoke を取る。
-- recursive operation の policy を明示する:
-  - followしない
-  - same-shareだけfollow
-  - explicit `--follow-reparse` のみ
-
-完了条件:
-
-- Samba / Windows / macOS SMBX で reparse target または unsupported を正しく返す。
-- recursive operation で cycle しない。
-
-### P1-10. byte-level resume / transfer verification / sparse file
-
-状態: `partial`
-
-実装確認:
-
-- `downloadDirectory` / `uploadDirectory` の `resume` は size一致なら skip するだけ。
-- 2026-07-02: 単一 file download は `resume` / `smbcli get --resume` で local partial size から
-  range read を再開できる。
-- 2026-07-02: 単一 file upload は `resume` / `smbcli put --resume` で remote partial size から
-  local file を seek して WRITE 再開できる。
-- 2026-07-02: `smbcli get --verify size` / `smbcli put --verify size` を追加。単一 file 転送後に
-  local/remote size を照合できる。2026-07-03: `--verify hash` (SHA-256 read-back) を追加。
-- 2026-07-02: recursive `get -r` / `put -r` / `cp -r --verify size` を追加。成功した file action だけを
-  local/remote または source/destination stat で照合する。2026-07-03: hash verify も対応。
-- 2026-07-03: `--verify hash` を追加。`SMBTransferVerification.localSHA256Hex` /
-  `remoteSHA256Hex` (withReadStream の streaming read-back) で get / put / cp
-  (単一 + recursive) の SHA-256 照合ができる。単一 `cp --verify` が silent no-op だったのも修正。
-  CLI smoke (`bin/e2e/smbcli-smoke.sh`) に get/put `--verify hash` を追加。
-- 2026-07-03: **sparse file 対応を実装**。FSCTL_SET_SPARSE / FSCTL_SET_ZERO_DATA (hole punch) /
-  FSCTL_QUERY_ALLOCATED_RANGES を codec 化し、`SMBClientSession.setSparse/zeroRange/allocatedRanges`
-  + `smbcli sparse` を追加。fixture unit + 実 Samba E2E (FS 非対応時は STATUS_INVALID_DEVICE_REQUEST を
-  skip 扱い)。残: allocation size を stat に出す拡張は未実施。
+- 現在は NTLMv2 / NT hash / anonymous が中心。
+- SPNEGO は NTLM OID 前提。
+- `SMBAuthenticator` のような auth backend 抽象化は未実装。
 
 Linux/macOS smbclient として必要な理由:
 
-- 大ファイル転送、動画、VM image、バックアップ用途では中断再開が必要。
-- size一致だけでは corruption を検出できない。
-- sparse file を通常転送すると通信量・ディスク使用量が膨らむ。
+- Active Directory / enterprise NAS / macOS Finder 相当認証では Kerberos / GSS が必要になる場面がある。
+- Kerberos 非対応のままでもよいが、その場合は README limitations と runtime error を明確にする。
 
 やること:
 
-- local partial file の扱いを決める:
-  - download: existing destination に direct append
-  - upload: `.part` staging / range write policy
-  - mtime/size/optional hash check
-- `--verify hash` を検討する。
-- sparse file 対応を調査する:
-  - allocation size の取得
-  - zero range / hole preservation の可能性
-  - ローカルFS側の sparse write
+- `SMBAuthenticator` protocol を設計する。
+- NTLM backend を既存実装から切り出す。
+- GSS backend を別実装にする:
+  - macOS: GSS.framework / Security.framework
+  - Linux: GSSAPI / krb5。SwiftPM optional feature または別 target にする。
+- SPNEGO mech list を NTLM only から NTLM / Kerberos 切替へ拡張する。
+- GSS token exchange 後に SMB signing/encryption 用 session key material を得られるか検証する。
+- AD / Samba AD / macOS SMBX で実測する。
 
 完了条件:
 
-- 意図的に中断した download/upload を再実行して途中から再開できる。
-- `--verify` で転送後の破損を検出できる。
+- `smbcli --kerberos` または同等の auth mode で `SESSION_SETUP` が通る。
+- Kerberos session でも signing/encryption が動く。
+- 失敗時は NTLM fallback するか、明示エラーにするかを documented policy にする。
 
-### P1-11. macOS metadata / resource fork / alternate data stream policy
+### P1-5. durable handle / persistent handle / reconnect policy
+
+状態: `explicitly-unsupported`
+
+判断:
+
+- durable / persistent handle は、接続断をまたいで file handle を復元する状態機械であり、実サーバでの切断シミュレーション E2E なしには検証しきれない大タスク。
+- 現時点では **明示的に unsupported** とする。
+- CREATE は durable / lease / oplock context を送らない。
+- README / docs/coverage.md の limitations に載せる。
+
+完了条件:
+
+- 非対応のままなら、README / docs/coverage.md / runtime limitation に載る。
+- 対応するなら、transfer 中の接続断 simulation で再開できる。
+
+### P1-6. macOS metadata / resource fork / alternate data stream policy
 
 状態: `missing`
 
-実装確認:
+現状:
 
-- named stream / alternate data stream / resource fork を扱う public API は確認できない。
-- `QUERY_DIRECTORY` / `QUERY_INFO` は通常ファイル metadata 中心。
+- named stream / alternate data stream / resource fork を扱う public API はない。
+- 通常の data fork と基本 metadata が中心。
 
 Linux/macOS smbclient として必要な理由:
 
 - macOS の Finder 相当コピーでは、拡張属性・resource fork・Finder info が問題になる。
-- Linux/macOS の CLI copy として「データ fork だけコピー」なのか「macOS metadata も保つ」のかを明示しないと事故る。
+- CLI copy として「data fork だけコピー」なのか「macOS metadata も保つ」のかを明示しないと事故る。
 
 やること:
 
@@ -501,200 +268,97 @@ Linux/macOS smbclient として必要な理由:
 - README limitations に data fork only か metadata preservation 対応かを明記する。
 - 対応するなら macOS SMBX と Samba fruit module で smoke を通す。
 
-## P2: 実用性・管理系 smbclient として欲しい未実装
+## P2: 実用性・管理系 smbclient として欲しい残件
 
-### P2-1. SID -> account name resolution
+### P2-1. path handling / Unicode normalization smoke
 
-状態: `partial`
+状態: `implemented-but-underverified`
 
-実装確認:
+現状:
 
-- `securityInfo` は SID 文字列を返す。
-- 2026-07-02: `SMBWellKnownSID` table と `smbcli acl --resolve-sids` を追加。JSON は `resolveSIDs` 指定時に owner/group/trustee の name field を追加する。
-- `issues/008-acl-followups-sid-name-resolution-set-security.md` に MS-LSAT `LsarLookupSids` が未実装と記録されている。
-- `setSecurityInfo` は後から実装済みになったため、issue 008 の B は stale。A の domain SID 名解決はまだ未実装。
-
-- 2026-07-03: **LSARPC lookup を実装**。`lsarpc` pipe に bind → LsarOpenPolicy2
-  (POLICY_LOOKUP_NAMES) → LsarLookupSids (level 1) → LsarClose。公開 API
-  `SMBee.lookupSIDs(host:port:credential:sids:)` (`SMBResolvedSIDName` 位置対応・未解決 nil、
-  STATUS_SOME_NOT_MAPPED / NONE_MAPPED 許容)。`smbcli acl --resolve-sids` は well-known table で
-  引けない SID を LSARPC で best-effort 解決 (失敗時は SID 表示に degrade)。
-  request/response の NDR fixture unit + 実 Samba E2E (owner SID lookup) を追加。
+- CLI URL parser と public API の validation は `SMBPath` / `SMBShareName` に寄せた。
+- `.` / `..` / decoded separator / 空 share などは拒否する。
 
 残:
 
-- AD / Samba AD の domain SID での実測 (互換 matrix 側)。
-- `issues/008` の A を done に更新する。
+- macOS Finder / Samba / Windows / NAS で Unicode normalization 差を実測する。
+- matrix に path encoding / normalization の観測結果を残す。
 
-完了条件:
+### P2-2. share discovery / volume / metadata / ACL の実サーバ smoke
 
-- `S-1-1-0` などの well-known SID が human-readable に表示される。
-- AD / Samba AD で domain user SID を解決できる。
+状態: `implemented-but-underverified`
 
-### P2-2. owner / group / SACL write
+残:
 
-状態: `implemented` (owner/group。SACL は対象外で確定)
+- SRVSVC share discovery の macOS SMBX / Windows / NAS smoke。
+- volume info の macOS SMBX / Windows / NAS smoke。
+- ACL / owner / group / SID lookup の AD / Samba AD 実測。
+- Samba POSIX backend の正規化差分を docs に残す。
 
-実装確認:
+### P2-3. reparse / readlink 実サーバ smoke
 
-- 2026-07-03: SET_SECURITY を component 単位に拡張。non-nil の owner/group/DACL だけ
-  AdditionalInformation bit を立てて書く (`SMB2SetInfo.encodeSecurityDescriptorRequest`)。
-  owner/group 書き込み時は open に WRITE_OWNER を追加 (`.setSecurity(includeOwner:)`)。
-  公開 API `setSecurityInfo(path:ownerSID:groupSID:dacl:force:)` (session/facade) と
-  `smbcli setacl --owner/--group` を追加。DACL-only の旧経路は read-modify-write を廃止
-  (AdditionalInformation の semantics 上、選択しない component はサーバが触らない)。
-  fixture unit + 実 Samba E2E を追加。実測: Samba (POSIX backend) は非特権ユーザーの owner/group 書き込みを chown 相当として ACCESS_DENIED にするため、E2E は accessDenied を server policy として許容 (wire path は unit fixture で担保)。
-- SACL は SeSecurityPrivilege 要求のため **対象外で確定** (docs/coverage.md に明記)。
-  任意 owner への変更は server 側 privilege が必要な旨も doc に明記。
+状態: `implemented-but-underverified`
 
-やること:
+残:
 
-- owner/group write を実装するか決める。
-- SACL は監査権限が必要なため、原則 out-of-scope でもよい。
-- 実装する場合は `AdditionalInformation` の OWNER / GROUP / SACL bit と権限エラーを丁寧に扱う。
+- Samba / Windows / macOS SMBX で `smbcli readlink` smoke を取る。
+- recursive operation の policy を docs に明記する:
+  - follow しない
+  - same-share だけ follow
+  - explicit `--follow-reparse` のみ
 
-完了条件:
-
-- 非対応なら docs に明記。
-- 対応するなら専用 test share で rollback 可能な E2E を作る。
-
-### P2-3. CHANGE_NOTIFY の reconnect / JSON / full-rescan helper
+### P2-4. sparse file preservation / allocation size
 
 状態: `partial`
 
-実装確認:
+現状:
 
-- `withChangeNotifications` はある。
-- 2026-07-02: `smbcli watch --json` を追加。CHANGE_NOTIFY events は newline-delimited JSON として `changes` / `overflow` を出力できる。
-- 2026-07-02: `SMBChangeNotifyEvent.changes` / `requiresRescan` を追加し、overflow を machine-readable な full-rescan signal として扱えるようにした。
-- 再接続時の再購読は未配線。
+- `FSCTL_SET_SPARSE` / `FSCTL_SET_ZERO_DATA` / `FSCTL_QUERY_ALLOCATED_RANGES` は実装済み。
+- `smbcli sparse` はある。
 
-- 2026-07-03: **reconnect 再購読を実装**。`SMBClientSession` が `connect(...)` 由来のとき
-  接続パラメータ (host/port/share/credentialProvider/makeTransport) を保持し、
-  `withChangeNotifications(autoReconnect:maxReconnectAttempts:)` で接続断
-  (connectionLost / transport error / networkNameDeleted) 時に新 session を張り直して
-  再購読する。購読断中の変更は取りこぼすため、再購読成功ごとに `.overflow` を callback へ
-  流して full-rescan を促す。cancellation / 非接続断エラーは伝播。`smbcli watch --reconnect`。
-  fixture unit (transport #1 drop → reconnect → transport #2 の ADDED + overflow) を追加。
+残:
 
-完了条件:
+- allocation size を `stat` / JSON に出すか決める。
+- copy/get/put で sparse hole を保存する policy を決める。
+- ローカル FS 側の sparse write と SMB 側 allocated ranges の対応を検証する。
 
-- [x] watch中に接続断 -> reconnect -> 再購読できる (unit で検証)。
-
-### P2-4. CLI batch / wildcard の拡張
+### P2-5. operation-level deadline の public API 方針
 
 状態: `partial`
 
-実装確認:
+現状:
 
-- `mget` / `mput` はある。
-- `todo.md` に recursive `mget/mput -r`、`--create-dirs`、個別 progress、確認 prompt は defer と記録されている。
-- 2026-07-02: `mget -r` / `mput -r` を追加。recursive match は basename glob + relative-path exclude を使い、転送時は relative path を保存する。
-- 2026-07-02: `get -r` / `put -r` / `cp -r` に `--include` / `--exclude` を追加。file は include/exclude、directory は exclude による枝刈りを行う。dry-run unit coverage あり。
-- 2026-07-02: single-file `get` / `put` に `--create-dirs` を追加。`get` は local parent、`put` は remote parent を作成する。CLI parse coverage あり。
-- 2026-07-02: `get -r --progress` / `put -r --progress` を追加。recursive transfer の実ファイル転送ごとに既存 byte progress を stderr に出す。skip/dry-run は progress なし。
+- socket-level `timeout` は配線済み。
+- CLI は `--operation-timeout` と recursive transfer の `--per-file-timeout` を持つ。
 
-- 2026-07-03: `mget` / `mput` に per-file `--progress` を追加 (stderr にファイル名 + 既存 byte progress)。
-  parse unit coverage あり。
-
-完了条件:
-
-- shell glob と SMB path validation の責務が崩れない。
-- dry-run 出力で転送計画が確認できる。
-
-### P2-5. CLI JSON parity / stable machine-readable output
-
-状態: `partial`
-
-実装確認:
-
-- `probe` / `ls` / `stat` / `shares` / `df` / `acl` / `dfs` は JSON 出力がある。
-- 2026-07-02: `watch --json` は newline-delimited JSON 出力あり。
-- 2026-07-02: `docs/smbcli-json.md` に JSON 対応コマンドと、mutating command は exit status を
-  安定した成功/失敗 signal とする方針を記録。
-- 2026-07-02: mutating commands (`get` / `put` / `cp` / `mv` / `rm` / `mkdir` / `setacl`) に
-  `--json` 成功 object (`ok`, `command`, `path`) を追加。dry-run recursive は human plan を優先。
-- 2026-07-02: `--json` 指定時の error output を structured stderr object (`ok=false`, `category`,
-  `exitCode`, `error`) に変更。
-
-やること:
-
-- 追加の JSON schema が増えたら `docs/smbcli-json.md` を更新する。
-
-完了条件:
-
-- 自動化スクリプトが stdout/stderr を安定して parse できる。
-
-### P2-6. operation-level deadline
-
-状態: `missing`
-
-実装確認:
-
-- `timeout` は socket-level timeout として配線済み。
-- `todo.md` に全操作 deadline は未対応と記録されている。
-- 2026-07-02: `SMBOperationDeadline.run(timeout:)` と CLI `--operation-timeout` を追加。まず `probe` / `ls` / `ping` に配線し、共通 timeout helper の unit と option parse test を追加。
-- 2026-07-02: `smbcli` 全コマンドを `--operation-timeout` で wrap。batch (`mget` / `mput`) も全体 deadline として扱う。
-- 2026-07-02: recursive directory transfer (`get -r` / `put -r` / `cp -r`) に public API `perFileTimeout` と CLI `--per-file-timeout` を追加。全体 timeout と per-file timeout を分離。
-
-やること:
+残:
 
 - `operationTimeout` / `deadline` を public API に広げるか決める。
+- timeout error taxonomy を固定する。
 
-完了条件:
-
-- hanging server / stalled transfer を bounded に中断できる。
-
-### P2-7. SMB ECHO / keepalive
+### P2-6. keepalive と reconnect policy の統合
 
 状態: `partial`
 
-実装確認:
+現状:
 
-- 2026-07-02: `SMB2Commands.echo` / `SMB2Echo` codec を追加。
-- 2026-07-02: `SMBClientSession.echo()` / `SMBee.echo(...)` / `smbcli ping` を追加。
-- 2026-07-02: codec shape、facade teardown、CLI parse の unit coverage を追加。
-- 2026-07-02: `SMBClientSession.startKeepAlive(interval:)` / `stopKeepAlive()` を追加。
-  persistent session で opt-in periodic ECHO を送れる。ECHO 失敗時は transport を閉じて loop を止める。
+- `SMBClientSession.echo()` / `SMBee.echo(...)` / `smbcli ping` はある。
+- `SMBClientSession.startKeepAlive(interval:)` / `stopKeepAlive()` はある。
 
-Linux/macOS smbclient として必要な理由:
+残:
 
-- 長時間 watch / large transfer / idle persistent session で server / NAT / VPN の idle timeout を検出したい。
+- keepalive 失敗時に reconnect まで行うか、session invalidation のみにするか決める。
+- watch reconnect との責務分離を docs に書く。
 
-やること:
-
-- reconnect policy と組み合わせるかは別途決める。
-
-完了条件:
-
-- authenticated ECHO を明示的に送れる。
-- idle session で periodic ECHO を送れる。
-- server切断を bounded に検出できる。再接続まではしない。
-
-### P2-8. SMB CANCEL command
+### P2-7. CLI surface follow-up
 
 状態: `partial`
 
-実装確認:
+残:
 
-- `SMB2Commands.cancel` constant はある。
-- 2026-07-02: `SMB2Cancel` encoder と `SMBSession.sendCancel(messageId:treeId:)` を追加。request shape unit coverage あり。
-- 2026-07-02: `CHANGE_NOTIFY` の task cancellation で、元 request の MessageId/TreeId を使った SMB2 CANCEL を送るように変更。transport close-on-cancel は廃止。unit coverage あり。
-- 2026-07-02: `STATUS_CANCELLED` (`0xc0000120`) を追加し、通常 decode path では `CancellationError` として扱う。mapper unit と CHANGE_NOTIFY cancel response coverage あり。
-- 2026-07-02: 通常 `signedWireTransaction` の task cancellation でも元 request の MessageId/TreeId で SMB2 CANCEL を送る。READ cancellation unit coverage あり。IOCTL も同じ transaction path。
-
-Linux/macOS smbclient として必要な理由:
-
-- `CHANGE_NOTIFY` や長い IOCTL/READ を protocol 的にキャンセルしたい場面がある。
-- transport close は強い手段であり、session再利用と相性が悪い。
-
-やること:
-
-- outstanding request tracking と結びつける。
-
-完了条件:
-
-- watch / long read を TCP close なしで cancel できる。watch は対応済み。
+- byte-range lock の CLI surface を出すか決める。
+- mget/mput の確認 prompt を実装するか、`--dry-run` で代替すると明記する。
+- JSON schema が増えたら `docs/smbcli-json.md` を更新する。
 
 ## P3: optional / advanced / 明示的に後回し
 
@@ -702,7 +366,7 @@ Linux/macOS smbclient として必要な理由:
 
 状態: `missing`
 
-SMB 3.1.1 の compression は未実装。WAN越しや大ファイル転送では有効な場合があるが、ローカルNAS/obaket MVPでは後回しでよい。
+SMB 3.1.1 compression は未実装。WAN 越しや大ファイル転送では有効な場合があるが、ローカル NAS / obaket MVP では後回し。
 
 完了条件:
 
@@ -712,7 +376,7 @@ SMB 3.1.1 の compression は未実装。WAN越しや大ファイル転送では
 
 状態: `missing`
 
-複数NIC / Wi-Fi+Ethernet / 高速NASで効くが、実装規模が大きい。Linux/macOS userspace client としては optional。
+複数 NIC / Wi-Fi + Ethernet / 高速 NAS で効くが、実装規模が大きい。Linux/macOS userspace client としては optional。
 
 完了条件:
 
@@ -723,80 +387,78 @@ SMB 3.1.1 の compression は未実装。WAN越しや大ファイル転送では
 
 状態: `missing`
 
-Windows系の新しい構成向け。Linux/macOS の汎用 smbclient MVPでは scope 外。
+Windows 系の新しい構成向け。Linux/macOS の汎用 smbclient MVP では scope 外。
 
 完了条件:
 
-- 明示的に unsupported。
+- unsupported と明記する。
 
 ### P3-4. SMB Direct / RDMA
 
-状態: `explicitly-out-of-scope`
+状態: `explicitly-unsupported`
 
 userspace Swift SMB client の範囲外。
 
 ### P3-5. printer / print share support
 
-状態: `explicitly-out-of-scope`
+状態: `explicitly-unsupported`
 
 MS-SMB2 は file / print resource sharing を含むが、SMBee の用途は file browser / object storage backend。printer share は scope 外。
 
 ### P3-6. SMB1 / NetBIOS session service / port 139
 
-状態: `explicitly-out-of-scope`
+状態: `explicitly-unsupported`
 
-`docs/smb-protocol.md` でも SMB1 / CIFS は scope 外、transport は direct TCP 445 としている。
+SMB1 / CIFS は scope 外。transport は direct TCP 445 のみ。
 
 ### P3-7. POSIX / UNIX extensions
 
 状態: `missing`
 
-Linux client としては mode/uid/gid/symlink/xattr の期待が出るが、SMB2/3標準互換との境界が難しい。まず metadata/resource fork/ADS policy を決めた後に扱う。
+Linux client としては mode/uid/gid/symlink/xattr の期待が出るが、SMB2/3 標準互換との境界が難しい。まず metadata/resource fork/ADS policy を決めた後に扱う。
 
 ### P3-8. quotas / named streams / extended attributes
 
 状態: `missing`
 
-File browser / backup / macOS metadata preservation を本格的にやるなら必要。MVPでは data fork only として明示する方が安全。
+file browser / backup / macOS metadata preservation を本格的にやるなら必要。MVP では data fork only として明示する方が安全。
 
-## Stale / 注意が必要な既存 issue
+## stale note cleanup
 
-### `issues/008-acl-followups-sid-name-resolution-set-security.md`
+下記は古い未実装記述が残りやすいので、現在の扱いを固定する。
 
-- B: SET_SECURITY は既に実装済み。`todo.md` と `SMBClient.swift` / `SMB2ReadCodecs.swift` / `SMBeeE2ETests.swift` でも確認できる。
-- A: SID 名前解決は未実装のまま。
-- C: SID 6-byte authority は現状維持でよい記録項目。
-
-対応:
-
-- issue 008 を更新し、SET_SECURITY 部分を done にする。
-- SID lookup だけを新 issue に分離する。
+- SMB 3.1.1 GMAC/GCM: 実装済み。Samba E2E green。残件は Windows/NAS smoke。
+- CHANGE_NOTIFY reconnect: 実装済み。残件は実サーバ互換 matrix。
+- SID lookup: LSARPC lookup 実装済み。残件は AD / Samba AD 実測と issue 更新。
+- owner/group write: 実装済み。SACL は scope 外。
+- byte-level resume / verify: 実装済み。残件は sparse preservation / allocation size。
+- operation timeout: CLI には実装済み。残件は public API 化の判断。
+- durable handle: 現時点では unsupported として明記する。
 
 ## README に書くべき limitations
 
-2026-07-02: README に下記 limitations を同期済み。
-
 `smbclient` として過大に見せないため、README には次を明記する。
 
-- SMB 3.x only。SMB 2.1 authenticated fallback は非対応 (probe-only、authenticated connect は診断付き `protocolError`)。
+- SMB 3.x only。SMB 2.1 authenticated fallback は非対応。SMB 2.1 は probe-only。
 - Kerberos / GSS は未対応。現状は NTLMv2 / NT hash / anonymous。
 - Windows SMB Server / NAS は smoke 未完了。
-- durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) のみ (CLI 非対応)。
+- durable / persistent handle は未対応。lease / oplock は要求しない。byte-range lock は library API 先行。
 - DFS referral は metadata 取得のみ。auto-follow と実 msdfs E2E は未完了。
-- symlink / mount point / LX symlink は `readlink` で target 解決可。DFS/NFS reparse data は opaque (MS-FSCC 準拠)。
-- byte-level resume (download/upload) と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file preservation は未対応。
+- symlink / mount point / LX symlink は `readlink` で target 解決可。DFS/NFS reparse data は opaque。
+- byte-level resume と `--verify size|hash` は対応済み。
+- sparse FSCTL は対応済みだが、転送時の sparse preservation と allocation size 表示は未整理。
 - macOS resource fork / xattr / named stream preservation は未対応または方針未決。
 - SMB1 / NetBIOS / port 139 / printer / RDMA / QUIC / multichannel / compression は未対応。
 
 ## 推奨実装順
 
-1. P0-1 compatibility matrix の実サーバ結果埋め (Windows / NAS / macOS SMBX re-run)
-2. P1-3 credit accounting / multi-credit
-3. P1-7 multi-tree session model
-4. P1-8 DFS real E2E + optional auto-follow
-5. P1-9 reparse target resolution
-6. P1-10 byte-level resume / verification
-7. P1-1 Kerberos/GSS only if real user/server requirements demand it
+1. P0-1 compatibility matrix の実サーバ結果埋め。Windows / NAS / macOS SMBX re-run。
+2. P1-1 credit accounting / multi-credit large IO E2E。
+3. P1-2 multi-tree session model。
+4. P1-3 DFS real E2E + optional auto-follow。
+5. P0-2 API stability / packaging。
+6. P1-6 macOS metadata / named stream policy。
+7. P1-4 Kerberos / GSS。実ユーザーや実サーバ要件が出たら着手。
 
 ## 完了の定義
 

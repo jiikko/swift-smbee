@@ -11,9 +11,9 @@
 consumer アプリで **約 80 KB/s** しか出ない。87.9 MB の動画ファイルの先頭 ~830 KB
 (moov 解析分) の読み込みに約 10.5 秒かかった。
 
-## 根本原因 (実測で確定済み — 推測ではない)
+## 根本原因の分析 (A は単体ベンチで強く示唆。着手時に in-place 計測で確定させる)
 
-### A. 主犯: pure-Swift AES-CCM 復号 (`AESCCM.open`)
+### A. 最有力: pure-Swift AES-CCM 復号 (`AESCCM.open`)
 
 `AESCCM` / `AESCMAC.AES128` はテーブル実装の pure-Swift AES。64 KiB チャンク 1 個の
 `open` を単体ベンチした結果 (2026-07-09, Apple Silicon):
@@ -23,9 +23,14 @@ consumer アプリで **約 80 KB/s** しか出ない。87.9 MB の動画ファ�
 | `-Onone` | **829 ms** | **0.08 MB/s** |
 | `-O` | 15.6 ms | 4.2 MB/s |
 
-観測値 80 KB/s = 0.08 MB/s と `-Onone` の実測が**完全一致**。consumer (obaket) の
-dev ビルドは SPM 依存も -Onone でビルドされるため、この経路がそのまま実効速度になる。
-release でも 4.2 MB/s が上限で、LAN の SMB としては 2 桁遅い。
+観測値 80 KB/s = 0.08 MB/s と `-Onone` の実測が一致する。consumer (obaket) の
+dev ビルドは SPM 依存も -Onone でビルドされるため、この経路がそのまま実効速度の
+天井になりうる。release でも 4.2 MB/s が上限で、LAN の SMB としては 2 桁遅い。
+
+注意: この一致は単体ベンチとの突合であり、`AVPlayer.observedBitrate` は SMB read の
+直接計測ではない (コンテナ解析・要求間隔・consumer 処理も含む)。着手時はまず
+`AESCCM.open` の累積時間 / `readChunk` の内訳を実セッションでログ計測し、
+主犯であることを in-place で確定させてから修正に入る (codex P2 指摘)。
 
 補足: GCM をネゴシエートできた場合は `SMBCrypto.aesGCMOpen` (CryptoKit, HW
 アクセラレーション) を使うため問題ない。**CCM に倒れたときだけ** pure-Swift 経路になる
@@ -43,24 +48,32 @@ A を直しても次はここが天井になる (スループット ≒ 64 KiB /
    `creditAwareReadChunkSize()` / `creditAwareWriteChunkSize()` が
    `localLimit: 64 * 1024` をハードコード。negotiate で得た `maxReadSize`
    (通常 1〜8 MiB) を活かしていない。
-2. **credit window が育たない**: `SMB2Read.encodeRequest` / `SMB2Write.encodeRequest`
-   が `credits: creditCharge` しか要求しないため、サーバは消費分しか補充せず
-   残高が初期値 1 (= 64 KiB 分) のまま。`creditWindowChunkSize` が常に
-   1 credit 相当へクランプする。
+2. **credit window が育たない可能性 (要実測)**: `SMB2Read.encodeRequest` /
+   `SMB2Write.encodeRequest` が `credits: creditCharge` しか要求しない。サーバは
+   要求数を超えて grant することも仕様上は可能 (MS-SMB2) なため「残高が 1 のまま」
+   と断定はできないが、要求ベースの grant をするサーバでは窓が育たず
+   `creditWindowChunkSize` が 1 credit 相当 (64 KiB) にクランプされ続ける。
+   修正前に実ログで credit 残高の推移を観測して確定させる。
 3. **streamRead が完全直列**: 1 チャンク要求 → 応答待ち → `onChunk` 完了待ち → 次、
    のループ (`SMBClient.streamRead`)。multi-flight demux は実装済み (issues/done/002)
    だが read pipeline では使っていない。
 
 ## 修正方針 (効果順)
 
-1. **AES-CCM を CommonCrypto ベースに置換** (`CCCrypt` の AES-CTR + HW AES での
-   CBC-MAC)。Apple platform で数百 MB/s 級になる見込み。Linux は
+1. **AES-CCM を CommonCrypto ベースに置換**。CTR 部は `CCCryptorCreateWithMode(...,
+   kCCModeCTR, ...)` を使う (`CCCrypt` one-shot は CTR を直接指定できない — codex P1)。
+   CBC-MAC 部も HW AES (ECB/CBC) で構成。速度向上幅は仮説であり、着手時に
+   単体ベンチで before/after を実測する (CCM の CBC-MAC は直列依存のため
+   「CommonCrypto = 数百 MB/s」を保証しない — codex P3)。Linux は
    `#if canImport(CommonCrypto)` で現行 pure-Swift にフォールバック。
    併せて `open` の二重 CTR を解消 (tag 検証は CBC-MAC の再計算だけで足り、
    keystream の再生成は不要)。既存 unit (RFC 3610 test vector 等) を green のまま維持。
-2. **read チャンク上限と credit 要求の是正**: `localLimit` を数 MiB へ引き上げ
-   (negotiated `maxReadSize` とサーバ grant credit でクランプされる構造は既存のまま)、
-   READ/WRITE の credits 要求を「窓を育てる」値 (例: `max(charge, 64)`) にする。
+2. **read チャンク上限と credit 要求の是正**: `localLimit` を数 MiB へ引き上げる。
+   credits 要求は固定値の上乗せ (例: `max(charge, 64)`) ではなく、目標 in-flight 量・
+   サーバ grant 実績・待機中要求を踏まえた credit request policy として設計する
+   (codex P2)。`transformOverhead` を `maxReadSize` から差し引く現行クランプの
+   意味的妥当性 (maxReadSize は READ データ長上限であり transform 込みフレーム長
+   ではない) も MS-SMB2 で確認する (codex P3)。
 3. **(切り分け) なぜ GCM にならないか確認**: サーバが SMB 3.1.1 + GCM 対応なら
    negotiate 側の問題の可能性。dialect / cipher の negotiate 結果を観測してから判断する。
 4. (optional, 2 の後) streamRead の multi-flight pipeline 化。demux 基盤は既存。
@@ -78,7 +91,8 @@ A を直しても次はここが天井になる (スループット ≒ 64 KiB /
 ## 受け入れ条件
 
 - [ ] 暗号化 CCM セッションの read 実効スループットが release で 50 MB/s 以上
-      (container Samba ローカルループバック基準)
+      (container Samba ローカルループバック基準。未実測の目標値であり、
+      HW AES 化後の実測で達成不能と判明したら根拠つきで改訂する)
 - [ ] debug (-Onone) でも動画 preview が実用になる (>5 MB/s 目安)
 - [ ] RFC 3610 / 既存 crypto unit test green + E2E smoke (encrypted profile) green
 - [ ] Linux ビルド green (CommonCrypto フォールバック)

@@ -120,6 +120,7 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
             if descriptor >= 0 {
                 replaceSocketFileDescriptor(descriptor)
                 do {
+                    try disableSIGPIPEIfNeeded(descriptor)
                     try connectSocket(
                         descriptor,
                         address: candidate.pointee.ai_addr,
@@ -146,7 +147,7 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
                     descriptor,
                     buffer.baseAddress!.advanced(by: sent),
                     bytes.count - sent,
-                    0
+                    DarwinOrGlibc.sendFlagsSuppressingSIGPIPE
                 )
             }
             guard count > 0 else {
@@ -207,6 +208,21 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
             if socketErrorValue == ETIMEDOUT { throw SMBTransportError.timedOut }
             throw SMBTransportError.socketFailure("connect failed: errno \(socketErrorValue)")
         }
+    }
+
+    // ピアが切断済みのソケットへの send() は SIGPIPE を発生させ、デフォルト動作は
+    // クラッシュレポート無しのプロセス即死 (Obaket で「切れた SMB セッションへの
+    // preview read でアプリごと落ちる」として実際に発生)。Darwin では fd 単位の
+    // SO_NOSIGPIPE で抑止し、send は EPIPE エラーとして返して SMBTransportError に
+    // 正規化させる。Linux に SO_NOSIGPIPE は無いので send 側の MSG_NOSIGNAL で抑止する。
+    private func disableSIGPIPEIfNeeded(_ descriptor: Int32) throws {
+        #if !os(Linux)
+        var enabled: Int32 = 1
+        let length = socklen_t(MemoryLayout<Int32>.size)
+        guard DarwinOrGlibc.setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, length) == 0 else {
+            throw socketError(operation: "setsockopt(SO_NOSIGPIPE)")
+        }
+        #endif
     }
 
     private func applySocketTimeoutIfNeeded(_ descriptor: Int32) throws {
@@ -283,6 +299,16 @@ private enum DarwinOrGlibc {
         Glibc.errno
         #else
         Darwin.errno
+        #endif
+    }
+
+    // Linux は send フラグの MSG_NOSIGNAL で SIGPIPE を抑止する
+    // (Darwin は fd 単位の SO_NOSIGPIPE で抑止済みなのでフラグ不要)。
+    static var sendFlagsSuppressingSIGPIPE: Int32 {
+        #if os(Linux)
+        Int32(MSG_NOSIGNAL)
+        #else
+        0
         #endif
     }
 

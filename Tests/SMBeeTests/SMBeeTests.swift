@@ -2074,14 +2074,15 @@ final class SMBeeTests: XCTestCase {
     func testSRVSVCNetrShareEnumRequestUsesLevel1() {
         let request = SRVSVC.encodeNetrShareEnumRequest()
 
-        XCTAssertEqual(request.count, 28)
-        XCTAssertEqual(readUInt32LE(request, at: 0), 0)
-        XCTAssertEqual(readUInt32LE(request, at: 4), 1)
-        XCTAssertEqual(readUInt32LE(request, at: 8), 1)
-        XCTAssertEqual(readUInt32LE(request, at: 12), 0)
-        XCTAssertEqual(readUInt32LE(request, at: 16), 0)
-        XCTAssertEqual(readUInt32LE(request, at: 20), 0xffff_ffff)
-        XCTAssertEqual(readUInt32LE(request, at: 24), 0)
+        XCTAssertEqual(request.count, 32)
+        XCTAssertEqual(readUInt32LE(request, at: 0), 0) // ServerName ptr NULL
+        XCTAssertEqual(readUInt32LE(request, at: 4), 1) // Level
+        XCTAssertEqual(readUInt32LE(request, at: 8), 1) // union discriminant
+        XCTAssertNotEqual(readUInt32LE(request, at: 12), 0) // container referent (non-NULL, さもないと WERR 87)
+        XCTAssertEqual(readUInt32LE(request, at: 16), 0) // EntriesRead
+        XCTAssertEqual(readUInt32LE(request, at: 20), 0) // Buffer ptr NULL
+        XCTAssertEqual(readUInt32LE(request, at: 24), 0xffff_ffff) // PreferMaximumLength
+        XCTAssertEqual(readUInt32LE(request, at: 28), 0) // ResumeHandle ptr NULL
     }
 
     func testSRVSVCNetrShareEnumResponseDecodesShareInfo1() throws {

@@ -169,6 +169,10 @@ enum SRVSVC {
         writer.writeUInt32(0) // ServerName unique pointer: NULL = local server for this binding.
         writer.writeUInt32(1) // SHARE_ENUM_STRUCT.Level
         writer.writeUInt32(1) // union discriminant
+        // SHARE_INFO_1_CONTAINER unique pointer (referent id). Level=1 なのに NULL を送ると
+        // サーバは ERROR_INVALID_PARAMETER (87) を返す (Samba / Windows とも)。decode 側
+        // (`decodeNetrShareEnumResponse`) が containerReferent を読むのと対称の位置。
+        writer.writeUInt32(0x0002_0000)
         writer.writeUInt32(0) // SHARE_INFO_1_CONTAINER.EntriesRead
         writer.writeUInt32(0) // SHARE_INFO_1_CONTAINER.Buffer NULL
         writer.writeUInt32(maxPreferredLength)

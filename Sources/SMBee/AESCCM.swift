@@ -75,14 +75,17 @@ public enum AESCCM {
         tagLength: Int
     ) throws -> [UInt8] {
         let q = 15 - nonce.count
-        guard message.count < (1 << (8 * q)) else {
+        // q >= 8 (nonce 7 バイト) は Int の全域が表現可能なので長さ制限は不要。
+        // Swift の << は過剰シフトで 0 になるため、そのまま比較すると全 message を
+        // 誤って reject する (codex P2)。
+        guard q >= 8 || message.count < (1 << (8 * q)) else {
             throw SMBCodecError.invalidValue("AES-CCM message too large for nonce length")
         }
         var b0Flags = UInt8(((tagLength - 2) / 2) << 3) | UInt8(q - 1)
         if !authenticatedData.isEmpty { b0Flags |= 0x40 }
         var macInput = [b0Flags] + nonce + encodeLength(message.count, bytes: q)
         if !authenticatedData.isEmpty {
-            macInput += encodeAADLength(authenticatedData.count)
+            macInput += try encodeAADLength(authenticatedData.count)
             macInput += authenticatedData
             while macInput.count % 16 != 0 { macInput.append(0) }
         }
@@ -102,9 +105,15 @@ public enum AESCCM {
         }
     }
 
-    private static func encodeAADLength(_ length: Int) -> [UInt8] {
+    private static func encodeAADLength(_ length: Int) throws -> [UInt8] {
         if length < 0xff00 {
             return [UInt8((length >> 8) & 0xff), UInt8(length & 0xff)]
+        }
+        // RFC 3610 は 2^32 以上の AAD に 0xffff + 8 バイト長形式を規定するが、SMB の
+        // AAD は transform header 32 バイト固定で到達しないため未実装。silent な
+        // 下位 32bit 切り詰めを避けるため明示的に reject する (codex P3)。
+        guard length < (1 << 32) else {
+            throw SMBCodecError.invalidValue("AES-CCM authenticated data longer than 2^32-1 is unsupported")
         }
         var encoded: [UInt8] = [0xff, 0xfe]
         encoded += encodeLength(length, bytes: 4)
@@ -150,7 +159,11 @@ public enum AESCCM {
                     nil,
                     0,
                     0,
-                    0,
+                    // CCM の counter は big-endian。現行 CommonCrypto の CTR は BE のみ
+                    // (kCCModeOptionCTR_BE は deprecated で指定不要) だが、実装差への
+                    // 依存を明示するため指定しておく (codex P2)。BE であることは
+                    // RFC 3610 ベクタの unit test が Apple platform 上で担保する。
+                    CCModeOptions(kCCModeOptionCTR_BE),
                     &cryptorOrNil
                 )
             }

@@ -2438,10 +2438,13 @@ public enum SMBClient {
         let transferProgress = SMBTransferProgressEmitter(totalBytes: length, onProgress: onProgress)
         var cursor = offset
         var remaining = length
+        let perfStart = ContinuousClock.now
+        var perfChunks = 0
         while remaining > 0 {
             try Task.checkCancellation()
             let chunk = try await session.readChunk(treeId: treeId, fileId: fileId, offset: cursor, length: remaining)
             if chunk.isEmpty { break }
+            perfChunks += 1
             let advanced = try SMBChunkedTransfer.advancedReadPosition(
                 cursor: cursor,
                 remaining: remaining,
@@ -2457,6 +2460,15 @@ public enum SMBClient {
             remaining = advanced.remaining
         }
         let received = progress.received
+        if SMBPerfLog.isEnabled {
+            let elapsed = ContinuousClock.now - perfStart
+            let seconds = Double(elapsed.components.seconds)
+                + Double(elapsed.components.attoseconds) / 1e18
+            let throughput = seconds > 0 ? Double(received) / seconds / 1e6 : 0
+            SMBPerfLog.line(
+                "stream total=\(received) elapsed=\(SMBPerfLog.milliseconds(elapsed))ms throughput=\(String(format: "%.2f", throughput))MB/s chunks=\(perfChunks)"
+            )
+        }
         guard received == length else {
             throw SMBCodecError.invalidValue("short SMB read: expected \(length) bytes, got \(received)")
         }
@@ -3277,6 +3289,20 @@ actor SMBSession {
                 encryptionAlgorithm = .aes128GCM
             }
         }
+        if SMBPerfLog.isEnabled {
+            let cipherLabel: String
+            switch result.cipher {
+            case SMBNegotiateConstants.aes128GCM: cipherLabel = "gcm"
+            case SMBNegotiateConstants.aes128CCM: cipherLabel = "ccm"
+            case nil: cipherLabel = "none(pre-3.1.1-default:ccm)"
+            case let other?: cipherLabel = "0x\(String(other, radix: 16))"
+            }
+            let signingLabel = signingAlgorithm == .aesGMAC ? "gmac" : "cmac"
+            let credits = await creditWindow.balance
+            SMBPerfLog.line(
+                "negotiate dialect=0x\(String(result.dialect, radix: 16)) cipher=\(cipherLabel) signing=\(signingLabel) maxRead=\(result.maxReadSize) maxWrite=\(result.maxWriteSize) credits=\(credits)"
+            )
+        }
 
         let type1Message = try NTLM.makeType1(domain: credential.domain)
         let type1 = SPNEGO.wrapNegTokenInit(type1Message)
@@ -3597,6 +3623,8 @@ actor SMBSession {
             length: requestLength
         )
         debugDump("READ request", packet)
+        let perfCreditsBefore = SMBPerfLog.isEnabled ? await creditWindow.balance : 0
+        let perfStart = ContinuousClock.now
         let response = try await signedWireTransaction(packet: packet, responseLabel: "READ response")
         let header = try SMB2Header.decode(response)
         if header.status == SMB2Status.endOfFile {
@@ -3604,6 +3632,9 @@ actor SMBSession {
         }
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "READ")
         let data = try SMB2Read.decodeResponse(response)
+        SMBPerfLog.line(
+            "read req=\(requestLength) got=\(data.count) wire=\(SMBPerfLog.milliseconds(ContinuousClock.now - perfStart))ms credits=\(perfCreditsBefore)"
+        )
         guard data.count <= Int(requestLength) else {
             throw SMBCodecError.invalidValue("SMB read returned more data than requested")
         }
@@ -4601,6 +4632,7 @@ actor SMBSession {
         guard ciphertext.count == Int(header.originalMessageSize) else {
             throw SMBCodecError.invalidValue("SMB3 transform original message size mismatch")
         }
+        let perfStart = ContinuousClock.now
         let plaintext: [UInt8]
         switch encryptionAlgorithm {
         case .aes128CCM:
@@ -4620,6 +4652,9 @@ actor SMBSession {
                 tag: header.signature
             )
         }
+        SMBPerfLog.line(
+            "decrypt cipher=\(encryptionAlgorithm == .aes128CCM ? "ccm" : "gcm") bytes=\(ciphertext.count) ms=\(SMBPerfLog.milliseconds(ContinuousClock.now - perfStart))"
+        )
         debugDump("decrypted \(packet.count)-byte SMB3 transform", plaintext)
         return plaintext
     }

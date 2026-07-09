@@ -2,6 +2,8 @@
 
 - 種別: perf
 - 起票: 2026-07-09
+- 状態: **A (CCM 復号) 対応済み 2026-07-09** (`06317af` 観測ログ / `f4fb911` CommonCrypto 化 /
+  `c8cfaab` レビュー反映)。**B (チャンク/credit/pipeline) は defer** — trigger は末尾「対応記録」参照
 - 発見経緯: obaket の SMB 動画 preview が再生開始まで 10 秒超かかる。実効スループット
   約 80 KB/s (AVPlayer `observedBitrate:641244`) を観測し、原因を smbee 側で切り分けた。
 
@@ -106,3 +108,43 @@ A を直しても次はここが天井になる (スループット ≒ 64 KiB /
 - `Sources/SMBee/SMB2ReadCodecs.swift`: `SMB2Read.encodeRequest` (credits 要求)
 - `issues/done/002-design-smbsession-concurrent-multiflight.md` (multi-flight 基盤)
 - `issues/done/012-credit-window-followups.md` (credit window の既知残件)
+
+## 対応記録 (2026-07-09)
+
+### 観測 (M1, `06317af`) — 推測でなくログで主犯を確定
+
+`SMBEE_PERF=1` の計測ログを negotiate / readChunk / decrypt / streamRead に追加し、
+container Samba (smb302-encrypted-required = CCM) に 16 MiB ファイルで実測:
+
+```
+[smbee-perf] negotiate dialect=0x302 cipher=none(pre-3.1.1-default:ccm) signing=cmac maxRead=8388608 maxWrite=8388608 credits=2
+[smbee-perf] read req=65536 got=65536 wire=832.7-862.8ms credits=7
+[smbee-perf] decrypt cipher=ccm bytes=65616 ms=858.0-877.8
+```
+
+- **decrypt が wire 時間のほぼ 100%** → A (pure-Swift CCM 復号) が主犯と確定
+- credit 残高は 7 まで育つ (サーバは要求超過 grant する) — 「1 のまま」仮説は棄却。
+  ただし 64 KiB 固定チャンク (localLimit) は残存
+- maxRead=8 MiB をサーバは提示している
+
+### 修正 (M2, `f4fb911` + `c8cfaab`)
+
+AES-CCM を Apple platform で CommonCrypto (HW AES) 化 + open() の二重 CTR 解消。
+
+| 計測 | before | after |
+|---|---|---|
+| 単体 `AESCCM.open` 64 KiB (-Onone) | 829 ms (0.08 MB/s) | 0.1 ms (518 MB/s) |
+| 単体 `AESCCM.open` 64 KiB (-O) | 15.6 ms (4.2 MB/s) | 0.03 ms (2.1 GB/s) |
+| E2E 16 MiB get, CCM, debug build | wire 835-863 ms/chunk | wire 1.5-2.1 ms/chunk, 総 0.42 s ≈ **40 MB/s** |
+
+swift test 282 green (RFC 3610 外部ベクタ含む) / E2E smoke green (smb302 CCM + smb311 GCM)。
+受け入れ条件の「release 50 MB/s」は debug で既に 40 MB/s のため実質達成見込みだが、
+consumer (obaket) 実機での確認は未了。
+
+### B の defer 判断
+
+loopback では wire 1.5-2 ms/chunk まで下がり、64 KiB 直列でも ~40 MB/s 出る。B が効くのは
+RTT が大きい実ネットワーク (例: RTT 5 ms → 直列 64 KiB は ~13 MB/s に頭打ち)。
+**trigger**: obaket 実機 (実 NAS) で A 適用後も preview / 転送が遅い、または `SMBEE_PERF=1`
+ログで wire 時間が RTT 支配 (decrypt ≪ wire) と観測されたら、チャンク引き上げ +
+credit request policy + streamRead pipeline 化 (修正方針 2/4) に着手する。

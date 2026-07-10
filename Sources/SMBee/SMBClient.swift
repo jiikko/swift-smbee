@@ -2305,7 +2305,7 @@ public enum SMBClient {
         for entry in entries {
             try Task.checkCancellation()
             guard !entry.isReparsePoint else { continue }
-            try validateDirectoryEntryName(entry.name)
+            try SMBPath.validateDirectoryEntryName(entry.name)
             let remoteChild = joinSMBPath(path, entry.name)
             let relativeChild = joinSMBPath(relativePath, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
@@ -3232,14 +3232,6 @@ public enum SMBClient {
         return "\(trimmedParent)\\\(child)"
     }
 
-    private static func validateDirectoryEntryName(_ name: String) throws {
-        guard !name.isEmpty, name != ".", name != "..",
-              !name.contains("/"), !name.contains("\\"),
-              !name.unicodeScalars.contains(where: { $0.value == 0 })
-        else {
-            throw SMBCodecError.invalidValue("invalid directory entry name")
-        }
-    }
 }
 
 extension Error {

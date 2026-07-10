@@ -728,6 +728,13 @@ final class SMBeeTests: XCTestCase {
         XCTAssertThrowsError(try SMBPath.normalize("dir/../child"))
     }
 
+    func testSMBPathRejectsUnsafeDirectoryEntryNames() {
+        for name in ["..", "../outside", "a/b", "a\\b", "/absolute", ""] {
+            XCTAssertThrowsError(try SMBPath.validateDirectoryEntryName(name))
+        }
+        XCTAssertNoThrow(try SMBPath.validateDirectoryEntryName("日本語.txt"))
+    }
+
     func testSMBPathRejectsRecursiveDirectoryCopyTargets() throws {
         XCTAssertThrowsError(try SMBPath.validateDirectoryCopyTarget(fromPath: "a", toPath: "a")) { error in
             XCTAssertEqual(error as? SMBError, .invalidRecursion("destination is inside source directory"))

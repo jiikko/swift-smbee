@@ -53,6 +53,14 @@ public struct SMBPath: Equatable, Sendable {
         return "\(normalizedParent)\\\(normalizedChild)"
     }
 
+    static func validateDirectoryEntryName(_ name: String) throws {
+        guard !name.isEmpty, name != ".", name != "..",
+              !name.contains("/"), !name.contains("\\"),
+              !name.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw SMBCodecError.invalidValue("invalid directory entry name")
+        }
+    }
+
     static func validateDirectoryCopyTarget(fromPath: String, toPath: String) throws {
         let source = try normalize(fromPath)
         let destination = try normalize(toPath)

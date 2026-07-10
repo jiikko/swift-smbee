@@ -4698,9 +4698,18 @@ actor SMBSession {
         return bytes + Array(repeating: 0, count: length - bytes.count)
     }
 
+    /// READ 1 リクエストの local 上限。READ は「投げて応答を待つ」直列往復なので、
+    /// チャンクが小さいとスループット上限が RTT × チャンクで決まる (64 KiB × ~19ms
+    /// RTT = 実測 3.3 MB/s、obaket issue 389)。1 MiB に上げると往復回数が 1/16 に
+    /// なる。実際のリクエスト長は negotiate の maxRead と credit 残高
+    /// (1 MiB = 16 credits) で常に clamp されるため、サーバ制約は破らない。
+    /// write 側 (`localWriteChunkLimit` / `creditAwareWriteChunkSize`) は別途計測して
+    /// から判断する (読みだけが preview 律速のため先行)。
+    private static let localReadChunkLimit = 1024 * 1024
+
     private func negotiatedReadChunkSize() -> Int {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
-        return SMBTransferLimits.negotiatedChunkSize(localLimit: 64 * 1024, negotiatedLimit: maxReadSize, transformOverhead: transformOverhead)
+        return SMBTransferLimits.negotiatedChunkSize(localLimit: Self.localReadChunkLimit, negotiatedLimit: maxReadSize, transformOverhead: transformOverhead)
     }
 
     private func creditAwareWriteChunkSize() async -> Int {
@@ -4718,7 +4727,7 @@ actor SMBSession {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
         let availableCredits = await creditWindow.balance
         return SMBTransferLimits.creditWindowChunkSize(
-            localLimit: 64 * 1024,
+            localLimit: Self.localReadChunkLimit,
             negotiatedLimit: maxReadSize,
             transformOverhead: transformOverhead,
             availableCredits: availableCredits

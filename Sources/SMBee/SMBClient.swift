@@ -4705,7 +4705,8 @@ actor SMBSession {
     /// (1 MiB = 16 credits) で常に clamp されるため、サーバ制約は破らない。
     /// write 側 (`localWriteChunkLimit` / `creditAwareWriteChunkSize`) は別途計測して
     /// から判断する (読みだけが preview 律速のため先行)。
-    private static let localReadChunkLimit = 1024 * 1024
+    // internal: SMBeePerformanceRegressionTests が期待チャンク数の導出に参照する。
+    static let localReadChunkLimit = 1024 * 1024
 
     private func negotiatedReadChunkSize() -> Int {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize

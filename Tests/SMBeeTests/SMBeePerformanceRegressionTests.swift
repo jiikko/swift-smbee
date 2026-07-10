@@ -11,7 +11,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
     func testReadStreamingUsesExpectedReadCommandChunkAndByteCounts() async throws {
         let fileSize = 64 * 1024 * 2 + 123
         let effectiveReadChunkSize = SMBTransferLimits.negotiatedChunkSize(
-            localLimit: 64 * 1024,
+            localLimit: SMBSession.localReadChunkLimit,
             negotiatedLimit: UInt32.max,
             transformOverhead: 0
         )

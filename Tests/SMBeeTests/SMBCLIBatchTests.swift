@@ -66,6 +66,20 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(files.map(\.name), ["a.log", "nested\\b.log"])
     }
 
+    func testLocalRecursiveBatchGlobEntriesSkipsSymlinks() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let outside = root.deletingLastPathComponent().appendingPathComponent("outside-(UUID().uuidString).secret")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("secret".utf8).write(to: outside)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        try FileManager.default.createSymbolicLink(at: root.appendingPathComponent("linked.txt"), withDestinationURL: outside)
+
+        XCTAssertEqual(try localRecursiveBatchGlobEntries(directory: root.path, include: "*", exclude: []).map(\.name), [])
+    }
+
     func testMGetParsesPositionalsAndFlags() throws {
         let command = try MGet.parse([
             "smb://user@host/share/dir",

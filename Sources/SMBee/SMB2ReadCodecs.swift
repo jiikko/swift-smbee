@@ -1055,10 +1055,10 @@ enum SMB2SetInfo {
         update: SMBFileMetadataUpdate
     ) throws -> [UInt8] {
         var buffer = SMBByteWriter()
-        buffer.writeUInt64LE(dateToFiletime(update.creationTime))
-        buffer.writeUInt64LE(dateToFiletime(update.lastAccessTime))
-        buffer.writeUInt64LE(dateToFiletime(update.modifiedTime))
-        buffer.writeUInt64LE(dateToFiletime(update.changeTime))
+        buffer.writeUInt64LE(try dateToFiletime(update.creationTime))
+        buffer.writeUInt64LE(try dateToFiletime(update.lastAccessTime))
+        buffer.writeUInt64LE(try dateToFiletime(update.modifiedTime))
+        buffer.writeUInt64LE(try dateToFiletime(update.changeTime))
         buffer.writeUInt32LE(update.attributes ?? 0)
         buffer.writeUInt32LE(0)
         return try encodeRequest(
@@ -1515,8 +1515,12 @@ private func filetimeToDate(_ value: UInt64) -> Date? {
     return Date(timeIntervalSince1970: (TimeInterval(value) / 10_000_000) - secondsBetween1601And1970)
 }
 
-private func dateToFiletime(_ date: Date?) -> UInt64 {
+private func dateToFiletime(_ date: Date?) throws -> UInt64 {
     guard let date else { return 0 }
     let secondsBetween1601And1970: TimeInterval = 11_644_473_600
-    return UInt64((date.timeIntervalSince1970 + secondsBetween1601And1970) * 10_000_000)
+    let ticks = (date.timeIntervalSince1970 + secondsBetween1601And1970) * 10_000_000
+    guard ticks.isFinite, ticks >= 0, ticks <= Double(UInt64.max) else {
+        throw SMBCodecError.invalidValue("date is outside SMB FILETIME range")
+    }
+    return UInt64(ticks)
 }

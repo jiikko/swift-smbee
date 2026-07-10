@@ -991,14 +991,24 @@ public actor SMBClientSession {
         if !overwrite && FileManager.default.fileExists(atPath: localFile.path) {
             throw SMBCodecError.invalidValue("local destination already exists")
         }
-        FileManager.default.createFile(atPath: localFile.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: localFile)
+        let fileManager = FileManager.default
+        let temporary = localFile.deletingLastPathComponent()
+            .appendingPathComponent(".smbee-(UUID().uuidString).part")
+        fileManager.createFile(atPath: temporary.path, contents: nil)
+        defer { try? fileManager.removeItem(at: temporary) }
+        let handle = try FileHandle(forWritingTo: temporary)
         defer { try? handle.close() }
         let sink = SMBDownloadSink(handle: handle, onProgress: onProgress)
         try await withReadStream(path: path) { chunk in
             try sink.handle.write(contentsOf: Data(chunk))
             sink.total += UInt64(chunk.count)
             sink.onProgress?(SMBTransferProgress(bytesTransferred: sink.total, totalBytes: nil, bytesPerSecond: 0))
+        }
+        try handle.close()
+        if fileManager.fileExists(atPath: localFile.path) {
+            _ = try fileManager.replaceItemAt(localFile, withItemAt: temporary)
+        } else {
+            try fileManager.moveItem(at: temporary, to: localFile)
         }
     }
 
@@ -2036,6 +2046,13 @@ public enum SMBClient {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         if resume, fileManager.fileExists(atPath: destination.path) {
             let existingSize = try localFileSize(at: destination, fileManager: fileManager)
+            let remoteSize = try await stat(
+                host: host, port: port, share: share, path: path,
+                credential: credential, timeout: timeout, makeTransport: makeTransport
+            ).size
+            guard existingSize <= remoteSize else {
+                throw SMBCodecError.invalidValue("local resume file is larger than remote file")
+            }
             let handle = try FileHandle(forWritingTo: destination)
             do {
                 try handle.seekToEnd()
@@ -2053,6 +2070,10 @@ public enum SMBClient {
                     try handle.write(contentsOf: Data(chunk))
                 }
                 try handle.close()
+                let finalSize = try localFileSize(at: destination, fileManager: fileManager)
+                guard finalSize == remoteSize else {
+                    throw SMBCodecError.invalidValue("remote file changed during resume")
+                }
             } catch {
                 try? handle.close()
                 throw error
@@ -2295,6 +2316,7 @@ public enum SMBClient {
         for entry in entries {
             try Task.checkCancellation()
             guard !entry.isReparsePoint else { continue }
+            try validateDirectoryEntryName(entry.name)
             let remoteChild = joinSMBPath(path, entry.name)
             let relativeChild = joinSMBPath(relativePath, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
@@ -3219,6 +3241,15 @@ public enum SMBClient {
         if trimmedParent.isEmpty { return child }
         return "\(trimmedParent)\\\(child)"
     }
+
+    private static func validateDirectoryEntryName(_ name: String) throws {
+        guard !name.isEmpty, name != ".", name != "..",
+              !name.contains("/"), !name.contains("\\"),
+              !name.unicodeScalars.contains(where: { $0.value == 0 })
+        else {
+            throw SMBCodecError.invalidValue("invalid directory entry name")
+        }
+    }
 }
 
 extension Error {
@@ -3256,6 +3287,7 @@ actor SMBSession {
     private var messageId: UInt64 = 0
     private var sessionId: UInt64 = 0
     private var signingKey: [UInt8]?
+    private var signingRequired = false
     private var encryptionKey: [UInt8]?
     private var decryptionKey: [UInt8]?
     private var signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC
@@ -3301,6 +3333,7 @@ actor SMBSession {
         let negotiateResponse = try await unsignedWireTransaction(packet: negotiate, responseLabel: "NEGOTIATE response")
         preauthMessages.append(negotiateResponse)
         let result = try SMBNegotiateCodec.decodeResponse(negotiateResponse)
+        signingRequired = result.signingRequired
         maxReadSize = result.maxReadSize
         maxWriteSize = result.maxWriteSize
         guard SMBNegotiateCodec.supportsAuthenticatedConnection(dialect: result.dialect) else {
@@ -4295,7 +4328,7 @@ actor SMBSession {
     func close(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Close.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("CLOSE request", packet)
-        _ = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response", verifySignature: false)
+        _ = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response")
     }
 
     func treeDisconnect(treeId: UInt32) async throws {
@@ -4345,6 +4378,7 @@ actor SMBSession {
 
     func closeTransport() {
         transport.close()
+        failAllPendingResponses(error: SMBTransportError.connectionClosed)
         // Parked credit waiters can no longer be granted once the transport is closed.
         let creditWindow = creditWindow
         Task { await creditWindow.failAllWaiters(SMBTransportError.connectionClosed) }
@@ -4370,6 +4404,7 @@ actor SMBSession {
             )
         } onCancel: {
             Task {
+                await self.failPendingResponse(messageId: requestHeader.messageId, error: CancellationError())
                 await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
             }
         }
@@ -4390,6 +4425,7 @@ actor SMBSession {
             )
         } onCancel: {
             Task {
+                await self.failPendingResponse(messageId: requestHeader.messageId, error: CancellationError())
                 await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
             }
         }
@@ -4514,7 +4550,12 @@ actor SMBSession {
         if packet.starts(with: SMB3TransformHeader.protocolId) { return }
         guard let signingKey else { return }
         let header = try SMB2Header.decode(packet)
-        guard (header.flags & SMB2Flags.signed) != 0 else { return }
+        guard (header.flags & SMB2Flags.signed) != 0 else {
+            guard !signingRequired else {
+                throw SMBCodecError.invalidValue("SMB response missing required signature")
+            }
+            return
+        }
         let expected = try SMBSessionSigning.signature(
             algorithm: signingAlgorithm,
             key: signingKey,

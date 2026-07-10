@@ -95,8 +95,8 @@ enum LSARPC {
             _ = try reader.readUInt32() // MaxEntries
             if arrayReferent != 0 {
                 let count = Int(try reader.readUInt32()) // conformant count
-                guard count == Int(entries) || count >= 0 else { throw SMBCodecError.invalidValue("invalid domain count") }
-                var nameHeaders: [(length: UInt16, referent: UInt32)] = []
+                guard count == Int(entries) else { throw SMBCodecError.invalidValue("invalid domain count") }
+                var nameHeaders: [(length: UInt16, maximumLength: UInt16, referent: UInt32)] = []
                 for _ in 0..<count {
                     let header = try reader.readRPCUnicodeStringHeader()
                     let sidReferent = try reader.readUInt32()
@@ -120,7 +120,7 @@ enum LSARPC {
             guard count == Int(translatedEntries) else {
                 throw SMBCodecError.invalidValue("translated name count mismatch")
             }
-            var entries: [(use: UInt16, header: (length: UInt16, referent: UInt32), domainIndex: Int32)] = []
+            var entries: [(use: UInt16, header: (length: UInt16, maximumLength: UInt16, referent: UInt32), domainIndex: Int32)] = []
             for _ in 0..<count {
                 let use = try reader.readUInt16()
                 _ = try reader.readUInt16() // NDR struct padding: RPC_UNICODE_STRING aligns to 4

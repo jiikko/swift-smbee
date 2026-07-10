@@ -309,11 +309,14 @@ struct Watch: AsyncParsableCommand {
             task.cancel()
         }
         sigint.resume()
+        defer {
+            task.cancel()
+            sigint.cancel()
+        }
         do {
             try await task.value
         } catch is CancellationError {
         }
-        sigint.cancel()
     }
 
     private func formatChangeAction(_ action: SMBFileChangeAction) -> String {

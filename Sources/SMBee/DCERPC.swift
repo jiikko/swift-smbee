@@ -297,21 +297,27 @@ struct NDRReader {
 
     /// RPC_UNICODE_STRING header: Length (bytes), MaximumLength (bytes), Buffer pointer.
     /// The buffer contents are deferred (read later with `readRPCUnicodeStringBuffer`).
-    mutating func readRPCUnicodeStringHeader() throws -> (length: UInt16, referent: UInt32) {
+    mutating func readRPCUnicodeStringHeader() throws -> (length: UInt16, maximumLength: UInt16, referent: UInt32) {
         let length = try readUInt16()
-        _ = try readUInt16() // MaximumLength
+        let maximumLength = try readUInt16()
         let referent = try readUInt32()
-        return (length, referent)
+        guard length <= maximumLength, length % 2 == 0, maximumLength % 2 == 0 else {
+            throw SMBCodecError.invalidValue("invalid RPC_UNICODE_STRING lengths")
+        }
+        return (length, maximumLength, referent)
     }
 
     /// Deferred RPC_UNICODE_STRING buffer: conformant varying UInt16 array. Counts are in
     /// characters; `lengthInBytes` (from the header) bounds the significant characters
     /// because the buffer is not guaranteed to be null-terminated.
     mutating func readRPCUnicodeStringBuffer(lengthInBytes: UInt16) throws -> String {
-        _ = try readUInt32() // maxCount
+        let maxCount = try readUInt32()
         let offset = try readUInt32()
         let actualCount = try readUInt32()
         guard offset == 0 else { throw SMBCodecError.invalidValue("unsupported non-zero NDR string offset") }
+        guard actualCount <= maxCount, actualCount <= UInt32(lengthInBytes / 2) else {
+            throw SMBCodecError.invalidValue("invalid NDR string counts")
+        }
         let byteCount = Int(actualCount) * 2
         guard cursor + byteCount <= bytes.count else { throw SMBCodecError.truncated }
         let significant = min(byteCount, Int(lengthInBytes))

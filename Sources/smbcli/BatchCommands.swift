@@ -63,6 +63,7 @@ struct MGet: AsyncParsableCommand {
                 files = try await remoteRecursiveBatchGlobEntries(session: session, rootPath: endpoint.path, include: pattern, exclude: exclude)
             } else {
                 let entries = try await remoteDirectoryEntries(session: session, path: endpoint.path)
+                for entry in entries { try validateRemoteEntryName(entry.name) }
                 files = batchGlobEntries(entries, include: pattern, exclude: exclude).map {
                     RemoteBatchFile(name: $0.name, relativePath: $0.name)
                 }
@@ -361,6 +362,7 @@ private func appendRemoteRecursiveBatchGlobEntries(
     let directoryPath = relativeDirectory.isEmpty ? rootPath : try SMBPath.join(rootPath, relativeDirectory)
     let entries = try await remoteDirectoryEntries(session: session, path: directoryPath)
     for entry in entries {
+        try validateRemoteEntryName(entry.name)
         let relativePath = relativeDirectory.isEmpty ? entry.name : try SMBPath.join(relativeDirectory, entry.name)
         if entry.isDirectory {
             try await appendRemoteRecursiveBatchGlobEntries(
@@ -372,6 +374,14 @@ private func appendRemoteRecursiveBatchGlobEntries(
                   !isExcludedByGlob(relativePath, exclude: exclude) {
             files.append(RemoteBatchFile(name: entry.name, relativePath: relativePath))
         }
+    }
+}
+
+private func validateRemoteEntryName(_ name: String) throws {
+    guard !name.isEmpty, name != ".", name != "..",
+          !name.contains("/"), !name.contains("\\"),
+          !name.unicodeScalars.contains(where: { $0.value == 0 }) else {
+        throw SMBError.protocolError("invalid remote directory entry name")
     }
 }
 

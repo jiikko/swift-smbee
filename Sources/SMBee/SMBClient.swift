@@ -3294,6 +3294,7 @@ actor SMBSession {
         transport: SMBTransport,
         signingKey: [UInt8]? = nil,
         signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC,
+        signingRequired: Bool = false,
         initialCredits: UInt32 = 1
     ) {
         self.host = host
@@ -3302,6 +3303,7 @@ actor SMBSession {
         self.transport = transport
         self.signingKey = signingKey
         self.signingAlgorithm = signingAlgorithm
+        self.signingRequired = signingRequired
         self.creditWindow = SMB2CreditWindow(initialCredits: initialCredits)
     }
 

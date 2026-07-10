@@ -4394,6 +4394,25 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testSessionRejectsUnsignedResponseWhenSigningIsRequired() async throws {
+        let key = Array(repeating: UInt8(0x11), count: 16)
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2ReadResponse(Array("ok".utf8), messageId: 0, treeId: 0x3344)
+        ]))
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: key, signingRequired: true
+        )
+        do {
+            _ = try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 2)
+            XCTFail("unsigned response unexpectedly accepted")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("signature"))
+        }
+    }
+
     func testSessionReadChunkDoesNotReplayPreviousChunkAfterConnectionLoss() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([

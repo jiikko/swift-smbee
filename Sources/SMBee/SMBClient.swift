@@ -2046,13 +2046,6 @@ public enum SMBClient {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         if resume, fileManager.fileExists(atPath: destination.path) {
             let existingSize = try localFileSize(at: destination, fileManager: fileManager)
-            let remoteSize = try await stat(
-                host: host, port: port, share: share, path: path,
-                credential: credential, timeout: timeout, makeTransport: makeTransport
-            ).size
-            guard existingSize <= remoteSize else {
-                throw SMBCodecError.invalidValue("local resume file is larger than remote file")
-            }
             let handle = try FileHandle(forWritingTo: destination)
             do {
                 try handle.seekToEnd()
@@ -2070,10 +2063,6 @@ public enum SMBClient {
                     try handle.write(contentsOf: Data(chunk))
                 }
                 try handle.close()
-                let finalSize = try localFileSize(at: destination, fileManager: fileManager)
-                guard finalSize == remoteSize else {
-                    throw SMBCodecError.invalidValue("remote file changed during resume")
-                }
             } catch {
                 try? handle.close()
                 throw error
@@ -2754,12 +2743,13 @@ public enum SMBClient {
         let fileManager = FileManager.default
         let contents = try fileManager.contentsOfDirectory(
             at: localDirectory,
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: []
         ).sorted { $0.lastPathComponent < $1.lastPathComponent }
         for localChild in contents {
             try Task.checkCancellation()
-            let resourceValues = try localChild.resourceValues(forKeys: [.isDirectoryKey])
+            let resourceValues = try localChild.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            if resourceValues.isSymbolicLink == true { continue }
             let remoteChild = joinSMBPath(path, localChild.lastPathComponent)
             let relativeChild = joinSMBPath(relativePath, localChild.lastPathComponent)
             if recursiveEntryIsExcluded(name: localChild.lastPathComponent, relativePath: relativeChild, exclude: exclude) {
@@ -3267,6 +3257,9 @@ extension Error {
 private struct SMBPendingResponse {
     let label: String
     let longPoll: Bool
+    let expectedCommand: UInt16
+    let expectedSessionId: UInt64
+    let expectedTreeId: UInt32
     var pendingCount: Int = 0
     let continuation: CheckedContinuation<[UInt8], Error>
 }
@@ -4446,6 +4439,9 @@ actor SMBSession {
             pendingResponses[requestHeader.messageId] = SMBPendingResponse(
                 label: responseLabel,
                 longPoll: longPoll,
+                expectedCommand: requestHeader.command,
+                expectedSessionId: requestHeader.sessionId,
+                expectedTreeId: requestHeader.treeId,
                 continuation: continuation
             )
             Task {
@@ -4622,6 +4618,14 @@ actor SMBSession {
             orphanResponses[header.messageId] = packet
             debugLine("SMB response queued for future message id \(header.messageId)")
             return
+        }
+        // SESSION_SETUP/legacy test and server responses may carry zero session/tree
+        // before the authenticated context is established; once populated, both are
+        // part of the correlation key.
+        guard header.command == pending.expectedCommand,
+              (pending.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == pending.expectedSessionId),
+              (pending.expectedTreeId == 0 || header.treeId == 0 || header.treeId == pending.expectedTreeId) else {
+            throw SMBCodecError.invalidValue("SMB response correlation mismatch command=\(header.command)/\(pending.expectedCommand) session=\(header.sessionId)/\(pending.expectedSessionId) tree=\(header.treeId)/\(pending.expectedTreeId)")
         }
         if try SMB2AsyncInterim.shouldDiscard(packet) {
             pending.pendingCount += 1

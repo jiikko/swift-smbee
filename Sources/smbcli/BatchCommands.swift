@@ -293,7 +293,7 @@ func localRecursiveBatchGlobEntries(directory: String, include pattern: String, 
     let fileManager = FileManager.default
     guard let enumerator = fileManager.enumerator(
         at: rootURL,
-        includingPropertiesForKeys: [.isRegularFileKey],
+        includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
         options: [.skipsHiddenFiles]
     ) else {
         return []
@@ -303,6 +303,9 @@ func localRecursiveBatchGlobEntries(directory: String, include pattern: String, 
     for case let url as URL in enumerator {
         let standardizedURL = url.standardizedFileURL
         let values = try standardizedURL.resourceValues(forKeys: [.isRegularFileKey])
+        if (try? standardizedURL.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+            continue
+        }
         guard values.isRegularFile == true else { continue }
         let relativePath = String(standardizedURL.path.dropFirst(rootURL.path.count + 1))
         let normalizedRelativePath = relativePath.replacingOccurrences(of: "/", with: "\\")

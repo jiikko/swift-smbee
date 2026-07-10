@@ -3571,8 +3571,8 @@ final class SMBeeTests: XCTestCase {
         let inbound = try framed([
             try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
             try smb2WriteResponse(count: 65_537, messageId: 1, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 2, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344),
         ])
         let transport = InMemoryTransport(inbound: inbound)
         let session = SMBSession(
@@ -3599,8 +3599,8 @@ final class SMBeeTests: XCTestCase {
         let inbound = try framed([
             try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
             try smb2WriteResponse(count: firstChunkSize, messageId: 1, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 2, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344),
         ])
         let transport = InMemoryTransport(inbound: inbound)
         let session = SMBSession(

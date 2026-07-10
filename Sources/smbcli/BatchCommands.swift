@@ -60,7 +60,7 @@ struct MGet: AsyncParsableCommand {
             defer { Task { await session.close() } }
             let files: [RemoteBatchFile]
             if recursive {
-                files = try await remoteRecursiveBatchGlobEntries(endpoint: endpoint, credential: credential, include: pattern, exclude: exclude, timeout: transport.duration)
+                files = try await remoteRecursiveBatchGlobEntries(session: session, rootPath: endpoint.path, include: pattern, exclude: exclude)
             } else {
                 let entries = try await remoteDirectoryEntries(session: session, path: endpoint.path)
                 files = batchGlobEntries(entries, include: pattern, exclude: exclude).map {
@@ -179,12 +179,6 @@ struct MPut: AsyncParsableCommand {
         return Set(entries.filter { !$0.isDirectory }.map(\.name))
     }
 
-    private func remoteExistingFileNames(endpoint: SMBURLParser.ReadURL, credential: SMBCredential) async throws -> Set<String> {
-        guard noOverwrite else { return [] }
-        let entries = try await remoteDirectoryEntries(endpoint: endpoint, credential: credential, timeout: transport.duration)
-        return Set(entries.filter { !$0.isDirectory }.map(\.name))
-    }
-
     private func upload(
         files: [LocalBatchFile],
         endpoint: SMBURLParser.ReadURL,
@@ -198,7 +192,7 @@ struct MPut: AsyncParsableCommand {
             let remotePath = try SMBPath.join(endpoint.path, file.name)
             let exists: Bool
             if recursive {
-                exists = try await remotePathExists(endpoint: endpoint, credential: credential, path: remotePath)
+                exists = await sessionPathExists(session: session, path: remotePath)
             } else {
                 exists = remoteExisting.contains(file.name)
             }
@@ -211,7 +205,7 @@ struct MPut: AsyncParsableCommand {
                 print("upload \(file.url.path) -> \(remotePath)")
                 continue
             }
-            try await makeRemoteParentDirectories(endpoint: endpoint, credential: credential, remotePath: remotePath)
+            try await makeRemoteParentDirectories(session: session, remotePath: remotePath)
             let progressWriter = progress ? TransferProgressWriter() : nil
             var onProgress: (@Sendable (SMBTransferProgress) -> Void)?
             if let progressWriter {
@@ -228,39 +222,24 @@ struct MPut: AsyncParsableCommand {
         printBatchSummary(action: dryRun ? "planned" : "uploaded", count: count, skipped: skipped)
     }
 
-    private func makeRemoteParentDirectories(endpoint: SMBURLParser.ReadURL, credential: SMBCredential, remotePath: String) async throws {
+    private func makeRemoteParentDirectories(session: SMBClientSession, remotePath: String) async throws {
         let components = remotePath.split(separator: "\\").map(String.init)
         guard components.count > 1 else { return }
         var current = ""
         for component in components.dropLast() {
             current = try SMBPath.join(current, component)
             do {
-                try await SMBee.makeDirectory(
-                    host: endpoint.host,
-                    port: endpoint.port,
-                    credential: credential,
-                    share: endpoint.share,
-                    path: current,
-                    timeout: transport.duration
-                )
+                try await session.makeDirectory(path: current)
             } catch SMBError.nameCollision {
             }
         }
     }
 
-    private func remotePathExists(endpoint: SMBURLParser.ReadURL, credential: SMBCredential, path: String) async throws -> Bool {
-        guard noOverwrite else { return false }
+    private func sessionPathExists(session: SMBClientSession, path: String) async -> Bool {
         do {
-            _ = try await SMBee.stat(
-                host: endpoint.host,
-                port: endpoint.port,
-                credential: credential,
-                share: endpoint.share,
-                path: path,
-                timeout: transport.duration
-            )
+            _ = try await session.stat(path: path)
             return true
-        } catch SMBError.notFound {
+        } catch {
             return false
         }
     }
@@ -355,6 +334,45 @@ private func remoteRecursiveBatchGlobEntries(
         files: &files
     )
     return files.sorted { $0.relativePath < $1.relativePath }
+}
+
+private func remoteRecursiveBatchGlobEntries(
+    session: SMBClientSession,
+    rootPath: String,
+    include pattern: String,
+    exclude: [String]
+) async throws -> [RemoteBatchFile] {
+    var files: [RemoteBatchFile] = []
+    try await appendRemoteRecursiveBatchGlobEntries(
+        session: session, rootPath: rootPath, relativeDirectory: "",
+        include: pattern, exclude: exclude, files: &files
+    )
+    return files.sorted { $0.relativePath < $1.relativePath }
+}
+
+private func appendRemoteRecursiveBatchGlobEntries(
+    session: SMBClientSession,
+    rootPath: String,
+    relativeDirectory: String,
+    include pattern: String,
+    exclude: [String],
+    files: inout [RemoteBatchFile]
+) async throws {
+    let directoryPath = relativeDirectory.isEmpty ? rootPath : try SMBPath.join(rootPath, relativeDirectory)
+    let entries = try await remoteDirectoryEntries(session: session, path: directoryPath)
+    for entry in entries {
+        let relativePath = relativeDirectory.isEmpty ? entry.name : try SMBPath.join(relativeDirectory, entry.name)
+        if entry.isDirectory {
+            try await appendRemoteRecursiveBatchGlobEntries(
+                session: session, rootPath: rootPath, relativeDirectory: relativePath,
+                include: pattern, exclude: exclude, files: &files
+            )
+        } else if globMatches(pattern, entry.name),
+                  !isExcludedByGlob(entry.name, exclude: exclude),
+                  !isExcludedByGlob(relativePath, exclude: exclude) {
+            files.append(RemoteBatchFile(name: entry.name, relativePath: relativePath))
+        }
+    }
 }
 
 private func appendRemoteRecursiveBatchGlobEntries(

@@ -611,17 +611,17 @@ public actor SMBClientSession {
                 elements: [.lock(offset: offset, length: length, shared: shared, failImmediately: failImmediately)]
             )
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
         do {
             let result = try await body()
             try? await session.lock(treeId: treeId, fileId: fileId, elements: [.unlock(offset: offset, length: length)])
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return result
         } catch {
             try? await session.lock(treeId: treeId, fileId: fileId, elements: [.unlock(offset: offset, length: length)])
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -687,9 +687,9 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, path: path, directory: true)
         do {
             try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -728,10 +728,10 @@ public actor SMBClientSession {
                         watchTree: watchTree,
                         onChange: onChange
                     )
-                    try? await session.close(treeId: treeId, fileId: fileId)
+                    await session.bestEffortClose(treeId: treeId, fileId: fileId)
                     return
                 } catch {
-                    try? await session.close(treeId: treeId, fileId: fileId)
+                    await session.bestEffortClose(treeId: treeId, fileId: fileId)
                     throw error
                 }
             } catch is CancellationError {
@@ -777,10 +777,10 @@ public actor SMBClientSession {
         let fileId = try await session.createForMetadata(treeId: treeId, path: path)
         do {
             let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return stat
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -790,10 +790,10 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, request: .reparsePoint(path: path))
         do {
             let reparsePoint = try await session.reparsePoint(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return reparsePoint
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -803,10 +803,10 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, request: .querySecurity(path: path))
         do {
             let info = try await session.querySecurityInfo(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return info
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -842,9 +842,9 @@ public actor SMBClientSession {
                 dacl: dacl,
                 force: force
             )
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -856,9 +856,9 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, request: .sparse(path: path))
         do {
             try await session.setSparse(treeId: treeId, fileId: fileId, sparse: sparse)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -871,9 +871,9 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, request: .sparse(path: path))
         do {
             try await session.setZeroData(treeId: treeId, fileId: fileId, offset: offset, length: length)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -885,10 +885,10 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, request: .sparse(path: path))
         do {
             let ranges = try await session.queryAllocatedRanges(treeId: treeId, fileId: fileId, offset: offset, length: length)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return ranges
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -898,10 +898,10 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, path: "", directory: true)
         do {
             let info = try await session.volumeInfo(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return info
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -920,10 +920,10 @@ public actor SMBClientSession {
             guard UInt64(data.count) == requested else {
                 throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
             }
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return data
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -950,9 +950,9 @@ public actor SMBClientSession {
                 onProgress: onProgress,
                 onChunk: onChunk
             )
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             if progress.startedYielding, error.isSMBConnectionLoss {
                 throw SMBError.connectionLost(operation: "READ")
             }
@@ -977,9 +977,9 @@ public actor SMBClientSession {
         do {
             try await session.write(treeId: treeId, fileId: fileId, data: data, onProgress: onProgress)
             try await session.flush(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -1057,9 +1057,9 @@ public actor SMBClientSession {
                 return Array(data)
             }
             try await session.flush(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -1103,9 +1103,9 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, request: .rename(path: fromPath))
         do {
             try await session.rename(treeId: treeId, fileId: fileId, newPath: toPath, replaceIfExists: replaceIfExists)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -1142,9 +1142,9 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, request: .metadata(path: path, directory: directory))
         do {
             try await session.setBasicInfo(treeId: treeId, fileId: fileId, update: update)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -1197,9 +1197,9 @@ public actor SMBClientTreeSession {
         let fileId = try await session.create(treeId: treeId, path: path, directory: true)
         do {
             try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -1209,10 +1209,10 @@ public actor SMBClientTreeSession {
         let fileId = try await session.createForMetadata(treeId: treeId, path: path)
         do {
             let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return stat
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -1222,10 +1222,10 @@ public actor SMBClientTreeSession {
         let fileId = try await session.create(treeId: treeId, request: .reparsePoint(path: path))
         do {
             let reparsePoint = try await session.reparsePoint(treeId: treeId, fileId: fileId)
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             return reparsePoint
         } catch {
-            try? await session.close(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -1553,9 +1553,9 @@ public enum SMBClient {
             let fileId = try await session.create(treeId: treeId, path: path, directory: true)
             do {
                 try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -1598,9 +1598,9 @@ public enum SMBClient {
             let fileId = try await session.create(treeId: treeId, request: .changeNotify(path: path))
             do {
                 try await session.changeNotify(treeId: treeId, fileId: fileId, filter: filter, watchTree: watchTree, onChange: onChange)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -1644,10 +1644,10 @@ public enum SMBClient {
             let fileId = try await session.createForMetadata(treeId: treeId, path: path)
             do {
                 let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 return stat
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -1670,10 +1670,10 @@ public enum SMBClient {
             let fileId = try await session.create(treeId: treeId, request: .reparsePoint(path: path))
             do {
                 let reparsePoint = try await session.reparsePoint(treeId: treeId, fileId: fileId)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 return reparsePoint
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -1693,10 +1693,10 @@ public enum SMBClient {
             let fileId = try await session.create(treeId: treeId, request: .querySecurity(path: path))
             do {
                 let info = try await session.querySecurityInfo(treeId: treeId, fileId: fileId)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 return info
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -1758,9 +1758,9 @@ public enum SMBClient {
                     dacl: dacl,
                     force: force
                 )
-                try? await session.close(treeId: treeId, fileId: writeFileId)
+                await session.bestEffortClose(treeId: treeId, fileId: writeFileId)
             } catch {
-                try? await session.close(treeId: treeId, fileId: writeFileId)
+                await session.bestEffortClose(treeId: treeId, fileId: writeFileId)
                 throw error
             }
         }
@@ -1779,10 +1779,10 @@ public enum SMBClient {
             let fileId = try await session.create(treeId: treeId, path: "", directory: true)
             do {
                 let info = try await session.volumeInfo(treeId: treeId, fileId: fileId)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 return info
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -1910,10 +1910,10 @@ public enum SMBClient {
                 guard UInt64(data.count) == requested else {
                     throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
                 }
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 return data
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -1988,9 +1988,9 @@ public enum SMBClient {
                 guard received == requested else {
                     throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(received)")
                 }
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 if progress.startedYielding, error.isSMBConnectionLoss {
                     throw SMBError.connectionLost(operation: "READ")
                 }
@@ -2566,9 +2566,9 @@ public enum SMBClient {
             do {
                 try await session.write(treeId: treeId, fileId: fileId, data: data, onProgress: onProgress)
                 try await session.flush(treeId: treeId, fileId: fileId)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -3061,9 +3061,9 @@ public enum SMBClient {
             let fileId = try await session.create(treeId: treeId, request: .metadata(path: path, directory: directory))
             do {
                 try await session.setBasicInfo(treeId: treeId, fileId: fileId, update: update)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -3107,9 +3107,9 @@ public enum SMBClient {
             let fileId = try await session.create(treeId: treeId, request: .rename(path: fromPath))
             do {
                 try await session.rename(treeId: treeId, fileId: fileId, newPath: toPath, replaceIfExists: replaceIfExists)
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
             } catch {
-                try? await session.close(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -4322,6 +4322,14 @@ actor SMBSession {
         let packet = try SMB2Close.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("CLOSE request", packet)
         _ = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response")
+    }
+
+    /// Cleanup path: do not inherit caller cancellation while trying to release a handle.
+    func bestEffortClose(treeId: UInt32, fileId: [UInt8]) async {
+        let task = Task.detached { [self] in
+            try? await self.close(treeId: treeId, fileId: fileId)
+        }
+        await task.value
     }
 
     func treeDisconnect(treeId: UInt32) async throws {

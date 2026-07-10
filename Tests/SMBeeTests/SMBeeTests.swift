@@ -4252,6 +4252,18 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt32LE(request, at: 128), SMBFileAttributes.hidden | SMBFileAttributes.archive)
     }
 
+    func testSetInfoRejectsOutOfRangeFiletimeWithoutTrapping() {
+        let fileId = Array(repeating: UInt8(0), count: 16)
+        XCTAssertThrowsError(try SMB2SetInfo.encodeBasicInfoRequest(
+            messageId: 1, sessionId: 2, treeId: 3, fileId: fileId,
+            update: SMBFileMetadataUpdate(creationTime: Date(timeIntervalSince1970: -11_644_473_601))
+        ))
+        XCTAssertThrowsError(try SMB2SetInfo.encodeBasicInfoRequest(
+            messageId: 1, sessionId: 2, treeId: 3, fileId: fileId,
+            update: SMBFileMetadataUpdate(creationTime: Date(timeIntervalSince1970: 1e20))
+        ))
+    }
+
     func testReadRequestUsesOffsetLengthFileIdAndOneByteBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let request = try SMB2Read.encodeRequest(

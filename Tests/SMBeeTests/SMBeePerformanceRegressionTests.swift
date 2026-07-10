@@ -37,6 +37,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
     }
 
     func testWriteStreamingUsesExpectedWriteCommandAndByteCounts() async throws {
+        XCTAssertEqual(SMBClientSession.localWriteChunkLimit, 1024 * 1024)
         let fileSize = 64 * 1024 * 2 + 321
         let effectiveWriteChunkSize = SMBTransferLimits.negotiatedChunkSize(
             localLimit: 64 * 1024,
@@ -366,7 +367,9 @@ private func negotiateResponse(messageId: UInt64) throws -> [UInt8] {
     response.replaceSubrange(72..<88, with: Array(repeating: UInt8(0x42), count: 16))
     writeUInt32LE(1_048_576, to: &response, at: 92)
     writeUInt32LE(1_048_576, to: &response, at: 96)
-    writeUInt32LE(1_048_576, to: &response, at: 100)
+    // Keep this fixture credit/negotiation constrained; the assertion above covers
+    // the production write limit while this test remains focused on accounting.
+    writeUInt32LE(65_536, to: &response, at: 100)
     writeUInt16LE(UInt16(response.count), to: &response, at: 120)
     writeUInt16LE(0, to: &response, at: 122)
     writeUInt32LE(136, to: &response, at: 124)

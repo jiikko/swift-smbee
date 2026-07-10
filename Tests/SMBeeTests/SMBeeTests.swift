@@ -3171,6 +3171,7 @@ final class SMBeeTests: XCTestCase {
 
         let header = try SMB2Header.decode(request)
         XCTAssertEqual(header.command, SMB2Commands.queryDirectory)
+        XCTAssertEqual(readUInt32LE(request, at: 92), SMB2QueryDirectory.outputBufferSize)
         XCTAssertEqual(header.messageId, 11)
         XCTAssertEqual(header.treeId, 0x5566_7788)
         XCTAssertEqual(header.sessionId, 0x1122_3344)
@@ -3182,7 +3183,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[72..<88]), fileId)
         XCTAssertEqual(readUInt16LE(request, at: 88), 96)
         XCTAssertEqual(readUInt16LE(request, at: 90), 2)
-        XCTAssertEqual(readUInt32LE(request, at: 92), 65_536)
+        XCTAssertEqual(readUInt32LE(request, at: 92), SMB2QueryDirectory.outputBufferSize)
         XCTAssertEqual(Array(request[96..<98]), [0x2a, 0x00])
     }
 
@@ -3569,10 +3570,9 @@ final class SMBeeTests: XCTestCase {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([
             try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
-            try smb2WriteResponse(count: 65_536, messageId: 1, treeId: 0x3344),
-            try smb2WriteResponse(count: 1, messageId: 2, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 3, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344),
+            try smb2WriteResponse(count: 65_537, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344),
         ])
         let transport = InMemoryTransport(inbound: inbound)
         let session = SMBSession(
@@ -3588,21 +3588,19 @@ final class SMBeeTests: XCTestCase {
 
         try await clientSession.upload(path: "file.txt", data: data, onProgress: progress.append)
 
-        XCTAssertEqual(progress.snapshots.map(\.bytesTransferred), [65_536, 65_537])
-        XCTAssertEqual(progress.snapshots.map(\.totalBytes), [65_537, 65_537])
+        XCTAssertEqual(progress.snapshots.map(\.bytesTransferred), [65_537])
+        XCTAssertEqual(progress.snapshots.map(\.totalBytes), [65_537])
         XCTAssertTrue(progress.snapshots.allSatisfy { $0.bytesPerSecond >= 0 })
     }
 
     func testClientSessionStreamingUploadWritesTempFileInChunks() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let firstChunkSize = 65_536
-        let secondChunkSize = 11
+        let firstChunkSize = 65_536 + 11
         let inbound = try framed([
             try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
             try smb2WriteResponse(count: firstChunkSize, messageId: 1, treeId: 0x3344),
-            try smb2WriteResponse(count: secondChunkSize, messageId: 2, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 3, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344),
         ])
         let transport = InMemoryTransport(inbound: inbound)
         let session = SMBSession(
@@ -3613,7 +3611,7 @@ final class SMBeeTests: XCTestCase {
             signingKey: Array(repeating: UInt8(0x11), count: 16)
         )
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
-        let payload = (0..<(firstChunkSize + secondChunkSize)).map { UInt8($0 % 251) }
+        let payload = (0..<firstChunkSize).map { UInt8($0 % 251) }
         let fileURL = try writeTemporaryFile(bytes: payload)
         defer { try? FileManager.default.removeItem(at: fileURL) }
 
@@ -3623,15 +3621,12 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
             SMB2Commands.create,
             SMB2Commands.write,
-            SMB2Commands.write,
             SMB2Commands.flush,
             SMB2Commands.close,
         ])
         XCTAssertEqual(readUInt64LE(requests[1], at: 72), 0)
-        XCTAssertEqual(readUInt64LE(requests[2], at: 72), UInt64(firstChunkSize))
         XCTAssertEqual(try writePayload(from: requests[1]).count, firstChunkSize)
-        XCTAssertEqual(try writePayload(from: requests[2]).count, secondChunkSize)
-        XCTAssertEqual(try writePayload(from: requests[1]) + writePayload(from: requests[2]), payload)
+        XCTAssertEqual(try writePayload(from: requests[1]), payload)
     }
 
     func testClientSessionStreamingUploadResumeWritesFromRemoteSize() async throws {

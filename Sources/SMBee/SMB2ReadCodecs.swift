@@ -1262,6 +1262,7 @@ enum SMB2SetInfo {
 enum SMB2QueryDirectory {
     private static let fixedPartSize = 32
     private static let fileNameOffset = SMB2Header.encodedSize + fixedPartSize
+    static let outputBufferSize: UInt32 = 256 * 1024
 
     static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8], restartScan: Bool = true) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
@@ -1275,7 +1276,7 @@ enum SMB2QueryDirectory {
         writer.writeBytes(fileId)
         writer.writeUInt16LE(UInt16(fileNameOffset))
         writer.writeUInt16LE(2)
-        writer.writeUInt32LE(65_536)
+        writer.writeUInt32LE(outputBufferSize)
         writer.writeBytes([0x2a, 0x00])
         return writer.bytes
     }
@@ -1285,10 +1286,10 @@ enum SMB2QueryDirectory {
         guard try reader.readUInt16LE() == 9 else {
             throw SMBCodecError.invalidValue("invalid QUERY_DIRECTORY response structure size")
         }
-        let offset = Int(try reader.readUInt16LE())
+        let dataOffset = Int(try reader.readUInt16LE())
         let length = Int(try reader.readUInt32LE())
-        guard offset + length <= bytes.count else { throw SMBCodecError.truncated }
-        let data = Array(bytes[offset..<offset + length])
+        guard dataOffset + length <= bytes.count else { throw SMBCodecError.truncated }
+        let data = bytes[dataOffset..<dataOffset + length]
         var entries: [SMBDirectoryEntry] = []
         var entryOffset = 0
         while entryOffset + 104 <= data.count {
@@ -1302,7 +1303,8 @@ enum SMB2QueryDirectory {
             let fileId = rawFileId == 0 ? nil : rawFileId
             let nameOffset = entryOffset + 104
             guard nameOffset + nameLength <= data.count else { throw SMBCodecError.truncated }
-            let name = decodeUTF16LE(Array(data[nameOffset..<nameOffset + nameLength]))
+            let nameStart = data.startIndex + nameOffset
+            let name = decodeUTF16LE(Array(data[nameStart..<nameStart + nameLength]))
             if name != "." && name != ".." {
                 entries.append(SMBDirectoryEntry(
                     name: name,
@@ -1321,14 +1323,15 @@ enum SMB2QueryDirectory {
         return entries
     }
 
-    private static func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
-        UInt32(bytes[offset])
-            | (UInt32(bytes[offset + 1]) << 8)
-            | (UInt32(bytes[offset + 2]) << 16)
-            | (UInt32(bytes[offset + 3]) << 24)
+    private static func readUInt32LE(_ bytes: ArraySlice<UInt8>, at offset: Int) -> UInt32 {
+        let i = bytes.startIndex + offset
+        return UInt32(bytes[i])
+            | (UInt32(bytes[i + 1]) << 8)
+            | (UInt32(bytes[i + 2]) << 16)
+            | (UInt32(bytes[i + 3]) << 24)
     }
 
-    private static func readUInt64LE(_ bytes: [UInt8], at offset: Int) -> UInt64 {
+    private static func readUInt64LE(_ bytes: ArraySlice<UInt8>, at offset: Int) -> UInt64 {
         UInt64(readUInt32LE(bytes, at: offset)) | (UInt64(readUInt32LE(bytes, at: offset + 4)) << 32)
     }
 }

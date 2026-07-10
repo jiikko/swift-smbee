@@ -507,8 +507,19 @@ private final class SMBReadAccumulator: @unchecked Sendable {
     }
 }
 
+private final class SMBDownloadSink: @unchecked Sendable {
+    let handle: FileHandle
+    let onProgress: (@Sendable (SMBTransferProgress) -> Void)?
+    var total: UInt64 = 0
+    init(handle: FileHandle, onProgress: (@Sendable (SMBTransferProgress) -> Void)?) {
+        self.handle = handle
+        self.onProgress = onProgress
+    }
+}
+
 public actor SMBClientSession {
-    private static let localWriteChunkLimit = 64 * 1024
+    // Keep writes comparable to reads; credit/negotiated limits still clamp this.
+    static let localWriteChunkLimit = 1024 * 1024
 
     /// Everything needed to rebuild a dropped connection for opt-in watch resubscribe.
     /// Only sessions created via `connect(...)` carry this; `withTree`-derived sessions do not.
@@ -970,6 +981,24 @@ public actor SMBClientSession {
         } catch {
             try? await session.close(treeId: treeId, fileId: fileId)
             throw error
+        }
+    }
+
+    /// Download a file using this already-connected session.
+    public func download(path: String, localFile: URL, overwrite: Bool = true,
+                         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil) async throws {
+        try ensureOpen()
+        if !overwrite && FileManager.default.fileExists(atPath: localFile.path) {
+            throw SMBCodecError.invalidValue("local destination already exists")
+        }
+        FileManager.default.createFile(atPath: localFile.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: localFile)
+        defer { try? handle.close() }
+        let sink = SMBDownloadSink(handle: handle, onProgress: onProgress)
+        try await withReadStream(path: path) { chunk in
+            try sink.handle.write(contentsOf: Data(chunk))
+            sink.total += UInt64(chunk.count)
+            sink.onProgress?(SMBTransferProgress(bytesTransferred: sink.total, totalBytes: nil, bytesPerSecond: 0))
         }
     }
 
@@ -3992,8 +4021,13 @@ actor SMBSession {
             data: data
         )
         debugDump("WRITE request", packet)
+        let perfCreditsBefore = SMBPerfLog.isEnabled ? await creditWindow.balance : 0
+        let perfStart = ContinuousClock.now
         let response = try await signedWireTransaction(packet: packet, responseLabel: "WRITE response")
         let count = try SMB2Write.decodeResponseCount(response)
+        SMBPerfLog.line(
+            "write req=\(data.count) got=\(count) wire=\(SMBPerfLog.milliseconds(ContinuousClock.now - perfStart))ms credits=\(perfCreditsBefore)"
+        )
         guard count == data.count else {
             throw SMBCodecError.invalidValue("short SMB write: expected \(data.count) bytes, got \(count)")
         }
@@ -4717,7 +4751,7 @@ actor SMBSession {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
         let availableCredits = await creditWindow.balance
         return SMBTransferLimits.creditWindowChunkSize(
-            localLimit: 64 * 1024,
+            localLimit: SMBClientSession.localWriteChunkLimit,
             negotiatedLimit: maxWriteSize,
             transformOverhead: transformOverhead,
             availableCredits: availableCredits

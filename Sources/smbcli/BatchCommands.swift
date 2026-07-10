@@ -56,11 +56,13 @@ struct MGet: AsyncParsableCommand {
 
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: remoteDirectory, auth: auth)
         try await transport.withOperationDeadline {
+            let session = try await SMBClient.connect(host: endpoint.host, port: endpoint.port, share: endpoint.share, credential: credential, timeout: transport.duration)
+            defer { Task { await session.close() } }
             let files: [RemoteBatchFile]
             if recursive {
                 files = try await remoteRecursiveBatchGlobEntries(endpoint: endpoint, credential: credential, include: pattern, exclude: exclude, timeout: transport.duration)
             } else {
-                let entries = try await remoteDirectoryEntries(endpoint: endpoint, credential: credential, timeout: transport.duration)
+                let entries = try await remoteDirectoryEntries(session: session, path: endpoint.path)
                 files = batchGlobEntries(entries, include: pattern, exclude: exclude).map {
                     RemoteBatchFile(name: $0.name, relativePath: $0.name)
                 }
@@ -70,11 +72,11 @@ struct MGet: AsyncParsableCommand {
                 return
             }
 
-            try await download(files: files, endpoint: endpoint, credential: credential)
+            try await download(files: files, endpoint: endpoint, credential: credential, session: session)
         }
     }
 
-    private func download(files: [RemoteBatchFile], endpoint: SMBURLParser.ReadURL, credential: SMBCredential) async throws {
+    private func download(files: [RemoteBatchFile], endpoint: SMBURLParser.ReadURL, credential: SMBCredential, session: SMBClientSession) async throws {
         var transferred = 0
         var skipped = 0
         for file in files {
@@ -98,17 +100,7 @@ struct MGet: AsyncParsableCommand {
             if progressWriter != nil {
                 writeStandardError("\(file.relativePath)\n")
             }
-            try await SMBee.download(
-                host: endpoint.host,
-                port: endpoint.port,
-                credential: credential,
-                share: endpoint.share,
-                path: remotePath,
-                localFile: localFile,
-                overwrite: !noOverwrite,
-                timeout: transport.duration,
-                onProgress: onProgress
-            )
+            try await session.download(path: remotePath, localFile: localFile, overwrite: !noOverwrite, onProgress: onProgress)
             progressWriter?.finish()
             transferred += 1
         }
@@ -174,9 +166,17 @@ struct MPut: AsyncParsableCommand {
 
         let (endpoint, credential) = try makeEndpointAndCredential(url: remoteDirectory, auth: auth)
         try await transport.withOperationDeadline {
-            let remoteExisting = try await remoteExistingFileNames(endpoint: endpoint, credential: credential)
-            try await upload(files: files, endpoint: endpoint, credential: credential, remoteExisting: remoteExisting)
+            let session = try await SMBClient.connect(host: endpoint.host, port: endpoint.port, share: endpoint.share, credential: credential, timeout: transport.duration)
+            defer { Task { await session.close() } }
+            let remoteExisting = try await remoteExistingFileNames(session: session, path: endpoint.path)
+            try await upload(files: files, endpoint: endpoint, credential: credential, remoteExisting: remoteExisting, session: session)
         }
+    }
+
+    private func remoteExistingFileNames(session: SMBClientSession, path: String) async throws -> Set<String> {
+        guard noOverwrite else { return [] }
+        let entries = try await remoteDirectoryEntries(session: session, path: path)
+        return Set(entries.filter { !$0.isDirectory }.map(\.name))
     }
 
     private func remoteExistingFileNames(endpoint: SMBURLParser.ReadURL, credential: SMBCredential) async throws -> Set<String> {
@@ -189,7 +189,8 @@ struct MPut: AsyncParsableCommand {
         files: [LocalBatchFile],
         endpoint: SMBURLParser.ReadURL,
         credential: SMBCredential,
-        remoteExisting: Set<String>
+        remoteExisting: Set<String>,
+        session: SMBClientSession
     ) async throws {
         var transferred = 0
         var skipped = 0
@@ -219,17 +220,7 @@ struct MPut: AsyncParsableCommand {
             if progressWriter != nil {
                 writeStandardError("\(file.name)\n")
             }
-            try await SMBee.upload(
-                host: endpoint.host,
-                port: endpoint.port,
-                credential: credential,
-                share: endpoint.share,
-                path: remotePath,
-                fileURL: file.url,
-                overwrite: !noOverwrite,
-                timeout: transport.duration,
-                onProgress: onProgress
-            )
+            try await session.upload(path: remotePath, fileURL: file.url, overwrite: !noOverwrite, onProgress: onProgress)
             progressWriter?.finish()
             transferred += 1
         }
@@ -416,6 +407,14 @@ private func remoteDirectoryEntries(
         path: path ?? endpoint.path,
         timeout: timeout
     ) { entry in
+        collector.append(entry)
+    }
+    return collector.entries
+}
+
+private func remoteDirectoryEntries(session: SMBClientSession, path: String) async throws -> [SMBDirectoryEntry] {
+    let collector = DirectoryEntryCollector()
+    try await session.withDirectoryStream(path: path) { entry in
         collector.append(entry)
     }
     return collector.entries

@@ -42,6 +42,10 @@ jobs:
             profile: smb311-encrypted-required
             scope: authenticated-smoke
             test_filter: SMBeeE2ETests.testAuthenticatedFastSmoke
+          - swift_version: "6.2"
+            profile: guest
+            scope: anonymous-smoke
+            test_filter: SMBeeE2ETests.testGuestAnonymousSmoke
     env:
       SAMBA_CONTAINER: smbee-samba-api-${{ matrix.profile }}-${{ matrix.swift_version }}
       SAMBA_BASE_IMAGE: ubuntu:24.04
@@ -70,6 +74,10 @@ jobs:
           bash test/e2e/run-swift-in-container.sh '
             swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
             swift test --filter "${TEST_FILTER}"
+            if [ "${SMBEE_E2E_PROFILE}" = guest ]; then
+              swift run smbcli ls "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public"
+              swift run smbcli cat "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public/known.txt" --guest
+            fi
           '
 
       - name: Samba logs and teardown

@@ -16,6 +16,31 @@ private func smbFileSizeValue(from attributes: [FileAttributeKey: Any]) -> UInt6
     return nil
 }
 
+private struct SMBLocalFileSnapshot: Equatable {
+    let device: UInt64
+    let inode: UInt64
+    let size: UInt64
+    let modificationSeconds: Int64
+    let modificationNanoseconds: Int64
+
+    init(handle: FileHandle) throws {
+        var value = stat()
+        guard fstat(handle.fileDescriptor, &value) == 0, value.st_size >= 0 else {
+            throw SMBCodecError.invalidValue("unable to inspect local source file")
+        }
+        device = UInt64(value.st_dev)
+        inode = UInt64(value.st_ino)
+        size = UInt64(value.st_size)
+#if os(Linux)
+        modificationSeconds = Int64(value.st_mtim.tv_sec)
+        modificationNanoseconds = Int64(value.st_mtim.tv_nsec)
+#else
+        modificationSeconds = Int64(value.st_mtimespec.tv_sec)
+        modificationNanoseconds = Int64(value.st_mtimespec.tv_nsec)
+#endif
+    }
+}
+
 /// Replaces `destination` (file or directory) with `source`. `replaceItemAt` gives an atomic swap on
 /// Darwin, but swift-corelibs-foundation implements it unreliably on Linux — it non-deterministically
 /// either throws "file doesn't exist" or returns without actually swapping, leaving the old content.
@@ -468,11 +493,17 @@ private final class SMBReadStreamProgress: @unchecked Sendable {
     }
 }
 
-private struct SMBTransferProgressEmitter {
+/// Delivers callbacks away from protocol actors. At most one pending snapshot is retained; a slow
+/// consumer observes monotonic coalesced values and the transfer awaits the final delivery.
+private final class SMBTransferProgressEmitter: @unchecked Sendable {
     private let totalBytes: UInt64?
     private let onProgress: (@Sendable (SMBTransferProgress) -> Void)?
     private let clock = ContinuousClock()
     private let start: ContinuousClock.Instant
+    private let queue = DispatchQueue(label: "SMBee.transfer-progress")
+    private let lock = NSLock()
+    private var latest: SMBTransferProgress?
+    private var drainScheduled = false
 
     init(totalBytes: UInt64?, onProgress: (@Sendable (SMBTransferProgress) -> Void)?) {
         self.totalBytes = totalBytes
@@ -481,16 +512,46 @@ private struct SMBTransferProgressEmitter {
     }
 
     func emit(bytesTransferred: UInt64) {
-        guard let onProgress else { return }
+        guard onProgress != nil else { return }
         let elapsed = start.duration(to: clock.now)
         let components = elapsed.components
         let seconds = Double(components.seconds) + (Double(components.attoseconds) / 1_000_000_000_000_000_000)
         let bytesPerSecond = seconds > 0 ? Double(bytesTransferred) / seconds : 0
-        onProgress(SMBTransferProgress(
+        let snapshot = SMBTransferProgress(
             bytesTransferred: bytesTransferred,
             totalBytes: totalBytes,
             bytesPerSecond: bytesPerSecond
-        ))
+        )
+        lock.lock()
+        latest = snapshot
+        if drainScheduled {
+            lock.unlock()
+            return
+        }
+        drainScheduled = true
+        lock.unlock()
+        queue.async { self.drain() }
+    }
+
+    func finish() async {
+        guard onProgress != nil else { return }
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume() }
+        }
+    }
+
+    private func drain() {
+        while true {
+            lock.lock()
+            guard let snapshot = latest else {
+                drainScheduled = false
+                lock.unlock()
+                return
+            }
+            latest = nil
+            lock.unlock()
+            onProgress?(snapshot)
+        }
     }
 }
 
@@ -562,6 +623,10 @@ public actor SMBClientSession {
         self.session = session
         self.treeId = treeId
         self.reconnectInfo = reconnectInfo
+    }
+
+    func retainsAuthenticationCredentialForTesting() async -> Bool {
+        await session.retainsAuthenticationCredentialForTesting()
     }
 
     /// Tear down the current connection and establish a fresh session + tree from the
@@ -1046,43 +1111,77 @@ public actor SMBClientSession {
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try ensureOpen()
-        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-        guard let totalBytes = smbFileSizeValue(from: attributes) else {
-            throw SMBCodecError.invalidValue("local file size is unavailable")
-        }
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer { try? handle.close() }
+        let sourceSnapshot = try SMBLocalFileSnapshot(handle: handle)
+        let totalBytes = sourceSnapshot.size
         let remoteSize: UInt64
+        var fileId: [UInt8]
         if resume {
             do {
-                remoteSize = try await stat(path: path).size
+                fileId = try await session.create(treeId: treeId, request: .uploadResume(path: path))
+                remoteSize = try await session.queryInfo(treeId: treeId, fileId: fileId).size
             } catch SMBError.notFound {
                 remoteSize = 0
+                fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: true))
             }
             guard remoteSize <= totalBytes else {
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw SMBCodecError.invalidValue("remote file is larger than local source")
             }
         } else {
             remoteSize = 0
+            fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
         }
-        let request: SMB2CreateRequest = resume && remoteSize > 0
-            ? .uploadResume(path: path)
-            : .upload(path: path, overwrite: resume ? true : overwrite)
-        let fileId = try await session.create(treeId: treeId, request: request)
-        let handle = try FileHandle(forReadingFrom: fileURL)
-        defer { try? handle.close() }
         let progress = SMBTransferProgressEmitter(totalBytes: totalBytes, onProgress: onProgress)
-        try handle.seek(toOffset: remoteSize)
         var bytesTransferred = remoteSize
         do {
-            try await session.write(treeId: treeId, fileId: fileId, offset: remoteSize) { maxLength in
-                let length = min(maxLength, Self.localWriteChunkLimit)
-                let data = try handle.read(upToCount: length) ?? Data()
-                bytesTransferred += UInt64(data.count)
-                if !data.isEmpty {
-                    progress.emit(bytesTransferred: bytesTransferred)
+            if remoteSize > 0 {
+                try handle.seek(toOffset: 0)
+                var compared: UInt64 = 0
+                while compared < remoteSize {
+                    let requested = min(remoteSize - compared, UInt64(Self.localWriteChunkLimit))
+                    let remote = try await session.readChunk(
+                        treeId: treeId,
+                        fileId: fileId,
+                        offset: compared,
+                        length: requested
+                    )
+                    let local = try handle.read(upToCount: remote.count) ?? Data()
+                    guard !remote.isEmpty, local.count == remote.count, Array(local) == remote else {
+                        throw SMBCodecError.invalidValue("remote upload resume prefix does not match local source")
+                    }
+                    compared += UInt64(remote.count)
                 }
+                let verifiedSize = try await session.queryInfo(treeId: treeId, fileId: fileId).size
+                guard verifiedSize == remoteSize else {
+                    throw SMBCodecError.invalidValue("remote file changed during upload resume validation")
+                }
+            }
+            try handle.seek(toOffset: remoteSize)
+            try await session.write(treeId: treeId, fileId: fileId, offset: remoteSize) { maxLength in
+                let remaining = totalBytes - bytesTransferred
+                guard remaining > 0 else { return [] }
+                let length = min(maxLength, Self.localWriteChunkLimit, Int(remaining))
+                let data = try handle.read(upToCount: length) ?? Data()
+                guard !data.isEmpty else {
+                    throw SMBCodecError.invalidValue("local source file ended before its initial size")
+                }
+                bytesTransferred += UInt64(data.count)
+                progress.emit(bytesTransferred: bytesTransferred)
                 return Array(data)
             }
+            await progress.finish()
+            guard bytesTransferred == totalBytes else {
+                throw SMBCodecError.invalidValue("local source file ended before its initial size")
+            }
+            guard try SMBLocalFileSnapshot(handle: handle) == sourceSnapshot else {
+                throw SMBCodecError.invalidValue("local source file changed during upload")
+            }
             try await session.flush(treeId: treeId, fileId: fileId)
+            guard try SMBLocalFileSnapshot(handle: handle) == sourceSnapshot else {
+                throw SMBCodecError.invalidValue("local source file changed during upload")
+            }
             await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
             await session.bestEffortClose(treeId: treeId, fileId: fileId)
@@ -2014,6 +2113,7 @@ public enum SMBClient {
                 guard received == requested else {
                     throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(received)")
                 }
+                await transferProgress.finish()
                 await session.bestEffortClose(treeId: treeId, fileId: fileId)
             } catch {
                 await session.bestEffortClose(treeId: treeId, fileId: fileId)
@@ -2502,6 +2602,7 @@ public enum SMBClient {
             cursor = advanced.cursor
             remaining = advanced.remaining
         }
+        await progress.finish()
         return result.bytes
     }
 
@@ -2552,6 +2653,7 @@ public enum SMBClient {
         guard received == length else {
             throw SMBCodecError.invalidValue("short SMB read: expected \(length) bytes, got \(received)")
         }
+        await transferProgress.finish()
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
@@ -3315,7 +3417,9 @@ private struct SMBPendingResponse {
 actor SMBSession {
     private let host: String
     private let port: UInt16
-    private let credential: SMBCredential
+    // The source credential is needed only while SESSION_SETUP is being built. Derived session
+    // keys are sufficient afterwards; reconnect obtains a fresh value from its provider.
+    private var authenticationCredential: SMBCredential?
     private let transport: SMBTransport
     private var messageId: UInt64 = 0
     private var sessionId: UInt64 = 0
@@ -3349,7 +3453,7 @@ actor SMBSession {
     ) {
         self.host = host
         self.port = port
-        self.credential = credential
+        self.authenticationCredential = credential
         self.transport = transport
         self.signingKey = signingKey
         self.signingAlgorithm = signingAlgorithm
@@ -3359,6 +3463,9 @@ actor SMBSession {
     }
 
     func connect() async throws {
+        guard let credential = authenticationCredential else {
+            throw SMBCodecError.invalidValue("SMB session authentication credential is unavailable")
+        }
         try Task.checkCancellation()
         try await transport.connect(host: host, port: port)
         wireFailure = nil
@@ -3443,6 +3550,7 @@ actor SMBSession {
             // cannot be derived here. If a server requires signing/encryption for guest access, the
             // later signed or encrypted operation is expected to fail until guest E2E coverage defines
             // a server-specific fallback.
+            authenticationCredential = nil
             return
         }
         if result.dialect == SMBNegotiateConstants.dialect311 {
@@ -3457,6 +3565,14 @@ actor SMBSession {
             encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
             decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
         }
+        // Swift cannot guarantee zeroization of copied String/Array backing storage. Releasing the
+        // session's owning reference here still bounds the plaintext credential lifetime instead of
+        // retaining it for every subsequent operation.
+        authenticationCredential = nil
+    }
+
+    func retainsAuthenticationCredentialForTesting() -> Bool {
+        authenticationCredential != nil
     }
 
     private func logNegotiatePerf(_ result: SMBProbeResult) async {
@@ -3775,6 +3891,7 @@ actor SMBSession {
             progress.emit(bytesTransferred: UInt64(cursor))
             chunkSize = await creditAwareWriteChunkSize()
         }
+        await progress.finish()
     }
 
     func write(treeId: UInt32, fileId: [UInt8], nextChunk: (Int) throws -> [UInt8]) async throws {
@@ -3811,14 +3928,14 @@ actor SMBSession {
                     }
                 }
                 try await flush(treeId: treeId, fileId: destinationFileId)
-                try? await close(treeId: treeId, fileId: destinationFileId)
-                try? await close(treeId: treeId, fileId: sourceFileId)
+                await bestEffortClose(treeId: treeId, fileId: destinationFileId)
+                await bestEffortClose(treeId: treeId, fileId: sourceFileId)
             } catch {
-                try? await close(treeId: treeId, fileId: destinationFileId)
+                await bestEffortClose(treeId: treeId, fileId: destinationFileId)
                 throw error
             }
         } catch {
-            try? await close(treeId: treeId, fileId: sourceFileId)
+            await bestEffortClose(treeId: treeId, fileId: sourceFileId)
             throw error
         }
     }
@@ -4026,13 +4143,13 @@ actor SMBSession {
             // Existing destination directories are reused only when overwrite is explicit.
         } catch SMBError.nameCollision where skipExisting {
             onAction?(SMBRecursiveAction(kind: .skip, path: toPath))
-            try? await close(treeId: treeId, fileId: sourceFileId)
+            await bestEffortClose(treeId: treeId, fileId: sourceFileId)
             if failures == nil {
                 try collector.throwIfNeeded()
             }
             return
         } catch {
-            try? await close(treeId: treeId, fileId: sourceFileId)
+            await bestEffortClose(treeId: treeId, fileId: sourceFileId)
             throw error
         }
 
@@ -4088,9 +4205,9 @@ actor SMBSession {
                     }
                 }
             }
-            try? await close(treeId: treeId, fileId: sourceFileId)
+            await bestEffortClose(treeId: treeId, fileId: sourceFileId)
         } catch {
-            try? await close(treeId: treeId, fileId: sourceFileId)
+            await bestEffortClose(treeId: treeId, fileId: sourceFileId)
             throw error
         }
         if failures == nil {
@@ -4213,9 +4330,9 @@ actor SMBSession {
                         collector.record(path: self.joinSMBPath(path, entry.name), error: error)
                     }
                 }
-                try? await close(treeId: treeId, fileId: fileId)
+                await bestEffortClose(treeId: treeId, fileId: fileId)
             } catch {
-                try? await close(treeId: treeId, fileId: fileId)
+                await bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
             }
         }
@@ -4304,10 +4421,10 @@ actor SMBSession {
             )
             let response = try await pipeTransceive(treeId: treeId, fileId: fileId, input: request)
             let shares = try SRVSVC.decodeNetrShareEnumResponse(try DCERPC.decodeResponseStub(response))
-            try? await close(treeId: treeId, fileId: fileId)
+            await bestEffortClose(treeId: treeId, fileId: fileId)
             return shares
         } catch {
-            try? await close(treeId: treeId, fileId: fileId)
+            await bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }
@@ -4348,14 +4465,14 @@ actor SMBSession {
                 stub: try LSARPC.encodeCloseRequest(handle: handle)
             )
             _ = try? await pipeTransceive(treeId: treeId, fileId: fileId, input: closeRequest)
-            try? await close(treeId: treeId, fileId: fileId)
+            await bestEffortClose(treeId: treeId, fileId: fileId)
             // Positional guarantee: pad if the server returned fewer entries than requested.
             if names.count < sids.count {
                 return names + Array(repeating: nil, count: sids.count - names.count)
             }
             return Array(names.prefix(sids.count))
         } catch {
-            try? await close(treeId: treeId, fileId: fileId)
+            await bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
     }

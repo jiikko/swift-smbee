@@ -67,12 +67,20 @@ public struct SMBPath: Equatable, Sendable {
         guard !source.isEmpty else {
             throw SMBError.invalidRecursion("destination is inside source directory")
         }
-        let foldedSource = source.lowercased()
-        let foldedDestination = destination.lowercased()
-        // ⓥ SMB path matching is case-insensitive. Unicode normalization is intentionally not applied.
+        let foldedSource = canonicalComparisonComponents(source)
+        let foldedDestination = canonicalComparisonComponents(destination)
         guard foldedDestination != foldedSource,
-              !foldedDestination.hasPrefix("\(foldedSource)\\") else {
+              !foldedDestination.starts(with: foldedSource) else {
             throw SMBError.invalidRecursion("destination is inside source directory")
+        }
+    }
+
+    private static func canonicalComparisonComponents(_ path: String) -> [String] {
+        path.split(separator: "\\").map {
+            String($0)
+                .precomposedStringWithCanonicalMapping
+                .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+                .precomposedStringWithCanonicalMapping
         }
     }
 

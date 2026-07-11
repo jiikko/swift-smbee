@@ -7,6 +7,20 @@ import Glibc
 import Darwin
 #endif
 
+func withBatchSession<T: Sendable>(
+    _ session: SMBClientSession,
+    operation: @Sendable () async throws -> T
+) async throws -> T {
+    do {
+        let result = try await operation()
+        await session.close()
+        return result
+    } catch {
+        await session.close()
+        throw error
+    }
+}
+
 struct MGet: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "mget",
@@ -57,23 +71,24 @@ struct MGet: AsyncParsableCommand {
         let (endpoint, credential) = try makeReadEndpointAndCredential(url: remoteDirectory, auth: auth)
         try await transport.withOperationDeadline {
             let session = try await SMBClient.connect(host: endpoint.host, port: endpoint.port, share: endpoint.share, credential: credential, timeout: transport.duration)
-            defer { Task { await session.close() } }
-            let files: [RemoteBatchFile]
-            if recursive {
-                files = try await remoteRecursiveBatchGlobEntries(session: session, rootPath: endpoint.path, include: pattern, exclude: exclude)
-            } else {
-                let entries = try await remoteDirectoryEntries(session: session, path: endpoint.path)
-                for entry in entries { try validateRemoteEntryName(entry.name) }
-                files = batchGlobEntries(entries, include: pattern, exclude: exclude).map {
-                    RemoteBatchFile(name: $0.name, relativePath: $0.name)
+            try await withBatchSession(session) {
+                let files: [RemoteBatchFile]
+                if recursive {
+                    files = try await remoteRecursiveBatchGlobEntries(session: session, rootPath: endpoint.path, include: pattern, exclude: exclude)
+                } else {
+                    let entries = try await remoteDirectoryEntries(session: session, path: endpoint.path)
+                    for entry in entries { try validateRemoteEntryName(entry.name) }
+                    files = batchGlobEntries(entries, include: pattern, exclude: exclude).map {
+                        RemoteBatchFile(name: $0.name, relativePath: $0.name)
+                    }
                 }
-            }
-            if files.isEmpty {
-                writeStandardError("Warning: no files matched \(pattern)\n")
-                return
-            }
+                if files.isEmpty {
+                    writeStandardError("Warning: no files matched \(pattern)\n")
+                    return
+                }
 
-            try await download(files: files, endpoint: endpoint, credential: credential, session: session)
+                try await download(files: files, endpoint: endpoint, credential: credential, session: session)
+            }
         }
     }
 
@@ -168,9 +183,10 @@ struct MPut: AsyncParsableCommand {
         let (endpoint, credential) = try makeEndpointAndCredential(url: remoteDirectory, auth: auth)
         try await transport.withOperationDeadline {
             let session = try await SMBClient.connect(host: endpoint.host, port: endpoint.port, share: endpoint.share, credential: credential, timeout: transport.duration)
-            defer { Task { await session.close() } }
-            let remoteExisting = try await remoteExistingFileNames(session: session, path: endpoint.path)
-            try await upload(files: files, endpoint: endpoint, credential: credential, remoteExisting: remoteExisting, session: session)
+            try await withBatchSession(session) {
+                let remoteExisting = try await remoteExistingFileNames(session: session, path: endpoint.path)
+                try await upload(files: files, endpoint: endpoint, credential: credential, remoteExisting: remoteExisting, session: session)
+            }
         }
     }
 

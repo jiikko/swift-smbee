@@ -19,6 +19,12 @@ final class SMBeeE2ETests: XCTestCase {
 
         let result = try await SMBProbe.probe(host: host, port: port)
         switch environment["SMBEE_E2E_PROFILE"] ?? "smb302-encrypted-required" {
+        case "guest":
+            XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect302)
+            XCTAssertFalse(result.signingRequired)
+            XCTAssertNil(result.signingAlgorithm)
+            XCTAssertNil(result.cipher)
+            XCTAssertNil(result.preauthHashAlgorithm)
         case "smb302-encrypted-required":
             XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect302)
             XCTAssertTrue(result.signingRequired)
@@ -39,6 +45,48 @@ final class SMBeeE2ETests: XCTestCase {
             XCTAssertEqual(result.preauthHashAlgorithm, SMBNegotiateConstants.sha512)
         default:
             XCTFail("Unknown SMBEE_E2E_PROFILE")
+        }
+    }
+
+    func testGuestAnonymousSmoke() async throws {
+        guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["SMBEE_E2E_PROFILE"] == "guest" else {
+            throw XCTSkip("Guest smoke requires SMBEE_E2E_PROFILE=guest")
+        }
+        let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
+        let portString = environment["SMBEE_E2E_PORT"] ?? "445"
+        guard let port = UInt16(portString) else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16, got \(portString)")
+            return
+        }
+        let share = environment["SMBEE_E2E_SHARE"] ?? "public"
+        let probe = try await SMBProbe.probe(host: host, port: port)
+        XCTAssertEqual(probe.dialect, SMBNegotiateConstants.dialect302)
+        XCTAssertFalse(probe.signingRequired)
+        XCTAssertNil(probe.cipher)
+
+        let credential = SMBCredential.anonymous
+        let session = try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        let suffix = UUID().uuidString
+        let path = "guest-smoke-\(suffix).txt"
+        let payload = Array("guest smoke \(suffix)\n".utf8)
+        do {
+            let entries = try await session.list()
+            XCTAssertTrue(entries.contains { $0.name == "known.txt" && !$0.isDirectory })
+            let known = try await session.read(path: "known.txt")
+            XCTAssertEqual(String(decoding: known, as: UTF8.self), "hello from SMBee E2E\n")
+            try await session.upload(path: path, data: payload)
+            let roundTrip = try await session.read(path: path)
+            XCTAssertEqual(roundTrip, payload)
+            try await session.delete(path: path)
+            await session.close()
+        } catch {
+            try? await session.delete(path: path)
+            await session.close()
+            throw error
         }
     }
 

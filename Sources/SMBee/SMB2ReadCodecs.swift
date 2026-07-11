@@ -341,7 +341,9 @@ struct SMB2CreateRequest {
     static func uploadResume(path: String) -> SMB2CreateRequest {
         SMB2CreateRequest(
             path: path,
-            desiredAccess: 0x0000_0002 | 0x0000_0080,
+            // Resume validation reads the existing prefix through this same handle before writing.
+            // Keeping validation and writes on one open also prevents a path replacement race.
+            desiredAccess: 0x0000_0001 | 0x0000_0002 | 0x0000_0080,
             createDisposition: 0x0000_0001,
             createOptions: 0x0000_0040
         )

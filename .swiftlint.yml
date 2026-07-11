@@ -18,3 +18,20 @@ custom_rules:
     regex: 'writeUInt16LE\(UInt16\([^)]*(\.count|[sS]ize)\)'
     message: "Use writeUInt16LE(count:of:) for variable-length fields; UInt16(Int) traps on overflow (issues/011)"
     severity: error
+
+  no_fire_and_forget_session_close:
+    name: "No fire-and-forget session close"
+    # async cleanupを同期deferからTaskへ逃がすと、scope/process終了前の完了を保証できない。
+    # 現存箇所はissues/040で追跡し、解消後にseverityをerrorへ上げる。
+    regex: 'defer\s*\{\s*Task\s*\{\s*await\s+[^}]*\.close\(\)'
+    message: "Await session cleanup in the owning async scope; fire-and-forget close can outlive the command (issues/040)"
+    severity: warning
+
+  no_cancellable_cleanup_close:
+    name: "No cancellable best-effort SMB close"
+    # cleanupの直接CLOSEはcancel済みtaskでは送信されない。bestEffortCloseを使う。
+    # 現存箇所はissues/041で追跡し、解消後にseverityをerrorへ上げる。
+    # bestEffortClose helper内部の`self.close`はshielded Task内なので対象外。
+    regex: 'try\?\s+await\s+close\(treeId:'
+    message: "Use bestEffortClose for cleanup so caller cancellation does not skip SMB CLOSE (issues/041)"
+    severity: warning

@@ -287,8 +287,8 @@ jobs:
                   metric = full_name
                   sub("^" operation "\\.", "", metric)
                   value = size = runs = ""
-                  for (index = 3; index <= NF; index++) {
-                    split($index, pair, "=")
+                  for (field_index = 3; field_index <= NF; field_index++) {
+                    split($field_index, pair, "=")
                     if (pair[1] == "value") value = pair[2]
                     if (pair[1] == "size_mib") size = pair[2]
                     if (pair[1] == "runs") runs = pair[2]

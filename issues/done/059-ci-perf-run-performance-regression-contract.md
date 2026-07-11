@@ -1,6 +1,6 @@
 # 059 ci: run-performance-regression の目的と実行契約を整理する
 
-状態: **open**
+状態: **done**
 起票: 2026-07-12
 優先度: **P3**
 コスト: **S**
@@ -22,8 +22,13 @@
 
 ## 完了条件
 
-- [ ] 維持または削除の決定と理由がスクリプトまたは docs に記録されている。
-- [ ] 維持する場合、Debug contract、対象 test、workflow から呼ばれないこと、`-c release` を付けないことが明記されている。
-- [ ] 削除する場合、リポジトリ内に参照がなく、削除後も workflow と `bin/ci/test-performance-scripts` が成立する。
-- [ ] `bin/ci/test-performance-scripts` が選択した契約を bash 構文検査だけでなく、検証可能な形で確認する。
+- [x] 維持または削除の決定と理由がスクリプトまたは docs に記録されている。
+- [x] 維持する場合、Debug contract、対象 test、workflow から呼ばれないこと、`-c release` を付けないことが明記されている。
+- [x] 削除する場合、リポジトリ内に参照がなく、削除後も workflow と `bin/ci/test-performance-scripts` が成立する。
+- [x] `bin/ci/test-performance-scripts` が選択した契約を bash 構文検査だけでなく、検証可能な形で確認する。
 
+## 対応結果
+
+`run-performance-regression` は standalone の Debug deterministic contract 実行用として維持した。
+既存の Docker stub を呼び出し単位の引数記録に拡張し、`swift --version` と
+`swift test --filter SMBeePerformanceRegressionTests` の 2 回の Docker 呼び出しを検証する。

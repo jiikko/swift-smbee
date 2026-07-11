@@ -41,6 +41,16 @@ cat > "${temporary}/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 touch "${DOCKER_STUB_MARKER}"
+if [ -n "${DOCKER_STUB_LOG:-}" ]; then
+  invocation_count_file="${DOCKER_STUB_LOG}.count"
+  invocation_count=0
+  if [ -f "${invocation_count_file}" ]; then
+    invocation_count="$(cat "${invocation_count_file}")"
+  fi
+  invocation_count=$((invocation_count + 1))
+  printf '%s\n' "${invocation_count}" > "${invocation_count_file}"
+  printf '%s\n' "$@" > "${DOCKER_STUB_LOG}.${invocation_count}"
+fi
 EOF
 chmod +x "${temporary}/docker"
 
@@ -85,6 +95,22 @@ fi
 grep -F 'RESOURCE_PERFORMANCE_LOG must be the default path' "${temporary}/custom.err"
 grep -F 'custom paths are not supported' "${temporary}/custom.err"
 test ! -e "${docker_stub_marker}"
+
+performance_docker_log="${temporary}/performance-docker-call"
+rm -f "${docker_stub_marker}" "${performance_docker_log}".*
+PATH="${temporary}:${PATH}" \
+SWIFT_IMAGE=swift:test \
+DOCKER_STUB_MARKER="${docker_stub_marker}" \
+DOCKER_STUB_LOG="${performance_docker_log}" \
+  "${SCRIPT_DIR}/run-performance-regression" \
+  >"${temporary}/performance.out" 2>"${temporary}/performance.err"
+
+test -e "${docker_stub_marker}"
+test "$(cat "${performance_docker_log}.count")" -eq 2
+printf '%s\n' run --rm swift:test swift --version \
+  | diff -u - "${performance_docker_log}.1"
+printf '%s\n' run --rm -v "${REPO_ROOT}:/workspace" -w /workspace swift:test swift test --filter SMBeePerformanceRegressionTests \
+  | diff -u - "${performance_docker_log}.2"
 
 log_file="${temporary}/resource.log"
 summary_file="${temporary}/summary.md"

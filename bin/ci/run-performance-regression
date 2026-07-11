@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# This is a standalone, manual utility for running the Debug deterministic
+# contract in SMBeePerformanceRegressionTests inside Docker. It is not called
+# by the workflow: Release resource measurements use run-resource-performance
+# as a separate path. Do not use this script to measure resource metrics.
+# The command intentionally omits -c release because this contract validates
+# deterministic behavior, rather than the Linux Release resource contract.
 set -euo pipefail
 unset CDPATH
 

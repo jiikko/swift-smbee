@@ -17,7 +17,15 @@ SMBEE_E2E_PROFILE=smb311-signing-required \
 SAMBA_CONFIG=test/e2e/smb/smb311-signing-required.conf \
   bin/e2e/container-samba.sh
 
+if ! git diff --quiet HEAD -- Sources/SMBee; then
+  printf 'ERROR: Sources/SMBee has uncommitted changes; commit them before running smoke-all\n' >&2
+  printf '(the marker certifies the committed Sources/SMBee subtree, not the dirty worktree).\n' >&2
+  exit 1
+fi
+
 mkdir -p tmp
-marker="./tmp/e2e-verified-$(git rev-parse HEAD)"
-touch "${marker}"
-printf '\nE2E smoke verified HEAD: %s\n' "$(git rev-parse HEAD)"
+# Key the marker to the Sources/SMBee subtree hash: docs-only commits keep it valid,
+# any wire-code change invalidates it.
+tree="$(git rev-parse HEAD:Sources/SMBee)"
+touch "./tmp/e2e-verified-tree-${tree}"
+printf '\nE2E smoke verified Sources/SMBee tree: %s\n' "${tree}"

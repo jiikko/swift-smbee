@@ -6,8 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-marker="./tmp/e2e-verified-$(git rev-parse HEAD)"
-production_change=0
+gate_sha=""
 
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${local_sha:-}" ] || continue
@@ -21,20 +20,23 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     files=$(git diff --name-only "${remote_sha}" "${local_sha}" 2>/dev/null || true)
   fi
   if printf '%s\n' "${files}" | grep -q '^Sources/SMBee/'; then
-    production_change=1
+    gate_sha="${local_sha}"
     break
   fi
 done
 
-[ "${production_change}" -eq 1 ] || exit 0
+[ -n "${gate_sha}" ] || exit 0
 
 if [ "${SMBEE_SKIP_E2E_GATE:-0}" = "1" ]; then
   printf 'WARNING: skipping SMBee E2E pre-push gate (SMBEE_SKIP_E2E_GATE=1).\n' >&2
   exit 0
 fi
 
-if [ ! -e "${marker}" ]; then
-  printf 'Push rejected: Sources/SMBee/ changed, but this HEAD has no E2E smoke marker.\n' >&2
-  printf 'Run bin/e2e/smoke-all (or make smoke), then push again.\n' >&2
+# The marker is keyed to the Sources/SMBee subtree hash of the pushed tip, so
+# follow-up commits that do not touch wire code keep an existing marker valid.
+tree="$(git rev-parse "${gate_sha}:Sources/SMBee")"
+if [ ! -e "./tmp/e2e-verified-tree-${tree}" ]; then
+  printf 'Push rejected: Sources/SMBee/ changed, but its subtree (%s) has no E2E smoke marker.\n' "${tree}" >&2
+  printf 'Run bin/e2e/smoke-all (or make smoke) on the committed tree, then push again.\n' >&2
   exit 1
 fi

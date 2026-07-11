@@ -19,8 +19,9 @@ bin/e2e/container-samba.sh          # 2. production を触ったら container Sa
 2プロファイルをまとめて検証し、push 前ゲート用マーカーを作るには `bin/e2e/smoke-all`（または
 `make smoke`）を実行する。初回だけ `make setup-hooks` でリポジトリ管理の pre-push フックを有効化する。
 `SMBEE_SKIP_E2E_GATE=1 git push` は緊急時の明示的なスキップに使える。
-**順序は commit → smoke → push**（マーカーは HEAD の commit hash に紐づくため、smoke 後に
-commit すると hash が変わり gate に弾かれる）。
+マーカーは `Sources/SMBee` の subtree hash に紐づくため、docs / test だけの後続 commit では
+無効化されない。ただし smoke は committed tree を証明するので **wire 変更は commit してから
+smoke を回す**（`Sources/SMBee` が dirty だと smoke-all が拒否する）。
 
 `bin/e2e/container-samba.sh` は container 起動 → `smbcli probe` → `swift test --filter SMBeeE2ETests`
 → `smbcli` smoke → 後始末までを 1 発で回す。主な env（既定は SMB 3.0.2 encrypted-required profile）:

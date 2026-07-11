@@ -3880,11 +3880,12 @@ final class SMBeeTests: XCTestCase {
         while commands.count > 3, commands.first == SMB2Commands.echo, commands.dropFirst().first == SMB2Commands.echo {
             commands.removeFirst()
         }
+        let rawCommands = requests.map { (try? SMB2Header.decode($0)).map { "\($0.command)#\($0.messageId)" } ?? "?" }
         XCTAssertEqual(commands, [
             SMB2Commands.echo,
             SMB2Commands.treeDisconnect,
             SMB2Commands.logoff,
-        ])
+        ], "raw outbound (command#messageId): \(rawCommands)")
     }
 
     func testClientSessionCloseWaitsForInFlightKeepAliveEcho() async throws {

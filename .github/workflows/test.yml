@@ -69,6 +69,10 @@ jobs:
 
       - name: Cancel and teardown bounded stress
         timeout-minutes: 5
+        # SMBEE_DEBUG=1 keeps the wire/credit trace in the job log — this failure class
+        # only reproduces on slow CI runners, so this trace is the primary observation.
+        env:
+          SMBEE_DEBUG: "1"
         run: |
           for i in $(seq 1 20); do
             swift test --skip SMBeeE2ETests --filter 'KeepAlive|Cancel' &

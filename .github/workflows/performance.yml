@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: performance-${{ github.ref }}
@@ -49,9 +50,48 @@ jobs:
       - name: Build resource metrics artifact
         if: always()
         run: bin/ci/write-resource-performance-artifact
+      - name: Download previous master resource artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          reference_dir="${RUNNER_TEMP}/resource-performance-reference"
+          rm -rf "${reference_dir}"
+          mkdir -p "${reference_dir}"
+          previous_run_id="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/performance.yml/runs?branch=master&event=push&status=success&per_page=100" \
+            --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | .id" \
+            | head -n 1)"
+          if [ -z "${previous_run_id}" ]; then
+            echo 'No previous successful master push run found.'
+            exit 0
+          fi
+          artifact_name="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${previous_run_id}/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.name | startswith("resource-performance-")) | .name' \
+            | head -n 1)"
+          if [ -z "${artifact_name}" ]; then
+            echo "No resource performance artifact found for run ${previous_run_id}."
+            exit 0
+          fi
+          gh run download "${previous_run_id}" --name "${artifact_name}" --dir "${reference_dir}"
+          reference_jsonl="$(find "${reference_dir}" -type f -name resource-performance.jsonl -print -quit)"
+          if [ -z "${reference_jsonl}" ]; then
+            echo 'Downloaded artifact did not contain resource-performance.jsonl.'
+            exit 0
+          fi
+          cp "${reference_jsonl}" "${RUNNER_TEMP}/resource-performance-reference.jsonl"
       - name: Publish resource metrics to job summary
         if: always()
         run: bin/ci/publish-resource-performance-summary
+      - name: Compare resource metrics with previous master run
+        if: always()
+        run: |
+          bin/ci/compare-resource-performance \
+            .build/resource-performance.jsonl \
+            "${RUNNER_TEMP}/resource-performance-reference.jsonl" >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload resource metrics artifact
         if: always()
         uses: actions/upload-artifact@v6

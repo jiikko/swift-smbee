@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -u
+unset CDPATH
+
+# This command is deliberately advisory-only.  Artifact selection belongs to the
+# workflow; keeping this command file-to-file makes it deterministic and easy to test.
+python3 - "$@" <<'PY' || true
+from __future__ import annotations
+
+import json
+import sys
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+
+OPERATIONS = ("read_stream", "write_stream")
+METRICS = ("throughput_mib_s", "user_cpu_ms", "system_cpu_ms", "max_rss_kb")
+METADATA_KEYS = ("swift_image", "runner_os", "runner_arch")
+
+
+class ComparableError(Exception):
+    pass
+
+
+def decimal(value: object, description: str) -> Decimal:
+    if isinstance(value, bool) or value is None:
+        raise ComparableError(f"{description} is not numeric")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        raise ComparableError(f"{description} is not numeric") from None
+    if not parsed.is_finite():
+        raise ComparableError(f"{description} is not finite")
+    return parsed
+
+
+def workload(row: dict[str, object], description: str) -> tuple[Decimal, int, int]:
+    try:
+        size = decimal(row["size_mib"], f"{description} size_mib")
+        runs = int(row["runs"])
+        iterations = int(row["iterations"])
+    except (KeyError, TypeError, ValueError):
+        raise ComparableError(f"{description} has an invalid workload") from None
+    if runs < 1 or iterations < 1:
+        raise ComparableError(f"{description} has an invalid workload")
+    return size, runs, iterations
+
+
+def median(values: list[Decimal]) -> Decimal:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / Decimal(2)
+
+
+def load(path: Path, label: str) -> tuple[dict[str, object], dict[str, list[dict[str, object]]], dict[str, tuple[Decimal, int, int]]]:
+    if not path.is_file():
+        raise ComparableError(f"{label} JSONL is missing")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        raise ComparableError(f"{label} JSONL could not be read") from None
+
+    rows: list[dict[str, object]] = []
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            raise ComparableError(f"{label} JSONL parse failure") from None
+        if not isinstance(row, dict):
+            raise ComparableError(f"{label} JSONL parse failure")
+        if row.get("type") == "parse_failure":
+            raise ComparableError(f"{label} JSONL contains parse_failure")
+        rows.append(row)
+    if not rows:
+        raise ComparableError(f"{label} JSONL parse failure")
+
+    metadata_rows = [row for row in rows if row.get("type") == "metadata"]
+    if len(metadata_rows) != 1:
+        raise ComparableError(f"{label} JSONL metadata is missing or duplicated")
+    metadata = metadata_rows[0]
+    for key in METADATA_KEYS:
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value or value == "unknown":
+            raise ComparableError(f"{label} metadata {key} is unavailable")
+
+    summaries: dict[str, list[dict[str, object]]] = {
+        f"{operation}.{metric}": []
+        for operation in OPERATIONS
+        for metric in METRICS
+    }
+    for row in rows:
+        if row.get("type") != "summary":
+            continue
+        name = row.get("name")
+        if isinstance(name, str) and name in summaries:
+            summaries[name].append(row)
+
+    workloads: dict[str, tuple[Decimal, int, int]] = {}
+    for operation in OPERATIONS:
+        operation_workloads: set[tuple[Decimal, int, int]] = set()
+        for metric in METRICS:
+            key = f"{operation}.{metric}"
+            metric_rows = summaries[key]
+            if not metric_rows:
+                raise ComparableError(f"{label} JSONL is missing {key}")
+            for row in metric_rows:
+                operation_workloads.add(workload(row, f"{label} {key}"))
+                decimal(row.get("value"), f"{label} {key} value")
+        if len(operation_workloads) != 1:
+            raise ComparableError(f"{label} JSONL has inconsistent {operation} workload")
+        workloads[operation] = next(iter(operation_workloads))
+    return metadata, summaries, workloads
+
+
+def display_number(value: Decimal, metric: str) -> str:
+    if metric == "max_rss_kb":
+        return f"{value:.1f} KiB"
+    unit = "MiB/s" if metric == "throughput_mib_s" else "ms"
+    return f"{value:.3f} {unit}"
+
+
+def percent_change(current: Decimal, reference: Decimal, metric: str) -> tuple[str, str]:
+    if reference == 0:
+        if current == 0:
+            return "±0.0%", "unchanged"
+        raise ComparableError(f"reference {metric} median is zero")
+    change = (current - reference) / reference * Decimal(100)
+    if not change:
+        return "±0.0%", "unchanged"
+    improved = (metric == "throughput_mib_s" and change > 0) or (metric != "throughput_mib_s" and change < 0)
+    direction = "improved" if improved else "regressed"
+    sign = "+" if change > 0 else ""
+    return f"{sign}{change:.1f}%", direction
+
+
+def compare(current_path: Path, reference_path: Path) -> None:
+    try:
+        current_metadata, current_summaries, current_workloads = load(current_path, "current")
+        reference_metadata, reference_summaries, reference_workloads = load(reference_path, "reference")
+        metadata_mismatches = [
+            key for key in METADATA_KEYS if current_metadata.get(key) != reference_metadata.get(key)
+        ]
+        if metadata_mismatches:
+            raise ComparableError("metadata mismatch: " + ", ".join(metadata_mismatches))
+        workload_mismatches = [
+            operation for operation in OPERATIONS if current_workloads[operation] != reference_workloads[operation]
+        ]
+        if workload_mismatches:
+            raise ComparableError("workload mismatch: " + ", ".join(workload_mismatches))
+
+        results: list[tuple[str, str, Decimal, Decimal, str, str]] = []
+        for operation in OPERATIONS:
+            for metric in METRICS:
+                key = f"{operation}.{metric}"
+                current_values = [decimal(row["value"], f"current {key} value") for row in current_summaries[key]]
+                reference_values = [decimal(row["value"], f"reference {key} value") for row in reference_summaries[key]]
+                current_median = median(current_values)
+                reference_median = median(reference_values)
+                change, direction = percent_change(current_median, reference_median, metric)
+                results.append((operation, metric, current_median, reference_median, direction, change))
+    except ComparableError as error:
+        print(f"## Resource performance history comparison\n\nNo comparable baseline ({error}).\n\nAdvisory only; this comparison does not affect guardrails or job status.")
+        return
+
+    print("## Resource performance history comparison")
+    print()
+    print("Advisory only: compared with the previous successful master push run; this does not affect guardrails or job status.")
+    print()
+    print("| Operation | Metric | Current median | Reference median | Change |")
+    print("|---|---|---:|---:|---|")
+    for operation, metric, current, reference, direction, change in results:
+        print(
+            f"| `{operation}` | `{metric}` | {display_number(current, metric)} | "
+            f"{display_number(reference, metric)} | {direction} ({change}) |"
+        )
+
+
+def main() -> None:
+    if len(sys.argv) != 3:
+        print("## Resource performance history comparison\n\nNo comparable baseline (current or reference JSONL argument is missing).\n\nAdvisory only; this comparison does not affect guardrails or job status.")
+        return
+    try:
+        compare(Path(sys.argv[1]), Path(sys.argv[2]))
+    except Exception as error:  # The comparison is advisory and must never fail the job.
+        print(f"## Resource performance history comparison\n\nNo comparable baseline (comparison failed: {error}).\n\nAdvisory only; this comparison does not affect guardrails or job status.")
+
+
+main()
+PY

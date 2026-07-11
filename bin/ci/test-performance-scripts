@@ -12,7 +12,8 @@ for script in \
   "${SCRIPT_DIR}/resource-performance-metadata" \
   "${SCRIPT_DIR}/parse-resource-performance" \
   "${SCRIPT_DIR}/publish-resource-performance-summary" \
-  "${SCRIPT_DIR}/write-resource-performance-artifact"; do
+  "${SCRIPT_DIR}/write-resource-performance-artifact" \
+  "${SCRIPT_DIR}/compare-resource-performance"; do
   case "${script}" in
     *parse-resource-performance) ;;
     *) bash -n "${script}" ;;
@@ -298,6 +299,77 @@ for operation in read_stream write_stream; do
   done
 done
 grep -F '"type":"process","baseline_run":2,"metric":"max_rss_kb","value":682080' "${jsonl_file}"
+
+compare_reference="${temporary}/compare-reference.jsonl"
+compare_metadata_mismatch="${temporary}/compare-metadata-mismatch.jsonl"
+compare_workload_mismatch="${temporary}/compare-workload-mismatch.jsonl"
+compare_parse_failure="${temporary}/compare-parse-failure.jsonl"
+python3 - "${jsonl_file}" "${compare_reference}" "${compare_metadata_mismatch}" "${compare_workload_mismatch}" "${compare_parse_failure}" <<'PY'
+import copy
+import json
+import sys
+from decimal import Decimal
+
+source, reference_path, metadata_path, workload_path, parse_failure_path = sys.argv[1:]
+rows = [json.loads(line) for line in open(source, encoding="utf-8") if line.strip()]
+
+reference = copy.deepcopy(rows)
+for row in reference:
+    if row.get("type") != "summary":
+        continue
+    metric = row["name"].split(".", 1)[1]
+    value = Decimal(str(row["value"]))
+    if metric == "throughput_mib_s":
+        row["value"] = float(value / 2)
+    elif metric in {"user_cpu_ms", "system_cpu_ms", "max_rss_kb"}:
+        row["value"] = float(value * 2)
+
+metadata_mismatch = copy.deepcopy(rows)
+next(row for row in metadata_mismatch if row.get("type") == "metadata")["runner_os"] = "OtherOS"
+
+workload_mismatch = copy.deepcopy(rows)
+for row in workload_mismatch:
+    if row.get("type") == "summary" and row["name"].startswith("read_stream."):
+        row["size_mib"] = 999
+
+parse_failure = [row for row in rows if row.get("type") == "metadata"]
+parse_failure.append({"type": "parse_failure", "error": "fixture parse failure"})
+
+for path, fixture in (
+    (reference_path, reference),
+    (metadata_path, metadata_mismatch),
+    (workload_path, workload_mismatch),
+    (parse_failure_path, parse_failure),
+):
+    with open(path, "w", encoding="utf-8") as stream:
+        for row in fixture:
+            stream.write(json.dumps(row, separators=(",", ":")) + "\n")
+PY
+
+compare_output="${temporary}/compare-output.md"
+compare_status=0
+"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_reference}" >"${compare_output}" || compare_status=$?
+test "${compare_status}" -eq 0
+grep -F '| `read_stream` | `throughput_mib_s` | 737.364 MiB/s | 368.682 MiB/s | improved (+100.0%) |' "${compare_output}"
+grep -F '| `read_stream` | `user_cpu_ms` | 200.000 ms | 400.000 ms | improved (-50.0%) |' "${compare_output}"
+grep -F '| `read_stream` | `system_cpu_ms` | 4.000 ms | 8.000 ms | improved (-50.0%) |' "${compare_output}"
+grep -F '| `read_stream` | `max_rss_kb` | 286048.0 KiB | 572096.0 KiB | improved (-50.0%) |' "${compare_output}"
+grep -F '| `write_stream` | `system_cpu_ms` | 0.000 ms | 0.000 ms | unchanged (±0.0%) |' "${compare_output}"
+grep -F 'Advisory only' "${compare_output}"
+if grep -Eq '✅|❌|Pass|Fail' "${compare_output}"; then
+  echo 'comparison unexpectedly included guardrail status' >&2
+  exit 1
+fi
+
+no_baseline_output="${temporary}/no-baseline.md"
+"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${temporary}/missing-reference.jsonl" >"${no_baseline_output}"
+grep -F 'No comparable baseline (reference JSONL is missing).' "${no_baseline_output}"
+"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_metadata_mismatch}" >"${no_baseline_output}"
+grep -F 'No comparable baseline (metadata mismatch: runner_os).' "${no_baseline_output}"
+"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_workload_mismatch}" >"${no_baseline_output}"
+grep -F 'No comparable baseline (workload mismatch: read_stream).' "${no_baseline_output}"
+"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_parse_failure}" >"${no_baseline_output}"
+grep -F 'No comparable baseline (reference JSONL contains parse_failure).' "${no_baseline_output}"
 
 baseline_summary="${temporary}/baseline.md"
 "${SCRIPT_DIR}/summarize-resource-baseline" "${jsonl_file}" > "${baseline_summary}"

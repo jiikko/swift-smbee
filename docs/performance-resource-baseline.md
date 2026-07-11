@@ -91,6 +91,14 @@ CPU efficiency と write stage の比率は Observe-only であり、guardrail �
 
 guardrailは改善目標ではない。改善のA/B判定にはmedianとMADを使い、同一runner/workloadで差を確認する。
 
+## History comparison
+
+master の `push` では、同一 workflow の直近の成功した `push` run（現在の run 自身を除く）にある、30日保持の
+`resource-performance-*` artifact を参照する。swift image、runner、operation ごとの
+`size_mib`/`runs`/`iterations` が一致した場合だけ、各 metric の代表値 median の増減率を比較する。
+初回、fork PR、artifact 期限切れ、取得失敗、parse failure、metadata/workload 不一致では
+`No comparable baseline` と表示する。この比較は Advisory であり、guardrail 判定と job の exit status には使わない。
+
 ## Reproduction
 
 1. Performance workflowを`baseline_runs=20`でdispatchする。

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${REPO_ROOT}"
+
+marker="./tmp/e2e-verified-$(git rev-parse HEAD)"
+production_change=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  # Deleting a remote ref has no commits to validate.
+  [ "${local_sha}" != "0000000000000000000000000000000000000000" ] || continue
+
+  if [ "${remote_sha:-}" = "0000000000000000000000000000000000000000" ] || [ -z "${remote_sha:-}" ]; then
+    # New branches have no remote base; inspect every commit reachable from the tip.
+    files=$(git log --format= --name-only "${local_sha}" 2>/dev/null || true)
+  else
+    files=$(git diff --name-only "${remote_sha}" "${local_sha}" 2>/dev/null || true)
+  fi
+  if printf '%s\n' "${files}" | grep -q '^Sources/SMBee/'; then
+    production_change=1
+    break
+  fi
+done
+
+[ "${production_change}" -eq 1 ] || exit 0
+
+if [ "${SMBEE_SKIP_E2E_GATE:-0}" = "1" ]; then
+  printf 'WARNING: skipping SMBee E2E pre-push gate (SMBEE_SKIP_E2E_GATE=1).\n' >&2
+  exit 0
+fi
+
+if [ ! -e "${marker}" ]; then
+  printf 'Push rejected: Sources/SMBee/ changed, but this HEAD has no E2E smoke marker.\n' >&2
+  printf 'Run bin/e2e/smoke-all (or make smoke), then push again.\n' >&2
+  exit 1
+fi

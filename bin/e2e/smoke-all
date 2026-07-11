@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+cd "${REPO_ROOT}"
+
+printf '== E2E smoke: smb302-encrypted-required ==\n'
+SMBEE_E2E_PROFILE=smb302-encrypted-required \
+SAMBA_CONFIG=test/e2e/smb/smb302-encrypted-required.conf \
+  bin/e2e/container-samba.sh
+
+printf '\n== E2E smoke: smb311-signing-required ==\n'
+SMBEE_E2E_PROFILE=smb311-signing-required \
+SAMBA_CONFIG=test/e2e/smb/smb311-signing-required.conf \
+  bin/e2e/container-samba.sh
+
+mkdir -p tmp
+marker="./tmp/e2e-verified-$(git rev-parse HEAD)"
+touch "${marker}"
+printf '\nE2E smoke verified HEAD: %s\n' "$(git rev-parse HEAD)"

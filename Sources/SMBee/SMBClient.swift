@@ -2046,6 +2046,20 @@ public enum SMBClient {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         if resume, fileManager.fileExists(atPath: destination.path) {
             let existingSize = try localFileSize(at: destination, fileManager: fileManager)
+            if existingSize > 0 {
+                let overlap = min(existingSize, UInt64(64 * 1024))
+                let remotePrefix = try await read(
+                    host: host, port: port, share: share, path: path,
+                    range: SMBReadRange(offset: 0, length: overlap),
+                    credential: credential, timeout: timeout, makeTransport: makeTransport
+                )
+                let localHandle = try FileHandle(forReadingFrom: destination)
+                let localPrefix = try localHandle.read(upToCount: Int(overlap)) ?? Data()
+                try localHandle.close()
+                guard Data(remotePrefix) == localPrefix else {
+                    throw SMBCodecError.invalidValue("local resume prefix does not match remote file")
+                }
+            }
             let handle = try FileHandle(forWritingTo: destination)
             do {
                 try handle.seekToEnd()
@@ -4366,9 +4380,12 @@ actor SMBSession {
     }
 
     func disconnect(treeId: UInt32) async {
-        try? await treeDisconnect(treeId: treeId)
-        try? await logoff()
-        closeTransport()
+        let task = Task.detached { [self] in
+            try? await self.treeDisconnect(treeId: treeId)
+            try? await self.logoff()
+            await self.closeTransport()
+        }
+        await task.value
     }
 
     func closeTransport() {

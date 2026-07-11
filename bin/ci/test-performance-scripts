@@ -148,6 +148,7 @@ test_syntax_checks() {
     "${SCRIPT_DIR}/parse-resource-performance" \
     "${SCRIPT_DIR}/publish-resource-performance-summary" \
     "${SCRIPT_DIR}/write-resource-performance-artifact" \
+    "${SCRIPT_DIR}/update-swift-image-digest" \
     "${SCRIPT_DIR}/compare-resource-performance"; do
     case "${script}" in
       *parse-resource-performance) ;;
@@ -164,14 +165,37 @@ PY
 }
 
 test_swift_image() {
-  local expected_image
-  expected_image="swift:$(tr -d '[:space:]' < "${REPO_ROOT}/.swift-version")"
-  local actual_image
+  local version digest expected_image actual_image
+  version="$(tr -d '[:space:]' < "${REPO_ROOT}/.swift-version")"
+  digest="$(<"${REPO_ROOT}/.swift-image-digest")"
+  expected_image="swift:${version}@${digest}"
   actual_image="$("${SCRIPT_DIR}/swift-image")"
   if [ "${actual_image}" != "${expected_image}" ]; then
     echo "swift-image mismatch: expected ${expected_image}, got ${actual_image}" >&2
     return 1
   fi
+
+  local scenario_dir temporary_repo
+  scenario_dir="$(new_scenario_dir)"
+  temporary_repo="${scenario_dir}/temporary-repo"
+  mkdir -p "${temporary_repo}/bin/ci"
+  cp "${SCRIPT_DIR}/swift-image" "${temporary_repo}/bin/ci/swift-image"
+  chmod +x "${temporary_repo}/bin/ci/swift-image"
+  printf '%s\n' "${version}" > "${temporary_repo}/.swift-version"
+
+  local tag_only_image
+  tag_only_image="$("${temporary_repo}/bin/ci/swift-image")"
+  if [ "${tag_only_image}" != "swift:${version}" ]; then
+    echo "swift-image tag-only fallback mismatch: got ${tag_only_image}" >&2
+    return 1
+  fi
+
+  printf '%s\n' 'sha256:not-a-valid-digest' > "${temporary_repo}/.swift-image-digest"
+  if "${temporary_repo}/bin/ci/swift-image" >"${scenario_dir}/invalid.out" 2>"${scenario_dir}/invalid.err"; then
+    echo 'swift-image unexpectedly accepted an invalid digest' >&2
+    return 1
+  fi
+  test -s "${scenario_dir}/invalid.err"
 }
 
 test_run_resource_performance_log_path() {

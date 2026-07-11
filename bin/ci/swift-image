@@ -11,4 +11,15 @@ if [ -z "${version}" ]; then
   exit 1
 fi
 
-printf 'swift:%s\n' "${version}"
+digest_file="${REPO_ROOT}/.swift-image-digest"
+if [ -e "${digest_file}" ]; then
+  digest="$(<"${digest_file}")"
+  if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "Invalid Swift image digest in ${digest_file}: expected sha256:[0-9a-f]{64}" >&2
+    exit 1
+  fi
+  printf 'swift:%s@%s\n' "${version}" "${digest}"
+else
+  # Keep the tag-only fallback for local checkouts that predate digest pinning.
+  printf 'swift:%s\n' "${version}"
+fi

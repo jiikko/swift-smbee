@@ -39,9 +39,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .build
-          key: performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', 'Package.resolved') }}-${{ github.sha }}
+          key: performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', '.swift-image-digest', 'Package.resolved') }}-${{ github.sha }}
           restore-keys: |
-            performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', 'Package.resolved') }}-
+            performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', '.swift-image-digest', 'Package.resolved') }}-
       - name: Deterministic contracts and Release resource metrics
         timeout-minutes: 15
         env:

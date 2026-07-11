@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Run this when .swift-version changes or when intentionally updating the measurement image.
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+digest_file="${REPO_ROOT}/.swift-image-digest"
+tag="$(tr -d '[:space:]' < "${REPO_ROOT}/.swift-version")"
+
+if [ -z "${tag}" ]; then
+  echo ".swift-version is empty" >&2
+  exit 1
+fi
+
+api_url="https://hub.docker.com/v2/repositories/library/swift/tags/${tag}"
+new_digest="$(
+  curl --fail --silent --show-error --location "${api_url}" |
+    python3 -c '
+import json
+import re
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError) as error:
+    print(f"failed to parse Docker Hub response: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+digest = payload.get("digest")
+if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    print("Docker Hub response did not contain a valid manifest list digest", file=sys.stderr)
+    raise SystemExit(1)
+print(digest)
+'
+)"
+
+old_digest='<missing>'
+if [ -e "${digest_file}" ]; then
+  old_digest="$(<"${digest_file}")"
+fi
+
+temporary_file="$(mktemp "${digest_file}.tmp.XXXXXX")"
+trap 'rm -f "${temporary_file}"' EXIT
+printf '%s\n' "${new_digest}" > "${temporary_file}"
+mv "${temporary_file}" "${digest_file}"
+trap - EXIT
+
+printf 'old: %s\n' "${old_digest}"
+printf 'new: %s\n' "${new_digest}"

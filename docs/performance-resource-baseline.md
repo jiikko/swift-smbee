@@ -10,6 +10,10 @@
 - read workload: 160 MiB/sample (8 MiB × 20 transfer intervals)
 - write workload: 8 MiB/sample
 
+測定用 Swift image は、リポジトリ直下の `.swift-image-digest` に manifest list digest を固定している。
+`.swift-version` を変更した時、または意図的に測定 image を更新したい時は、
+`bin/ci/update-swift-image-digest` を実行し、表示された old/new digest と差分を確認する。
+
 ## Resource log contract (version 1)
 
 `bin/ci/run-resource-performance` のログは `bin/ci/parse-resource-performance` が検証する。

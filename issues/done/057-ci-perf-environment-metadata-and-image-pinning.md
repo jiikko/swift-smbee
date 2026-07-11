@@ -1,6 +1,6 @@
 # 057 perf: resource performance の環境 metadata と image を固定する
 
-状態: **open**
+状態: **done**
 起票: 2026-07-12
 優先度: **P2**
 コスト: **M**
@@ -33,10 +33,10 @@ JSONL metadata に Swift version 全文、Docker image digest、kernel、CPU mod
 - [x] 測定 run で毎回の apt install を不要にする構成、またはその時間を測定結果から明確に分離する構成が検証される。
 - [x] metadata の正常値・未取得値と cache hit の fixture が `bin/ci/test-performance-scripts` で検証される。
 
-## 進捗（部分完了、2026-07-12）
+## 進捗（完了、2026-07-12）
 
 上記の metadata 拡張、`PERF_ENV` の parser 契約、`/usr/bin/time` の条件付き導入、summary 表示、fixture 検証を実装した。
-image digest は artifact metadata へ記録するが、今回の変更では `swift:<version>` のタグを
-`swift:<version>@sha256:...` の immutable digest 指定へは変更していない。
+image digest は artifact metadata へ記録し、`.swift-image-digest` に manifest list digest を固定した。
+`bin/ci/update-swift-image-digest` で `.swift-version` のタグに対応する digest を更新できる。
 
-- [ ] 測定 image のタグを digest 固定指定へ変更し、更新手順を定める。
+- [x] 測定 image のタグを digest 固定指定へ変更し、更新手順を定める。

@@ -3887,6 +3887,77 @@ final class SMBeeTests: XCTestCase {
         ])
     }
 
+    func testClientSessionCloseWaitsForInFlightKeepAliveEcho() async throws {
+        let transport = ControlledReceiveTransport()
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        try await clientSession.startKeepAlive(interval: .milliseconds(50))
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let closeTask = Task { await clientSession.close() }
+
+        // Release the in-flight ECHO only after close has had a chance to cancel it.
+        try await Task.sleep(nanoseconds: 20_000_000)
+        transport.enqueueInbound(try framed([smb2EchoResponse(messageId: 0)]))
+        try await waitForOutboundFrameCount(2, transport: transport)
+        let outboundAfterEcho = try unframed(transport.outbound)
+        let teardownCount = outboundAfterEcho.filter {
+            let command = try? SMB2Header.decode($0).command
+            return command == SMB2Commands.treeDisconnect || command == SMB2Commands.logoff
+        }.count
+        XCTAssertEqual(teardownCount, 0)
+
+        transport.enqueueInbound(try framed([
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 1, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 2, treeId: 0),
+        ]))
+        try await awaitWithTimeout("close after in-flight keepalive") { await closeTask.value }
+
+        let commands = try unframed(transport.outbound).map { try SMB2Header.decode($0).command }
+        XCTAssertEqual(commands.filter { $0 != SMB2Commands.cancel }, [
+            SMB2Commands.echo, SMB2Commands.treeDisconnect, SMB2Commands.logoff,
+        ])
+    }
+
+    func testCancelledParkedEchoDoesNotSendStaleFrameAfterCreditGrant() async throws {
+        let transport = ControlledReceiveTransport()
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16),
+            initialCredits: 1
+        )
+
+        let first = Task { try await session.echo() }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let firstHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+        let second = Task { try await session.echo() }
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(try unframed(transport.outbound).count, 1, "second ECHO should be parked on credits")
+        second.cancel()
+        do {
+            _ = try await awaitWithTimeout("cancel parked ECHO") { try await second.value }
+            XCTFail("cancelled parked ECHO unexpectedly completed")
+        } catch is CancellationError {
+        }
+
+        transport.enqueueInbound(try framed([
+            smb2EchoResponse(messageId: firstHeader.messageId, credits: 1),
+        ]))
+        try await awaitWithTimeout("first ECHO") { try await first.value }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        // Cancellation legitimately emits an SMB2 CANCEL frame; the regression under test
+        // is a stale ECHO being replayed once the grant arrives, so count ECHO frames only.
+        let echoFrames = try unframed(transport.outbound).filter {
+            (try? SMB2Header.decode($0).command) == SMB2Commands.echo
+        }
+        XCTAssertEqual(echoFrames.count, 1)
+    }
+
     func testQueryDirectoryResponseDropsDotEntriesForRecursiveDeleteWalks() throws {
         var response = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: 11).encode()
         let payload = makeDirectoryEntry(name: ".", isDirectory: true, nextOffset: 112)
@@ -6626,8 +6697,8 @@ final class SMBeeTests: XCTestCase {
         try SMB2Header(status: status, command: command, credits: credits, messageId: messageId, treeId: treeId).encode()
     }
 
-    private func smb2EchoResponse(messageId: UInt64) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.echo, messageId: messageId).encode()
+    private func smb2EchoResponse(messageId: UInt64, credits: UInt16 = 1) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.echo, credits: credits, messageId: messageId).encode()
         response.append(contentsOf: [4, 0, 0, 0])
         return response
     }

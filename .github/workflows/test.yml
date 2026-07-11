@@ -67,6 +67,28 @@ jobs:
           fi
           wait "$test_pid"
 
+      - name: Cancel and teardown bounded stress
+        timeout-minutes: 5
+        run: |
+          for i in $(seq 1 20); do
+            swift test --skip SMBeeE2ETests --filter 'KeepAlive|Cancel' &
+            test_pid=$!
+            for _ in $(seq 1 30); do
+              kill -0 "$test_pid" 2>/dev/null || break
+              sleep 1
+            done
+            if kill -0 "$test_pid" 2>/dev/null; then
+              echo "::error::cancel/teardown stress iteration $i hung; sampling processes"
+              for pid in $(pgrep -x xctest) $(pgrep -f SMBeePackageTests); do
+                echo "--- sample of pid $pid ---"
+                sample "$pid" 5 2>/dev/null || true
+              done
+              kill -9 "$test_pid" 2>/dev/null || true
+              exit 1
+            fi
+            wait "$test_pid"
+          done
+
   linux-build-test:
     name: linux-build-test / .swift-version
     # Linux runner で、Network.framework 依存が SMB 本体へ漏れていないことと、

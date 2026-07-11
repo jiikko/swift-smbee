@@ -264,7 +264,43 @@ jobs:
         timeout-minutes: 15
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bash -c '
+            set -o pipefail
             apt-get update -qq
             apt-get install -y -qq time >/dev/null
-            /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests
+            mkdir -p .build
+            /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests 2>&1 | tee .build/resource-performance.log
           '
+      - name: Publish resource metrics to job summary
+        if: always()
+        run: |
+          {
+            echo '## SMBee resource performance'
+            echo
+            echo '| Operation | Metric | Value | Size (MiB) | Runs |'
+            echo '|---|---|---:|---:|---:|'
+            if [ -f .build/resource-performance.log ]; then
+              awk '
+                /^PERF_RESOURCE / {
+                  full_name = $2
+                  split(full_name, name_parts, ".")
+                  operation = name_parts[1]
+                  metric = full_name
+                  sub("^" operation "\\.", "", metric)
+                  value = size = runs = ""
+                  for (index = 3; index <= NF; index++) {
+                    split($index, pair, "=")
+                    if (pair[1] == "value") value = pair[2]
+                    if (pair[1] == "size_mib") size = pair[2]
+                    if (pair[1] == "runs") runs = pair[2]
+                  }
+                  printf "| `%s` | `%s` | %s | %s | %s |\n", operation, metric, value, size, runs
+                  found = 1
+                }
+                END {
+                  if (!found) print "| — | Metrics unavailable | — | — | — |"
+                }
+              ' .build/resource-performance.log
+            else
+              echo '| — | Metrics unavailable | — | — | — |'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

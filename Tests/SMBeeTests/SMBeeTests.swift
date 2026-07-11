@@ -1932,6 +1932,44 @@ final class SMBeeTests: XCTestCase {
         }
         let waiters = await window.pendingWaiterCount
         XCTAssertEqual(waiters, 0)
+
+        do {
+            _ = try await window.reserve(charge: 1)
+            XCTFail("reserve unexpectedly succeeded after failure")
+        } catch let error as SMBTransportError {
+            XCTAssertEqual(error, .connectionClosed)
+        }
+        let balance = await window.balance
+        XCTAssertEqual(balance, 0)
+        _ = await window.grant(10)
+        let balanceAfterGrant = await window.balance
+        XCTAssertEqual(balanceAfterGrant, 0)
+        _ = await window.refund(charge: 1)
+        let balanceAfterRefund = await window.balance
+        XCTAssertEqual(balanceAfterRefund, 0)
+
+        await window.failAllWaiters(SMBTransportError.connectionClosed)
+    }
+
+    func testSMB2CreditWindowResetReactivatesWindowAndOldFailureCanWinRace() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0)
+        let parked = Task { try await window.reserve(charge: 1) }
+        while await window.pendingWaiterCount == 0 { await Task.yield() }
+
+        await window.failAllWaiters(SMBTransportError.connectionClosed)
+        _ = try? await parked.value
+        await window.reset(initialCredits: 2)
+        let reserveAfterReset = try await window.reserve(charge: 1)
+        XCTAssertEqual(reserveAfterReset, 1)
+
+        // The window does not identify connection generations: a delayed old event
+        // transitions the reset window back to failed, as specified.
+        await window.failAllWaiters(SMBTransportError.connectionClosed)
+        do {
+            _ = try await window.reserve(charge: 1)
+            XCTFail("reserve unexpectedly succeeded after delayed failure")
+        } catch is SMBTransportError {
+        }
     }
 
     func testSMB2CreditWindowDoesNotConsumeZeroChargeRequests() async throws {

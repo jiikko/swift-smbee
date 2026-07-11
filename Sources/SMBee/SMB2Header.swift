@@ -120,6 +120,11 @@ enum SMB2Credit {
 }
 
 actor SMB2CreditWindow {
+    private enum State {
+        case active
+        case failed(Error)
+    }
+
     private struct Waiter {
         let charge: UInt16
         let id: UInt64
@@ -129,6 +134,7 @@ actor SMB2CreditWindow {
     private var available: UInt32
     private var waiters: [Waiter] = []
     private var nextWaiterId: UInt64 = 0
+    private var state: State = .active
 
     init(initialCredits: UInt32 = 1) {
         self.available = initialCredits
@@ -143,6 +149,9 @@ actor SMB2CreditWindow {
     }
 
     func reserve(charge requestedCharge: UInt16) async throws -> UInt32 {
+        if case .failed(let error) = state {
+            throw error
+        }
         guard requestedCharge > 0 else { return available }
         let charge = requestedCharge
         if available >= UInt32(charge) {
@@ -160,6 +169,10 @@ actor SMB2CreditWindow {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
+                if case .failed(let error) = state {
+                    continuation.resume(throwing: error)
+                    return
+                }
                 waiters.append(Waiter(charge: charge, id: id, continuation: continuation))
                 resumeReadyWaiters()
             }
@@ -172,11 +185,22 @@ actor SMB2CreditWindow {
     /// leak when the session dies while credits are exhausted (issues/010 §B — grant only
     /// arrives from received responses, which stop on transport failure).
     func failAllWaiters(_ error: Error) {
+        state = .failed(error)
         let parked = waiters
         waiters.removeAll()
         for waiter in parked {
             waiter.continuation.resume(throwing: error)
         }
+    }
+
+    func reset(initialCredits: UInt32) {
+        let parked = waiters
+        waiters.removeAll()
+        for waiter in parked {
+            waiter.continuation.resume(throwing: CancellationError())
+        }
+        available = initialCredits
+        state = .active
     }
 
     private func cancelWaiter(id: UInt64) {
@@ -187,12 +211,14 @@ actor SMB2CreditWindow {
     }
 
     func grant(_ credits: UInt16) -> UInt32 {
+        if case .failed = state { return available }
         available = SMB2Credit.balanceAfterReceiving(current: available, granted: credits)
         resumeReadyWaiters()
         return available
     }
 
     func refund(charge requestedCharge: UInt16) -> UInt32 {
+        if case .failed = state { return available }
         guard requestedCharge > 0 else { return available }
         available = SMB2Credit.balanceAfterReceiving(current: available, granted: requestedCharge)
         resumeReadyWaiters()

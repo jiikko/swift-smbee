@@ -3329,6 +3329,7 @@ actor SMBSession {
     private var maxReadSize: UInt32 = UInt32.max
     private var maxWriteSize: UInt32 = UInt32.max
     private let creditWindow: SMB2CreditWindow
+    private let initialCredits: UInt32
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
     private var sentResponseMessageIds: Set<UInt64> = []
     private var orphanResponses: [UInt64: SMBReceivedFrame] = [:]
@@ -3353,6 +3354,7 @@ actor SMBSession {
         self.signingKey = signingKey
         self.signingAlgorithm = signingAlgorithm
         self.signingRequired = signingRequired
+        self.initialCredits = initialCredits
         self.creditWindow = SMB2CreditWindow(initialCredits: initialCredits)
     }
 
@@ -3360,6 +3362,7 @@ actor SMBSession {
         try Task.checkCancellation()
         try await transport.connect(host: host, port: port)
         wireFailure = nil
+        await creditWindow.reset(initialCredits: initialCredits)
         let negotiate = try SMBNegotiateCodec.encodeRequest(
             clientGuid: UUID(),
             messageId: nextMessageId(),

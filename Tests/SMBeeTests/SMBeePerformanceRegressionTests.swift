@@ -146,8 +146,9 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
 }
 
 final class SMBeeResourcePerformanceTests: XCTestCase {
-    private let measuredRuns = 3
+    private let measuredRuns = 5
     private let payloadSize = 8 * 1024 * 1024
+    private let readIterationsPerSample = 20
     private let treeId: UInt32 = 0x3344
     private let fileId = Array(UInt8(0)..<UInt8(16))
     private let credential = SMBCredential(username: "user", password: "pass")
@@ -159,9 +160,13 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         _ = try await measureRead(size: 1024 * 1024)
         var samples: [ResourcePerformanceSample] = []
         for _ in 0..<measuredRuns {
-            samples.append(try await measureRead(size: payloadSize))
+            var iterations: [ResourcePerformanceSample] = []
+            for _ in 0..<readIterationsPerSample {
+                iterations.append(try await measureRead(size: payloadSize))
+            }
+            samples.append(ResourcePerformanceSample.combining(iterations))
         }
-        assertAndPrint(samples: samples, operation: "read_stream")
+        assertAndPrint(samples: samples, operation: "read_stream", iterationsPerSample: readIterationsPerSample)
     }
 
     func testSyntheticWriteStreamResourceUsage() async throws {
@@ -171,7 +176,7 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         for _ in 0..<measuredRuns {
             samples.append(try await measureWrite(size: payloadSize))
         }
-        assertAndPrint(samples: samples, operation: "write_stream")
+        assertAndPrint(samples: samples, operation: "write_stream", iterationsPerSample: 1)
     }
 
     private func measureRead(size: Int) async throws -> ResourcePerformanceSample {
@@ -255,17 +260,29 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         return ResourcePerformanceSample(size: size, elapsedSeconds: elapsed, before: before, after: after)
     }
 
-    private func assertAndPrint(samples: [ResourcePerformanceSample], operation: String) {
+    private func assertAndPrint(samples: [ResourcePerformanceSample], operation: String, iterationsPerSample: Int) {
         let throughput = median(samples.map(\.throughputMiBPerSecond))
         let userCPU = median(samples.map(\.userCPUMilliseconds))
         let systemCPU = median(samples.map(\.systemCPUMilliseconds))
+        let elapsed = median(samples.map(\.elapsedMilliseconds))
         let maxRSS = samples.map(\.maxRSSKilobytes).max() ?? 0
-        let sizeMiB = payloadSize / (1024 * 1024)
-        print("PERF_RESOURCE \(operation).throughput_mib_s value=\(format(throughput)) size_mib=\(sizeMiB) runs=\(measuredRuns) config=release")
-        print("PERF_RESOURCE \(operation).user_cpu_ms value=\(format(userCPU)) size_mib=\(sizeMiB) runs=\(measuredRuns) config=release")
-        print("PERF_RESOURCE \(operation).system_cpu_ms value=\(format(systemCPU)) size_mib=\(sizeMiB) runs=\(measuredRuns) config=release")
-        print("PERF_RESOURCE \(operation).max_rss_kb value=\(maxRSS) size_mib=\(sizeMiB) runs=\(measuredRuns) config=release")
+        let totalSizeMiB = (samples.first?.size ?? 0) / (1024 * 1024)
+        for (index, sample) in samples.enumerated() {
+            print(
+                "PERF_RESOURCE_SAMPLE operation=\(operation) run=\(index + 1) "
+                    + "elapsed_ms=\(format(sample.elapsedMilliseconds)) throughput_mib_s=\(format(sample.throughputMiBPerSecond)) "
+                    + "user_cpu_ms=\(format(sample.userCPUMilliseconds)) system_cpu_ms=\(format(sample.systemCPUMilliseconds)) "
+                    + "max_rss_kb=\(sample.maxRSSKilobytes) total_size_mib=\(totalSizeMiB) iterations=\(iterationsPerSample)"
+            )
+        }
+        let common = "size_mib=\(totalSizeMiB) runs=\(measuredRuns) iterations=\(iterationsPerSample) config=release"
+        print("PERF_RESOURCE \(operation).throughput_mib_s value=\(format(throughput)) \(common)")
+        print("PERF_RESOURCE \(operation).user_cpu_ms value=\(format(userCPU)) \(common)")
+        print("PERF_RESOURCE \(operation).system_cpu_ms value=\(format(systemCPU)) \(common)")
+        print("PERF_RESOURCE \(operation).sample_elapsed_ms value=\(format(elapsed)) \(common)")
+        print("PERF_RESOURCE \(operation).max_rss_kb value=\(maxRSS) \(common)")
         XCTAssertGreaterThan(throughput, 5, "catastrophic synthetic \(operation) throughput regression")
+        XCTAssertGreaterThanOrEqual(elapsed, 200, "synthetic \(operation) sample is too short for stable timing")
         XCTAssertLessThan(maxRSS, 512 * 1024, "catastrophic synthetic \(operation) RSS regression")
     }
 
@@ -308,22 +325,50 @@ private struct ResourceUsageSnapshot {
 private struct ResourcePerformanceSample {
     let size: Int
     let elapsedSeconds: Double
-    let before: ResourceUsageSnapshot
-    let after: ResourceUsageSnapshot
+    let userMicroseconds: Int64
+    let systemMicroseconds: Int64
+    let maxRSSKilobytes: Int64
+
+    init(size: Int, elapsedSeconds: Double, before: ResourceUsageSnapshot, after: ResourceUsageSnapshot) {
+        self.size = size
+        self.elapsedSeconds = elapsedSeconds
+        self.userMicroseconds = after.userMicroseconds - before.userMicroseconds
+        self.systemMicroseconds = after.systemMicroseconds - before.systemMicroseconds
+        self.maxRSSKilobytes = after.maxRSSKilobytes
+    }
+
+    private init(size: Int, elapsedSeconds: Double, userMicroseconds: Int64, systemMicroseconds: Int64, maxRSSKilobytes: Int64) {
+        self.size = size
+        self.elapsedSeconds = elapsedSeconds
+        self.userMicroseconds = userMicroseconds
+        self.systemMicroseconds = systemMicroseconds
+        self.maxRSSKilobytes = maxRSSKilobytes
+    }
+
+    static func combining(_ samples: [ResourcePerformanceSample]) -> ResourcePerformanceSample {
+        precondition(!samples.isEmpty)
+        return ResourcePerformanceSample(
+            size: samples.reduce(0) { $0 + $1.size },
+            elapsedSeconds: samples.reduce(0) { $0 + $1.elapsedSeconds },
+            userMicroseconds: samples.reduce(0) { $0 + $1.userMicroseconds },
+            systemMicroseconds: samples.reduce(0) { $0 + $1.systemMicroseconds },
+            maxRSSKilobytes: samples.map(\.maxRSSKilobytes).max() ?? 0
+        )
+    }
 
     var throughputMiBPerSecond: Double {
         Double(size) / elapsedSeconds / 1024 / 1024
     }
 
     var userCPUMilliseconds: Double {
-        Double(after.userMicroseconds - before.userMicroseconds) / 1000
+        Double(userMicroseconds) / 1000
     }
 
     var systemCPUMilliseconds: Double {
-        Double(after.systemMicroseconds - before.systemMicroseconds) / 1000
+        Double(systemMicroseconds) / 1000
     }
 
-    var maxRSSKilobytes: Int64 { after.maxRSSKilobytes }
+    var elapsedMilliseconds: Double { elapsedSeconds * 1000 }
 }
 
 private extension Duration {

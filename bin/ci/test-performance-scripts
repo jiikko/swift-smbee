@@ -9,7 +9,8 @@ for script in \
   "${SCRIPT_DIR}/swift-image" \
   "${SCRIPT_DIR}/run-performance-regression" \
   "${SCRIPT_DIR}/run-resource-performance" \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"; do
+  "${SCRIPT_DIR}/publish-resource-performance-summary" \
+  "${SCRIPT_DIR}/write-resource-performance-artifact"; do
   bash -n "${script}"
 done
 
@@ -26,9 +27,12 @@ log_file="${temporary}/resource.log"
 summary_file="${temporary}/summary.md"
 
 cat > "${log_file}" <<'EOF'
-PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=8 runs=3 config=release
-PERF_RESOURCE read_stream.user_cpu_ms value=9.861 size_mib=8 runs=3 config=release
-PERF_RESOURCE write_stream.max_rss_kb value=286048 size_mib=8 runs=3 config=release
+PERF_RESOURCE_SAMPLE operation=read_stream run=1 elapsed_ms=245.000 throughput_mib_s=653.061 user_cpu_ms=200.000 system_cpu_ms=4.000 max_rss_kb=286048 total_size_mib=160 iterations=20
+PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=160 runs=5 iterations=20 config=release
+PERF_RESOURCE read_stream.user_cpu_ms value=200.000 size_mib=160 runs=5 iterations=20 config=release
+PERF_RESOURCE read_stream.sample_elapsed_ms value=245.000 size_mib=160 runs=5 iterations=20 config=release
+PERF_RESOURCE write_stream.max_rss_kb value=286048 size_mib=8 runs=5 iterations=1 config=release
+	Maximum resident set size (kbytes): 682080
 EOF
 
 RESOURCE_PERFORMANCE_LOG="${log_file}" \
@@ -37,11 +41,26 @@ GITHUB_STEP_SUMMARY="${summary_file}" \
 
 # Literal Markdown backticks are intentional; expanding them would execute commands.
 # shellcheck disable=SC2016
-grep -F '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 5 MiB/s | Median | 8 MiB × 3 runs |' "${summary_file}"
+grep -F '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 5 MiB/s | Median | 160 MiB × 5 runs × 20 iterations |' "${summary_file}"
 # shellcheck disable=SC2016
-grep -F '| `read_stream` | User CPU | ℹ️ Observe | 9.861 ms | Lower ↓ | Observation only | Median | 8 MiB × 3 runs |' "${summary_file}"
+grep -F '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | Lower ↓ | Observation only | Median | 160 MiB × 5 runs × 20 iterations |' "${summary_file}"
 # shellcheck disable=SC2016
-grep -F '| `write_stream` | Process max RSS | ✅ Pass | 279.3 MiB | Lower ↓ | < 512 MiB | Peak | 8 MiB × 3 runs |' "${summary_file}"
+grep -F '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | Stable window | ≥ 200 ms | Median | 160 MiB × 5 runs × 20 iterations |' "${summary_file}"
+# shellcheck disable=SC2016
+grep -F '| `write_stream` | Process max RSS | ✅ Pass | 279.3 MiB | Lower ↓ | < 512 MiB | Peak | 8 MiB × 5 runs × 1 iterations |' "${summary_file}"
+grep -F 'Compiler + XCTest maximum RSS: **666.0 MiB** (682080 KiB).' "${summary_file}"
+
+jsonl_file="${temporary}/resource.jsonl"
+RESOURCE_PERFORMANCE_LOG="${log_file}" \
+RESOURCE_PERFORMANCE_JSONL="${jsonl_file}" \
+GITHUB_SHA="0123456789abcdef" \
+RUNNER_OS="Linux" \
+RUNNER_ARCH="X64" \
+  "${SCRIPT_DIR}/write-resource-performance-artifact"
+grep -F '"type":"metadata","commit_sha":"0123456789abcdef"' "${jsonl_file}"
+grep -F '"type":"sample","operation":"read_stream","run":1,"elapsed_ms":245.000' "${jsonl_file}"
+grep -F '"type":"summary","name":"read_stream.throughput_mib_s","value":737.364' "${jsonl_file}"
+grep -F '"type":"process","metric":"max_rss_kb","value":682080' "${jsonl_file}"
 
 missing_summary="${temporary}/missing-summary.md"
 RESOURCE_PERFORMANCE_LOG="${temporary}/missing.log" \

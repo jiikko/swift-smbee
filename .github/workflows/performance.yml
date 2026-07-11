@@ -38,6 +38,19 @@ jobs:
       - name: Release resource performance metrics
         timeout-minutes: 15
         run: bin/ci/run-resource-performance
+      - name: Build resource metrics artifact
+        if: always()
+        run: bin/ci/write-resource-performance-artifact
       - name: Publish resource metrics to job summary
         if: always()
         run: bin/ci/publish-resource-performance-summary
+      - name: Upload resource metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: resource-performance-${{ github.sha }}
+          retention-days: 30
+          path: |
+            .build/resource-performance.log
+            .build/resource-performance.jsonl
+          if-no-files-found: warn

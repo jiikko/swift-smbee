@@ -49,19 +49,20 @@ def shown(name: str) -> str:
     value = metadata.get(name, "unknown")
     return str(value) if value not in (None, "") else "unknown"
 
-print(f"- Commit SHA: `{shown('commit_sha')}`")
-print(f"- Swift image: `{shown('swift_image')}`")
-print(f"- Image digest: `{shown('image_digest')}`")
-print(f"- Runner: `{shown('runner_os')}/{shown('runner_arch')}`")
-print(f"- GITHUB_RUN_ID: `{shown('github_run_id')}`")
-print(f"- GITHUB_RUN_ATTEMPT: `{shown('github_run_attempt')}`")
-print(f"- Swift version full: `{shown('swift_version_full')}`")
-print(f"- Kernel: `{shown('kernel')}`")
-print(f"- CPU model: `{shown('cpu_model')}`")
-print(f"- CPU count: `{shown('cpu_count')}`")
+print(f"- Commit: `{shown('commit_sha')}` · Runner: `{shown('runner_os')}/{shown('runner_arch')}` · Cache exact hit: **{cache_hit}**")
 print(f"- Baseline runs: **{shown('baseline_runs')}**")
 print(f"- Raw samples: **{sample_count}**")
-print(f"- Build cache exact hit: **{cache_hit}**")
+print()
+print("<details><summary>Environment details</summary>")
+print()
+print(f"- Swift image: `{shown('swift_image')}`")
+print(f"- Image digest: `{shown('image_digest')}`")
+print(f"- GITHUB_RUN_ID / attempt: `{shown('github_run_id')}` / `{shown('github_run_attempt')}`")
+print(f"- Swift version full: `{shown('swift_version_full')}`")
+print(f"- Kernel: `{shown('kernel')}`")
+print(f"- CPU model / count: `{shown('cpu_model')}` / `{shown('cpu_count')}`")
+print()
+print("</details>")
 PY
   else
     python3 - "${metadata_file}" <<'PY'
@@ -92,11 +93,11 @@ PY
   echo
   echo '> **Healthy means:** guarded metrics show **✅ Pass**. CPU metrics are **ℹ️ Observe** until enough CI history exists for a stable threshold.'
   echo
-  echo '| Operation | Metric | Result | Value | Better | Guardrail | Aggregation | Workload | Spread (raw) | N |'
-  echo '|---|---|:---:|---:|:---:|---|---|---|---|---:|'
+  echo '| Operation | Metric | Result | Value | Guardrail headroom | Better | Guardrail | Aggregation | Workload | Spread (raw) | N |'
+  echo '|---|---|:---:|---:|---:|:---:|---|---|---|---|---:|'
 
   if [ ! -f "${LOG_FILE}" ]; then
-    echo '| — | Metrics unavailable | ⚠️ Unavailable | — | — | — | — | — | — | — |'
+    echo '| — | Metrics unavailable | ⚠️ Unavailable | — | — | — | — | — | — | — | — |'
     echo
     echo '### How to read this'
     echo
@@ -106,7 +107,7 @@ PY
     echo '- **Measured duration:** each aggregated sample must cover at least 200 ms of transfer-only intervals to reduce timer and scheduler noise.'
     echo '- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.'
   elif [ "${parse_status}" -ne 0 ]; then
-    echo '| — | Metrics unavailable | ❌ Parse failed | — | — | — | — | — | — | — |'
+    echo '| — | Metrics unavailable | ❌ Parse failed | — | — | — | — | — | — | — | — |'
     echo
     echo '- **Parse failed:** resource-performance.log violated the log contract. This step exits non-zero to fail the job.'
     exit "${parse_status}"
@@ -183,10 +184,14 @@ labels = {
 }
 
 for (operation, metric), metric_rows in summary_metrics.items():
+    if metric == "max_rss_kb":
+        continue
     representative_values = [Decimal(row["value"]) for row in metric_rows]
     multiple_baselines = len({row["baseline_run"] for row in metric_rows}) > 1
     display_value_number = median(representative_values) if multiple_baselines else representative_values[0]
     display_value = metric_number(metric, display_value_number)
+    if display_value_number == 0 and metric in {"user_cpu_ms", "system_cpu_ms"}:
+        display_value = "<0.001 ms"
     raw_values = [Decimal(row[sample_fields[metric]]) for row in samples if row["operation"] == operation]
     distribution_values = representative_values if multiple_baselines else raw_values
     spread_value = spread(metric, distribution_values, raw=not multiple_baselines)
@@ -196,29 +201,39 @@ for (operation, metric), metric_rows in summary_metrics.items():
     guardrail = "Observation only"
     aggregation = "Median"
     result = "ℹ️ Observe"
+    headroom = "—"
     if metric == "throughput_mib_s":
         direction = "Higher ↑"
+        floor = Decimal(metric_rows[0]["throughput_floor_mib_s"])
         guardrail = "> " + general(metric_rows[0]["throughput_floor_mib_s"]) + " MiB/s"
-        result = "✅ Pass" if display_value_number > Decimal(metric_rows[0]["throughput_floor_mib_s"]) else "❌ Fail"
+        result = "✅ Pass" if display_value_number > floor else "❌ Fail"
+        headroom = f"{display_value_number / floor:.2f}× / {(display_value_number / floor - 1) * 100:+.1f}%"
     elif metric in {"user_cpu_ms", "system_cpu_ms", "max_rss_kb"}:
         direction = "Lower ↓"
     elif metric == "sample_elapsed_ms":
         direction = "Stable window"
         guardrail = "≥ 200 ms"
         result = "✅ Pass" if display_value_number >= 200 else "❌ Too short"
-    if metric == "max_rss_kb":
-        guardrail = "< 512 MiB"
-        aggregation = "Peak"
-        result = "✅ Pass" if display_value_number < 524288 else "❌ Fail"
     workload = metric_rows[0]
     workload_text = f"{workload['size_mib']} MiB × {workload['runs']} runs × {workload['iterations']} iterations"
-    print(f"| `{operation}` | {label} | {result} | {display_value} | {direction} | {guardrail} | {aggregation} | {workload_text} | {spread_value} | {n_value} |")
+    print(f"| `{operation}` | {label} | {result} | {display_value} | {headroom} | {direction} | {guardrail} | {aggregation} | {workload_text} | {spread_value} | {n_value} |")
+
+contracts = [row for row in rows if row.get("type") == "contract"]
+print()
+print("### Deterministic performance contracts")
+print()
+if contracts:
+    passed = sum(Decimal(row["actual"]) == Decimal(row["expected"]) for row in contracts)
+    status = "✅" if passed == len(contracts) else "❌"
+    print(f"- {status} **{passed}/{len(contracts)} passed**")
+else:
+    print("- ⚠️ Contract metrics unavailable")
 
 print()
 print("### CPU efficiency (Observe-only)")
 print()
 print("These derived metrics are Observe-only and do not affect guardrail results or exit status.")
-print("CPU utilization is reported as a ratio of user plus system CPU time to measured elapsed time.")
+print("CPU utilization is user plus system CPU time divided by elapsed time, shown as a percentage of one logical core.")
 print()
 print("| Operation | user ms/MiB | system ms/MiB | CPU utilization |")
 print("|---|---:|---:|---:|")
@@ -233,7 +248,12 @@ for row in derived_rows:
 
 def derived_display(operation: str, metric: str) -> str:
     values = derived_metrics.get((operation, metric), [])
-    return fixed(median(values)) if values else "n/a"
+    if not values:
+        return "n/a"
+    value = median(values)
+    if metric == "cpu_utilization":
+        return f"{value * 100:.1f}% of one core"
+    return "<0.001" if value == 0 else fixed(value)
 
 for operation in ("read_stream", "write_stream"):
     print(
@@ -247,7 +267,7 @@ print("### How to read this")
 print()
 print("- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; calibrated catastrophic floors are shown per operation.")
 print("- **User/System CPU:** CPU consumed during the measured transfer. Lower is better, but currently informational because hosted-runner variance needs more history.")
-print("- **Process max RSS:** peak memory for the entire XCTest process, not a per-operation allocation delta. It can repeat across read/write rows; the job fails at 512 MiB or above.")
+print("- **Process max RSS:** shown once below because it is a process-wide peak, not an operation-specific allocation delta.")
 print("- **Measured duration:** each aggregated sample must cover at least 200 ms of transfer-only intervals to reduce timer and scheduler noise.")
 print("- **Spread (raw):** with one baseline run, this is the raw sample min–max. With multiple runs, it is the representative-value MAD and min–max; N is the number of values used.")
 print("- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.")
@@ -272,16 +292,27 @@ if profiles:
             "full_synthetic": "End-to-end synthetic write",
         }.get(stage, "WRITE encoding only")
         share = stage_shares.get((row["baseline_run"], stage))
-        share_display = fixed(Decimal(str(share))) if share is not None else "n/a"
+        share_display = f"{Decimal(str(share)) * 100:.1f}%" if share is not None else "n/a"
         print(f"| {stage.replace('_', ' ')} | {fixed(Decimal(row['median_ms']))} ms | {fixed(Decimal(row['throughput_mib_s']))} MiB/s | {share_display} | {interpretation} |")
 
 process_rows = [row for row in rows if row.get("type") == "process"]
-if process_rows:
-    process_rss = process_rows[-1]["value"]
+rss_rows = [row for row in process_rows if row.get("metric") == "max_rss_kb"]
+elapsed_rows = [row for row in process_rows if row.get("metric") == "elapsed_seconds"]
+resource_rss_values = [Decimal(row["value"]) for row in summaries if row["name"].endswith(".max_rss_kb")]
+if rss_rows or resource_rss_values or elapsed_rows:
     print()
-    print("### Whole `swift test` process tree")
+    print("### Process-wide memory and CI cost")
     print()
-    print(f"- Compiler + XCTest maximum RSS: **{Decimal(process_rss) / Decimal(1024):.1f} MiB** ({process_rss} KiB). This is CI cost, not an operation allocation metric.")
+    if resource_rss_values:
+        resource_rss = max(resource_rss_values)
+        status = "✅ Pass" if resource_rss < 524288 else "❌ Fail"
+        print(f"- XCTest process peak RSS: **{resource_rss / Decimal(1024):.1f} MiB** · {status} (`< 512 MiB` guardrail).")
+    if rss_rows:
+        process_rss = Decimal(rss_rows[-1]["value"])
+        print(f"- Whole `swift test` process-tree peak RSS: **{process_rss / Decimal(1024):.1f} MiB** ({process_rss} KiB).")
+    if elapsed_rows:
+        print(f"- `swift test` wall time: **{Decimal(elapsed_rows[-1]['value']):.2f} s**.")
+    print("- These are process-wide CI metrics; they do not attribute memory to read or write individually.")
 PY
   fi
 } >> "${SUMMARY_FILE}"

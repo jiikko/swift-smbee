@@ -131,9 +131,11 @@ def percent_change(current: Decimal, reference: Decimal, metric: str) -> tuple[s
     change = (current - reference) / reference * Decimal(100)
     if not change:
         return "±0.0%", "unchanged"
+    sign = "+" if change > 0 else ""
+    if abs(change) < Decimal(10):
+        return f"{sign}{change:.1f}%", "within noise"
     improved = (metric == "throughput_mib_s" and change > 0) or (metric != "throughput_mib_s" and change < 0)
     direction = "improved" if improved else "regressed"
-    sign = "+" if change > 0 else ""
     return f"{sign}{change:.1f}%", direction
 
 
@@ -169,6 +171,7 @@ def compare(current_path: Path, reference_path: Path) -> None:
     print("## Resource performance history comparison")
     print()
     print("Advisory only: compared with the previous successful master push run; this does not affect guardrails or job status.")
+    print("Changes below 10% are labelled `within noise`; use the calibrated multi-run baseline for optimization decisions.")
     print()
     print("| Operation | Metric | Current median | Reference median | Change |")
     print("|---|---|---:|---:|---|")

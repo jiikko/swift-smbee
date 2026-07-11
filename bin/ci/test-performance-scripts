@@ -122,6 +122,7 @@ PERF_WRITE_PROFILE stage=session_no_outbound_retention median_ms=658.768 through
 PERF_WRITE_PROFILE stage=full_synthetic median_ms=659.644 throughput_mib_s=12.128 size_mib=8 runs=5 chunks=128
 EOF
     fi
+    printf '\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:42.50\n' >> "${log_file}"
     printf '\tMaximum resident set size (kbytes): 682080\n' >> "${log_file}"
   done
 }
@@ -313,31 +314,30 @@ test_summary_happy_path() {
   # shellcheck disable=SC2016
   expect_contains "${summary_file}" \
     '### Run metadata' \
-    '- Commit SHA: `0123456789abcdef`' \
+    '- Commit: `0123456789abcdef` · Runner: `Linux/X64` · Cache exact hit: **false**' \
+    '<details><summary>Environment details</summary>' \
     '- Swift image: `swift:test`' \
     '- Image digest: `swift:test@sha256:deadbeef`' \
-    '- Runner: `Linux/X64`' \
-    '- GITHUB_RUN_ID: `1234567890`' \
-    '- GITHUB_RUN_ATTEMPT: `2`' \
+    '- GITHUB_RUN_ID / attempt: `1234567890` / `2`' \
     '- Swift version full: `Swift version 6.2.0 (swift-6.2.0-RELEASE)`' \
     '- Kernel: `Linux 6.8.0 x86_64`' \
-    '- CPU model: `Genuine Intel(R) CPU`' \
-    '- CPU count: `4`' \
+    '- CPU model / count: `Genuine Intel(R) CPU` / `4`' \
     '- Baseline runs: **2**' \
     '- Raw samples: **read_stream=10, write_stream=10**' \
-    '- Build cache exact hit: **false**' \
-    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 MiB/s; 737.364 MiB/s–737.364 MiB/s | 2 |' \
-    '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | Lower ↓ | Observation only | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 200.000 ms–200.000 ms | 2 |' \
-    '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | Stable window | ≥ 200 ms | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' \
-    '| `write_stream` | Process max RSS | ✅ Pass | 279.3 MiB | Lower ↓ | < 512 MiB | Peak | 8 MiB × 5 runs × 1 iterations | MAD 0.0 MiB; 279.3 MiB–279.3 MiB | 2 |' \
+    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | 1.84× / +84.3% | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 MiB/s; 737.364 MiB/s–737.364 MiB/s | 2 |' \
+    '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | — | Lower ↓ | Observation only | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 200.000 ms–200.000 ms | 2 |' \
+    '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | — | Stable window | ≥ 200 ms | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' \
+    '- ✅ **1/1 passed**' \
     '### CPU efficiency (Observe-only)' \
     'These derived metrics are Observe-only and do not affect guardrail results or exit status.' \
-    '| `read_stream` | 1.250 | 0.025 | 0.833 |' \
-    '| `write_stream` | 137.750 | 0.000 | 1.005 |' \
-    'Compiler + XCTest maximum RSS: **666.1 MiB** (682080 KiB).' \
+    '| `read_stream` | 1.250 | 0.025 | 83.3% of one core |' \
+    '| `write_stream` | 137.750 | <0.001 | 100.5% of one core |' \
+    'XCTest process peak RSS: **279.3 MiB** · ✅ Pass (`< 512 MiB` guardrail).' \
+    'Whole `swift test` process-tree peak RSS: **666.1 MiB** (682080 KiB).' \
+    '`swift test` wall time: **42.50 s**.' \
     '| Stage | Median | Effective throughput | Share of full synthetic | Interpretation |' \
-    '| signing only | 640.369 ms | 12.493 MiB/s | 0.971 | AES-CMAC cost |' \
-    '| full synthetic | 659.644 ms | 12.128 MiB/s | 1.000 | End-to-end synthetic write |'
+    '| signing only | 640.369 ms | 12.493 MiB/s | 97.1% | AES-CMAC cost |' \
+    '| full synthetic | 659.644 ms | 12.128 MiB/s | 100.0% | End-to-end synthetic write |'
 
   local single_run_log="${scenario_dir}/single-run.log"
   awk '/^PERF_BASELINE_RUN run=2 / { exit } { print }' "${log_file}" \
@@ -357,7 +357,7 @@ test_summary_happy_path() {
   expect_contains "${single_run_summary}" \
     '- Baseline runs: **1**' \
     '- Raw samples: **read_stream=5, write_stream=5**' \
-    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | 653.061 MiB/s–653.061 MiB/s | 5 |'
+    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | 1.84× / +84.3% | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | 653.061 MiB/s–653.061 MiB/s | 5 |'
 }
 
 test_artifact_jsonl() {
@@ -387,6 +387,7 @@ test_artifact_jsonl() {
     '"image_digest":"swift:test@sha256:deadbeef"' \
     '"github_run_id":"1234567890","github_run_attempt":"2"' \
     '"type":"env","key":"swift_version","value":"Swift version 6.2.0 (swift-6.2.0-RELEASE)"' \
+    '"type":"contract","name":"deterministic_command_count","actual":12,"expected":12' \
     '"type":"sample","baseline_run":1,"operation":"read_stream","run":1,"elapsed_ms":245.000' \
     '"type":"summary","baseline_run":1,"name":"read_stream.throughput_mib_s","value":737.364' \
     '"type":"derived","baseline_run":1,"operation":"read_stream","user_cpu_ms_per_mib":1.250,"system_cpu_ms_per_mib":0.025,"cpu_utilization":0.833' \
@@ -394,6 +395,7 @@ test_artifact_jsonl() {
     '"type":"derived_stage","baseline_run":1,"stage":"signing_only","share_of_full_synthetic":0.971' \
     '"type":"derived_stage","baseline_run":1,"stage":"full_synthetic","share_of_full_synthetic":1.000' \
     '"type":"process","baseline_run":1,"metric":"max_rss_kb","value":682080' \
+    '"type":"process","baseline_run":1,"metric":"elapsed_seconds","value":42.50' \
     '"type":"write_profile","baseline_run":1,"stage":"signing_only","median_ms":640.369' \
     '"type":"sample","baseline_run":2,"operation":"read_stream","run":1,"elapsed_ms":245.000' \
     '"type":"sample","baseline_run":2,"operation":"write_stream","run":1,"elapsed_ms":1096.000'
@@ -617,9 +619,9 @@ test_summary_edge_cases() {
   # Literal Markdown backticks are intentional.
   # shellcheck disable=SC2016
   expect_contains "${boundary_summary}" \
-    '| `read_stream` | Throughput | ❌ Fail | 400.000 MiB/s | Higher ↑ | > 400 MiB/s | Median |' \
-    '| `read_stream` | Measured duration | ✅ Pass | 200.000 ms | Stable window | ≥ 200 ms | Median |' \
-    '| `write_stream` | Process max RSS | ❌ Fail | 512.0 MiB | Lower ↓ | < 512 MiB | Peak |'
+    '| `read_stream` | Throughput | ❌ Fail | 400.000 MiB/s | 1.00× / +0.0% | Higher ↑ | > 400 MiB/s | Median |' \
+    '| `read_stream` | Measured duration | ✅ Pass | 200.000 ms | — | Stable window | ≥ 200 ms | Median |' \
+    'XCTest process peak RSS: **512.0 MiB** · ❌ Fail (`< 512 MiB` guardrail).'
 
   local no_cache_log="${scenario_dir}/no-cache.log"
   grep -v '^PERF_BUILD_CACHE ' "${log_file}" > "${no_cache_log}"
@@ -634,7 +636,7 @@ test_summary_edge_cases() {
     "${SCRIPT_DIR}/publish-resource-performance-summary"
   expect_contains "${no_cache_summary}" \
     '- Raw samples: **read_stream=10, write_stream=10**' \
-    '- Build cache exact hit: **unknown**'
+    'Cache exact hit: **unknown**'
 }
 
 test_artifact_and_summary_parse_failure() {

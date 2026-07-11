@@ -45,6 +45,7 @@ NUMBER_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
 METRIC_NUMBER_RE = re.compile(r"[+-]?(?:(?:0|[1-9][0-9]*)(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z")
 INT_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 RSS_RE = re.compile(r"Maximum resident set size \(kbytes\):\s*(\S+)")
+ELAPSED_RE = re.compile(r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*(\S+)")
 
 
 class ContractError(Exception):
@@ -88,6 +89,20 @@ def metric_numeric(value: str, line_number: int, field_name: str) -> str:
     if not math.isfinite(parsed):
         raise ContractError(f"line {line_number}: {field_name} is not finite")
     return value
+
+
+def elapsed_seconds(value: str, line_number: int) -> str:
+    parts = value.split(":")
+    if len(parts) not in {2, 3}:
+        raise ContractError(f"line {line_number}: elapsed wall time is malformed: {value!r}")
+    try:
+        numbers = [Decimal(part) for part in parts]
+    except Exception:
+        raise ContractError(f"line {line_number}: elapsed wall time is malformed: {value!r}") from None
+    if any(not number.is_finite() or number < 0 for number in numbers):
+        raise ContractError(f"line {line_number}: elapsed wall time is malformed: {value!r}")
+    total = numbers[0] * 60 + numbers[1] if len(numbers) == 2 else numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
+    return format(total, "f")
 
 
 def positive(data: dict[str, str], name: str, line_number: int, label: str) -> None:
@@ -235,6 +250,15 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
             current["process"].append(row)
             rows.append(row)
             continue
+        elapsed_match = ELAPSED_RE.search(stripped)
+        if elapsed_match:
+            if current is None:
+                raise ContractError(f"line {line_number}: elapsed wall time appeared before PERF_BASELINE_RUN")
+            value = elapsed_seconds(elapsed_match.group(1), line_number)
+            row = {"type": "process", "baseline_run": current["run"], "metric": "elapsed_seconds", "value": value}
+            current["process"].append(row)
+            rows.append(row)
+            continue
         if "Maximum resident set size (kbytes):" in stripped:
             raise ContractError(f"line {line_number}: malformed process RSS line")
         if not stripped.startswith("PERF_"):
@@ -289,6 +313,7 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
             require(data, {"actual", "expected"}, line_number, kind)
             metric_numeric(data["actual"], line_number, "PERF_METRIC actual")
             metric_numeric(data["expected"], line_number, "PERF_METRIC expected")
+            rows.append({"type": "contract", "name": tokens[1], "actual": data["actual"], "expected": data["expected"]})
             continue
         if kind == "PERF_BASELINE_RUN":
             data = fields(tokens[1:], line_number, kind)
@@ -407,7 +432,9 @@ def json_number_line(row: dict[str, Any]) -> str:
         return json.dumps(row, ensure_ascii=False, separators=(",", ":"))
     if row_type == "build_cache":
         return '{"type":"build_cache","exact_hit":' + row["exact_hit"] + "}"
-    if row_type == "sample":
+    if row_type == "contract":
+        names = ("name", "actual", "expected")
+    elif row_type == "sample":
         names = ("baseline_run", "operation", "run", "elapsed_ms", "throughput_mib_s", "user_cpu_ms", "system_cpu_ms", "max_rss_kb", "total_size_mib", "iterations")
     elif row_type == "summary":
         names = ("baseline_run", "name", "value", "size_mib", "runs", "iterations", "throughput_floor_mib_s")

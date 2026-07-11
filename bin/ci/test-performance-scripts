@@ -186,7 +186,10 @@ PERF_RUN_COMPLETE operation=write_stream
 EOF
   if [ "${baseline_run}" -eq 1 ]; then
     cat >> "${log_file}" <<'EOF'
+PERF_WRITE_PROFILE stage=codec_only median_ms=10.000 throughput_mib_s=800.000 size_mib=8 runs=5 chunks=128
 PERF_WRITE_PROFILE stage=signing_only median_ms=640.369 throughput_mib_s=12.493 size_mib=8 runs=5 chunks=128
+PERF_WRITE_PROFILE stage=session_no_outbound_retention median_ms=658.768 throughput_mib_s=12.153 size_mib=8 runs=5 chunks=128
+PERF_WRITE_PROFILE stage=full_synthetic median_ms=659.644 throughput_mib_s=12.128 size_mib=8 runs=5 chunks=128
 EOF
   fi
   printf '\tMaximum resident set size (kbytes): 682080\n' >> "${log_file}"
@@ -229,8 +232,17 @@ grep -F '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | Lower ↓ | 
 grep -F '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | Stable window | ≥ 200 ms | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' "${summary_file}"
 # shellcheck disable=SC2016
 grep -F '| `write_stream` | Process max RSS | ✅ Pass | 279.3 MiB | Lower ↓ | < 512 MiB | Peak | 8 MiB × 5 runs × 1 iterations | MAD 0.0 MiB; 279.3 MiB–279.3 MiB | 2 |' "${summary_file}"
+grep -F '### CPU efficiency (Observe-only)' "${summary_file}"
+grep -F 'These derived metrics are Observe-only and do not affect guardrail results or exit status.' "${summary_file}"
+# Literal Markdown backticks are intentional.
+# shellcheck disable=SC2016
+grep -F '| `read_stream` | 1.250 | 0.025 | 0.833 |' "${summary_file}"
+# shellcheck disable=SC2016
+grep -F '| `write_stream` | 137.750 | 0.000 | 1.005 |' "${summary_file}"
 grep -F 'Compiler + XCTest maximum RSS: **666.1 MiB** (682080 KiB).' "${summary_file}"
-grep -F '| signing only | 640.369 ms | 12.493 MiB/s | AES-CMAC cost |' "${summary_file}"
+grep -F '| Stage | Median | Effective throughput | Share of full synthetic | Interpretation |' "${summary_file}"
+grep -F '| signing only | 640.369 ms | 12.493 MiB/s | 0.971 | AES-CMAC cost |' "${summary_file}"
+grep -F '| full synthetic | 659.644 ms | 12.128 MiB/s | 1.000 | End-to-end synthetic write |' "${summary_file}"
 
 single_run_log="${temporary}/single-run.log"
 awk '/^PERF_BASELINE_RUN run=2 / { exit } { print }' "${log_file}" \
@@ -272,6 +284,10 @@ grep -F '"github_run_id":"1234567890","github_run_attempt":"2"' "${jsonl_file}"
 grep -F '"type":"env","key":"swift_version","value":"Swift version 6.2.0 (swift-6.2.0-RELEASE)"' "${jsonl_file}"
 grep -F '"type":"sample","baseline_run":1,"operation":"read_stream","run":1,"elapsed_ms":245.000' "${jsonl_file}"
 grep -F '"type":"summary","baseline_run":1,"name":"read_stream.throughput_mib_s","value":737.364' "${jsonl_file}"
+grep -F '"type":"derived","baseline_run":1,"operation":"read_stream","user_cpu_ms_per_mib":1.250,"system_cpu_ms_per_mib":0.025,"cpu_utilization":0.833' "${jsonl_file}"
+grep -F '"type":"derived","baseline_run":1,"operation":"write_stream","user_cpu_ms_per_mib":137.750,"system_cpu_ms_per_mib":0.000,"cpu_utilization":1.005' "${jsonl_file}"
+grep -F '"type":"derived_stage","baseline_run":1,"stage":"signing_only","share_of_full_synthetic":0.971' "${jsonl_file}"
+grep -F '"type":"derived_stage","baseline_run":1,"stage":"full_synthetic","share_of_full_synthetic":1.000' "${jsonl_file}"
 grep -F '"type":"process","baseline_run":1,"metric":"max_rss_kb","value":682080' "${jsonl_file}"
 grep -F '"type":"write_profile","baseline_run":1,"stage":"signing_only","median_ms":640.369' "${jsonl_file}"
 grep -F '"type":"sample","baseline_run":2,"operation":"read_stream","run":1,"elapsed_ms":245.000' "${jsonl_file}"
@@ -291,6 +307,39 @@ grep -F '# SMBee resource performance baseline' "${baseline_summary}"
 grep -F '| `read_stream.throughput_mib_s` | 2 | 737.364 | 737.364 | 737.364 | 0.000 | 0.0000 | 737.364 | 737.364 |' "${baseline_summary}"
 grep -F -- '- first invocation (includes Release build): 666.1 MiB' "${baseline_summary}"
 grep -F -- '- baseline invocations: 2' "${baseline_summary}"
+
+zero_denominator_log="${temporary}/zero-denominator.log"
+sed \
+  -e 's/total_size_mib=160/total_size_mib=0/g' \
+  -e 's/size_mib=160/size_mib=0/g' \
+  -e 's/PERF_RESOURCE read_stream.sample_elapsed_ms value=245.000/PERF_RESOURCE read_stream.sample_elapsed_ms value=0.000/' \
+  "${log_file}" > "${zero_denominator_log}"
+zero_denominator_summary="${temporary}/zero-denominator-summary.md"
+RESOURCE_PERFORMANCE_LOG="${zero_denominator_log}" \
+GITHUB_STEP_SUMMARY="${zero_denominator_summary}" \
+  "${SCRIPT_DIR}/publish-resource-performance-summary"
+# A zero workload and zero elapsed denominator are explicitly rendered as n/a.
+# shellcheck disable=SC2016
+grep -F '| `read_stream` | n/a | n/a | n/a |' "${zero_denominator_summary}"
+zero_denominator_jsonl="${temporary}/zero-denominator.jsonl"
+"${SCRIPT_DIR}/parse-resource-performance" "${zero_denominator_log}" > "${zero_denominator_jsonl}"
+grep -F '"type":"derived","baseline_run":1,"operation":"read_stream","user_cpu_ms_per_mib":null,"system_cpu_ms_per_mib":null,"cpu_utilization":null' "${zero_denominator_jsonl}"
+
+missing_full_log="${temporary}/missing-full-synthetic.log"
+grep -v 'stage=full_synthetic ' "${log_file}" > "${missing_full_log}"
+missing_full_jsonl="${temporary}/missing-full-synthetic.jsonl"
+"${SCRIPT_DIR}/parse-resource-performance" "${missing_full_log}" > "${missing_full_jsonl}"
+if grep -q '"type":"derived_stage"' "${missing_full_jsonl}"; then
+  echo 'parser unexpectedly emitted a stage share without full_synthetic' >&2
+  exit 1
+fi
+missing_full_summary="${temporary}/missing-full-synthetic-summary.md"
+RESOURCE_PERFORMANCE_LOG="${missing_full_log}" \
+GITHUB_STEP_SUMMARY="${missing_full_summary}" \
+  "${SCRIPT_DIR}/publish-resource-performance-summary"
+# A missing full_synthetic denominator leaves the profile share unavailable.
+# shellcheck disable=SC2016
+grep -F '| signing only | 640.369 ms | 12.493 MiB/s | n/a | AES-CMAC cost |' "${missing_full_summary}"
 
 expect_parser_failure() {
   local name="$1"
@@ -381,13 +430,17 @@ grep -F 'Parse failed:' "${parse_failure_summary}"
 
 missing_log="${temporary}/missing.log"
 missing_jsonl="${temporary}/missing.jsonl"
-RESOURCE_PERFORMANCE_LOG="${missing_log}" \
-RESOURCE_PERFORMANCE_JSONL="${missing_jsonl}" \
+# The hosted runner exports GITHUB_RUN_ID/ATTEMPT for real; unset them so the
+# "unknown" expectations below stay environment-independent.
+env -u GITHUB_RUN_ID -u GITHUB_RUN_ATTEMPT \
+  RESOURCE_PERFORMANCE_LOG="${missing_log}" \
+  RESOURCE_PERFORMANCE_JSONL="${missing_jsonl}" \
   "${SCRIPT_DIR}/write-resource-performance-artifact"
 grep -F '"type":"metadata"' "${missing_jsonl}"
 missing_summary="${temporary}/missing-summary.md"
-RESOURCE_PERFORMANCE_LOG="${missing_log}" \
-GITHUB_STEP_SUMMARY="${missing_summary}" \
+env -u GITHUB_RUN_ID -u GITHUB_RUN_ATTEMPT \
+  RESOURCE_PERFORMANCE_LOG="${missing_log}" \
+  GITHUB_STEP_SUMMARY="${missing_summary}" \
   "${SCRIPT_DIR}/publish-resource-performance-summary"
 grep -F '⚠️ Unavailable' "${missing_summary}"
 grep -F -- '- Image digest: `unknown`' "${missing_summary}"

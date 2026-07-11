@@ -11,11 +11,16 @@ temporary="$(mktemp -d)"
 trap 'rm -rf "${temporary}"' EXIT
 metadata_file="${temporary}/metadata.jsonl"
 validated_jsonl="${temporary}/resource-performance.jsonl"
-"${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_file}"
 
 parse_status=0
 if [ -f "${LOG_FILE}" ]; then
   "${SCRIPT_DIR}/parse-resource-performance" "${LOG_FILE}" >"${validated_jsonl}" || parse_status=$?
+fi
+if [ -f "${validated_jsonl}" ] && [ "${parse_status}" -eq 0 ]; then
+  RESOURCE_PERFORMANCE_ENV_JSONL="${validated_jsonl}" \
+    "${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_file}"
+else
+  "${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_file}"
 fi
 
 {
@@ -46,7 +51,14 @@ def shown(name: str) -> str:
 
 print(f"- Commit SHA: `{shown('commit_sha')}`")
 print(f"- Swift image: `{shown('swift_image')}`")
+print(f"- Image digest: `{shown('image_digest')}`")
 print(f"- Runner: `{shown('runner_os')}/{shown('runner_arch')}`")
+print(f"- GITHUB_RUN_ID: `{shown('github_run_id')}`")
+print(f"- GITHUB_RUN_ATTEMPT: `{shown('github_run_attempt')}`")
+print(f"- Swift version full: `{shown('swift_version_full')}`")
+print(f"- Kernel: `{shown('kernel')}`")
+print(f"- CPU model: `{shown('cpu_model')}`")
+print(f"- CPU count: `{shown('cpu_count')}`")
 print(f"- Baseline runs: **{shown('baseline_runs')}**")
 print(f"- Raw samples: **{sample_count}**")
 print(f"- Build cache exact hit: **{cache_hit}**")
@@ -64,7 +76,14 @@ def shown(name: str) -> str:
 
 print(f"- Commit SHA: `{shown('commit_sha')}`")
 print(f"- Swift image: `{shown('swift_image')}`")
+print(f"- Image digest: `{shown('image_digest')}`")
 print(f"- Runner: `{shown('runner_os')}/{shown('runner_arch')}`")
+print(f"- GITHUB_RUN_ID: `{shown('github_run_id')}`")
+print(f"- GITHUB_RUN_ATTEMPT: `{shown('github_run_attempt')}`")
+print(f"- Swift version full: `{shown('swift_version_full')}`")
+print(f"- Kernel: `{shown('kernel')}`")
+print(f"- CPU model: `{shown('cpu_model')}`")
+print(f"- CPU count: `{shown('cpu_count')}`")
 print(f"- Baseline runs: **{shown('baseline_runs')}**")
 print("- Raw samples: **unknown**")
 print("- Build cache exact hit: **unknown**")

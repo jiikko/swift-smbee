@@ -12,7 +12,7 @@ The log contract (version 1) is deliberately fail-closed:
   All five resource metrics are required for each operation.
 * Each operation must end with exactly one
   ``PERF_RUN_COMPLETE operation=<operation>`` after its samples and summaries.
-* ``PERF_BUILD_CACHE``, ``PERF_METRIC``, ``PERF_WRITE_PROFILE``, and the
+* ``PERF_ENV``, ``PERF_BUILD_CACHE``, ``PERF_METRIC``, ``PERF_WRITE_PROFILE``, and the
   ``/usr/bin/time`` process RSS line are optional, but are validated when
   present.  Other ``PERF_*`` rows are malformed and cause failure.
 
@@ -32,6 +32,7 @@ from typing import Any
 
 
 OPERATIONS = ("read_stream", "write_stream")
+ENV_KEYS = ("swift_version", "kernel", "cpu_model", "cpu_count")
 RESOURCE_METRICS = (
     "throughput_mib_s",
     "user_cpu_ms",
@@ -100,6 +101,7 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
     current: dict[str, Any] | None = None
     format_count = 0
     build_cache_seen = False
+    env_seen: set[str] = set()
 
     def finish_baseline(line_number: int) -> None:
         nonlocal format_count
@@ -171,6 +173,19 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
 
         tokens = stripped.split()
         kind = tokens[0]
+        if kind == "PERF_ENV":
+            env_tokens = stripped.split(None, 2)
+            if len(env_tokens) != 3 or not env_tokens[1] or env_tokens[1] not in ENV_KEYS:
+                raise ContractError(f"line {line_number}: malformed or unknown PERF_ENV key")
+            key = env_tokens[1]
+            if key in env_seen:
+                raise ContractError(f"line {line_number}: duplicate PERF_ENV key {key!r}")
+            value = env_tokens[2]
+            if not value:
+                raise ContractError(f"line {line_number}: PERF_ENV {key} has an empty value")
+            env_seen.add(key)
+            rows.append({"type": "env", "key": key, "value": value})
+            continue
         if kind == "PERF_BUILD_CACHE":
             data = fields(tokens[1:], line_number, kind)
             require(data, {"exact_hit"}, line_number, kind)
@@ -318,6 +333,8 @@ def json_number_line(row: dict[str, Any]) -> str:
         return json.dumps(value, ensure_ascii=False)
 
     row_type = row["type"]
+    if row_type == "env":
+        return json.dumps(row, ensure_ascii=False, separators=(",", ":"))
     if row_type == "build_cache":
         return '{"type":"build_cache","exact_hit":' + row["exact_hit"] + "}"
     if row_type == "sample":

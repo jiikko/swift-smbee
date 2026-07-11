@@ -9,16 +9,41 @@ swift_image="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"
 runner_os="${RUNNER_OS:-$(uname -s)}"
 runner_arch="${RUNNER_ARCH:-$(uname -m)}"
 baseline_runs="${RESOURCE_BASELINE_RUNS:-1}"
+image_digest="unknown"
+if image_digest_value="$(docker image inspect --format '{{index .RepoDigests 0}}' "${swift_image}" 2>/dev/null)" &&
+    [ -n "${image_digest_value}" ] && [ "${image_digest_value}" != '<no value>' ]; then
+  image_digest="${image_digest_value}"
+fi
+github_run_id="${GITHUB_RUN_ID:-unknown}"
+github_run_attempt="${GITHUB_RUN_ATTEMPT:-unknown}"
+env_jsonl="${RESOURCE_PERFORMANCE_ENV_JSONL:-}"
 
-python3 - "${commit_sha}" "${swift_image}" "${runner_os}" "${runner_arch}" "${baseline_runs}" <<'PY'
+python3 - "${commit_sha}" "${swift_image}" "${runner_os}" "${runner_arch}" "${baseline_runs}" "${image_digest}" "${github_run_id}" "${github_run_attempt}" "${env_jsonl}" <<'PY'
 import json
 import sys
 
-commit_sha, swift_image, runner_os, runner_arch, baseline_runs = sys.argv[1:]
+commit_sha, swift_image, runner_os, runner_arch, baseline_runs, image_digest, github_run_id, github_run_attempt, env_jsonl = sys.argv[1:]
 try:
     baseline_runs_value = int(baseline_runs)
 except ValueError:
     baseline_runs_value = "unknown"
+environment = {}
+if env_jsonl:
+    try:
+        with open(env_jsonl, encoding="utf-8") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("type") == "env":
+                    environment[row["key"]] = row["value"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        environment = {}
+
+def known(name: str) -> str:
+    value = environment.get(name, "unknown")
+    return value if value not in (None, "") else "unknown"
+
 row = {
     "type": "metadata",
     "commit_sha": commit_sha or "unknown",
@@ -26,6 +51,13 @@ row = {
     "runner_os": runner_os or "unknown",
     "runner_arch": runner_arch or "unknown",
     "baseline_runs": baseline_runs_value,
+    "swift_version_full": known("swift_version"),
+    "image_digest": image_digest or "unknown",
+    "github_run_id": github_run_id or "unknown",
+    "github_run_attempt": github_run_attempt or "unknown",
+    "kernel": known("kernel"),
+    "cpu_model": known("cpu_model"),
+    "cpu_count": known("cpu_count"),
 }
 print(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
 PY

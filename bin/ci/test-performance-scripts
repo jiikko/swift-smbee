@@ -40,7 +40,13 @@ docker_stub_marker="${temporary}/docker-stub-called"
 cat > "${temporary}/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-touch "${DOCKER_STUB_MARKER}"
+if [ "${1:-}" = image ] && [ "${2:-}" = inspect ]; then
+  printf '%s\n' "${DOCKER_STUB_IMAGE_DIGEST:-}"
+  exit 0
+fi
+if [ -n "${DOCKER_STUB_MARKER:-}" ]; then
+  touch "${DOCKER_STUB_MARKER}"
+fi
 if [ -n "${DOCKER_STUB_LOG:-}" ]; then
   invocation_count_file="${DOCKER_STUB_LOG}.count"
   invocation_count=0
@@ -72,6 +78,29 @@ if ! (
   exit 1
 fi
 test -e "${docker_stub_marker}"
+
+resource_docker_log="${temporary}/resource-docker-call"
+rm -f "${docker_stub_marker}" "${resource_docker_log}".*
+PATH="${temporary}:${PATH}" \
+SWIFT_IMAGE=swift:test \
+DOCKER_STUB_MARKER="${docker_stub_marker}" \
+DOCKER_STUB_LOG="${resource_docker_log}" \
+RESOURCE_SKIP_BUILD=true \
+  "${SCRIPT_DIR}/run-resource-performance" \
+  >"${temporary}/resource-run.out" 2>"${temporary}/resource-run.err"
+test -e "${docker_stub_marker}"
+test "$(cat "${resource_docker_log}.count")" -eq 1
+grep -F 'if [ -x /usr/bin/time ]; then' "${resource_docker_log}.1"
+grep -F 'apt-get update -qq' "${resource_docker_log}.1"
+grep -F 'emit_env swift_version' "${resource_docker_log}.1"
+
+metadata_with_digest="${temporary}/metadata-with-digest.jsonl"
+PATH="${temporary}:${PATH}" \
+SWIFT_IMAGE=swift:test \
+GITHUB_SHA=0123456789abcdef \
+DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:metadata' \
+  "${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_with_digest}"
+grep -F '"image_digest":"swift:test@sha256:metadata"' "${metadata_with_digest}"
 
 rm -f "${docker_stub_marker}"
 if ! RESOURCE_PERFORMANCE_LOG="${REPO_ROOT}/.build/resource-performance.log" \
@@ -116,6 +145,10 @@ log_file="${temporary}/resource.log"
 summary_file="${temporary}/summary.md"
 
 cat > "${log_file}" <<'EOF'
+PERF_ENV swift_version Swift version 6.2.0 (swift-6.2.0-RELEASE)
+PERF_ENV kernel Linux 6.8.0 x86_64
+PERF_ENV cpu_model Genuine Intel(R) CPU
+PERF_ENV cpu_count 4
 PERF_BUILD_CACHE exact_hit=false
 EOF
 for baseline_run in 1 2; do
@@ -162,16 +195,27 @@ done
 RESOURCE_PERFORMANCE_LOG="${log_file}" \
 GITHUB_STEP_SUMMARY="${summary_file}" \
 GITHUB_SHA="0123456789abcdef" \
+GITHUB_RUN_ID="1234567890" \
+GITHUB_RUN_ATTEMPT="2" \
 SWIFT_IMAGE="swift:test" \
 RUNNER_OS="Linux" \
 RUNNER_ARCH="X64" \
 RESOURCE_BASELINE_RUNS=2 \
+DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:deadbeef' \
+PATH="${temporary}:${PATH}" \
   "${SCRIPT_DIR}/publish-resource-performance-summary"
 
 grep -F '### Run metadata' "${summary_file}"
 grep -F -- '- Commit SHA: `0123456789abcdef`' "${summary_file}"
 grep -F -- '- Swift image: `swift:test`' "${summary_file}"
+grep -F -- '- Image digest: `swift:test@sha256:deadbeef`' "${summary_file}"
 grep -F -- '- Runner: `Linux/X64`' "${summary_file}"
+grep -F -- '- GITHUB_RUN_ID: `1234567890`' "${summary_file}"
+grep -F -- '- GITHUB_RUN_ATTEMPT: `2`' "${summary_file}"
+grep -F -- '- Swift version full: `Swift version 6.2.0 (swift-6.2.0-RELEASE)`' "${summary_file}"
+grep -F -- '- Kernel: `Linux 6.8.0 x86_64`' "${summary_file}"
+grep -F -- '- CPU model: `Genuine Intel(R) CPU`' "${summary_file}"
+grep -F -- '- CPU count: `4`' "${summary_file}"
 grep -F -- '- Baseline runs: **2**' "${summary_file}"
 grep -F -- '- Raw samples: **read_stream=10, write_stream=10**' "${summary_file}"
 grep -F -- '- Build cache exact hit: **false**' "${summary_file}"
@@ -213,11 +257,19 @@ RESOURCE_PERFORMANCE_JSONL="${jsonl_file}" \
   RESOURCE_BASELINE_RUNS=2 \
   SWIFT_IMAGE="swift:test" \
 GITHUB_SHA="0123456789abcdef" \
+GITHUB_RUN_ID="1234567890" \
+GITHUB_RUN_ATTEMPT="2" \
 RUNNER_OS="Linux" \
 RUNNER_ARCH="X64" \
+DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:deadbeef' \
+PATH="${temporary}:${PATH}" \
   "${SCRIPT_DIR}/write-resource-performance-artifact"
 grep -F '"type":"metadata","commit_sha":"0123456789abcdef"' "${jsonl_file}"
 grep -F '"baseline_runs":2' "${jsonl_file}"
+grep -F '"swift_version_full":"Swift version 6.2.0 (swift-6.2.0-RELEASE)"' "${jsonl_file}"
+grep -F '"image_digest":"swift:test@sha256:deadbeef"' "${jsonl_file}"
+grep -F '"github_run_id":"1234567890","github_run_attempt":"2"' "${jsonl_file}"
+grep -F '"type":"env","key":"swift_version","value":"Swift version 6.2.0 (swift-6.2.0-RELEASE)"' "${jsonl_file}"
 grep -F '"type":"sample","baseline_run":1,"operation":"read_stream","run":1,"elapsed_ms":245.000' "${jsonl_file}"
 grep -F '"type":"summary","baseline_run":1,"name":"read_stream.throughput_mib_s","value":737.364' "${jsonl_file}"
 grep -F '"type":"process","baseline_run":1,"metric":"max_rss_kb","value":682080' "${jsonl_file}"
@@ -285,6 +337,9 @@ sed 's/PERF_BASELINE_RUN run=2 total=2/PERF_BASELINE_RUN run=3 total=2/' "${log_
 expect_parser_failure noncontinuous-baseline "${temporary}/noncontinuous-baseline.log"
 grep -v 'write_stream' "${log_file}" > "${temporary}/missing-operation.log"
 expect_parser_failure missing-operation "${temporary}/missing-operation.log"
+cp "${log_file}" "${temporary}/duplicate-env.log"
+echo 'PERF_ENV kernel Duplicate kernel value' >> "${temporary}/duplicate-env.log"
+expect_parser_failure duplicate-env "${temporary}/duplicate-env.log"
 
 boundary_log="${temporary}/boundary.log"
 sed \
@@ -335,6 +390,12 @@ RESOURCE_PERFORMANCE_LOG="${missing_log}" \
 GITHUB_STEP_SUMMARY="${missing_summary}" \
   "${SCRIPT_DIR}/publish-resource-performance-summary"
 grep -F '⚠️ Unavailable' "${missing_summary}"
+grep -F -- '- Image digest: `unknown`' "${missing_summary}"
+grep -F -- '- GITHUB_RUN_ID: `unknown`' "${missing_summary}"
+grep -F -- '- Swift version full: `unknown`' "${missing_summary}"
+grep -F -- '- Kernel: `unknown`' "${missing_summary}"
+grep -F -- '- CPU model: `unknown`' "${missing_summary}"
+grep -F -- '- CPU count: `unknown`' "${missing_summary}"
 
 no_cache_log="${temporary}/no-cache.log"
 grep -v '^PERF_BUILD_CACHE ' "${log_file}" > "${no_cache_log}"

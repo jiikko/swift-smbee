@@ -37,15 +37,37 @@ docker run --rm \
   "${SWIFT_IMAGE}" \
   bash -c '
     set -euo pipefail
-    apt-get update -qq
-    apt-get install -y -qq time >/dev/null
+    if [ -x /usr/bin/time ]; then
+      :
+    else
+      # Revisit this external dependency when a measurement image bundles time.
+      apt-get update -qq
+      apt-get install -y -qq time >/dev/null
+    fi
     mkdir -p .build
     : > .build/resource-performance.log
     test_arguments=(-c release)
     if [ "${RESOURCE_SKIP_BUILD}" = true ]; then
       test_arguments+=(--skip-build)
     fi
+    emit_env() {
+      local key="$1"
+      shift
+      local value="$*"
+      if [ -z "${value}" ]; then
+        value=unknown
+      fi
+      printf "PERF_ENV %s %s\n" "${key}" "${value}"
+    }
+    swift_version="$(swift --version 2>/dev/null | head -n 1 || true)"
+    kernel="$(uname -a 2>/dev/null || true)"
+    cpu_model="$(grep -m1 -E "^(model name|Hardware|Processor)[[:space:]]*:" /proc/cpuinfo 2>/dev/null | sed -E "s/^[^:]*:[[:space:]]*//" || true)"
+    cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
     {
+      emit_env swift_version "${swift_version}"
+      emit_env kernel "${kernel}"
+      emit_env cpu_model "${cpu_model}"
+      emit_env cpu_count "${cpu_count}"
       echo "PERF_BUILD_CACHE exact_hit=${RESOURCE_SKIP_BUILD}"
       for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
         echo "PERF_BASELINE_RUN run=${baseline_run} total=${RESOURCE_BASELINE_RUNS}"

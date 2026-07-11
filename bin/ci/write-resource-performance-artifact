@@ -19,19 +19,23 @@ metadata_file="${temporary_directory}/metadata.jsonl"
 parsed_file="${temporary_directory}/parsed.jsonl"
 failure_file="${temporary_directory}/failure.jsonl"
 assembled_file="${temporary_directory}/assembled.jsonl"
-"${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_file}"
 
 if [ ! -f "${LOG_FILE}" ]; then
+  "${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_file}"
   mv "${metadata_file}" "${OUTPUT_FILE}"
   exit 0
 fi
 
 if "${SCRIPT_DIR}/parse-resource-performance" "${LOG_FILE}" >"${parsed_file}" 2>"${temporary_directory}/parse-error"; then
+  RESOURCE_PERFORMANCE_ENV_JSONL="${parsed_file}" \
+    "${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_file}"
   cat "${metadata_file}" "${parsed_file}" >"${assembled_file}"
   mv "${assembled_file}" "${OUTPUT_FILE}"
   exit 0
 fi
 
+cat "${temporary_directory}/parse-error" >&2
+"${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_file}"
 python3 - "${failure_file}" "${temporary_directory}/parse-error" <<'PY'
 import json
 import sys

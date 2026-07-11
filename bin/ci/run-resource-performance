@@ -45,16 +45,16 @@ docker run --rm \
     if [ "${RESOURCE_SKIP_BUILD}" = true ]; then
       test_arguments+=(--skip-build)
     fi
-    echo "PERF_BUILD_CACHE exact_hit=${RESOURCE_SKIP_BUILD}"
-    for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
-      {
+    {
+      echo "PERF_BUILD_CACHE exact_hit=${RESOURCE_SKIP_BUILD}"
+      for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
         echo "PERF_BASELINE_RUN run=${baseline_run} total=${RESOURCE_BASELINE_RUNS}"
         if [ "${baseline_run}" -eq 1 ]; then
           /usr/bin/time -v swift test "${test_arguments[@]}" --filter "SMBee(PerformanceRegression|ResourcePerformance)Tests"
         else
           /usr/bin/time -v swift test "${test_arguments[@]}" --filter SMBeeResourcePerformanceTests
         fi
-      } 2>&1 | tee -a .build/resource-performance.log
-    done
+      done
+    } 2>&1 | tee -a .build/resource-performance.log
     chmod -R a+rX .build
   '

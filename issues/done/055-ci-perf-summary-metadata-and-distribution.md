@@ -1,6 +1,6 @@
 # 055 perf: CI summary に実行 metadata と metric 分布を追加する
 
-状態: **open**
+状態: **done**
 起票: 2026-07-12
 優先度: **P2**
 コスト: **M**
@@ -29,9 +29,8 @@ job summary だけでは、異なる環境や実行条件の値を比較する�
 
 ## 完了条件
 
-- [ ] summary に commit SHA、Swift image、runner、baseline run 数、sample 数、cache hit が表示される。
-- [ ] throughput、CPU、RSS、duration など表示対象 metric に median、MAD、分布（min–max または p10–p90）、raw sample 数が表示される。
-- [ ] process RSS の表示が整数除算を使わず、fixture の 682080 KiB を 666.1 MiB と表示する。
-- [ ] metadata 欠落時の表示と、実際の cache hit 値の入力元がテストで検証される。
-- [ ] `bin/ci/test-performance-scripts` が新しい summary の全必須項目と統計値を検証する。
-
+- [x] summary に commit SHA、Swift image、runner、baseline run 数、sample 数、cache hit が表示される。
+- [x] throughput、CPU、RSS、duration など表示対象 metric に median、MAD、分布（min–max または p10–p90）、raw sample 数が表示される。
+- [x] process RSS の表示が整数除算を使わず、fixture の 682080 KiB を 666.1 MiB と表示する。
+- [x] metadata 欠落時の表示と、実際の cache hit 値の入力元がテストで検証される。
+- [x] `bin/ci/test-performance-scripts` が新しい summary の全必須項目と統計値を検証する。

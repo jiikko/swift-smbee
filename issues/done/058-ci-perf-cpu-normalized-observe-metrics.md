@@ -1,6 +1,6 @@
 # 058 perf: Observe 用の CPU 正規化 metric を追加する
 
-状態: **open**
+状態: **done**
 起票: 2026-07-12
 優先度: **P3**
 コスト: **M**
@@ -23,9 +23,8 @@ resource performance のログには throughput、elapsed、user CPU、system CP
 
 ## 完了条件
 
-- [ ] JSONL に user/system CPU ms per MiB、CPU utilization、write stage 比率が保存される。
-- [ ] Summary に各 metric の値、単位、Observe-only であることが表示される。
-- [ ] workload size、elapsed、stage 時間から計算した期待値を fixture で検証する。
-- [ ] elapsed や workload がゼロまたは欠落する入力の扱いが非曖昧で、テストされる。
-- [ ] 新しい metric が guardrail の failure 判定、workflow の exit status、既存の throughput/RSS 判定を変更しない。
-
+- [x] JSONL に user/system CPU ms per MiB、CPU utilization、write stage 比率が保存される。
+- [x] Summary に各 metric の値、単位、Observe-only であることが表示される。
+- [x] workload size、elapsed、stage 時間から計算した期待値を fixture で検証する。
+- [x] elapsed や workload がゼロまたは欠落する入力の扱いが非曖昧で、テストされる。
+- [x] 新しい metric が guardrail の failure 判定、workflow の exit status、既存の throughput/RSS 判定を変更しない。

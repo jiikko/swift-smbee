@@ -27,6 +27,7 @@ import json
 import math
 import re
 import sys
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,74 @@ def positive(data: dict[str, str], name: str, line_number: int, label: str) -> N
     value = int(data[name])
     if value < 1:
         raise ContractError(f"line {line_number}: {label} field {name!r} must be positive")
+
+
+def derived_value(numerator: Decimal | None, denominator: Decimal | None) -> Decimal | None:
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return (numerator / denominator).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+
+
+def decimal_value(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    parsed = Decimal(str(value))
+    return parsed if parsed.is_finite() else None
+
+
+def append_derived_rows(rows: list[dict[str, Any]], baselines: list[dict[str, Any]]) -> None:
+    """Append parser-derived values without changing producer or source rows."""
+    summary_rows = {
+        (row["baseline_run"], row["name"]): row
+        for row in rows
+        if row["type"] == "summary"
+    }
+    baseline_runs = [baseline["run"] for baseline in baselines]
+
+    for baseline_run in baseline_runs:
+        for operation in OPERATIONS:
+            user = summary_rows.get((baseline_run, f"{operation}.user_cpu_ms"))
+            system = summary_rows.get((baseline_run, f"{operation}.system_cpu_ms"))
+            elapsed = summary_rows.get((baseline_run, f"{operation}.sample_elapsed_ms"))
+            size = summary_rows.get((baseline_run, f"{operation}.user_cpu_ms"))
+
+            user_value = decimal_value(user.get("value")) if user else None
+            system_value = decimal_value(system.get("value")) if system else None
+            elapsed_value = decimal_value(elapsed.get("value")) if elapsed else None
+            size_value = decimal_value(size.get("size_mib")) if size else None
+            cpu_total = user_value + system_value if user_value is not None and system_value is not None else None
+
+            rows.append(
+                {
+                    "type": "derived",
+                    "baseline_run": baseline_run,
+                    "operation": operation,
+                    "user_cpu_ms_per_mib": derived_value(user_value, size_value),
+                    "system_cpu_ms_per_mib": derived_value(system_value, size_value),
+                    "cpu_utilization": derived_value(cpu_total, elapsed_value),
+                }
+            )
+
+    profiles = [row for row in rows if row["type"] == "write_profile"]
+    full_by_baseline = {
+        row["baseline_run"]: row
+        for row in profiles
+        if row["stage"] == "full_synthetic"
+    }
+    for profile in profiles:
+        full = full_by_baseline.get(profile["baseline_run"])
+        if full is None:
+            continue
+        stage_median = decimal_value(profile.get("median_ms"))
+        full_median = decimal_value(full.get("median_ms"))
+        rows.append(
+            {
+                "type": "derived_stage",
+                "baseline_run": profile["baseline_run"],
+                "stage": profile["stage"],
+                "share_of_full_synthetic": derived_value(stage_median, full_median),
+            }
+        )
 
 
 def parse_log(path: Path) -> list[dict[str, Any]]:
@@ -325,6 +394,7 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
     total = baselines[0]["total"]
     if len(baselines) != total:
         raise ContractError(f"expected {total} baseline runs, found {len(baselines)}")
+    append_derived_rows(rows, baselines)
     return rows
 
 
@@ -343,14 +413,21 @@ def json_number_line(row: dict[str, Any]) -> str:
         names = ("baseline_run", "name", "value", "size_mib", "runs", "iterations", "throughput_floor_mib_s")
     elif row_type == "write_profile":
         names = ("baseline_run", "stage", "median_ms", "throughput_mib_s", "size_mib", "runs", "chunks")
+    elif row_type == "derived":
+        names = ("baseline_run", "operation", "user_cpu_ms_per_mib", "system_cpu_ms_per_mib", "cpu_utilization")
+    elif row_type == "derived_stage":
+        names = ("baseline_run", "stage", "share_of_full_synthetic")
     else:
         names = ("baseline_run", "metric", "value")
     parts = [quote("type") + ":" + quote(row_type)]
     for name in names:
         value = row[name]
-        rendered = str(value) if isinstance(value, (int, float)) or name not in {"operation", "name", "stage", "metric"} else quote(value)
-        if name in {"operation", "name", "stage", "metric"}:
+        if value is None:
+            rendered = "null"
+        elif name in {"operation", "name", "stage", "metric"}:
             rendered = quote(value)
+        else:
+            rendered = str(value)
         parts.append(quote(name) + ":" + rendered)
     return "{" + ",".join(parts) + "}"
 

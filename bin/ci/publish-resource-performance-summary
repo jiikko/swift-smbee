@@ -215,6 +215,34 @@ for (operation, metric), metric_rows in summary_metrics.items():
     print(f"| `{operation}` | {label} | {result} | {display_value} | {direction} | {guardrail} | {aggregation} | {workload_text} | {spread_value} | {n_value} |")
 
 print()
+print("### CPU efficiency (Observe-only)")
+print()
+print("These derived metrics are Observe-only and do not affect guardrail results or exit status.")
+print("CPU utilization is reported as a ratio of user plus system CPU time to measured elapsed time.")
+print()
+print("| Operation | user ms/MiB | system ms/MiB | CPU utilization |")
+print("|---|---:|---:|---:|")
+
+derived_rows = [row for row in rows if row.get("type") == "derived"]
+derived_metrics = {}
+for row in derived_rows:
+    for metric in ("user_cpu_ms_per_mib", "system_cpu_ms_per_mib", "cpu_utilization"):
+        value = row.get(metric)
+        if value is not None:
+            derived_metrics.setdefault((row["operation"], metric), []).append(Decimal(str(value)))
+
+def derived_display(operation: str, metric: str) -> str:
+    values = derived_metrics.get((operation, metric), [])
+    return fixed(median(values)) if values else "n/a"
+
+for operation in ("read_stream", "write_stream"):
+    print(
+        f"| `{operation}` | {derived_display(operation, 'user_cpu_ms_per_mib')} "
+        f"| {derived_display(operation, 'system_cpu_ms_per_mib')} "
+        f"| {derived_display(operation, 'cpu_utilization')} |"
+    )
+
+print()
 print("### How to read this")
 print()
 print("- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; calibrated catastrophic floors are shown per operation.")
@@ -226,11 +254,16 @@ print("- Compare trends between runs of this same Linux Release job. Values from
 
 profiles = [row for row in rows if row.get("type") == "write_profile"]
 if profiles:
+    derived_stage_rows = [row for row in rows if row.get("type") == "derived_stage"]
+    stage_shares = {
+        (row["baseline_run"], row["stage"]): row.get("share_of_full_synthetic")
+        for row in derived_stage_rows
+    }
     print()
     print("### Write stage profile")
     print()
-    print("| Stage | Median | Effective throughput | Interpretation |")
-    print("|---|---:|---:|---|")
+    print("| Stage | Median | Effective throughput | Share of full synthetic | Interpretation |")
+    print("|---|---:|---:|---:|---|")
     for row in profiles:
         stage = row["stage"]
         interpretation = {
@@ -238,7 +271,9 @@ if profiles:
             "session_no_outbound_retention": "Session + transport, discard writes",
             "full_synthetic": "End-to-end synthetic write",
         }.get(stage, "WRITE encoding only")
-        print(f"| {stage.replace('_', ' ')} | {fixed(Decimal(row['median_ms']))} ms | {fixed(Decimal(row['throughput_mib_s']))} MiB/s | {interpretation} |")
+        share = stage_shares.get((row["baseline_run"], stage))
+        share_display = fixed(Decimal(str(share))) if share is not None else "n/a"
+        print(f"| {stage.replace('_', ' ')} | {fixed(Decimal(row['median_ms']))} ms | {fixed(Decimal(row['throughput_mib_s']))} MiB/s | {share_display} | {interpretation} |")
 
 process_rows = [row for row in rows if row.get("type") == "process"]
 if process_rows:

@@ -29,6 +29,21 @@ job summary の先頭には commit、Swift image、image digest、GitHub run ID/
 kernel、CPU、runner、baseline run 数、operation 別 raw sample 数、build cache exact hit と、metric ごとの
 代表値／分布（MAD・min–max・N）が表示される。
 
+parser は検証済みの summary 行と write profile 行から、producer のログには現れない派生行も JSONL に追加する。
+これらはログ形式 version 1 の producer 契約を変更しない parser 生成データである。
+
+- `{"type":"derived","baseline_run":N,"operation":...}` は、summary の user/system CPU median を
+  operation の `size_mib`（`PERF_RESOURCE_SAMPLE` の `total_size_mib`）で割った user/system CPU ms/MiB と、
+  user + system CPU median を `sample_elapsed_ms` median で割った CPU utilization（比率）を持つ。
+  workload または elapsed の分母が 0 または欠落する場合、該当値は JSON `null` となり、job summary では `n/a` と表示する。
+  read の 160 MiB/sample と write の 8 MiB/sample は異なるため、ms/MiB を operation 間で直接比較しない。
+- `{"type":"derived_stage","baseline_run":N,"stage":...}` は、同一 baseline の
+  `PERF_WRITE_PROFILE` の `median_ms` を `full_synthetic` の `median_ms` で割った比率を持つ。
+  `full_synthetic` がない場合はこの派生行を出力しない。分母が 0 の場合は比率を JSON `null` とする。
+
+CPU efficiency と write stage の比率は Observe-only であり、guardrail の判定、workflow の exit status、
+既存の throughput/RSS 判定を変更しない。
+
 ## Per-invocation representative metrics
 
 各invocationは5 raw samplesのmedianを代表値とする。次の表は20代表値の分布。

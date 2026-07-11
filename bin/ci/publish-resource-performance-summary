@@ -22,13 +22,14 @@ SUMMARY_FILE="${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
         operation = name_parts[1]
         metric = full_name
         sub("^" operation "\\.", "", metric)
-        value = size = runs = iterations = ""
+        value = size = runs = iterations = throughput_floor = ""
         for (field_index = 3; field_index <= NF; field_index++) {
           split($field_index, pair, "=")
           if (pair[1] == "value") value = pair[2]
           if (pair[1] == "size_mib") size = pair[2]
           if (pair[1] == "runs") runs = pair[2]
           if (pair[1] == "iterations") iterations = pair[2]
+          if (pair[1] == "throughput_floor_mib_s") throughput_floor = pair[2]
         }
         label = metric
         display_value = value
@@ -40,8 +41,8 @@ SUMMARY_FILE="${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
           label = "Throughput"
           display_value = value " MiB/s"
           direction = "Higher ↑"
-          guardrail = "> 5 MiB/s"
-          result = (value + 0 > 5) ? "✅ Pass" : "❌ Fail"
+          guardrail = "> " throughput_floor " MiB/s"
+          result = (value + 0 > throughput_floor + 0) ? "✅ Pass" : "❌ Fail"
         } else if (metric == "user_cpu_ms") {
           label = "User CPU"
           display_value = value " ms"
@@ -77,11 +78,32 @@ SUMMARY_FILE="${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
   echo
   echo '### How to read this'
   echo
-  echo '- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; the job fails at 5 MiB/s or below.'
+  echo '- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; calibrated catastrophic floors are shown per operation.'
   echo '- **User/System CPU:** CPU consumed during the measured transfer. Lower is better, but currently informational because hosted-runner variance needs more history.'
   echo '- **Process max RSS:** peak memory for the entire XCTest process, not a per-operation allocation delta. It can repeat across read/write rows; the job fails at 512 MiB or above.'
   echo '- **Measured duration:** each aggregated sample must cover at least 200 ms of transfer-only intervals to reduce timer and scheduler noise.'
   echo '- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.'
+  if [ -f "${LOG_FILE}" ] && grep -q '^PERF_WRITE_PROFILE ' "${LOG_FILE}"; then
+    echo
+    echo '### Write stage profile'
+    echo
+    echo '| Stage | Median | Effective throughput | Interpretation |'
+    echo '|---|---:|---:|---|'
+    awk '
+      /^PERF_WRITE_PROFILE / {
+        stage = elapsed = throughput = ""
+        for (field_index = 2; field_index <= NF; field_index++) {
+          split($field_index, pair, "=")
+          if (pair[1] == "stage") stage = pair[2]
+          if (pair[1] == "median_ms") elapsed = pair[2]
+          if (pair[1] == "throughput_mib_s") throughput = pair[2]
+        }
+        interpretation = stage == "signing_only" ? "AES-CMAC cost" : (stage == "session_no_outbound_retention" ? "Session + transport, discard writes" : (stage == "full_synthetic" ? "End-to-end synthetic write" : "WRITE encoding only"))
+        gsub("_", " ", stage)
+        printf "| %s | %s ms | %s MiB/s | %s |\n", stage, elapsed, throughput, interpretation
+      }
+    ' "${LOG_FILE}"
+  fi
   if [ -f "${LOG_FILE}" ]; then
     process_rss="$(awk -F: '/Maximum resident set size \(kbytes\)/ { value=$2; gsub(/[[:space:]]/, "", value) } END { print value }' "${LOG_FILE}")"
     if [ -n "${process_rss}" ]; then

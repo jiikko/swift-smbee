@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Summarize resource-performance JSONL into a reproducible Markdown baseline."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+from pathlib import Path
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def statistics_for(values: list[float]) -> dict[str, float]:
+    median = statistics.median(values)
+    deviations = [abs(value - median) for value in values]
+    mean = statistics.fmean(values)
+    standard_deviation = statistics.pstdev(values)
+    return {
+        "median": median,
+        "p10": percentile(values, 0.10),
+        "p90": percentile(values, 0.90),
+        "mad": statistics.median(deviations),
+        "cv": standard_deviation / mean if mean else 0.0,
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def format_number(value: float) -> str:
+    return f"{value:.3f}"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("jsonl", type=Path)
+    args = parser.parse_args()
+
+    rows = [json.loads(line) for line in args.jsonl.read_text().splitlines() if line.strip()]
+    metadata = next((row for row in rows if row.get("type") == "metadata"), {})
+    summaries = [row for row in rows if row.get("type") == "summary"]
+    samples = [row for row in rows if row.get("type") == "sample"]
+    process_rows = [row for row in rows if row.get("type") == "process"]
+    baseline_runs = len({row["baseline_run"] for row in samples})
+
+    print("# SMBee resource performance baseline")
+    print()
+    print(f"- commit: `{metadata.get('commit_sha', 'unknown')}`")
+    print(f"- Swift image: `{metadata.get('swift_image', 'unknown')}`")
+    print(f"- runner: `{metadata.get('runner_os', 'unknown')}/{metadata.get('runner_arch', 'unknown')}`")
+    print(f"- baseline invocations: {baseline_runs}")
+    print(f"- raw samples: {len(samples)}")
+    print()
+    print("## Per-invocation representative metrics")
+    print()
+    print("| Metric | N | Median | p10 | p90 | MAD | CV | Min | Max |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for name in sorted({row["name"] for row in summaries}):
+        values = [float(row["value"]) for row in summaries if row["name"] == name]
+        result = statistics_for(values)
+        print(
+            f"| `{name}` | {len(values)} | {format_number(result['median'])} | "
+            f"{format_number(result['p10'])} | {format_number(result['p90'])} | "
+            f"{format_number(result['mad'])} | {result['cv']:.4f} | "
+            f"{format_number(result['min'])} | {format_number(result['max'])} |"
+        )
+
+    print()
+    print("## Raw sample throughput")
+    print()
+    print("| Operation | N | Median | p10 | p90 | MAD | CV | Min | Max |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for operation in sorted({row["operation"] for row in samples}):
+        values = [
+            float(row["throughput_mib_s"])
+            for row in samples
+            if row["operation"] == operation
+        ]
+        result = statistics_for(values)
+        print(
+            f"| `{operation}` | {len(values)} | {format_number(result['median'])} | "
+            f"{format_number(result['p10'])} | {format_number(result['p90'])} | "
+            f"{format_number(result['mad'])} | {result['cv']:.4f} | "
+            f"{format_number(result['min'])} | {format_number(result['max'])} |"
+        )
+
+    if process_rows:
+        process_values = [float(row["value"]) for row in process_rows]
+        warm_values = process_values[1:] if len(process_values) > 1 else process_values
+        print()
+        print("## Whole swift-test process RSS")
+        print()
+        print(f"- first invocation (includes Release build): {process_values[0] / 1024:.1f} MiB")
+        print(f"- warm invocation median: {statistics.median(warm_values) / 1024:.1f} MiB")
+        print(f"- warm invocation range: {min(warm_values) / 1024:.1f}–{max(warm_values) / 1024:.1f} MiB")
+
+
+if __name__ == "__main__":
+    main()

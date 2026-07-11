@@ -26,15 +26,6 @@ jobs:
       - name: Test performance CI scripts
         run: bin/ci/test-performance-scripts
 
-  performance-regression:
-    needs: ci-script-tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Deterministic performance contracts
-        timeout-minutes: 10
-        run: bin/ci/run-performance-regression
-
   resource-performance:
     needs: ci-script-tests
     runs-on: ubuntu-latest
@@ -42,7 +33,7 @@ jobs:
       RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '1' }}
     steps:
       - uses: actions/checkout@v5
-      - name: Release resource performance metrics
+      - name: Deterministic contracts and Release resource metrics
         timeout-minutes: 15
         run: bin/ci/run-resource-performance
       - name: Build resource metrics artifact

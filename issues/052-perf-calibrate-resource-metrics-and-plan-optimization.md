@@ -1,6 +1,6 @@
 # 052 perf: resource metricsを校正し、測定根拠に基づく改善計画を作る
 
-状態: **open**
+状態: **in progress**
 起票: 2026-07-11
 関連: `issues/done/004-ci-throughput-cpu-memory-regression-metrics.md` / `issues/003-ci-performance-regression-metrics.md` / `Tests/SMBeeTests/SMBeePerformanceRegressionTests.swift` / `.github/workflows/performance.yml`
 観測run: https://github.com/jiikko/swift-smbee/actions/runs/29151622490
@@ -200,13 +200,15 @@ run `29151622490`ではbenchmark数秒に対してbuildが194秒なので、buil
 
 ## 完了条件
 
-- [ ] read measured durationを安定区間へ延長する。
-- [ ] measured runを5回以上にし、raw sampleを出力する。
-- [ ] JSONL/CSV artifactとrunner metadataを保存する。
-- [ ] 同一workflowで20 run以上のbaselineを収集する。
-- [ ] metricごとのmedian/p10/p90/MADを記録する。
-- [ ] false positive 0を確認してguardrailを確定する。
-- [ ] write経路をcodec/signing/session/fullの段階に分けてprofileする。
-- [ ] profile根拠付きの最適化候補とA/B測定結果を作る。
-- [ ] XCTest RSSとjob全体RSSをSummary上で区別する。
+- [x] read measured durationを安定区間へ延長する。
+- [x] measured runを5回以上にし、raw sampleを出力する。
+- [x] JSONL/CSV artifactとrunner metadataを保存する。
+- [x] 同一workflowで20 run以上のbaselineを収集する。
+- [x] metricごとのmedian/p10/p90/MADを記録する。
+- [x] false positive 0を確認してguardrailを確定する。
+- [x] write経路をcodec/signing/session/fullの段階に分けてprofileする。
+- [x] profile根拠付きの最適化候補とA/B測定結果を作る。
+- [x] XCTest RSSとjob全体RSSをSummary上で区別する。
 - [ ] resource-performanceのbuild時間を50%以上削減する案を検証する。
+
+測定値、guardrail根拠、profileとA/B結果は`docs/performance-resource-baseline.md`に記録する。

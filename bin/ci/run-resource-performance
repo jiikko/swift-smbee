@@ -31,7 +31,11 @@ docker run --rm \
     for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
       {
         echo "PERF_BASELINE_RUN run=${baseline_run} total=${RESOURCE_BASELINE_RUNS}"
-        /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests
+        if [ "${baseline_run}" -eq 1 ]; then
+          /usr/bin/time -v swift test -c release --filter "SMBee(PerformanceRegression|ResourcePerformance)Tests"
+        else
+          /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests
+        fi
       } 2>&1 | tee -a .build/resource-performance.log
     done
   '

@@ -179,6 +179,54 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         assertAndPrint(samples: samples, operation: "write_stream", iterationsPerSample: 1)
     }
 
+    func testSyntheticWriteStageProfile() async throws {
+        try requireReleaseConfiguration()
+        let chunkSize = 64 * 1024
+        let chunks = chunkLengths(fileSize: payloadSize, chunkSize: chunkSize)
+        let payload = Array(repeating: UInt8(0xa5), count: chunkSize)
+        let packets = try chunks.enumerated().map { index, length in
+            try SMB2Write.encodeRequest(
+                messageId: UInt64(index), sessionId: 1, treeId: treeId, fileId: fileId,
+                offset: UInt64(index * chunkSize), data: length == chunkSize ? payload : Array(payload.prefix(length))
+            )
+        }
+
+        var codecSamples: [Double] = []
+        var signingSamples: [Double] = []
+        var sessionSamples: [Double] = []
+        var fullSamples: [Double] = []
+        for _ in 0..<measuredRuns {
+            var encodedBytes = 0
+            var start = ContinuousClock.now
+            for (index, length) in chunks.enumerated() {
+                encodedBytes += try SMB2Write.encodeRequest(
+                    messageId: UInt64(index), sessionId: 1, treeId: treeId, fileId: fileId,
+                    offset: UInt64(index * chunkSize), data: length == chunkSize ? payload : Array(payload.prefix(length))
+                ).count
+            }
+            codecSamples.append(start.duration(to: ContinuousClock.now).secondsAsDouble * 1000)
+            XCTAssertGreaterThan(encodedBytes, payloadSize)
+
+            var signatureBytes = 0
+            start = ContinuousClock.now
+            for packet in packets {
+                signatureBytes += try SMBSessionSigning.signature(
+                    algorithm: .aesCMAC, key: signingKey, packet: packet, sender: .client
+                ).count
+            }
+            signingSamples.append(start.duration(to: ContinuousClock.now).secondsAsDouble * 1000)
+            XCTAssertEqual(signatureBytes, chunks.count * 16)
+
+            sessionSamples.append(try await measureWriteElapsed(size: payloadSize, retainOutbound: false))
+            fullSamples.append(try await measureWriteElapsed(size: payloadSize, retainOutbound: true))
+        }
+
+        printWriteProfile(stage: "codec_only", samples: codecSamples)
+        printWriteProfile(stage: "signing_only", samples: signingSamples)
+        printWriteProfile(stage: "session_no_outbound_retention", samples: sessionSamples)
+        printWriteProfile(stage: "full_synthetic", samples: fullSamples)
+    }
+
     private func measureRead(size: Int) async throws -> ResourcePerformanceSample {
         let chunkSize = 64 * 1024
         let lengths = chunkLengths(fileSize: size, chunkSize: chunkSize)
@@ -224,6 +272,15 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
     }
 
     private func measureWrite(size: Int) async throws -> ResourcePerformanceSample {
+        let before = ResourceUsageSnapshot.current()
+        let elapsedMilliseconds = try await measureWriteElapsed(size: size, retainOutbound: true)
+        let after = ResourceUsageSnapshot.current()
+        return ResourcePerformanceSample(
+            size: size, elapsedSeconds: elapsedMilliseconds / 1000, before: before, after: after
+        )
+    }
+
+    private func measureWriteElapsed(size: Int, retainOutbound: Bool) async throws -> Double {
         let chunkSize = 64 * 1024
         let lengths = chunkLengths(fileSize: size, chunkSize: chunkSize)
         let inbound = try framed(
@@ -245,19 +302,27 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
                     ),
                 ]
         )
-        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let transport = PerformanceInMemoryTransport(inbound: inbound, retainOutbound: retainOutbound)
         let session = SMBSession(
             host: "server", port: 445, credential: credential, transport: transport,
             signingKey: signingKey, initialCredits: initialCredits
         )
         let client = SMBClientSession(session: session, treeId: treeId)
         let payload = Array(repeating: UInt8(0xa5), count: size)
-        let before = ResourceUsageSnapshot.current()
         let start = ContinuousClock.now
         try await client.upload(path: "resource.bin", data: payload)
-        let elapsed = start.duration(to: ContinuousClock.now).secondsAsDouble
-        let after = ResourceUsageSnapshot.current()
-        return ResourcePerformanceSample(size: size, elapsedSeconds: elapsed, before: before, after: after)
+        let elapsed = start.duration(to: ContinuousClock.now).secondsAsDouble * 1000
+        XCTAssertGreaterThan(transport.sentByteCount, size)
+        return elapsed
+    }
+
+    private func printWriteProfile(stage: String, samples: [Double]) {
+        let value = median(samples)
+        let throughput = Double(payloadSize) / (value / 1000) / 1024 / 1024
+        print(
+            "PERF_WRITE_PROFILE stage=\(stage) median_ms=\(format(value)) "
+                + "throughput_mib_s=\(format(throughput)) size_mib=8 runs=\(measuredRuns) chunks=128"
+        )
     }
 
     private func assertAndPrint(samples: [ResourcePerformanceSample], operation: String, iterationsPerSample: Int) {
@@ -267,6 +332,7 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         let elapsed = median(samples.map(\.elapsedMilliseconds))
         let maxRSS = samples.map(\.maxRSSKilobytes).max() ?? 0
         let totalSizeMiB = (samples.first?.size ?? 0) / (1024 * 1024)
+        let throughputFloor = operation == "read_stream" ? 400 : 5
         for (index, sample) in samples.enumerated() {
             print(
                 "PERF_RESOURCE_SAMPLE operation=\(operation) run=\(index + 1) "
@@ -275,13 +341,13 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
                     + "max_rss_kb=\(sample.maxRSSKilobytes) total_size_mib=\(totalSizeMiB) iterations=\(iterationsPerSample)"
             )
         }
-        let common = "size_mib=\(totalSizeMiB) runs=\(measuredRuns) iterations=\(iterationsPerSample) config=release"
+        let common = "size_mib=\(totalSizeMiB) runs=\(measuredRuns) iterations=\(iterationsPerSample) throughput_floor_mib_s=\(throughputFloor) config=release"
         print("PERF_RESOURCE \(operation).throughput_mib_s value=\(format(throughput)) \(common)")
         print("PERF_RESOURCE \(operation).user_cpu_ms value=\(format(userCPU)) \(common)")
         print("PERF_RESOURCE \(operation).system_cpu_ms value=\(format(systemCPU)) \(common)")
         print("PERF_RESOURCE \(operation).sample_elapsed_ms value=\(format(elapsed)) \(common)")
         print("PERF_RESOURCE \(operation).max_rss_kb value=\(maxRSS) \(common)")
-        XCTAssertGreaterThan(throughput, 5, "catastrophic synthetic \(operation) throughput regression")
+        XCTAssertGreaterThan(throughput, Double(throughputFloor), "catastrophic synthetic \(operation) throughput regression")
         XCTAssertGreaterThanOrEqual(elapsed, 200, "synthetic \(operation) sample is too short for stable timing")
         XCTAssertLessThan(maxRSS, 512 * 1024, "catastrophic synthetic \(operation) RSS regression")
     }
@@ -383,6 +449,8 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
     private var inbound: [UInt8]
     private var inboundOffset = 0
     private var outboundStorage: [UInt8] = []
+    private var sentBytes = 0
+    private let retainOutbound: Bool
 
     var outbound: [UInt8] {
         lock.lock()
@@ -390,8 +458,13 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
         return outboundStorage
     }
 
-    init(inbound: [UInt8]) {
+    var sentByteCount: Int {
+        lock.withLock { sentBytes }
+    }
+
+    init(inbound: [UInt8], retainOutbound: Bool = true) {
         self.inbound = inbound
+        self.retainOutbound = retainOutbound
     }
 
     func connect(host: String, port: UInt16) async throws {
@@ -403,7 +476,10 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
     func send(_ bytes: [UInt8]) async throws {
         try Task.checkCancellation()
         lock.withLock {
-            outboundStorage.append(contentsOf: bytes)
+            sentBytes += bytes.count
+            if retainOutbound {
+                outboundStorage.append(contentsOf: bytes)
+            }
         }
     }
 

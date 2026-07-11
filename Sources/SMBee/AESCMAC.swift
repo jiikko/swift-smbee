@@ -5,7 +5,20 @@ enum AES128 {
         guard key.count == 16, block.count == 16 else {
             throw SMBCodecError.invalidValue("AES-128 requires 16-byte key and block")
         }
-        let roundKeys = expandKey(key)
+        return try encryptBlock(expandedKey: expandKey(key), block: block)
+    }
+
+    static func expandedKey(_ key: [UInt8]) throws -> [UInt8] {
+        guard key.count == 16 else {
+            throw SMBCodecError.invalidValue("AES-128 requires a 16-byte key")
+        }
+        return expandKey(key)
+    }
+
+    static func encryptBlock(expandedKey roundKeys: [UInt8], block: [UInt8]) throws -> [UInt8] {
+        guard roundKeys.count == 176, block.count == 16 else {
+            throw SMBCodecError.invalidValue("AES-128 requires an expanded key and 16-byte block")
+        }
         var state = block
         addRoundKey(&state, Array(roundKeys[0..<16]))
         for round in 1..<10 {
@@ -105,8 +118,9 @@ enum AES128 {
 public enum AESCMAC {
     public static func authenticationCode(key: [UInt8], message: [UInt8]) throws -> [UInt8] {
         guard key.count == 16 else { throw SMBCodecError.invalidValue("AES-CMAC requires a 16-byte key") }
+        let expandedKey = try AES128.expandedKey(key)
         let zero = [UInt8](repeating: 0, count: 16)
-        let l = try AES128.encryptBlock(key: key, block: zero)
+        let l = try AES128.encryptBlock(expandedKey: expandedKey, block: zero)
         let k1 = dbl(l)
         let k2 = dbl(k1)
         let blockCount = max(1, (message.count + 15) / 16)
@@ -129,11 +143,11 @@ public enum AESCMAC {
             for blockIndex in 0..<(blockCount - 1) {
                 var y = Array(message[(blockIndex * 16)..<(blockIndex * 16 + 16)])
                 xor(&y, x)
-                x = try AES128.encryptBlock(key: key, block: y)
+                x = try AES128.encryptBlock(expandedKey: expandedKey, block: y)
             }
         }
         xor(&last, x)
-        return try AES128.encryptBlock(key: key, block: last)
+        return try AES128.encryptBlock(expandedKey: expandedKey, block: last)
     }
 
     private static func dbl(_ input: [UInt8]) -> [UInt8] {

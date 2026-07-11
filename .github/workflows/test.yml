@@ -93,6 +93,62 @@ jobs:
             wait "$test_pid"
           done
 
+  macos-tsan:
+    name: macos-tsan / .swift-version
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify Swift version compatibility
+        run: |
+          required="$(tr -d '[:space:]' < .swift-version)"
+          actual="$(swift --version | sed -n 's/.*Swift version \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+          swift --version
+          if [ -z "$actual" ]; then
+            echo "Could not parse swift --version output" >&2
+            exit 1
+          fi
+          lowest="$(printf '%s\n%s\n' "$required" "$actual" | sort -V | head -n 1)"
+          if [ "$lowest" != "$required" ]; then
+            echo "Swift ${actual} is older than required .swift-version ${required}" >&2
+            exit 1
+          fi
+          echo "Swift ${actual} satisfies .swift-version ${required}"
+      - name: Thread Sanitizer tests
+        timeout-minutes: 15
+        run: |
+          swift test --sanitize=thread --skip SMBeeE2ETests &
+          test_pid=$!
+          for _ in $(seq 1 840); do
+            kill -0 "$test_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$test_pid" 2>/dev/null; then
+            echo "::error::TSan tests still running after 840s; sampling hung processes"
+            for pid in $(pgrep -x xctest) $(pgrep -f SMBeePackageTests); do
+              echo "--- sample of pid $pid ---"
+              sample "$pid" 5 2>/dev/null || true
+            done
+            kill -9 "$test_pid" 2>/dev/null || true
+            exit 1
+          fi
+          wait "$test_pid"
+
+  linux-asan:
+    name: linux-asan / .swift-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read Swift version
+        id: swift-version
+        run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
+      - name: Swift version
+        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
+      - name: Address Sanitizer tests
+        timeout-minutes: 15
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift test --sanitize=address --skip SMBeeE2ETests
+
   linux-build-test:
     name: linux-build-test / .swift-version
     # Linux runner で、Network.framework 依存が SMB 本体へ漏れていないことと、

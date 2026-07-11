@@ -1,44 +1,45 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set -E
 unset CDPATH
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-for script in \
-  "${SCRIPT_DIR}/swift-image" \
-  "${SCRIPT_DIR}/run-performance-regression" \
-  "${SCRIPT_DIR}/run-resource-performance" \
-  "${SCRIPT_DIR}/resource-performance-metadata" \
-  "${SCRIPT_DIR}/parse-resource-performance" \
-  "${SCRIPT_DIR}/publish-resource-performance-summary" \
-  "${SCRIPT_DIR}/write-resource-performance-artifact" \
-  "${SCRIPT_DIR}/compare-resource-performance"; do
-  case "${script}" in
-    *parse-resource-performance) ;;
-    *) bash -n "${script}" ;;
-  esac
-done
-PYTHONDONTWRITEBYTECODE=1 python3 - "${SCRIPT_DIR}/parse-resource-performance" <<'PY'
-import ast
-import pathlib
-import sys
-
-ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-PY
-
-expected_image="swift:$(tr -d '[:space:]' < "${REPO_ROOT}/.swift-version")"
-actual_image="$("${SCRIPT_DIR}/swift-image")"
-if [ "${actual_image}" != "${expected_image}" ]; then
-  echo "swift-image mismatch: expected ${expected_image}, got ${actual_image}" >&2
-  exit 1
-fi
-
 temporary="$(mktemp -d)"
 trap 'rm -rf "${temporary}"' EXIT
 
-docker_stub_marker="${temporary}/docker-stub-called"
-cat > "${temporary}/docker" <<'EOF'
+current_scenario=''
+
+scenario_failed() {
+  trap - ERR
+  printf 'FAILED in scenario %s\n' "${current_scenario}" >&2
+  exit 1
+}
+
+run_scenario() {
+  current_scenario="$1"
+  trap scenario_failed ERR
+  "${current_scenario}"
+  trap - ERR
+}
+
+new_scenario_dir() {
+  mktemp -d "${temporary}/scenario.XXXXXX"
+}
+
+expect_contains() {
+  local file="$1"
+  shift
+  local expected
+  for expected in "$@"; do
+    grep -F -- "${expected}" "${file}"
+  done
+}
+
+write_docker_stub() {
+  local scenario_dir="$1"
+  cat > "${scenario_dir}/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "${1:-}" = image ] && [ "${2:-}" = inspect ]; then
@@ -59,111 +60,39 @@ if [ -n "${DOCKER_STUB_LOG:-}" ]; then
   printf '%s\n' "$@" > "${DOCKER_STUB_LOG}.${invocation_count}"
 fi
 EOF
-chmod +x "${temporary}/docker"
+  chmod +x "${scenario_dir}/docker"
+}
 
 run_resource_performance_without_docker() {
-  PATH="${temporary}:${PATH}" \
+  local scenario_dir="$1"
+  shift
+  PATH="${scenario_dir}:${PATH}" \
   SWIFT_IMAGE=swift:test \
-  DOCKER_STUB_MARKER="${docker_stub_marker}" \
+  DOCKER_STUB_MARKER="${scenario_dir}/docker-stub-called" \
     "$@"
 }
 
-rm -f "${docker_stub_marker}"
-if ! (
-  unset RESOURCE_PERFORMANCE_LOG
-  run_resource_performance_without_docker \
-    "${SCRIPT_DIR}/run-resource-performance" \
-    >"${temporary}/default-unset.out" 2>"${temporary}/default-unset.err"
-); then
-  echo 'run-resource-performance unexpectedly rejected an unset log path' >&2
-  exit 1
-fi
-test -e "${docker_stub_marker}"
-
-resource_docker_log="${temporary}/resource-docker-call"
-rm -f "${docker_stub_marker}" "${resource_docker_log}".*
-PATH="${temporary}:${PATH}" \
-SWIFT_IMAGE=swift:test \
-DOCKER_STUB_MARKER="${docker_stub_marker}" \
-DOCKER_STUB_LOG="${resource_docker_log}" \
-RESOURCE_SKIP_BUILD=true \
-  "${SCRIPT_DIR}/run-resource-performance" \
-  >"${temporary}/resource-run.out" 2>"${temporary}/resource-run.err"
-test -e "${docker_stub_marker}"
-test "$(cat "${resource_docker_log}.count")" -eq 1
-grep -F 'if [ -x /usr/bin/time ]; then' "${resource_docker_log}.1"
-grep -F 'apt-get update -qq' "${resource_docker_log}.1"
-grep -F 'emit_env swift_version' "${resource_docker_log}.1"
-
-metadata_with_digest="${temporary}/metadata-with-digest.jsonl"
-PATH="${temporary}:${PATH}" \
-SWIFT_IMAGE=swift:test \
-GITHUB_SHA=0123456789abcdef \
-DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:metadata' \
-  "${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_with_digest}"
-grep -F '"image_digest":"swift:test@sha256:metadata"' "${metadata_with_digest}"
-
-rm -f "${docker_stub_marker}"
-if ! RESOURCE_PERFORMANCE_LOG="${REPO_ROOT}/.build/resource-performance.log" \
-  run_resource_performance_without_docker \
-  "${SCRIPT_DIR}/run-resource-performance" \
-  >"${temporary}/default-explicit.out" 2>"${temporary}/default-explicit.err"; then
-  echo 'run-resource-performance unexpectedly rejected the default log path' >&2
-  exit 1
-fi
-test -e "${docker_stub_marker}"
-
-rm -f "${docker_stub_marker}"
-custom_log="${temporary}/custom/resource.log"
-if RESOURCE_PERFORMANCE_LOG="${custom_log}" \
-  run_resource_performance_without_docker \
-  "${SCRIPT_DIR}/run-resource-performance" \
-  >"${temporary}/custom.out" 2>"${temporary}/custom.err"; then
-  echo 'run-resource-performance unexpectedly accepted a custom log path' >&2
-  exit 1
-fi
-grep -F 'RESOURCE_PERFORMANCE_LOG must be the default path' "${temporary}/custom.err"
-grep -F 'custom paths are not supported' "${temporary}/custom.err"
-test ! -e "${docker_stub_marker}"
-
-performance_docker_log="${temporary}/performance-docker-call"
-rm -f "${docker_stub_marker}" "${performance_docker_log}".*
-PATH="${temporary}:${PATH}" \
-SWIFT_IMAGE=swift:test \
-DOCKER_STUB_MARKER="${docker_stub_marker}" \
-DOCKER_STUB_LOG="${performance_docker_log}" \
-  "${SCRIPT_DIR}/run-performance-regression" \
-  >"${temporary}/performance.out" 2>"${temporary}/performance.err"
-
-test -e "${docker_stub_marker}"
-test "$(cat "${performance_docker_log}.count")" -eq 2
-printf '%s\n' run --rm swift:test swift --version \
-  | diff -u - "${performance_docker_log}.1"
-printf '%s\n' run --rm -v "${REPO_ROOT}:/workspace" -w /workspace swift:test swift test --filter SMBeePerformanceRegressionTests \
-  | diff -u - "${performance_docker_log}.2"
-
-log_file="${temporary}/resource.log"
-summary_file="${temporary}/summary.md"
-
-cat > "${log_file}" <<'EOF'
+write_canonical_log() {
+  local log_file="$1"
+  cat > "${log_file}" <<'EOF'
 PERF_ENV swift_version Swift version 6.2.0 (swift-6.2.0-RELEASE)
 PERF_ENV kernel Linux 6.8.0 x86_64
 PERF_ENV cpu_model Genuine Intel(R) CPU
 PERF_ENV cpu_count 4
 PERF_BUILD_CACHE exact_hit=false
 EOF
-for baseline_run in 1 2; do
-  cat >> "${log_file}" <<EOF
+  for baseline_run in 1 2; do
+    cat >> "${log_file}" <<EOF
 PERF_BASELINE_RUN run=${baseline_run} total=2
 $(if [ "${baseline_run}" -eq 1 ]; then echo 'PERF_METRIC deterministic_command_count actual=12 expected=12'; fi)
 PERF_FORMAT version=1
 EOF
-  for sample_run in 1 2 3 4 5; do
-    cat >> "${log_file}" <<EOF
+    for sample_run in 1 2 3 4 5; do
+      cat >> "${log_file}" <<EOF
 PERF_RESOURCE_SAMPLE operation=read_stream run=${sample_run} elapsed_ms=245.000 throughput_mib_s=653.061 user_cpu_ms=200.000 system_cpu_ms=4.000 max_rss_kb=286048 total_size_mib=160 iterations=20
 EOF
-  done
-  cat >> "${log_file}" <<'EOF'
+    done
+    cat >> "${log_file}" <<'EOF'
 PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release
 PERF_RESOURCE read_stream.user_cpu_ms value=200.000 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release
 PERF_RESOURCE read_stream.system_cpu_ms value=4.000 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release
@@ -172,12 +101,12 @@ PERF_RESOURCE read_stream.max_rss_kb value=286048 size_mib=160 runs=5 iterations
 PERF_RUN_COMPLETE operation=read_stream
 PERF_FORMAT version=1
 EOF
-  for sample_run in 1 2 3 4 5; do
-    cat >> "${log_file}" <<EOF
+    for sample_run in 1 2 3 4 5; do
+      cat >> "${log_file}" <<EOF
 PERF_RESOURCE_SAMPLE operation=write_stream run=${sample_run} elapsed_ms=1096.000 throughput_mib_s=7.298 user_cpu_ms=1102.000 system_cpu_ms=0.000 max_rss_kb=286048 total_size_mib=8 iterations=1
 EOF
-  done
-  cat >> "${log_file}" <<'EOF'
+    done
+    cat >> "${log_file}" <<'EOF'
 PERF_RESOURCE write_stream.throughput_mib_s value=7.298 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
 PERF_RESOURCE write_stream.user_cpu_ms value=1102.000 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
 PERF_RESOURCE write_stream.system_cpu_ms value=0.000 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
@@ -185,126 +114,301 @@ PERF_RESOURCE write_stream.sample_elapsed_ms value=1096.000 size_mib=8 runs=5 it
 PERF_RESOURCE write_stream.max_rss_kb value=286048 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
 PERF_RUN_COMPLETE operation=write_stream
 EOF
-  if [ "${baseline_run}" -eq 1 ]; then
-    cat >> "${log_file}" <<'EOF'
+    if [ "${baseline_run}" -eq 1 ]; then
+      cat >> "${log_file}" <<'EOF'
 PERF_WRITE_PROFILE stage=codec_only median_ms=10.000 throughput_mib_s=800.000 size_mib=8 runs=5 chunks=128
 PERF_WRITE_PROFILE stage=signing_only median_ms=640.369 throughput_mib_s=12.493 size_mib=8 runs=5 chunks=128
 PERF_WRITE_PROFILE stage=session_no_outbound_retention median_ms=658.768 throughput_mib_s=12.153 size_mib=8 runs=5 chunks=128
 PERF_WRITE_PROFILE stage=full_synthetic median_ms=659.644 throughput_mib_s=12.128 size_mib=8 runs=5 chunks=128
 EOF
+    fi
+    printf '\tMaximum resident set size (kbytes): 682080\n' >> "${log_file}"
+  done
+}
+
+expect_parser_failure() {
+  local scenario_dir="$1"
+  local name="$2"
+  local fixture="$3"
+  if "${SCRIPT_DIR}/parse-resource-performance" "${fixture}" \
+    >"${scenario_dir}/${name}.out" 2>"${scenario_dir}/${name}.err"; then
+    echo "parser unexpectedly accepted ${name}" >&2
+    return 1
   fi
-  printf '\tMaximum resident set size (kbytes): 682080\n' >> "${log_file}"
-done
+  test -s "${scenario_dir}/${name}.err"
+}
 
-RESOURCE_PERFORMANCE_LOG="${log_file}" \
-GITHUB_STEP_SUMMARY="${summary_file}" \
-GITHUB_SHA="0123456789abcdef" \
-GITHUB_RUN_ID="1234567890" \
-GITHUB_RUN_ATTEMPT="2" \
-SWIFT_IMAGE="swift:test" \
-RUNNER_OS="Linux" \
-RUNNER_ARCH="X64" \
-RESOURCE_BASELINE_RUNS=2 \
-DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:deadbeef' \
-PATH="${temporary}:${PATH}" \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"
+test_syntax_checks() {
+  local script
+  for script in \
+    "${SCRIPT_DIR}/swift-image" \
+    "${SCRIPT_DIR}/run-performance-regression" \
+    "${SCRIPT_DIR}/run-resource-performance" \
+    "${SCRIPT_DIR}/resource-performance-metadata" \
+    "${SCRIPT_DIR}/parse-resource-performance" \
+    "${SCRIPT_DIR}/publish-resource-performance-summary" \
+    "${SCRIPT_DIR}/write-resource-performance-artifact" \
+    "${SCRIPT_DIR}/compare-resource-performance"; do
+    case "${script}" in
+      *parse-resource-performance) ;;
+      *) bash -n "${script}" ;;
+    esac
+  done
+  PYTHONDONTWRITEBYTECODE=1 python3 - "${SCRIPT_DIR}/parse-resource-performance" <<'PY'
+import ast
+import pathlib
+import sys
 
-grep -F '### Run metadata' "${summary_file}"
-grep -F -- '- Commit SHA: `0123456789abcdef`' "${summary_file}"
-grep -F -- '- Swift image: `swift:test`' "${summary_file}"
-grep -F -- '- Image digest: `swift:test@sha256:deadbeef`' "${summary_file}"
-grep -F -- '- Runner: `Linux/X64`' "${summary_file}"
-grep -F -- '- GITHUB_RUN_ID: `1234567890`' "${summary_file}"
-grep -F -- '- GITHUB_RUN_ATTEMPT: `2`' "${summary_file}"
-grep -F -- '- Swift version full: `Swift version 6.2.0 (swift-6.2.0-RELEASE)`' "${summary_file}"
-grep -F -- '- Kernel: `Linux 6.8.0 x86_64`' "${summary_file}"
-grep -F -- '- CPU model: `Genuine Intel(R) CPU`' "${summary_file}"
-grep -F -- '- CPU count: `4`' "${summary_file}"
-grep -F -- '- Baseline runs: **2**' "${summary_file}"
-grep -F -- '- Raw samples: **read_stream=10, write_stream=10**' "${summary_file}"
-grep -F -- '- Build cache exact hit: **false**' "${summary_file}"
+ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+PY
+}
 
-# Literal Markdown backticks are intentional; expanding them would execute commands.
-# shellcheck disable=SC2016
-grep -F '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 MiB/s; 737.364 MiB/s–737.364 MiB/s | 2 |' "${summary_file}"
-# shellcheck disable=SC2016
-grep -F '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | Lower ↓ | Observation only | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 200.000 ms–200.000 ms | 2 |' "${summary_file}"
-# shellcheck disable=SC2016
-grep -F '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | Stable window | ≥ 200 ms | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' "${summary_file}"
-# shellcheck disable=SC2016
-grep -F '| `write_stream` | Process max RSS | ✅ Pass | 279.3 MiB | Lower ↓ | < 512 MiB | Peak | 8 MiB × 5 runs × 1 iterations | MAD 0.0 MiB; 279.3 MiB–279.3 MiB | 2 |' "${summary_file}"
-grep -F '### CPU efficiency (Observe-only)' "${summary_file}"
-grep -F 'These derived metrics are Observe-only and do not affect guardrail results or exit status.' "${summary_file}"
-# Literal Markdown backticks are intentional.
-# shellcheck disable=SC2016
-grep -F '| `read_stream` | 1.250 | 0.025 | 0.833 |' "${summary_file}"
-# shellcheck disable=SC2016
-grep -F '| `write_stream` | 137.750 | 0.000 | 1.005 |' "${summary_file}"
-grep -F 'Compiler + XCTest maximum RSS: **666.1 MiB** (682080 KiB).' "${summary_file}"
-grep -F '| Stage | Median | Effective throughput | Share of full synthetic | Interpretation |' "${summary_file}"
-grep -F '| signing only | 640.369 ms | 12.493 MiB/s | 0.971 | AES-CMAC cost |' "${summary_file}"
-grep -F '| full synthetic | 659.644 ms | 12.128 MiB/s | 1.000 | End-to-end synthetic write |' "${summary_file}"
+test_swift_image() {
+  local expected_image
+  expected_image="swift:$(tr -d '[:space:]' < "${REPO_ROOT}/.swift-version")"
+  local actual_image
+  actual_image="$("${SCRIPT_DIR}/swift-image")"
+  if [ "${actual_image}" != "${expected_image}" ]; then
+    echo "swift-image mismatch: expected ${expected_image}, got ${actual_image}" >&2
+    return 1
+  fi
+}
 
-single_run_log="${temporary}/single-run.log"
-awk '/^PERF_BASELINE_RUN run=2 / { exit } { print }' "${log_file}" \
-  | sed 's/PERF_BASELINE_RUN run=1 total=2/PERF_BASELINE_RUN run=1 total=1/' \
-  > "${single_run_log}"
-single_run_summary="${temporary}/single-run-summary.md"
-RESOURCE_PERFORMANCE_LOG="${single_run_log}" \
-GITHUB_STEP_SUMMARY="${single_run_summary}" \
-GITHUB_SHA="0123456789abcdef" \
-SWIFT_IMAGE="swift:test" \
-RUNNER_OS="Linux" \
-RUNNER_ARCH="X64" \
-RESOURCE_BASELINE_RUNS=1 \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"
-grep -F -- '- Baseline runs: **1**' "${single_run_summary}"
-grep -F -- '- Raw samples: **read_stream=5, write_stream=5**' "${single_run_summary}"
-# A single baseline uses raw PERF_RESOURCE_SAMPLE values for Spread (raw), not the summary value.
-# shellcheck disable=SC2016
-grep -F '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | 653.061 MiB/s–653.061 MiB/s | 5 |' "${single_run_summary}"
+test_run_resource_performance_log_path() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  write_docker_stub "${scenario_dir}"
 
-jsonl_file="${temporary}/resource.jsonl"
-RESOURCE_PERFORMANCE_LOG="${log_file}" \
-RESOURCE_PERFORMANCE_JSONL="${jsonl_file}" \
+  local docker_stub_marker="${scenario_dir}/docker-stub-called"
+  rm -f "${docker_stub_marker}"
+  if ! (
+    unset RESOURCE_PERFORMANCE_LOG
+    run_resource_performance_without_docker "${scenario_dir}" \
+      "${SCRIPT_DIR}/run-resource-performance" \
+      >"${scenario_dir}/default-unset.out" 2>"${scenario_dir}/default-unset.err"
+  ); then
+    echo 'run-resource-performance unexpectedly rejected an unset log path' >&2
+    return 1
+  fi
+  test -e "${docker_stub_marker}"
+
+  local resource_docker_log="${scenario_dir}/resource-docker-call"
+  rm -f "${docker_stub_marker}" "${resource_docker_log}".*
+  PATH="${scenario_dir}:${PATH}" \
+  SWIFT_IMAGE=swift:test \
+  DOCKER_STUB_MARKER="${docker_stub_marker}" \
+  DOCKER_STUB_LOG="${resource_docker_log}" \
+  RESOURCE_SKIP_BUILD=true \
+    "${SCRIPT_DIR}/run-resource-performance" \
+    >"${scenario_dir}/resource-run.out" 2>"${scenario_dir}/resource-run.err"
+  test -e "${docker_stub_marker}"
+  test "$(cat "${resource_docker_log}.count")" -eq 1
+  expect_contains "${resource_docker_log}.1" \
+    'if [ -x /usr/bin/time ]; then' \
+    'apt-get update -qq' \
+    'emit_env swift_version'
+
+  local metadata_with_digest="${scenario_dir}/metadata-with-digest.jsonl"
+  PATH="${scenario_dir}:${PATH}" \
+  SWIFT_IMAGE=swift:test \
+  GITHUB_SHA=0123456789abcdef \
+  DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:metadata' \
+    "${SCRIPT_DIR}/resource-performance-metadata" >"${metadata_with_digest}"
+  expect_contains "${metadata_with_digest}" \
+    '"image_digest":"swift:test@sha256:metadata"'
+
+  rm -f "${docker_stub_marker}"
+  if ! RESOURCE_PERFORMANCE_LOG="${REPO_ROOT}/.build/resource-performance.log" \
+    run_resource_performance_without_docker "${scenario_dir}" \
+    "${SCRIPT_DIR}/run-resource-performance" \
+    >"${scenario_dir}/default-explicit.out" 2>"${scenario_dir}/default-explicit.err"; then
+    echo 'run-resource-performance unexpectedly rejected the default log path' >&2
+    return 1
+  fi
+  test -e "${docker_stub_marker}"
+
+  rm -f "${docker_stub_marker}"
+  local custom_log="${scenario_dir}/custom/resource.log"
+  if RESOURCE_PERFORMANCE_LOG="${custom_log}" \
+    run_resource_performance_without_docker "${scenario_dir}" \
+    "${SCRIPT_DIR}/run-resource-performance" \
+    >"${scenario_dir}/custom.out" 2>"${scenario_dir}/custom.err"; then
+    echo 'run-resource-performance unexpectedly accepted a custom log path' >&2
+    return 1
+  fi
+  expect_contains "${scenario_dir}/custom.err" \
+    'RESOURCE_PERFORMANCE_LOG must be the default path' \
+    'custom paths are not supported'
+  test ! -e "${docker_stub_marker}"
+}
+
+test_run_performance_regression() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  write_docker_stub "${scenario_dir}"
+  local docker_stub_marker="${scenario_dir}/docker-stub-called"
+  local performance_docker_log="${scenario_dir}/performance-docker-call"
+  rm -f "${docker_stub_marker}" "${performance_docker_log}".*
+  PATH="${scenario_dir}:${PATH}" \
+  SWIFT_IMAGE=swift:test \
+  DOCKER_STUB_MARKER="${docker_stub_marker}" \
+  DOCKER_STUB_LOG="${performance_docker_log}" \
+    "${SCRIPT_DIR}/run-performance-regression" \
+    >"${scenario_dir}/performance.out" 2>"${scenario_dir}/performance.err"
+
+  test -e "${docker_stub_marker}"
+  test "$(cat "${performance_docker_log}.count")" -eq 2
+  printf '%s\n' run --rm swift:test swift --version \
+    | diff -u - "${performance_docker_log}.1"
+  printf '%s\n' run --rm -v "${REPO_ROOT}:/workspace" -w /workspace swift:test swift test --filter SMBeePerformanceRegressionTests \
+    | diff -u - "${performance_docker_log}.2"
+}
+
+test_summary_happy_path() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  write_docker_stub "${scenario_dir}"
+  local log_file="${scenario_dir}/resource.log"
+  local summary_file="${scenario_dir}/summary.md"
+  write_canonical_log "${log_file}"
+
+  RESOURCE_PERFORMANCE_LOG="${log_file}" \
+  GITHUB_STEP_SUMMARY="${summary_file}" \
+  GITHUB_SHA="0123456789abcdef" \
+  GITHUB_RUN_ID="1234567890" \
+  GITHUB_RUN_ATTEMPT="2" \
+  SWIFT_IMAGE="swift:test" \
+  RUNNER_OS="Linux" \
+  RUNNER_ARCH="X64" \
+  RESOURCE_BASELINE_RUNS=2 \
+  DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:deadbeef' \
+  PATH="${scenario_dir}:${PATH}" \
+    "${SCRIPT_DIR}/publish-resource-performance-summary"
+
+  # Literal Markdown backticks are intentional; expanding them would execute commands.
+  # shellcheck disable=SC2016
+  expect_contains "${summary_file}" \
+    '### Run metadata' \
+    '- Commit SHA: `0123456789abcdef`' \
+    '- Swift image: `swift:test`' \
+    '- Image digest: `swift:test@sha256:deadbeef`' \
+    '- Runner: `Linux/X64`' \
+    '- GITHUB_RUN_ID: `1234567890`' \
+    '- GITHUB_RUN_ATTEMPT: `2`' \
+    '- Swift version full: `Swift version 6.2.0 (swift-6.2.0-RELEASE)`' \
+    '- Kernel: `Linux 6.8.0 x86_64`' \
+    '- CPU model: `Genuine Intel(R) CPU`' \
+    '- CPU count: `4`' \
+    '- Baseline runs: **2**' \
+    '- Raw samples: **read_stream=10, write_stream=10**' \
+    '- Build cache exact hit: **false**' \
+    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 MiB/s; 737.364 MiB/s–737.364 MiB/s | 2 |' \
+    '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | Lower ↓ | Observation only | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 200.000 ms–200.000 ms | 2 |' \
+    '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | Stable window | ≥ 200 ms | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' \
+    '| `write_stream` | Process max RSS | ✅ Pass | 279.3 MiB | Lower ↓ | < 512 MiB | Peak | 8 MiB × 5 runs × 1 iterations | MAD 0.0 MiB; 279.3 MiB–279.3 MiB | 2 |' \
+    '### CPU efficiency (Observe-only)' \
+    'These derived metrics are Observe-only and do not affect guardrail results or exit status.' \
+    '| `read_stream` | 1.250 | 0.025 | 0.833 |' \
+    '| `write_stream` | 137.750 | 0.000 | 1.005 |' \
+    'Compiler + XCTest maximum RSS: **666.1 MiB** (682080 KiB).' \
+    '| Stage | Median | Effective throughput | Share of full synthetic | Interpretation |' \
+    '| signing only | 640.369 ms | 12.493 MiB/s | 0.971 | AES-CMAC cost |' \
+    '| full synthetic | 659.644 ms | 12.128 MiB/s | 1.000 | End-to-end synthetic write |'
+
+  local single_run_log="${scenario_dir}/single-run.log"
+  awk '/^PERF_BASELINE_RUN run=2 / { exit } { print }' "${log_file}" \
+    | sed 's/PERF_BASELINE_RUN run=1 total=2/PERF_BASELINE_RUN run=1 total=1/' \
+    > "${single_run_log}"
+  local single_run_summary="${scenario_dir}/single-run-summary.md"
+  RESOURCE_PERFORMANCE_LOG="${single_run_log}" \
+  GITHUB_STEP_SUMMARY="${single_run_summary}" \
+  GITHUB_SHA="0123456789abcdef" \
+  SWIFT_IMAGE="swift:test" \
+  RUNNER_OS="Linux" \
+  RUNNER_ARCH="X64" \
+  RESOURCE_BASELINE_RUNS=1 \
+    "${SCRIPT_DIR}/publish-resource-performance-summary"
+  # Literal Markdown backticks are intentional.
+  # shellcheck disable=SC2016
+  expect_contains "${single_run_summary}" \
+    '- Baseline runs: **1**' \
+    '- Raw samples: **read_stream=5, write_stream=5**' \
+    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | 653.061 MiB/s–653.061 MiB/s | 5 |'
+}
+
+test_artifact_jsonl() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  write_docker_stub "${scenario_dir}"
+  local log_file="${scenario_dir}/resource.log"
+  local jsonl_file="${scenario_dir}/resource.jsonl"
+  write_canonical_log "${log_file}"
+  RESOURCE_PERFORMANCE_LOG="${log_file}" \
+  RESOURCE_PERFORMANCE_JSONL="${jsonl_file}" \
   RESOURCE_BASELINE_RUNS=2 \
   SWIFT_IMAGE="swift:test" \
-GITHUB_SHA="0123456789abcdef" \
-GITHUB_RUN_ID="1234567890" \
-GITHUB_RUN_ATTEMPT="2" \
-RUNNER_OS="Linux" \
-RUNNER_ARCH="X64" \
-DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:deadbeef' \
-PATH="${temporary}:${PATH}" \
-  "${SCRIPT_DIR}/write-resource-performance-artifact"
-grep -F '"type":"metadata","commit_sha":"0123456789abcdef"' "${jsonl_file}"
-grep -F '"baseline_runs":2' "${jsonl_file}"
-grep -F '"swift_version_full":"Swift version 6.2.0 (swift-6.2.0-RELEASE)"' "${jsonl_file}"
-grep -F '"image_digest":"swift:test@sha256:deadbeef"' "${jsonl_file}"
-grep -F '"github_run_id":"1234567890","github_run_attempt":"2"' "${jsonl_file}"
-grep -F '"type":"env","key":"swift_version","value":"Swift version 6.2.0 (swift-6.2.0-RELEASE)"' "${jsonl_file}"
-grep -F '"type":"sample","baseline_run":1,"operation":"read_stream","run":1,"elapsed_ms":245.000' "${jsonl_file}"
-grep -F '"type":"summary","baseline_run":1,"name":"read_stream.throughput_mib_s","value":737.364' "${jsonl_file}"
-grep -F '"type":"derived","baseline_run":1,"operation":"read_stream","user_cpu_ms_per_mib":1.250,"system_cpu_ms_per_mib":0.025,"cpu_utilization":0.833' "${jsonl_file}"
-grep -F '"type":"derived","baseline_run":1,"operation":"write_stream","user_cpu_ms_per_mib":137.750,"system_cpu_ms_per_mib":0.000,"cpu_utilization":1.005' "${jsonl_file}"
-grep -F '"type":"derived_stage","baseline_run":1,"stage":"signing_only","share_of_full_synthetic":0.971' "${jsonl_file}"
-grep -F '"type":"derived_stage","baseline_run":1,"stage":"full_synthetic","share_of_full_synthetic":1.000' "${jsonl_file}"
-grep -F '"type":"process","baseline_run":1,"metric":"max_rss_kb","value":682080' "${jsonl_file}"
-grep -F '"type":"write_profile","baseline_run":1,"stage":"signing_only","median_ms":640.369' "${jsonl_file}"
-grep -F '"type":"sample","baseline_run":2,"operation":"read_stream","run":1,"elapsed_ms":245.000' "${jsonl_file}"
-grep -F '"type":"sample","baseline_run":2,"operation":"write_stream","run":1,"elapsed_ms":1096.000' "${jsonl_file}"
-for operation in read_stream write_stream; do
-  for metric in throughput_mib_s user_cpu_ms system_cpu_ms sample_elapsed_ms max_rss_kb; do
-    grep -F "\"type\":\"summary\",\"baseline_run\":2,\"name\":\"${operation}.${metric}\"" "${jsonl_file}"
-  done
-done
-grep -F '"type":"process","baseline_run":2,"metric":"max_rss_kb","value":682080' "${jsonl_file}"
+  GITHUB_SHA="0123456789abcdef" \
+  GITHUB_RUN_ID="1234567890" \
+  GITHUB_RUN_ATTEMPT="2" \
+  RUNNER_OS="Linux" \
+  RUNNER_ARCH="X64" \
+  DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:deadbeef' \
+  PATH="${scenario_dir}:${PATH}" \
+    "${SCRIPT_DIR}/write-resource-performance-artifact"
 
-compare_reference="${temporary}/compare-reference.jsonl"
-compare_metadata_mismatch="${temporary}/compare-metadata-mismatch.jsonl"
-compare_workload_mismatch="${temporary}/compare-workload-mismatch.jsonl"
-compare_parse_failure="${temporary}/compare-parse-failure.jsonl"
-python3 - "${jsonl_file}" "${compare_reference}" "${compare_metadata_mismatch}" "${compare_workload_mismatch}" "${compare_parse_failure}" <<'PY'
+  expect_contains "${jsonl_file}" \
+    '"type":"metadata","commit_sha":"0123456789abcdef"' \
+    '"baseline_runs":2' \
+    '"swift_version_full":"Swift version 6.2.0 (swift-6.2.0-RELEASE)"' \
+    '"image_digest":"swift:test@sha256:deadbeef"' \
+    '"github_run_id":"1234567890","github_run_attempt":"2"' \
+    '"type":"env","key":"swift_version","value":"Swift version 6.2.0 (swift-6.2.0-RELEASE)"' \
+    '"type":"sample","baseline_run":1,"operation":"read_stream","run":1,"elapsed_ms":245.000' \
+    '"type":"summary","baseline_run":1,"name":"read_stream.throughput_mib_s","value":737.364' \
+    '"type":"derived","baseline_run":1,"operation":"read_stream","user_cpu_ms_per_mib":1.250,"system_cpu_ms_per_mib":0.025,"cpu_utilization":0.833' \
+    '"type":"derived","baseline_run":1,"operation":"write_stream","user_cpu_ms_per_mib":137.750,"system_cpu_ms_per_mib":0.000,"cpu_utilization":1.005' \
+    '"type":"derived_stage","baseline_run":1,"stage":"signing_only","share_of_full_synthetic":0.971' \
+    '"type":"derived_stage","baseline_run":1,"stage":"full_synthetic","share_of_full_synthetic":1.000' \
+    '"type":"process","baseline_run":1,"metric":"max_rss_kb","value":682080' \
+    '"type":"write_profile","baseline_run":1,"stage":"signing_only","median_ms":640.369' \
+    '"type":"sample","baseline_run":2,"operation":"read_stream","run":1,"elapsed_ms":245.000' \
+    '"type":"sample","baseline_run":2,"operation":"write_stream","run":1,"elapsed_ms":1096.000'
+  local operation metric
+  for operation in read_stream write_stream; do
+    for metric in throughput_mib_s user_cpu_ms system_cpu_ms sample_elapsed_ms max_rss_kb; do
+      expect_contains "${jsonl_file}" \
+        "\"type\":\"summary\",\"baseline_run\":2,\"name\":\"${operation}.${metric}\""
+    done
+  done
+  expect_contains "${jsonl_file}" \
+    '"type":"process","baseline_run":2,"metric":"max_rss_kb","value":682080'
+}
+
+test_compare_history() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  write_docker_stub "${scenario_dir}"
+  local log_file="${scenario_dir}/resource.log"
+  local jsonl_file="${scenario_dir}/resource.jsonl"
+  write_canonical_log "${log_file}"
+  RESOURCE_PERFORMANCE_LOG="${log_file}" \
+  RESOURCE_PERFORMANCE_JSONL="${jsonl_file}" \
+  RESOURCE_BASELINE_RUNS=2 \
+  SWIFT_IMAGE="swift:test" \
+  GITHUB_SHA="0123456789abcdef" \
+  GITHUB_RUN_ID="1234567890" \
+  GITHUB_RUN_ATTEMPT="2" \
+  RUNNER_OS="Linux" \
+  RUNNER_ARCH="X64" \
+  DOCKER_STUB_IMAGE_DIGEST='swift:test@sha256:deadbeef' \
+  PATH="${scenario_dir}:${PATH}" \
+    "${SCRIPT_DIR}/write-resource-performance-artifact"
+
+  local compare_reference="${scenario_dir}/compare-reference.jsonl"
+  local compare_metadata_mismatch="${scenario_dir}/compare-metadata-mismatch.jsonl"
+  local compare_workload_mismatch="${scenario_dir}/compare-workload-mismatch.jsonl"
+  local compare_parse_failure="${scenario_dir}/compare-parse-failure.jsonl"
+  python3 - "${jsonl_file}" "${compare_reference}" "${compare_metadata_mismatch}" "${compare_workload_mismatch}" "${compare_parse_failure}" <<'PY'
 import copy
 import json
 import sys
@@ -346,194 +450,233 @@ for path, fixture in (
             stream.write(json.dumps(row, separators=(",", ":")) + "\n")
 PY
 
-compare_output="${temporary}/compare-output.md"
-compare_status=0
-"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_reference}" >"${compare_output}" || compare_status=$?
-test "${compare_status}" -eq 0
-grep -F '| `read_stream` | `throughput_mib_s` | 737.364 MiB/s | 368.682 MiB/s | improved (+100.0%) |' "${compare_output}"
-grep -F '| `read_stream` | `user_cpu_ms` | 200.000 ms | 400.000 ms | improved (-50.0%) |' "${compare_output}"
-grep -F '| `read_stream` | `system_cpu_ms` | 4.000 ms | 8.000 ms | improved (-50.0%) |' "${compare_output}"
-grep -F '| `read_stream` | `max_rss_kb` | 286048.0 KiB | 572096.0 KiB | improved (-50.0%) |' "${compare_output}"
-grep -F '| `write_stream` | `system_cpu_ms` | 0.000 ms | 0.000 ms | unchanged (±0.0%) |' "${compare_output}"
-grep -F 'Advisory only' "${compare_output}"
-if grep -Eq '✅|❌|Pass|Fail' "${compare_output}"; then
-  echo 'comparison unexpectedly included guardrail status' >&2
-  exit 1
-fi
-
-no_baseline_output="${temporary}/no-baseline.md"
-"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${temporary}/missing-reference.jsonl" >"${no_baseline_output}"
-grep -F 'No comparable baseline (reference JSONL is missing).' "${no_baseline_output}"
-"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_metadata_mismatch}" >"${no_baseline_output}"
-grep -F 'No comparable baseline (metadata mismatch: runner_os).' "${no_baseline_output}"
-"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_workload_mismatch}" >"${no_baseline_output}"
-grep -F 'No comparable baseline (workload mismatch: read_stream).' "${no_baseline_output}"
-"${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_parse_failure}" >"${no_baseline_output}"
-grep -F 'No comparable baseline (reference JSONL contains parse_failure).' "${no_baseline_output}"
-
-baseline_summary="${temporary}/baseline.md"
-"${SCRIPT_DIR}/summarize-resource-baseline" "${jsonl_file}" > "${baseline_summary}"
-grep -F '# SMBee resource performance baseline' "${baseline_summary}"
-# Literal Markdown backticks are intentional.
-# shellcheck disable=SC2016
-grep -F '| `read_stream.throughput_mib_s` | 2 | 737.364 | 737.364 | 737.364 | 0.000 | 0.0000 | 737.364 | 737.364 |' "${baseline_summary}"
-grep -F -- '- first invocation (includes Release build): 666.1 MiB' "${baseline_summary}"
-grep -F -- '- baseline invocations: 2' "${baseline_summary}"
-
-zero_denominator_log="${temporary}/zero-denominator.log"
-sed \
-  -e 's/total_size_mib=160/total_size_mib=0/g' \
-  -e 's/size_mib=160/size_mib=0/g' \
-  -e 's/PERF_RESOURCE read_stream.sample_elapsed_ms value=245.000/PERF_RESOURCE read_stream.sample_elapsed_ms value=0.000/' \
-  "${log_file}" > "${zero_denominator_log}"
-zero_denominator_summary="${temporary}/zero-denominator-summary.md"
-RESOURCE_PERFORMANCE_LOG="${zero_denominator_log}" \
-GITHUB_STEP_SUMMARY="${zero_denominator_summary}" \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"
-# A zero workload and zero elapsed denominator are explicitly rendered as n/a.
-# shellcheck disable=SC2016
-grep -F '| `read_stream` | n/a | n/a | n/a |' "${zero_denominator_summary}"
-zero_denominator_jsonl="${temporary}/zero-denominator.jsonl"
-"${SCRIPT_DIR}/parse-resource-performance" "${zero_denominator_log}" > "${zero_denominator_jsonl}"
-grep -F '"type":"derived","baseline_run":1,"operation":"read_stream","user_cpu_ms_per_mib":null,"system_cpu_ms_per_mib":null,"cpu_utilization":null' "${zero_denominator_jsonl}"
-
-missing_full_log="${temporary}/missing-full-synthetic.log"
-grep -v 'stage=full_synthetic ' "${log_file}" > "${missing_full_log}"
-missing_full_jsonl="${temporary}/missing-full-synthetic.jsonl"
-"${SCRIPT_DIR}/parse-resource-performance" "${missing_full_log}" > "${missing_full_jsonl}"
-if grep -q '"type":"derived_stage"' "${missing_full_jsonl}"; then
-  echo 'parser unexpectedly emitted a stage share without full_synthetic' >&2
-  exit 1
-fi
-missing_full_summary="${temporary}/missing-full-synthetic-summary.md"
-RESOURCE_PERFORMANCE_LOG="${missing_full_log}" \
-GITHUB_STEP_SUMMARY="${missing_full_summary}" \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"
-# A missing full_synthetic denominator leaves the profile share unavailable.
-# shellcheck disable=SC2016
-grep -F '| signing only | 640.369 ms | 12.493 MiB/s | n/a | AES-CMAC cost |' "${missing_full_summary}"
-
-expect_parser_failure() {
-  local name="$1"
-  local fixture="$2"
-  if "${SCRIPT_DIR}/parse-resource-performance" "${fixture}" >"${temporary}/${name}.out" 2>"${temporary}/${name}.err"; then
-    echo "parser unexpectedly accepted ${name}" >&2
-    exit 1
+  local compare_output="${scenario_dir}/compare-output.md"
+  local compare_status=0
+  "${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_reference}" \
+    >"${compare_output}" || compare_status=$?
+  test "${compare_status}" -eq 0
+  # Literal Markdown backticks are intentional.
+  # shellcheck disable=SC2016
+  expect_contains "${compare_output}" \
+    '| `read_stream` | `throughput_mib_s` | 737.364 MiB/s | 368.682 MiB/s | improved (+100.0%) |' \
+    '| `read_stream` | `user_cpu_ms` | 200.000 ms | 400.000 ms | improved (-50.0%) |' \
+    '| `read_stream` | `system_cpu_ms` | 4.000 ms | 8.000 ms | improved (-50.0%) |' \
+    '| `read_stream` | `max_rss_kb` | 286048.0 KiB | 572096.0 KiB | improved (-50.0%) |' \
+    '| `write_stream` | `system_cpu_ms` | 0.000 ms | 0.000 ms | unchanged (±0.0%) |' \
+    'Advisory only'
+  if grep -Eq '✅|❌|Pass|Fail' "${compare_output}"; then
+    echo 'comparison unexpectedly included guardrail status' >&2
+    return 1
   fi
-  test -s "${temporary}/${name}.err"
+
+  local no_baseline_output="${scenario_dir}/no-baseline.md"
+  "${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${scenario_dir}/missing-reference.jsonl" \
+    >"${no_baseline_output}"
+  expect_contains "${no_baseline_output}" 'No comparable baseline (reference JSONL is missing).'
+  "${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_metadata_mismatch}" \
+    >"${no_baseline_output}"
+  expect_contains "${no_baseline_output}" 'No comparable baseline (metadata mismatch: runner_os).'
+  "${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_workload_mismatch}" \
+    >"${no_baseline_output}"
+  expect_contains "${no_baseline_output}" 'No comparable baseline (workload mismatch: read_stream).'
+  "${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_parse_failure}" \
+    >"${no_baseline_output}"
+  expect_contains "${no_baseline_output}" 'No comparable baseline (reference JSONL contains parse_failure).'
+
+  local baseline_summary="${scenario_dir}/baseline.md"
+  "${SCRIPT_DIR}/summarize-resource-baseline" "${jsonl_file}" >"${baseline_summary}"
+  # Literal Markdown backticks are intentional.
+  # shellcheck disable=SC2016
+  expect_contains "${baseline_summary}" \
+    '# SMBee resource performance baseline' \
+    '| `read_stream.throughput_mib_s` | 2 | 737.364 | 737.364 | 737.364 | 0.000 | 0.0000 | 737.364 | 737.364 |' \
+    '- first invocation (includes Release build): 666.1 MiB' \
+    '- baseline invocations: 2'
 }
 
-sed '/^PERF_RESOURCE_SAMPLE operation=read_stream run=1 /s/ iterations=20//' "${log_file}" > "${temporary}/missing-field.log"
-expect_parser_failure missing-field "${temporary}/missing-field.log"
-sed 's/elapsed_ms=245.000/elapsed_ms=not-a-number/' "${log_file}" > "${temporary}/invalid-number.log"
-expect_parser_failure invalid-number "${temporary}/invalid-number.log"
-sed 's/PERF_METRIC deterministic_command_count actual=12 expected=12/PERF_METRIC deterministic_command_count actual=12/' "${log_file}" > "${temporary}/malformed-metric.log"
-expect_parser_failure malformed-metric "${temporary}/malformed-metric.log"
-sed 's/PERF_METRIC deterministic_command_count actual=12 expected=12/PERF_METRIC deterministic_command_count actual=-1.25e+2 expected=2.5E2/' "${log_file}" > "${temporary}/numeric-metric.log"
-"${SCRIPT_DIR}/parse-resource-performance" "${temporary}/numeric-metric.log" > /dev/null
-cp "${log_file}" "${temporary}/malformed.log"
-echo 'PERF_RESOURCE_SAMPLE malformed' >> "${temporary}/malformed.log"
-expect_parser_failure malformed "${temporary}/malformed.log"
-grep -v '^PERF_FORMAT ' "${log_file}" > "${temporary}/missing-format.log"
-expect_parser_failure missing-format "${temporary}/missing-format.log"
-sed 's/PERF_FORMAT version=1/PERF_FORMAT version=2/' "${log_file}" > "${temporary}/wrong-format.log"
-expect_parser_failure wrong-format "${temporary}/wrong-format.log"
-sed '/^PERF_RUN_COMPLETE operation=read_stream/d' "${log_file}" > "${temporary}/missing-completion.log"
-expect_parser_failure missing-completion "${temporary}/missing-completion.log"
-awk '/PERF_RESOURCE read_stream.throughput_mib_s value=737.364/ { print; print "PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release"; next } { print }' "${log_file}" > "${temporary}/duplicate-metric.log"
-expect_parser_failure duplicate-metric "${temporary}/duplicate-metric.log"
-awk '/PERF_RUN_COMPLETE operation=read_stream/ { print; print "PERF_RESOURCE_SAMPLE operation=read_stream run=1 elapsed_ms=245.000 throughput_mib_s=653.061 user_cpu_ms=200.000 system_cpu_ms=4.000 max_rss_kb=286048 total_size_mib=160 iterations=20"; next } { print }' "${log_file}" > "${temporary}/resource-after-completion.log"
-expect_parser_failure resource-after-completion "${temporary}/resource-after-completion.log"
-awk '/PERF_RUN_COMPLETE operation=read_stream/ { print; print "PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release"; next } { print }' "${log_file}" > "${temporary}/summary-after-completion.log"
-expect_parser_failure summary-after-completion "${temporary}/summary-after-completion.log"
-# PERF_FORMAT after the previous operation's completion is legitimate (each
-# resource test prints one), so the failure case is FORMAT after ALL
-# operations of the baseline run completed.
-awk '/PERF_RUN_COMPLETE operation=write_stream/ { print; print "PERF_FORMAT version=1"; next } { print }' "${log_file}" > "${temporary}/format-after-completion.log"
-expect_parser_failure format-after-completion "${temporary}/format-after-completion.log"
-cp "${log_file}" "${temporary}/duplicate-baseline.log"
-echo 'PERF_BASELINE_RUN run=1 total=2' >> "${temporary}/duplicate-baseline.log"
-expect_parser_failure duplicate-baseline "${temporary}/duplicate-baseline.log"
-sed 's/PERF_BASELINE_RUN run=2 total=2/PERF_BASELINE_RUN run=3 total=2/' "${log_file}" > "${temporary}/noncontinuous-baseline.log"
-expect_parser_failure noncontinuous-baseline "${temporary}/noncontinuous-baseline.log"
-grep -v 'write_stream' "${log_file}" > "${temporary}/missing-operation.log"
-expect_parser_failure missing-operation "${temporary}/missing-operation.log"
-cp "${log_file}" "${temporary}/duplicate-env.log"
-echo 'PERF_ENV kernel Duplicate kernel value' >> "${temporary}/duplicate-env.log"
-expect_parser_failure duplicate-env "${temporary}/duplicate-env.log"
+test_parser_rejects_malformed() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  local log_file="${scenario_dir}/resource.log"
+  write_canonical_log "${log_file}"
 
-boundary_log="${temporary}/boundary.log"
-sed \
-  -e 's/PERF_RESOURCE read_stream.throughput_mib_s value=737.364/PERF_RESOURCE read_stream.throughput_mib_s value=400.000/' \
-  -e 's/PERF_RESOURCE read_stream.sample_elapsed_ms value=245.000/PERF_RESOURCE read_stream.sample_elapsed_ms value=200.000/' \
-  -e 's/PERF_RESOURCE write_stream.max_rss_kb value=286048/PERF_RESOURCE write_stream.max_rss_kb value=524288/' \
-  "${log_file}" > "${boundary_log}"
-boundary_summary="${temporary}/boundary-summary.md"
-RESOURCE_PERFORMANCE_LOG="${boundary_log}" \
-GITHUB_STEP_SUMMARY="${boundary_summary}" \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"
-# Existing comparison operators are part of the contract: throughput/RSS fail at equality, duration passes at equality.
-# shellcheck disable=SC2016
-grep -F '| `read_stream` | Throughput | ❌ Fail | 400.000 MiB/s | Higher ↑ | > 400 MiB/s | Median |' "${boundary_summary}"
-# shellcheck disable=SC2016
-grep -F '| `read_stream` | Measured duration | ✅ Pass | 200.000 ms | Stable window | ≥ 200 ms | Median |' "${boundary_summary}"
-# shellcheck disable=SC2016
-grep -F '| `write_stream` | Process max RSS | ❌ Fail | 512.0 MiB | Lower ↓ | < 512 MiB | Peak |' "${boundary_summary}"
+  sed '/^PERF_RESOURCE_SAMPLE operation=read_stream run=1 /s/ iterations=20//' "${log_file}" > "${scenario_dir}/missing-field.log"
+  expect_parser_failure "${scenario_dir}" missing-field "${scenario_dir}/missing-field.log"
+  sed 's/elapsed_ms=245.000/elapsed_ms=not-a-number/' "${log_file}" > "${scenario_dir}/invalid-number.log"
+  expect_parser_failure "${scenario_dir}" invalid-number "${scenario_dir}/invalid-number.log"
+  sed 's/PERF_METRIC deterministic_command_count actual=12 expected=12/PERF_METRIC deterministic_command_count actual=12/' "${log_file}" > "${scenario_dir}/malformed-metric.log"
+  expect_parser_failure "${scenario_dir}" malformed-metric "${scenario_dir}/malformed-metric.log"
+  sed 's/PERF_METRIC deterministic_command_count actual=12 expected=12/PERF_METRIC deterministic_command_count actual=-1.25e+2 expected=2.5E2/' "${log_file}" > "${scenario_dir}/numeric-metric.log"
+  "${SCRIPT_DIR}/parse-resource-performance" "${scenario_dir}/numeric-metric.log" >/dev/null
+  cp "${log_file}" "${scenario_dir}/malformed.log"
+  echo 'PERF_RESOURCE_SAMPLE malformed' >> "${scenario_dir}/malformed.log"
+  expect_parser_failure "${scenario_dir}" malformed "${scenario_dir}/malformed.log"
+  grep -v '^PERF_FORMAT ' "${log_file}" > "${scenario_dir}/missing-format.log"
+  expect_parser_failure "${scenario_dir}" missing-format "${scenario_dir}/missing-format.log"
+  sed 's/PERF_FORMAT version=1/PERF_FORMAT version=2/' "${log_file}" > "${scenario_dir}/wrong-format.log"
+  expect_parser_failure "${scenario_dir}" wrong-format "${scenario_dir}/wrong-format.log"
+  sed '/^PERF_RUN_COMPLETE operation=read_stream/d' "${log_file}" > "${scenario_dir}/missing-completion.log"
+  expect_parser_failure "${scenario_dir}" missing-completion "${scenario_dir}/missing-completion.log"
+  awk '/PERF_RESOURCE read_stream.throughput_mib_s value=737.364/ { print; print "PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release"; next } { print }' "${log_file}" > "${scenario_dir}/duplicate-metric.log"
+  expect_parser_failure "${scenario_dir}" duplicate-metric "${scenario_dir}/duplicate-metric.log"
+  awk '/PERF_RUN_COMPLETE operation=read_stream/ { print; print "PERF_RESOURCE_SAMPLE operation=read_stream run=1 elapsed_ms=245.000 throughput_mib_s=653.061 user_cpu_ms=200.000 system_cpu_ms=4.000 max_rss_kb=286048 total_size_mib=160 iterations=20"; next } { print }' "${log_file}" > "${scenario_dir}/resource-after-completion.log"
+  expect_parser_failure "${scenario_dir}" resource-after-completion "${scenario_dir}/resource-after-completion.log"
+  awk '/PERF_RUN_COMPLETE operation=read_stream/ { print; print "PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release"; next } { print }' "${log_file}" > "${scenario_dir}/summary-after-completion.log"
+  expect_parser_failure "${scenario_dir}" summary-after-completion "${scenario_dir}/summary-after-completion.log"
+  # PERF_FORMAT after the previous operation's completion is legitimate (each
+  # resource test prints one), so the failure case is FORMAT after ALL
+  # operations of the baseline run completed.
+  awk '/PERF_RUN_COMPLETE operation=write_stream/ { print; print "PERF_FORMAT version=1"; next } { print }' "${log_file}" > "${scenario_dir}/format-after-completion.log"
+  expect_parser_failure "${scenario_dir}" format-after-completion "${scenario_dir}/format-after-completion.log"
+  cp "${log_file}" "${scenario_dir}/duplicate-baseline.log"
+  echo 'PERF_BASELINE_RUN run=1 total=2' >> "${scenario_dir}/duplicate-baseline.log"
+  expect_parser_failure "${scenario_dir}" duplicate-baseline "${scenario_dir}/duplicate-baseline.log"
+  sed 's/PERF_BASELINE_RUN run=2 total=2/PERF_BASELINE_RUN run=3 total=2/' "${log_file}" > "${scenario_dir}/noncontinuous-baseline.log"
+  expect_parser_failure "${scenario_dir}" noncontinuous-baseline "${scenario_dir}/noncontinuous-baseline.log"
+  grep -v 'write_stream' "${log_file}" > "${scenario_dir}/missing-operation.log"
+  expect_parser_failure "${scenario_dir}" missing-operation "${scenario_dir}/missing-operation.log"
+  cp "${log_file}" "${scenario_dir}/duplicate-env.log"
+  echo 'PERF_ENV kernel Duplicate kernel value' >> "${scenario_dir}/duplicate-env.log"
+  expect_parser_failure "${scenario_dir}" duplicate-env "${scenario_dir}/duplicate-env.log"
+}
 
-parse_failure_log="${temporary}/parse-failure.log"
-sed '/^PERF_FORMAT /d' "${log_file}" > "${parse_failure_log}"
-if RESOURCE_PERFORMANCE_LOG="${parse_failure_log}" \
-  RESOURCE_PERFORMANCE_JSONL="${temporary}/parse-failure.jsonl" \
-  "${SCRIPT_DIR}/write-resource-performance-artifact"; then
-  echo 'artifact unexpectedly accepted a malformed log' >&2
-  exit 1
-fi
-grep -F '"type":"metadata"' "${temporary}/parse-failure.jsonl"
-grep -F '"type":"parse_failure"' "${temporary}/parse-failure.jsonl"
-parse_failure_summary="${temporary}/parse-failure-summary.md"
-if RESOURCE_PERFORMANCE_LOG="${parse_failure_log}" \
-  GITHUB_STEP_SUMMARY="${parse_failure_summary}" \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"; then
-  echo 'summary unexpectedly accepted a malformed log' >&2
-  exit 1
-fi
-grep -F '❌ Parse failed' "${parse_failure_summary}"
-grep -F 'Parse failed:' "${parse_failure_summary}"
+test_summary_edge_cases() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  local log_file="${scenario_dir}/resource.log"
+  write_canonical_log "${log_file}"
 
-missing_log="${temporary}/missing.log"
-missing_jsonl="${temporary}/missing.jsonl"
-# The hosted runner exports GITHUB_RUN_ID/ATTEMPT for real; unset them so the
-# "unknown" expectations below stay environment-independent.
-env -u GITHUB_RUN_ID -u GITHUB_RUN_ATTEMPT \
-  RESOURCE_PERFORMANCE_LOG="${missing_log}" \
-  RESOURCE_PERFORMANCE_JSONL="${missing_jsonl}" \
-  "${SCRIPT_DIR}/write-resource-performance-artifact"
-grep -F '"type":"metadata"' "${missing_jsonl}"
-missing_summary="${temporary}/missing-summary.md"
-env -u GITHUB_RUN_ID -u GITHUB_RUN_ATTEMPT \
-  RESOURCE_PERFORMANCE_LOG="${missing_log}" \
-  GITHUB_STEP_SUMMARY="${missing_summary}" \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"
-grep -F '⚠️ Unavailable' "${missing_summary}"
-grep -F -- '- Image digest: `unknown`' "${missing_summary}"
-grep -F -- '- GITHUB_RUN_ID: `unknown`' "${missing_summary}"
-grep -F -- '- Swift version full: `unknown`' "${missing_summary}"
-grep -F -- '- Kernel: `unknown`' "${missing_summary}"
-grep -F -- '- CPU model: `unknown`' "${missing_summary}"
-grep -F -- '- CPU count: `unknown`' "${missing_summary}"
+  local zero_denominator_log="${scenario_dir}/zero-denominator.log"
+  sed \
+    -e 's/total_size_mib=160/total_size_mib=0/g' \
+    -e 's/size_mib=160/size_mib=0/g' \
+    -e 's/PERF_RESOURCE read_stream.sample_elapsed_ms value=245.000/PERF_RESOURCE read_stream.sample_elapsed_ms value=0.000/' \
+    "${log_file}" > "${zero_denominator_log}"
+  local zero_denominator_summary="${scenario_dir}/zero-denominator-summary.md"
+  RESOURCE_PERFORMANCE_LOG="${zero_denominator_log}" \
+  GITHUB_STEP_SUMMARY="${zero_denominator_summary}" \
+    "${SCRIPT_DIR}/publish-resource-performance-summary"
+  # Literal Markdown backticks are intentional.
+  # shellcheck disable=SC2016
+  expect_contains "${zero_denominator_summary}" '| `read_stream` | n/a | n/a | n/a |'
+  local zero_denominator_jsonl="${scenario_dir}/zero-denominator.jsonl"
+  "${SCRIPT_DIR}/parse-resource-performance" "${zero_denominator_log}" >"${zero_denominator_jsonl}"
+  expect_contains "${zero_denominator_jsonl}" \
+    '"type":"derived","baseline_run":1,"operation":"read_stream","user_cpu_ms_per_mib":null,"system_cpu_ms_per_mib":null,"cpu_utilization":null'
 
-no_cache_log="${temporary}/no-cache.log"
-grep -v '^PERF_BUILD_CACHE ' "${log_file}" > "${no_cache_log}"
-no_cache_summary="${temporary}/no-cache-summary.md"
-RESOURCE_PERFORMANCE_LOG="${no_cache_log}" \
-GITHUB_STEP_SUMMARY="${no_cache_summary}" \
-GITHUB_SHA="0123456789abcdef" \
-SWIFT_IMAGE="swift:test" \
-RUNNER_OS="Linux" \
-RUNNER_ARCH="X64" \
-RESOURCE_BASELINE_RUNS=2 \
-  "${SCRIPT_DIR}/publish-resource-performance-summary"
-grep -F -- '- Raw samples: **read_stream=10, write_stream=10**' "${no_cache_summary}"
-grep -F -- '- Build cache exact hit: **unknown**' "${no_cache_summary}"
+  local missing_full_log="${scenario_dir}/missing-full-synthetic.log"
+  grep -v 'stage=full_synthetic ' "${log_file}" > "${missing_full_log}"
+  local missing_full_jsonl="${scenario_dir}/missing-full-synthetic.jsonl"
+  "${SCRIPT_DIR}/parse-resource-performance" "${missing_full_log}" >"${missing_full_jsonl}"
+  if grep -q '"type":"derived_stage"' "${missing_full_jsonl}"; then
+    echo 'parser unexpectedly emitted a stage share without full_synthetic' >&2
+    return 1
+  fi
+  local missing_full_summary="${scenario_dir}/missing-full-synthetic-summary.md"
+  RESOURCE_PERFORMANCE_LOG="${missing_full_log}" \
+  GITHUB_STEP_SUMMARY="${missing_full_summary}" \
+    "${SCRIPT_DIR}/publish-resource-performance-summary"
+  expect_contains "${missing_full_summary}" \
+    '| signing only | 640.369 ms | 12.493 MiB/s | n/a | AES-CMAC cost |'
+
+  local boundary_log="${scenario_dir}/boundary.log"
+  sed \
+    -e 's/PERF_RESOURCE read_stream.throughput_mib_s value=737.364/PERF_RESOURCE read_stream.throughput_mib_s value=400.000/' \
+    -e 's/PERF_RESOURCE read_stream.sample_elapsed_ms value=245.000/PERF_RESOURCE read_stream.sample_elapsed_ms value=200.000/' \
+    -e 's/PERF_RESOURCE write_stream.max_rss_kb value=286048/PERF_RESOURCE write_stream.max_rss_kb value=524288/' \
+    "${log_file}" > "${boundary_log}"
+  local boundary_summary="${scenario_dir}/boundary-summary.md"
+  RESOURCE_PERFORMANCE_LOG="${boundary_log}" \
+  GITHUB_STEP_SUMMARY="${boundary_summary}" \
+    "${SCRIPT_DIR}/publish-resource-performance-summary"
+  # Existing comparison operators are part of the contract: throughput/RSS fail at equality, duration passes at equality.
+  # Literal Markdown backticks are intentional.
+  # shellcheck disable=SC2016
+  expect_contains "${boundary_summary}" \
+    '| `read_stream` | Throughput | ❌ Fail | 400.000 MiB/s | Higher ↑ | > 400 MiB/s | Median |' \
+    '| `read_stream` | Measured duration | ✅ Pass | 200.000 ms | Stable window | ≥ 200 ms | Median |' \
+    '| `write_stream` | Process max RSS | ❌ Fail | 512.0 MiB | Lower ↓ | < 512 MiB | Peak |'
+
+  local no_cache_log="${scenario_dir}/no-cache.log"
+  grep -v '^PERF_BUILD_CACHE ' "${log_file}" > "${no_cache_log}"
+  local no_cache_summary="${scenario_dir}/no-cache-summary.md"
+  RESOURCE_PERFORMANCE_LOG="${no_cache_log}" \
+  GITHUB_STEP_SUMMARY="${no_cache_summary}" \
+  GITHUB_SHA="0123456789abcdef" \
+  SWIFT_IMAGE="swift:test" \
+  RUNNER_OS="Linux" \
+  RUNNER_ARCH="X64" \
+  RESOURCE_BASELINE_RUNS=2 \
+    "${SCRIPT_DIR}/publish-resource-performance-summary"
+  expect_contains "${no_cache_summary}" \
+    '- Raw samples: **read_stream=10, write_stream=10**' \
+    '- Build cache exact hit: **unknown**'
+}
+
+test_artifact_and_summary_parse_failure() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  local log_file="${scenario_dir}/resource.log"
+  write_canonical_log "${log_file}"
+  local parse_failure_log="${scenario_dir}/parse-failure.log"
+  sed '/^PERF_FORMAT /d' "${log_file}" > "${parse_failure_log}"
+  local parse_failure_jsonl="${scenario_dir}/parse-failure.jsonl"
+  if RESOURCE_PERFORMANCE_LOG="${parse_failure_log}" \
+    RESOURCE_PERFORMANCE_JSONL="${parse_failure_jsonl}" \
+    "${SCRIPT_DIR}/write-resource-performance-artifact"; then
+    echo 'artifact unexpectedly accepted a malformed log' >&2
+    return 1
+  fi
+  expect_contains "${parse_failure_jsonl}" '"type":"metadata"' '"type":"parse_failure"'
+  local parse_failure_summary="${scenario_dir}/parse-failure-summary.md"
+  if RESOURCE_PERFORMANCE_LOG="${parse_failure_log}" \
+    GITHUB_STEP_SUMMARY="${parse_failure_summary}" \
+    "${SCRIPT_DIR}/publish-resource-performance-summary"; then
+    echo 'summary unexpectedly accepted a malformed log' >&2
+    return 1
+  fi
+  expect_contains "${parse_failure_summary}" '❌ Parse failed' 'Parse failed:'
+}
+
+test_missing_log_metadata() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  local missing_log="${scenario_dir}/missing.log"
+  local missing_jsonl="${scenario_dir}/missing.jsonl"
+  # The hosted runner exports GITHUB_RUN_ID/ATTEMPT for real; unset them so the
+  # "unknown" expectations below stay environment-independent.
+  env -u GITHUB_RUN_ID -u GITHUB_RUN_ATTEMPT \
+    RESOURCE_PERFORMANCE_LOG="${missing_log}" \
+    RESOURCE_PERFORMANCE_JSONL="${missing_jsonl}" \
+    "${SCRIPT_DIR}/write-resource-performance-artifact"
+  expect_contains "${missing_jsonl}" '"type":"metadata"'
+  local missing_summary="${scenario_dir}/missing-summary.md"
+  env -u GITHUB_RUN_ID -u GITHUB_RUN_ATTEMPT \
+    RESOURCE_PERFORMANCE_LOG="${missing_log}" \
+    GITHUB_STEP_SUMMARY="${missing_summary}" \
+    "${SCRIPT_DIR}/publish-resource-performance-summary"
+  # Literal Markdown backticks are intentional.
+  # shellcheck disable=SC2016
+  expect_contains "${missing_summary}" \
+    '⚠️ Unavailable' \
+    '- Image digest: `unknown`' \
+    '- GITHUB_RUN_ID: `unknown`' \
+    '- Swift version full: `unknown`' \
+    '- Kernel: `unknown`' \
+    '- CPU model: `unknown`' \
+    '- CPU count: `unknown`'
+}
+
+run_scenario test_syntax_checks
+run_scenario test_swift_image
+run_scenario test_run_resource_performance_log_path
+run_scenario test_run_performance_regression
+run_scenario test_summary_happy_path
+run_scenario test_artifact_jsonl
+run_scenario test_compare_history
+run_scenario test_parser_rejects_malformed
+run_scenario test_summary_edge_cases
+run_scenario test_artifact_and_summary_parse_failure
+run_scenario test_missing_log_metadata
 
 echo 'Performance CI script tests passed.'

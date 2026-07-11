@@ -252,3 +252,19 @@ jobs:
       - name: Performance regression tests
         timeout-minutes: 10
         run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift test --filter SMBeePerformanceRegressionTests
+
+  resource-performance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read Swift version
+        id: swift-version
+        run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
+      - name: Release resource performance metrics
+        timeout-minutes: 15
+        run: |
+          docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bash -c '
+            apt-get update -qq
+            apt-get install -y -qq time >/dev/null
+            /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests
+          '

@@ -1,6 +1,11 @@
 import Foundation
 import XCTest
 @testable import SMBee
+#if os(Linux)
+import Glibc
+#else
+import Darwin
+#endif
 
 final class SMBeePerformanceRegressionTests: XCTestCase {
     // This fixture represents a server after negotiation with ample credits.
@@ -140,9 +145,198 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
     }
 }
 
+final class SMBeeResourcePerformanceTests: XCTestCase {
+    private let measuredRuns = 3
+    private let payloadSize = 8 * 1024 * 1024
+    private let treeId: UInt32 = 0x3344
+    private let fileId = Array(UInt8(0)..<UInt8(16))
+    private let credential = SMBCredential(username: "user", password: "pass")
+    private let signingKey = Array(repeating: UInt8(0x11), count: 16)
+    private let initialCredits: UInt32 = 1
+
+    func testSyntheticReadStreamResourceUsage() async throws {
+        try requireReleaseConfiguration()
+        _ = try await measureRead(size: 1024 * 1024)
+        var samples: [ResourcePerformanceSample] = []
+        for _ in 0..<measuredRuns {
+            samples.append(try await measureRead(size: payloadSize))
+        }
+        assertAndPrint(samples: samples, operation: "read_stream")
+    }
+
+    func testSyntheticWriteStreamResourceUsage() async throws {
+        try requireReleaseConfiguration()
+        _ = try await measureWrite(size: 1024 * 1024)
+        var samples: [ResourcePerformanceSample] = []
+        for _ in 0..<measuredRuns {
+            samples.append(try await measureWrite(size: payloadSize))
+        }
+        assertAndPrint(samples: samples, operation: "write_stream")
+    }
+
+    private func measureRead(size: Int) async throws -> ResourcePerformanceSample {
+        let chunkSize = 64 * 1024
+        let lengths = chunkLengths(fileSize: size, chunkSize: chunkSize)
+        let inbound = try framed(
+            [
+                try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId),
+                try smb2QueryInfoResponse(size: UInt64(size), messageId: 1, treeId: treeId),
+            ] + lengths.enumerated().map { index, length in
+                try smb2ReadResponse(
+                    Array(repeating: UInt8(index & 0xff), count: length),
+                    messageId: UInt64(index + 2),
+                    treeId: treeId
+                )
+            } + [
+                try smb2StatusResponse(
+                    status: SMB2Status.success,
+                    command: SMB2Commands.close,
+                    messageId: UInt64(lengths.count + 2),
+                    treeId: treeId
+                ),
+            ]
+        )
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server", port: 445, credential: credential, transport: transport,
+            signingKey: signingKey, initialCredits: initialCredits
+        )
+        let client = SMBClientSession(session: session, treeId: treeId)
+        let sink = CountingChunkSink()
+        let before = ResourceUsageSnapshot.current()
+        let start = ContinuousClock.now
+        try await client.withReadStream(path: "resource.bin") { sink.record($0) }
+        let elapsed = start.duration(to: ContinuousClock.now).secondsAsDouble
+        let after = ResourceUsageSnapshot.current()
+        XCTAssertEqual(sink.byteCount, size)
+        return ResourcePerformanceSample(size: size, elapsedSeconds: elapsed, before: before, after: after)
+    }
+
+    private func requireReleaseConfiguration() throws {
+        if _isDebugAssertConfiguration() {
+            throw XCTSkip("Resource performance metrics run only with swift test -c release")
+        }
+    }
+
+    private func measureWrite(size: Int) async throws -> ResourcePerformanceSample {
+        let chunkSize = 64 * 1024
+        let lengths = chunkLengths(fileSize: size, chunkSize: chunkSize)
+        let inbound = try framed(
+            [try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId)]
+                + lengths.enumerated().map { index, length in
+                    try smb2WriteResponse(count: length, messageId: UInt64(index + 1), treeId: treeId)
+                } + [
+                    try smb2StatusResponse(
+                        status: SMB2Status.success,
+                        command: SMB2Commands.flush,
+                        messageId: UInt64(lengths.count + 1),
+                        treeId: treeId
+                    ),
+                    try smb2StatusResponse(
+                        status: SMB2Status.success,
+                        command: SMB2Commands.close,
+                        messageId: UInt64(lengths.count + 2),
+                        treeId: treeId
+                    ),
+                ]
+        )
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server", port: 445, credential: credential, transport: transport,
+            signingKey: signingKey, initialCredits: initialCredits
+        )
+        let client = SMBClientSession(session: session, treeId: treeId)
+        let payload = Array(repeating: UInt8(0xa5), count: size)
+        let before = ResourceUsageSnapshot.current()
+        let start = ContinuousClock.now
+        try await client.upload(path: "resource.bin", data: payload)
+        let elapsed = start.duration(to: ContinuousClock.now).secondsAsDouble
+        let after = ResourceUsageSnapshot.current()
+        return ResourcePerformanceSample(size: size, elapsedSeconds: elapsed, before: before, after: after)
+    }
+
+    private func assertAndPrint(samples: [ResourcePerformanceSample], operation: String) {
+        let throughput = median(samples.map(\.throughputMiBPerSecond))
+        let userCPU = median(samples.map(\.userCPUMilliseconds))
+        let systemCPU = median(samples.map(\.systemCPUMilliseconds))
+        let maxRSS = samples.map(\.maxRSSKilobytes).max() ?? 0
+        let sizeMiB = payloadSize / (1024 * 1024)
+        print("PERF_RESOURCE \(operation).throughput_mib_s value=\(format(throughput)) size_mib=\(sizeMiB) runs=\(measuredRuns) config=release")
+        print("PERF_RESOURCE \(operation).user_cpu_ms value=\(format(userCPU)) size_mib=\(sizeMiB) runs=\(measuredRuns) config=release")
+        print("PERF_RESOURCE \(operation).system_cpu_ms value=\(format(systemCPU)) size_mib=\(sizeMiB) runs=\(measuredRuns) config=release")
+        print("PERF_RESOURCE \(operation).max_rss_kb value=\(maxRSS) size_mib=\(sizeMiB) runs=\(measuredRuns) config=release")
+        XCTAssertGreaterThan(throughput, 5, "catastrophic synthetic \(operation) throughput regression")
+        XCTAssertLessThan(maxRSS, 512 * 1024, "catastrophic synthetic \(operation) RSS regression")
+    }
+
+    private func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        return sorted[sorted.count / 2]
+    }
+
+    private func format(_ value: Double) -> String {
+        String(format: "%.3f", value)
+    }
+}
+
+private struct ResourceUsageSnapshot {
+    let userMicroseconds: Int64
+    let systemMicroseconds: Int64
+    let maxRSSKilobytes: Int64
+
+    static func current() -> ResourceUsageSnapshot {
+        var usage = rusage()
+#if os(Linux)
+        _ = getrusage(__rusage_who_t(RUSAGE_SELF.rawValue), &usage)
+        let maxRSS = Int64(usage.ru_maxrss)
+#else
+        _ = getrusage(RUSAGE_SELF, &usage)
+        let maxRSS = Int64(usage.ru_maxrss) / 1024
+#endif
+        return ResourceUsageSnapshot(
+            userMicroseconds: micros(usage.ru_utime),
+            systemMicroseconds: micros(usage.ru_stime),
+            maxRSSKilobytes: maxRSS
+        )
+    }
+
+    private static func micros(_ value: timeval) -> Int64 {
+        Int64(value.tv_sec) * 1_000_000 + Int64(value.tv_usec)
+    }
+}
+
+private struct ResourcePerformanceSample {
+    let size: Int
+    let elapsedSeconds: Double
+    let before: ResourceUsageSnapshot
+    let after: ResourceUsageSnapshot
+
+    var throughputMiBPerSecond: Double {
+        Double(size) / elapsedSeconds / 1024 / 1024
+    }
+
+    var userCPUMilliseconds: Double {
+        Double(after.userMicroseconds - before.userMicroseconds) / 1000
+    }
+
+    var systemCPUMilliseconds: Double {
+        Double(after.systemMicroseconds - before.systemMicroseconds) / 1000
+    }
+
+    var maxRSSKilobytes: Int64 { after.maxRSSKilobytes }
+}
+
+private extension Duration {
+    var secondsAsDouble: Double {
+        let parts = components
+        return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
+    }
+}
+
 private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var inbound: [UInt8]
+    private var inboundOffset = 0
     private var outboundStorage: [UInt8] = []
 
     var outbound: [UInt8] {
@@ -171,10 +365,10 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
     func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
         return try lock.withLock {
-            guard !inbound.isEmpty else { throw SMBTransportError.connectionClosed }
-            let count = min(maxLength, inbound.count)
-            let chunk = Array(inbound.prefix(count))
-            inbound.removeFirst(count)
+            guard inboundOffset < inbound.count else { throw SMBTransportError.connectionClosed }
+            let count = min(maxLength, inbound.count - inboundOffset)
+            let chunk = Array(inbound[inboundOffset..<(inboundOffset + count)])
+            inboundOffset += count
             return chunk
         }
     }

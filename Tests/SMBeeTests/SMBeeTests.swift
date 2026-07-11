@@ -3387,6 +3387,36 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testCancelledEchoResponseReturnsCreditForNextRequest() async throws {
+        let transport = ControlledReceiveTransport()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            initialCredits: 1
+        )
+
+        let first = Task { try await session.echo() }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let firstHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+        first.cancel()
+        try await waitForOutboundFrameCount(2, transport: transport)
+        transport.enqueueInbound(try framed([smb2EchoResponse(messageId: firstHeader.messageId)]))
+
+        do {
+            try await awaitWithTimeout("cancelled ECHO") { try await first.value }
+            XCTFail("cancelled ECHO unexpectedly completed")
+        } catch is CancellationError {
+        }
+
+        let second = Task { try await session.echo() }
+        try await waitForOutboundFrameCount(3, transport: transport)
+        let secondHeader = try SMB2Header.decode(try unframed(transport.outbound)[2])
+        transport.enqueueInbound(try framed([smb2EchoResponse(messageId: secondHeader.messageId)]))
+        try await awaitWithTimeout("ECHO after cancelled ECHO") { try await second.value }
+    }
+
     func testChangeNotifyEventConvenienceProperties() {
         let changes = [
             SMBFileChange(action: .added, name: "new.txt"),

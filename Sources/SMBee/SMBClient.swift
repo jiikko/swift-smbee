@@ -4678,6 +4678,16 @@ actor SMBSession {
             return
         }
         guard var pending = pendingResponses[header.messageId] else {
+            if sentResponseMessageIds.contains(header.messageId) {
+                // A cancelled request still owns its wire response until the final frame.
+                if try SMB2AsyncInterim.shouldDiscard(packet) {
+                    debugLine("ignoring interim response for cancelled message id \(header.messageId)")
+                    return
+                }
+                sentResponseMessageIds.remove(header.messageId)
+                debugLine("completed cancelled SMB response message id \(header.messageId)")
+                return
+            }
             // Bound the orphan queue: spurious/duplicate server responses whose messageId is
             // never claimed by markRequestSent would otherwise accumulate for the whole
             // session lifetime (issues/012). Dropping the oldest is safe — a legitimate
@@ -4731,7 +4741,8 @@ actor SMBSession {
 
     private func failPendingResponse(messageId: UInt64, error: Error) {
         guard let pending = pendingResponses.removeValue(forKey: messageId) else { return }
-        sentResponseMessageIds.remove(messageId)
+        // Cancel releases pending state, but the wire response is unfinished — retain
+        // sentResponseMessageIds until its final response so credit grants remain observable.
         pending.continuation.resume(throwing: error)
     }
 

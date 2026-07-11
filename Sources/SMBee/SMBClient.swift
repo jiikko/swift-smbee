@@ -4472,8 +4472,9 @@ actor SMBSession {
             )
         } onCancel: {
             Task {
-                await self.failPendingResponse(messageId: requestHeader.messageId, error: CancellationError())
-                await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+                if await self.cancelInFlightRequest(messageId: requestHeader.messageId) {
+                    await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+                }
             }
         }
         if verifySignature {
@@ -4493,8 +4494,9 @@ actor SMBSession {
             )
         } onCancel: {
             Task {
-                await self.failPendingResponse(messageId: requestHeader.messageId, error: CancellationError())
-                await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+                if await self.cancelInFlightRequest(messageId: requestHeader.messageId) {
+                    await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+                }
             }
         }
         if verifySignature {
@@ -4753,6 +4755,12 @@ actor SMBSession {
         // Cancel releases pending state, but the wire response is unfinished — retain
         // sentResponseMessageIds until its final response so credit grants remain observable.
         pending.continuation.resume(throwing: error)
+    }
+
+    private func cancelInFlightRequest(messageId: UInt64) -> Bool {
+        let wasSent = sentResponseMessageIds.contains(messageId)
+        failPendingResponse(messageId: messageId, error: CancellationError())
+        return wasSent
     }
 
     private func failAllPendingResponses(error: Error) {

@@ -3852,12 +3852,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testClientSessionKeepAliveSendsPeriodicEchoUntilClose() async throws {
-        let inbound = try framed([
-            try smb2EchoResponse(messageId: 0),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 1, treeId: 0x3344),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 2, treeId: 0),
-        ])
-        let transport = InMemoryTransport(inbound: inbound)
+        let transport = ControlledReceiveTransport()
         let session = SMBSession(
             host: "server",
             port: 445,
@@ -3869,23 +3864,42 @@ final class SMBeeTests: XCTestCase {
 
         try await clientSession.startKeepAlive(interval: .milliseconds(50))
         try await waitForOutboundFrameCount(1, transport: transport)
-        await clientSession.close()
+        var observed = try unframed(transport.outbound)
+        let firstEcho = try SMB2Header.decode(observed[0])
+        transport.enqueueInbound(try framed([try smb2EchoResponse(messageId: firstEcho.messageId)]))
 
-        let requests = try unframed(transport.outbound)
-        var commands = requests.map { try? SMB2Header.decode($0).command }
-        // Timing tolerances for slow CI runners (both observed on GitHub Actions):
-        // - close() cancelling the keepalive mid-ECHO legitimately sends SMB2 CANCEL
-        // - a slow close can let the 50ms keepalive interval fire more than one ECHO
-        commands.removeAll { $0 == SMB2Commands.cancel }
-        while commands.count > 3, commands.first == SMB2Commands.echo, commands.dropFirst().first == SMB2Commands.echo {
-            commands.removeFirst()
+        let closeTask = Task { await clientSession.close() }
+        var responded = Set<UInt64>([firstEcho.messageId])
+        for _ in 0..<500 {
+            let requests = try unframed(transport.outbound)
+            if requests.count > observed.count {
+                for request in requests.dropFirst(observed.count) {
+                    let header = try SMB2Header.decode(request)
+                    guard responded.insert(header.messageId).inserted else { continue }
+                    switch header.command {
+                    case SMB2Commands.echo:
+                        transport.enqueueInbound(try framed([try smb2EchoResponse(messageId: header.messageId)]))
+                    case SMB2Commands.treeDisconnect:
+                        transport.enqueueInbound(try framed([try smb2StatusResponse(status: SMB2Status.success, command: header.command, messageId: header.messageId, treeId: header.treeId)]))
+                    case SMB2Commands.logoff:
+                        transport.enqueueInbound(try framed([try smb2StatusResponse(status: SMB2Status.success, command: header.command, messageId: header.messageId, treeId: header.treeId)]))
+                    default: break
+                    }
+                }
+                observed = requests
+            }
+            let commands = try observed.map { try SMB2Header.decode($0).command }.filter { $0 != SMB2Commands.cancel }
+            if commands.count >= 3,
+               commands.dropFirst().suffix(2).elementsEqual([SMB2Commands.treeDisconnect, SMB2Commands.logoff]) {
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
-        let rawCommands = requests.map { (try? SMB2Header.decode($0)).map { "\($0.command)#\($0.messageId)" } ?? "?" }
-        XCTAssertEqual(commands, [
-            SMB2Commands.echo,
-            SMB2Commands.treeDisconnect,
-            SMB2Commands.logoff,
-        ], "raw outbound (command#messageId): \(rawCommands)")
+        _ = await closeTask.value
+        let commands = try observed.map { try SMB2Header.decode($0).command }.filter { $0 != SMB2Commands.cancel }
+        XCTAssertGreaterThanOrEqual(commands.count, 3)
+        XCTAssertEqual(Array(commands.suffix(2)), [SMB2Commands.treeDisconnect, SMB2Commands.logoff])
+        XCTAssertTrue(commands.dropLast(2).allSatisfy { $0 == SMB2Commands.echo })
     }
 
     func testClientSessionCloseWaitsForInFlightKeepAliveEcho() async throws {

@@ -23,7 +23,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
                 + [try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: UInt64(2 + expectedChunks), treeId: treeId)]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound)
-        let clientSession = makeClientSession(transport: transport)
+        let clientSession = makeClientSession(transport: transport, initialCredits: 64)
         let sink = CountingChunkSink()
 
         try await clientSession.withReadStream(path: "large.bin") { chunk in
@@ -120,8 +120,8 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         counter.assertMetric("persistent_session.commands.TREE_CONNECT", command: SMB2Commands.treeConnect, expected: 1)
     }
 
-    private func makeClientSession(transport: PerformanceInMemoryTransport) -> SMBClientSession {
-        let session = SMBSession(host: "server", port: 445, credential: credential, transport: transport, signingKey: signingKey)
+    private func makeClientSession(transport: PerformanceInMemoryTransport, initialCredits: UInt32 = 1) -> SMBClientSession {
+        let session = SMBSession(host: "server", port: 445, credential: credential, transport: transport, signingKey: signingKey, initialCredits: initialCredits)
         return SMBClientSession(session: session, treeId: treeId)
     }
 

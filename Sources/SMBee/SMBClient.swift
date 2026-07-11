@@ -3284,6 +3284,13 @@ extension Error {
     }
 }
 
+/// Demux 済み response frame とその wire 上の出自。SMB3 transform から復号された frame は
+/// AEAD で完全性検証済みなので、署名必須の対象は平文で届いた frame だけ (MS-SMB2 §3.2.5.1.3)。
+private struct SMBReceivedFrame {
+    let bytes: [UInt8]
+    let decryptedFromTransform: Bool
+}
+
 private struct SMBPendingResponse {
     let label: String
     let longPoll: Bool
@@ -3291,7 +3298,7 @@ private struct SMBPendingResponse {
     let expectedSessionId: UInt64
     let expectedTreeId: UInt32
     var pendingCount: Int = 0
-    let continuation: CheckedContinuation<[UInt8], Error>
+    let continuation: CheckedContinuation<SMBReceivedFrame, Error>
 }
 
 /// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
@@ -3321,9 +3328,10 @@ actor SMBSession {
     private let creditWindow: SMB2CreditWindow
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
     private var sentResponseMessageIds: Set<UInt64> = []
-    private var orphanResponses: [UInt64: [UInt8]] = [:]
+    private var orphanResponses: [UInt64: SMBReceivedFrame] = [:]
     private static let maxOrphanResponses = 64
     private var receiveLoopRunning = false
+    private var wireFailure: Error?
 
     init(
         host: String,
@@ -3348,6 +3356,7 @@ actor SMBSession {
     func connect() async throws {
         try Task.checkCancellation()
         try await transport.connect(host: host, port: port)
+        wireFailure = nil
         let negotiate = try SMBNegotiateCodec.encodeRequest(
             clientGuid: UUID(),
             messageId: nextMessageId(),
@@ -3376,20 +3385,7 @@ actor SMBSession {
                 encryptionAlgorithm = .aes128GCM
             }
         }
-        if SMBPerfLog.isEnabled {
-            let cipherLabel: String
-            switch result.cipher {
-            case SMBNegotiateConstants.aes128GCM: cipherLabel = "gcm"
-            case SMBNegotiateConstants.aes128CCM: cipherLabel = "ccm"
-            case nil: cipherLabel = "none(pre-3.1.1-default:ccm)"
-            case let other?: cipherLabel = "0x\(String(other, radix: 16))"
-            }
-            let signingLabel = signingAlgorithm == .aesGMAC ? "gmac" : "cmac"
-            let credits = await creditWindow.balance
-            SMBPerfLog.line(
-                "negotiate dialect=0x\(String(result.dialect, radix: 16)) cipher=\(cipherLabel) signing=\(signingLabel) maxRead=\(result.maxReadSize) maxWrite=\(result.maxWriteSize) credits=\(credits)"
-            )
-        }
+        await logNegotiatePerf(result)
 
         let type1Message = try NTLM.makeType1(domain: credential.domain)
         let type1 = SPNEGO.wrapNegTokenInit(type1Message)
@@ -3455,6 +3451,22 @@ actor SMBSession {
             encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
             decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
         }
+    }
+
+    private func logNegotiatePerf(_ result: SMBProbeResult) async {
+        guard SMBPerfLog.isEnabled else { return }
+        let cipherLabel: String
+        switch result.cipher {
+        case SMBNegotiateConstants.aes128GCM: cipherLabel = "gcm"
+        case SMBNegotiateConstants.aes128CCM: cipherLabel = "ccm"
+        case nil: cipherLabel = "none(pre-3.1.1-default:ccm)"
+        case let other?: cipherLabel = "0x\(String(other, radix: 16))"
+        }
+        let signingLabel = signingAlgorithm == .aesGMAC ? "gmac" : "cmac"
+        let credits = await creditWindow.balance
+        SMBPerfLog.line(
+            "negotiate dialect=0x\(String(result.dialect, radix: 16)) cipher=\(cipherLabel) signing=\(signingLabel) maxRead=\(result.maxReadSize) maxWrite=\(result.maxWriteSize) credits=\(credits)"
+        )
     }
 
     func treeConnect(share: String) async throws -> UInt32 {
@@ -3548,12 +3560,17 @@ actor SMBSession {
 
     private func queryDirectoryPage(treeId: UInt32, fileId: [UInt8], restartScan: Bool) async throws -> [SMBDirectoryEntry]? {
         try Task.checkCancellation()
+        // Cap the output buffer by the granted credit window: requesting 256KiB with only
+        // 1 granted credit would either be rejected by the server (CreditCharge too low)
+        // or deadlock waiting for grants that never come. A smaller buffer just pages more.
+        let outputBufferLength = await creditCappedLength(SMB2QueryDirectory.outputBufferSize)
         let packet = try SMB2QueryDirectory.encodeRequest(
-            messageId: nextMessageId(),
+            messageId: nextMessageId(charge: SMB2Credit.charge(forPayloadLength: UInt64(outputBufferLength))),
             sessionId: sessionId,
             treeId: treeId,
             fileId: fileId,
-            restartScan: restartScan
+            restartScan: restartScan,
+            outputBufferLength: outputBufferLength
         )
         debugDump("QUERY_DIRECTORY request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_DIRECTORY response")
@@ -4426,10 +4443,7 @@ actor SMBSession {
 
     func closeTransport() {
         transport.close()
-        failAllPendingResponses(error: SMBTransportError.connectionClosed)
-        // Parked credit waiters can no longer be granted once the transport is closed.
-        let creditWindow = creditWindow
-        Task { await creditWindow.failAllWaiters(SMBTransportError.connectionClosed) }
+        failWire(error: SMBTransportError.connectionClosed)
     }
 
     private func unsignedWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
@@ -4438,7 +4452,7 @@ actor SMBSession {
             responseLabel: responseLabel,
             longPoll: false,
             send: sendUnsigned
-        )
+        ).bytes
     }
 
     private func signedWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
@@ -4459,7 +4473,7 @@ actor SMBSession {
         if verifySignature {
             try verifySigned(response)
         }
-        return response
+        return response.bytes
     }
 
     private func signedLongPollWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
@@ -4480,7 +4494,7 @@ actor SMBSession {
         if verifySignature {
             try verifySigned(response)
         }
-        return response
+        return response.bytes
     }
 
     private func demuxedWireTransaction(
@@ -4488,7 +4502,7 @@ actor SMBSession {
         responseLabel: String,
         longPoll: Bool,
         send: @escaping ([UInt8]) async throws -> Void
-    ) async throws -> [UInt8] {
+    ) async throws -> SMBReceivedFrame {
         let requestHeader = try SMB2Header.decode(packet)
         return try await withCheckedThrowingContinuation { continuation in
             pendingResponses[requestHeader.messageId] = SMBPendingResponse(
@@ -4597,8 +4611,9 @@ actor SMBSession {
         try Task.checkCancellation()
     }
 
-    private func verifySigned(_ packet: [UInt8]) throws {
-        if packet.starts(with: SMB3TransformHeader.protocolId) { return }
+    private func verifySigned(_ frame: SMBReceivedFrame) throws {
+        if frame.decryptedFromTransform { return }
+        let packet = frame.bytes
         guard let signingKey else { return }
         let header = try SMB2Header.decode(packet)
         guard (header.flags & SMB2Flags.signed) != 0 else {
@@ -4618,15 +4633,16 @@ actor SMBSession {
         }
     }
 
-    private func receiveDecryptedFrame(label: String) async throws -> [UInt8] {
+    private func receiveDecryptedFrame(label: String) async throws -> SMBReceivedFrame {
         let header = try await receiveExactly(4)
         let length = try DirectTCPFraming.length(from: header)
         debugDump("\(label) direct-TCP header length=\(length)", header)
         let body = try await receiveExactly(length)
         debugDump(label, body)
-        let packet = body.starts(with: SMB3TransformHeader.protocolId) ? try decryptTransform(body) : body
+        let decryptedFromTransform = body.starts(with: SMB3TransformHeader.protocolId)
+        let packet = decryptedFromTransform ? try decryptTransform(body) : body
         await recordCreditGrant(packet, label: label)
-        return packet
+        return SMBReceivedFrame(bytes: packet, decryptedFromTransform: decryptedFromTransform)
     }
 
     private func startReceiveLoopIfNeeded() {
@@ -4639,10 +4655,10 @@ actor SMBSession {
         while !sentResponseMessageIds.isEmpty {
             do {
                 try Task.checkCancellation()
-                let packet = try await receiveDecryptedFrame(label: "SMB response")
-                try dispatchReceivedPacket(packet)
+                let frame = try await receiveDecryptedFrame(label: "SMB response")
+                try dispatchReceivedPacket(frame)
             } catch {
-                failAllPendingResponses(error: error)
+                failWire(error: error)
                 receiveLoopRunning = false
                 return
             }
@@ -4650,7 +4666,8 @@ actor SMBSession {
         receiveLoopRunning = false
     }
 
-    private func dispatchReceivedPacket(_ packet: [UInt8]) throws {
+    private func dispatchReceivedPacket(_ frame: SMBReceivedFrame) throws {
+        let packet = frame.bytes
         let header = try SMB2Header.decode(packet)
         // Server-initiated notifications (oplock/lease break) arrive with MessageId
         // 0xFFFFFFFFFFFFFFFF and never correspond to a request. This client never requests
@@ -4670,7 +4687,7 @@ actor SMBSession {
                 orphanResponses.removeValue(forKey: oldestId)
                 debugLine("SMB orphan response queue full; dropped message id \(oldestId)")
             }
-            orphanResponses[header.messageId] = packet
+            orphanResponses[header.messageId] = frame
             debugLine("SMB response queued for future message id \(header.messageId)")
             return
         }
@@ -4695,7 +4712,7 @@ actor SMBSession {
         }
         pendingResponses.removeValue(forKey: header.messageId)
         sentResponseMessageIds.remove(header.messageId)
-        pending.continuation.resume(returning: packet)
+        pending.continuation.resume(returning: frame)
     }
 
     private func markRequestSent(messageId: UInt64) {
@@ -4733,15 +4750,34 @@ actor SMBSession {
         Task { await creditWindow.failAllWaiters(error) }
     }
 
+    private func failWire(error: Error) {
+        let failure = wireFailure ?? error
+        wireFailure = failure
+        failAllPendingResponses(error: failure)
+    }
+
     private func reserveCredit(_ packet: [UInt8]) async throws -> UInt16 {
+        if let wireFailure {
+            throw wireFailure
+        }
         // The packet was produced by our own encoders; a decode failure means an internal
         // bug. Failing here keeps the credit window in sync with what is actually sent —
         // a silent charge=1 fallback would drift the window against the embedded
         // CreditCharge (issues/012).
         let header = try SMB2Header.decode(packet)
-        let balance = try await creditWindow.reserve(charge: header.creditCharge)
-        debugLine("SMB credit charge=\(header.creditCharge) balance=\(balance)")
-        return header.creditCharge
+        // MS-SMB2 §3.2.4.1.2: CANCEL is exempt from the credit window — it must go out
+        // while the request it cancels still holds the window (e.g. a parked CHANGE_NOTIFY
+        // owns the last credit); gating it here would deadlock the cancellation path.
+        if header.command == SMB2Commands.cancel {
+            return 0
+        }
+        // MS-SMB2 §3.2.4.1.2: CreditCharge 0 and 1 both consume one credit. Reserving 0
+        // would let charge-0 requests inflate the window (each response still grants), so
+        // the effective charge is what gets reserved and later refunded on send failure.
+        let effectiveCharge = max(1, header.creditCharge)
+        let balance = try await creditWindow.reserve(charge: effectiveCharge)
+        debugLine("SMB credit charge=\(effectiveCharge) balance=\(balance)")
+        return effectiveCharge
     }
 
     private func refundCredit(charge: UInt16) async {
@@ -4849,24 +4885,28 @@ actor SMBSession {
 
     private func creditAwareWriteChunkSize() async -> Int {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
-        let availableCredits = await creditWindow.balance
-        return SMBTransferLimits.creditWindowChunkSize(
+        let negotiated = SMBTransferLimits.negotiatedChunkSize(
             localLimit: SMBClientSession.localWriteChunkLimit,
             negotiatedLimit: maxWriteSize,
             transformOverhead: transformOverhead,
-            availableCredits: availableCredits
         )
+        return Int(await creditCappedLength(UInt32(min(negotiated, Int(UInt32.max)))))
     }
 
     private func creditAwareReadChunkSize() async -> Int {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
-        let availableCredits = await creditWindow.balance
-        return SMBTransferLimits.creditWindowChunkSize(
+        let negotiated = SMBTransferLimits.negotiatedChunkSize(
             localLimit: Self.localReadChunkLimit,
             negotiatedLimit: maxReadSize,
             transformOverhead: transformOverhead,
-            availableCredits: availableCredits
         )
+        return Int(await creditCappedLength(UInt32(min(negotiated, Int(UInt32.max)))))
+    }
+
+    private func creditCappedLength(_ requested: UInt32) async -> UInt32 {
+        let balance = await creditWindow.balance
+        let cap = min(UInt64(max(1, balance)) * UInt64(SMB2Credit.unitSize), UInt64(UInt32.max))
+        return min(requested, UInt32(cap))
     }
 
     private nonisolated func joinSMBPath(_ parent: String, _ child: String) -> String {

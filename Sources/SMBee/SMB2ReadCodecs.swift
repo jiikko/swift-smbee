@@ -1264,9 +1264,29 @@ enum SMB2QueryDirectory {
     private static let fileNameOffset = SMB2Header.encodedSize + fixedPartSize
     static let outputBufferSize: UInt32 = 256 * 1024
 
-    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32, fileId: [UInt8], restartScan: Bool = true) throws -> [UInt8] {
+    /// MS-SMB2 §3.2.4.1.5: a request whose output buffer exceeds 64KiB must carry a
+    /// CreditCharge of ceil(size / 65536); Samba rejects charge=1 with INVALID_PARAMETER.
+    /// Callers cap `outputBufferLength` by the granted credit window (see
+    /// `SMBSession.queryDirectoryPage`) so the request never blocks waiting for
+    /// credits a stingy server has not granted.
+    static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        restartScan: Bool = true,
+        outputBufferLength: UInt32 = outputBufferSize
+    ) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
-        let header = try SMB2Header(command: SMB2Commands.queryDirectory, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+        let creditCharge = SMB2Credit.charge(forPayloadLength: UInt64(outputBufferLength))
+        let header = try SMB2Header(
+            creditCharge: creditCharge,
+            command: SMB2Commands.queryDirectory,
+            credits: creditCharge,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(33)
@@ -1276,7 +1296,7 @@ enum SMB2QueryDirectory {
         writer.writeBytes(fileId)
         writer.writeUInt16LE(UInt16(fileNameOffset))
         writer.writeUInt16LE(2)
-        writer.writeUInt32LE(outputBufferSize)
+        writer.writeUInt32LE(outputBufferLength)
         writer.writeBytes([0x2a, 0x00])
         return writer.bytes
     }

@@ -3609,7 +3609,10 @@ final class SMBeeTests: XCTestCase {
             port: 445,
             credential: SMBCredential(username: "user", password: "pass"),
             transport: transport,
-            signingKey: Array(repeating: UInt8(0x11), count: 16)
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            // 65 537 bytes must go out as ONE charge-2 WRITE (flush fixture is at messageId 3);
+            // the credit-window chunk cap would split it if the server had only granted 1 credit.
+            initialCredits: 64
         )
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
         let progress = TransferProgressCollector()
@@ -3637,7 +3640,9 @@ final class SMBeeTests: XCTestCase {
             port: 445,
             credential: SMBCredential(username: "user", password: "pass"),
             transport: transport,
-            signingKey: Array(repeating: UInt8(0x11), count: 16)
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            // Same as the progress test above: keep the >64KiB payload a single charge-2 WRITE.
+            initialCredits: 64
         )
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
         let payload = (0..<firstChunkSize).map { UInt8($0 % 251) }
@@ -4363,6 +4368,32 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(header.credits, 2)
     }
 
+    func testQueryDirectoryRequestChargesCreditsForOutputBuffer() throws {
+        let request = try SMB2QueryDirectory.encodeRequest(
+            messageId: 21,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: (0..<16).map(UInt8.init)
+        )
+
+        let header = try SMB2Header.decode(request)
+        let expected = SMB2Credit.charge(forPayloadLength: UInt64(SMB2QueryDirectory.outputBufferSize))
+        XCTAssertGreaterThan(expected, 1)
+        XCTAssertEqual(header.creditCharge, expected)
+        XCTAssertEqual(header.credits, expected)
+
+        let capped = try SMB2QueryDirectory.encodeRequest(
+            messageId: 21,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: (0..<16).map(UInt8.init),
+            outputBufferLength: 65_536
+        )
+        let cappedHeader = try SMB2Header.decode(capped)
+        XCTAssertEqual(cappedHeader.creditCharge, 1)
+        XCTAssertEqual(readUInt32LE(capped, at: 92), 65_536)
+    }
+
     func testReadResponseDecodesDataOffsetAndLength() throws {
         var response = try SMB2Header(command: SMB2Commands.read, messageId: 14).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
@@ -4480,6 +4511,32 @@ final class SMBeeTests: XCTestCase {
             let requests = try unframed(transport.outbound)
             XCTAssertEqual(requests.count, 2)
             XCTAssertEqual(readUInt64LE(requests[1], at: 72), 3)
+        } catch {
+            XCTFail("expected connectionClosed, got \(error)")
+        }
+    }
+
+    func testRequestAfterReceiveLoopFailureFailsWithoutCreditWait() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2ReadResponse(Array("hel".utf8), messageId: 0, treeId: 0x3344),
+        ]))
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        _ = try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        do {
+            _ = try await awaitWithTimeout("request after receive failure") {
+                try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 3, length: 2)
+            }
+            XCTFail("expected connectionClosed")
+        } catch SMBTransportError.connectionClosed {
+            // Expected: the second request must not park on the exhausted credit window.
         } catch {
             XCTFail("expected connectionClosed, got \(error)")
         }
@@ -5249,6 +5306,32 @@ final class SMBeeTests: XCTestCase {
             XCTAssertEqual(ranges.map { "\($0.lowerBound)..<\($0.upperBound)" }, expectedRanges.map { "\($0.lowerBound)..<\($0.upperBound)" })
             XCTAssertEqual(cursor, dataCount)
         }
+    }
+
+    func testSessionWriteWithOneCreditSplitsMultiCreditPayload() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2WriteResponse(count: 65_536, messageId: 0, treeId: 0x3344),
+            try smb2WriteResponse(count: 65_536, messageId: 1, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            initialCredits: 1
+        )
+
+        try await session.write(
+            treeId: 0x3344,
+            fileId: fileId,
+            data: Array(repeating: 0x41, count: 128 * 1024)
+        )
+
+        let writes = try unframed(transport.outbound).filter {
+            try SMB2Header.decode($0).command == SMB2Commands.write
+        }
+        XCTAssertEqual(try writes.map { try writePayload(from: $0).count }, [65_536, 65_536])
     }
 
     func testDownloadRejectsExistingDestinationWhenOverwriteIsFalse() async throws {

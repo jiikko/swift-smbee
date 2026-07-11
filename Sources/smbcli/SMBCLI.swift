@@ -1425,7 +1425,16 @@ struct TransportOptions: ParsableArguments {
     func withOperationDeadline<T: Sendable>(
         _ operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await SMBOperationDeadline.run(timeout: operationDuration, operation: operation)
+        try validate()
+        return try await SMBOperationDeadline.run(timeout: operationDuration, operation: operation)
+    }
+
+    func validate() throws {
+        for value in [timeout, operationTimeout, perFileTimeout].compactMap({ $0 }) {
+            guard value.isFinite, value > 0, value <= 7 * 24 * 60 * 60 else {
+                throw ValidationError("timeout values must be finite, greater than zero, and at most 7 days")
+            }
+        }
     }
 
     private static func duration(from seconds: Double?) -> Duration? {

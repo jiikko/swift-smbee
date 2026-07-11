@@ -24,8 +24,19 @@ private func smbReplaceItem(at destination: URL, with source: URL, fileManager: 
 #if canImport(Darwin)
     _ = try fileManager.replaceItemAt(destination, withItemAt: source)
 #else
-    try? fileManager.removeItem(at: destination)
-    try fileManager.moveItem(at: source, to: destination)
+    let backup = destination.deletingLastPathComponent()
+        .appendingPathComponent(".(destination.lastPathComponent).smbee-backup-(UUID().uuidString)")
+    let hadDestination = fileManager.fileExists(atPath: destination.path)
+    if hadDestination { try fileManager.moveItem(at: destination, to: backup) }
+    do {
+        try fileManager.moveItem(at: source, to: destination)
+        if hadDestination { try? fileManager.removeItem(at: backup) }
+    } catch {
+        if hadDestination, fileManager.fileExists(atPath: backup.path) {
+            try? fileManager.moveItem(at: backup, to: destination)
+        }
+        throw error
+    }
 #endif
 }
 
@@ -630,6 +641,9 @@ public actor SMBClientSession {
     /// If an ECHO fails, the underlying transport is closed and the keepalive loop stops.
     public func startKeepAlive(interval: Duration = .seconds(60)) throws {
         try ensureOpen()
+        guard interval > .zero, interval <= .seconds(7 * 24 * 60 * 60) else {
+            throw SMBCodecError.invalidValue("keep-alive interval must be greater than zero and at most 7 days")
+        }
         keepAliveTask?.cancel()
         let session = session
         keepAliveTask = Task {
@@ -993,8 +1007,11 @@ public actor SMBClientSession {
         }
         let fileManager = FileManager.default
         let temporary = localFile.deletingLastPathComponent()
-            .appendingPathComponent(".smbee-(UUID().uuidString).part")
-        fileManager.createFile(atPath: temporary.path, contents: nil)
+            .appendingPathComponent(".smbee-\(UUID().uuidString).part")
+        guard !fileManager.fileExists(atPath: temporary.path),
+              fileManager.createFile(atPath: temporary.path, contents: nil) else {
+            throw SMBCodecError.invalidValue("temporary download path already exists")
+        }
         defer { try? fileManager.removeItem(at: temporary) }
         let handle = try FileHandle(forWritingTo: temporary)
         defer { try? handle.close() }
@@ -1006,7 +1023,7 @@ public actor SMBClientSession {
         }
         try handle.close()
         if fileManager.fileExists(atPath: localFile.path) {
-            _ = try fileManager.replaceItemAt(localFile, withItemAt: temporary)
+            try smbReplaceItem(at: localFile, with: temporary, fileManager: fileManager)
         } else {
             try fileManager.moveItem(at: temporary, to: localFile)
         }
@@ -3505,10 +3522,16 @@ actor SMBSession {
         onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
     ) async throws {
         var restartScan = true
+        var pageFingerprints = Set<String>()
         while true {
             let entries = try await queryDirectoryPage(treeId: treeId, fileId: fileId, restartScan: restartScan)
             restartScan = false
             guard let entries else { return }
+            guard !entries.isEmpty else { return }
+            let fingerprint = entries.map { "\($0.name):\($0.fileSize):\($0.isDirectory)" }.joined(separator: "\u{1f}")
+            guard pageFingerprints.insert(fingerprint).inserted else {
+                throw SMBCodecError.invalidValue("QUERY_DIRECTORY response made no progress")
+            }
             for entry in entries {
                 try Task.checkCancellation()
                 try await onEntry(entry)
@@ -4087,11 +4110,17 @@ actor SMBSession {
             throw SMBErrorMapper.map(status: decoded.status, operation: "IOCTL")
         }
         var output = decoded.output
-        while !(try DCERPC.responseHasLastFragment(output)) {
+        let expectedCallId = try? DCERPC.callId(input)
+        var fragmentCount = 1
+        while !(try DCERPC.validateResponseFragments(output, expectedCallId: expectedCallId)) {
             try Task.checkCancellation()
             let chunk = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: UInt64(negotiatedReadChunkSize()))
             guard !chunk.isEmpty else {
                 throw SMBCodecError.invalidValue("short DCE/RPC pipe response")
+            }
+            fragmentCount += 1
+            guard fragmentCount <= 256, output.count + chunk.count <= 16 * 1024 * 1024 else {
+                throw SMBCodecError.invalidValue("DCE/RPC pipe response exceeds size limit")
             }
             output.append(contentsOf: chunk)
         }

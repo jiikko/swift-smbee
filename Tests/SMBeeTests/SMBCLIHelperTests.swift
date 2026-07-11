@@ -125,6 +125,12 @@ final class SMBCLIHelperTests: XCTestCase {
         XCTAssertEqual(options.perFileDuration, .seconds(1) + .milliseconds(250))
     }
 
+    func testTransportDurationRejectsInvalidValues() {
+        for value in ["0", "-1", "nan", "inf", "999999999"] {
+            XCTAssertThrowsError(try TransportOptions.parse(["--timeout", value]))
+        }
+    }
+
     func testSuccessJSONStringShape() throws {
         let data = try XCTUnwrap(successJSONString(command: "put", path: "dir\\file.txt").data(using: .utf8))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])

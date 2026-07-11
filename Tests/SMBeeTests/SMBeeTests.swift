@@ -3448,6 +3448,28 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(requests[2][67], 0x00)
     }
 
+    func testSessionQueryDirectoryStopsOnEmptySuccessPage() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2QueryDirectoryResponse(entries: [], messageId: 0, treeId: 0x3344)
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(host: "server", port: 445,
+                                 credential: SMBCredential(username: "user", password: "pass"),
+                                 transport: transport)
+        let collector = TestDirectoryEntryCollector()
+        try await session.queryDirectory(treeId: 0x3344, fileId: fileId) { collector.append($0) }
+        XCTAssertEqual(collector.entries.count, 0)
+        XCTAssertEqual(try unframed(transport.outbound).count, 1)
+    }
+
+    func testDCERPCResponseFragmentValidationRejectsWrongCallID() throws {
+        var response = try DCERPC.encodeRequest(callId: 99, opnum: 1, stub: [])
+        response[2] = 2
+        response[3] = 3
+        XCTAssertThrowsError(try DCERPC.validateResponseFragments(response, expectedCallId: 1))
+    }
+
     func testClientSessionReusesConnectedTreeForMultipleOperations() async throws {
         let directoryFileId = hexBytes("00112233445566778899aabbccddeeff")
         let statFileId = hexBytes("ffeeddccbbaa99887766554433221100")
@@ -4257,6 +4279,13 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt64LE(request, at: 112), 116_444_736_030_000_000)
         XCTAssertEqual(readUInt64LE(request, at: 120), 116_444_736_040_000_000)
         XCTAssertEqual(readUInt32LE(request, at: 128), SMBFileAttributes.hidden | SMBFileAttributes.archive)
+    }
+
+    func testSetInfoBasicRequestRejectsDatesOutsideFILETIME() throws {
+        XCTAssertThrowsError(try SMB2SetInfo.encodeBasicInfoRequest(
+            messageId: 1, sessionId: 2, treeId: 3, fileId: Array(repeating: 0, count: 16),
+            update: SMBFileMetadataUpdate(creationTime: Date(timeIntervalSince1970: -20_000_000_000), lastAccessTime: nil, modifiedTime: nil, changeTime: nil)
+        ))
     }
 
     func testSetInfoRejectsOutOfRangeFiletimeWithoutTrapping() {

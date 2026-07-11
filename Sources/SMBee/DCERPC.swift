@@ -101,6 +101,38 @@ enum DCERPC {
         }
     }
 
+    static func validateResponseFragments(_ bytes: [UInt8], expectedCallId: UInt32? = nil, maxBytes: Int = 16 * 1024 * 1024) throws -> Bool {
+        guard !bytes.isEmpty, bytes.count <= maxBytes else { throw SMBCodecError.invalidValue("DCE/RPC response exceeds size limit") }
+        var cursor = 0
+        var first = true
+        var fragments = 0
+        while cursor < bytes.count {
+            let header = try decodeHeader(Array(bytes[cursor...]))
+            let length = Int(header.fragLength)
+            guard header.type == pduTypeResponse, length >= 24,
+                  (expectedCallId == nil || header.callId == expectedCallId),
+                  bytes[cursor + 4..<cursor + 8] == dataRepresentation[0..<4]
+            else { throw SMBCodecError.invalidValue("invalid DCE/RPC response fragment correlation") }
+            guard first ? (header.flags & pfcFirstFrag) != 0 : (header.flags & pfcFirstFrag) == 0 else {
+                throw SMBCodecError.invalidValue("invalid DCE/RPC FIRST fragment flag")
+            }
+            first = false
+            fragments += 1
+            guard fragments <= 256 else { throw SMBCodecError.invalidValue("too many DCE/RPC response fragments") }
+            cursor += length
+            if (header.flags & pfcLastFrag) != 0 {
+                guard cursor == bytes.count else { throw SMBCodecError.invalidValue("data follows DCE/RPC LAST fragment") }
+                return true
+            }
+        }
+        return false
+    }
+
+    static func callId(_ bytes: [UInt8]) throws -> UInt32 {
+        guard bytes.count >= 16 else { throw SMBCodecError.truncated }
+        return readUInt32LE(bytes, at: 12)
+    }
+
     private static func encodeHeader(type: UInt8, callId: UInt32, body: [UInt8]) throws -> [UInt8] {
         var writer = SMBByteWriter()
         writer.writeUInt8(5)

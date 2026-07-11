@@ -68,6 +68,8 @@ container run -d --name "${CONTAINER_NAME}" -p "${SMBEE_E2E_HOST}:${SMBEE_E2E_PO
     useradd -M -s /usr/sbin/nologin smbee
     printf "smbee\nsmbee\n" | smbpasswd -a -s smbee
     printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
+    # Sparse boundary fixture for testReadRangesAround4GiBBoundary (no real 4GiB I/O).
+    truncate -s 4295032833 /srv/smbee/public/large-4gib-plus.bin
     chown -R smbee:smbee /srv/smbee
     smbd --version
     testparm -s

@@ -529,6 +529,43 @@ final class SMBeeE2ETests: XCTestCase {
         XCTAssertEqual(total, stat.size)
     }
 
+    func testReadRangesAround4GiBBoundary() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+
+        let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
+        guard let port = UInt16(environment["SMBEE_E2E_PORT"] ?? "445") else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16")
+            return
+        }
+        let username = environment["SMBEE_E2E_USERNAME"] ?? "smbee"
+        let password = environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
+        let share = environment["SMBEE_E2E_SHARE"] ?? "public"
+        let path = environment["SMBEE_E2E_LARGE_PATH"] ?? "large-4gib-plus.bin"
+        let credential = SMBCredential(username: username, password: password)
+        let boundary = UInt64(UInt32.max)
+        let ranges = [
+            SMBReadRange(offset: boundary - 64 * 1024, length: 64 * 1024),
+            SMBReadRange(offset: boundary, length: 1),
+            SMBReadRange(offset: boundary + 1, length: 64 * 1024)
+        ]
+
+        let stat = try await SMBee.stat(
+            host: host, port: port, credential: credential, share: share, path: path
+        )
+        XCTAssertGreaterThanOrEqual(stat.size, boundary + 1)
+        for range in ranges {
+            let data = try await SMBee.read(
+                host: host, port: port, credential: credential, share: share,
+                path: path, range: range
+            )
+            XCTAssertEqual(data.count, Int(range.length))
+            XCTAssertTrue(data.allSatisfy { $0 == 0 }, "unwritten sparse range was not zero-filled")
+        }
+    }
+
     func testChangeNotifyReceivesFileCreation() async throws {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
             throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")

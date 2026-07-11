@@ -10,6 +10,21 @@
 - read workload: 160 MiB/sample (8 MiB × 20 transfer intervals)
 - write workload: 8 MiB/sample
 
+## Resource log contract (version 1)
+
+`bin/ci/run-resource-performance` のログは `bin/ci/parse-resource-performance` が検証する。
+各 `PERF_BASELINE_RUN run=N total=M` の後、resource 測定テスト開始時に
+`PERF_FORMAT version=1` を出力する（resource operation ごとに1回）。必須行は
+`PERF_RESOURCE_SAMPLE` と `PERF_RESOURCE` で、`read_stream` と `write_stream` の各 operation に
+ついて、sample 数が対応する `PERF_RESOURCE ... runs=` と一致し、5つの resource metric が揃う必要がある。
+各 operation の全 `assertAndPrint` 完了後に `PERF_RUN_COMPLETE operation=<operation>` を出力する。
+baseline run は1から連続し、重複や欠落は失敗扱いとする。
+
+`PERF_BUILD_CACHE`、`PERF_METRIC`、`PERF_WRITE_PROFILE`、`Maximum resident set size (kbytes):` は任意行だが、
+存在する場合も数値とフィールドを parser が検証する。未知の `PERF_*` 行、必須フィールド欠落、
+形式 version 不一致、完了 marker 欠落は解析失敗となる。artifact と job summary はこの共通 parser
+の検証済み JSONL のみを利用する。
+
 ## Per-invocation representative metrics
 
 各invocationは5 raw samplesのmedianを代表値とする。次の表は20代表値の分布。

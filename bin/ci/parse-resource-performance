@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Validate resource-performance.log and emit the contract JSONL.
+
+The log contract (version 1) is deliberately fail-closed:
+
+* One or more ``PERF_FORMAT version=1`` markers must occur after each
+  ``PERF_BASELINE_RUN`` marker.  The producer prints one at the start of each
+  resource-measurement operation; the parser requires at least one per run.
+* ``PERF_RESOURCE_SAMPLE`` and ``PERF_RESOURCE`` are required rows.  Every
+  baseline run must contain both ``read_stream`` and ``write_stream``; each
+  operation's sample count must equal its ``PERF_RESOURCE ... runs=`` value.
+  All five resource metrics are required for each operation.
+* Each operation must end with exactly one
+  ``PERF_RUN_COMPLETE operation=<operation>`` after its samples and summaries.
+* ``PERF_BUILD_CACHE``, ``PERF_METRIC``, ``PERF_WRITE_PROFILE``, and the
+  ``/usr/bin/time`` process RSS line are optional, but are validated when
+  present.  Other ``PERF_*`` rows are malformed and cause failure.
+
+Only after the complete file passes validation are JSONL rows written to
+stdout.  Numeric lexemes are retained so existing artifact consumers keep the
+same JSONL representation (for example, ``245.000`` remains ``245.000``).
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+OPERATIONS = ("read_stream", "write_stream")
+RESOURCE_METRICS = (
+    "throughput_mib_s",
+    "user_cpu_ms",
+    "system_cpu_ms",
+    "sample_elapsed_ms",
+    "max_rss_kb",
+)
+NUMBER_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
+METRIC_NUMBER_RE = re.compile(r"[+-]?(?:(?:0|[1-9][0-9]*)(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z")
+INT_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+RSS_RE = re.compile(r"Maximum resident set size \(kbytes\):\s*(\S+)")
+
+
+class ContractError(Exception):
+    pass
+
+
+def fields(tokens: list[str], line_number: int, label: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for token in tokens:
+        if "=" not in token:
+            raise ContractError(f"line {line_number}: malformed {label} field {token!r}")
+        key, value = token.split("=", 1)
+        if not key or not value:
+            raise ContractError(f"line {line_number}: malformed {label} field {token!r}")
+        if key in result:
+            raise ContractError(f"line {line_number}: duplicate {label} field {key!r}")
+        result[key] = value
+    return result
+
+
+def require(data: dict[str, str], names: set[str], line_number: int, label: str) -> None:
+    missing = sorted(names - data.keys())
+    if missing:
+        raise ContractError(f"line {line_number}: {label} missing required field(s): {', '.join(missing)}")
+
+
+def numeric(value: str, line_number: int, field_name: str, *, integer: bool = False) -> str:
+    pattern = INT_RE if integer else NUMBER_RE
+    if not pattern.fullmatch(value):
+        raise ContractError(f"line {line_number}: {field_name} is not a valid non-negative number: {value!r}")
+    parsed = int(value) if integer else float(value)
+    if not math.isfinite(parsed):
+        raise ContractError(f"line {line_number}: {field_name} is not finite")
+    return value
+
+
+def metric_numeric(value: str, line_number: int, field_name: str) -> str:
+    if not METRIC_NUMBER_RE.fullmatch(value):
+        raise ContractError(f"line {line_number}: {field_name} is not a valid number: {value!r}")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ContractError(f"line {line_number}: {field_name} is not finite")
+    return value
+
+
+def positive(data: dict[str, str], name: str, line_number: int, label: str) -> None:
+    value = int(data[name])
+    if value < 1:
+        raise ContractError(f"line {line_number}: {label} field {name!r} must be positive")
+
+
+def parse_log(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    baselines: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    format_count = 0
+    build_cache_seen = False
+
+    def finish_baseline(line_number: int) -> None:
+        nonlocal format_count
+        if current is None:
+            return
+        if format_count == 0:
+            raise ContractError(f"line {line_number}: baseline run {current['run']} has no PERF_FORMAT marker")
+        for operation in OPERATIONS:
+            samples = current["samples"][operation]
+            summaries = current["summaries"][operation]
+            completions = current["completions"]
+            if not samples:
+                raise ContractError(f"line {line_number}: baseline run {current['run']} has no {operation} samples")
+            if operation not in completions:
+                raise ContractError(
+                    f"line {line_number}: baseline run {current['run']} is missing PERF_RUN_COMPLETE for {operation}"
+                )
+            if len(completions) != len(OPERATIONS):
+                raise ContractError(f"line {line_number}: baseline run {current['run']} has an unexpected completion marker")
+            names = {row["name"].split(".", 1)[1] for row in summaries}
+            if names != set(RESOURCE_METRICS):
+                missing = sorted(set(RESOURCE_METRICS) - names)
+                extra = sorted(names - set(RESOURCE_METRICS))
+                detail = []
+                if missing:
+                    detail.append(f"missing {', '.join(missing)}")
+                if extra:
+                    detail.append(f"unexpected {', '.join(extra)}")
+                raise ContractError(
+                    f"line {line_number}: baseline run {current['run']} {operation} resource metrics are invalid ({'; '.join(detail)})"
+                )
+            run_counts = {row["runs"] for row in summaries}
+            if len(run_counts) != 1:
+                raise ContractError(f"line {line_number}: baseline run {current['run']} {operation} has inconsistent runs values")
+            expected = int(next(iter(run_counts)))
+            if len(samples) != expected:
+                raise ContractError(
+                    f"line {line_number}: baseline run {current['run']} {operation} has {len(samples)} samples, expected {expected}"
+                )
+            sample_runs = [int(row["run"]) for row in samples]
+            if sorted(sample_runs) != list(range(1, expected + 1)):
+                raise ContractError(f"line {line_number}: baseline run {current['run']} {operation} sample run numbers are not 1..{expected}")
+        baselines.append(current)
+        format_count = 0
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise ContractError(f"cannot read {path}: {error}") from error
+
+    for line_number, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        rss_match = RSS_RE.search(stripped)
+        if rss_match:
+            if current is None:
+                raise ContractError(f"line {line_number}: process RSS appeared before PERF_BASELINE_RUN")
+            value = numeric(rss_match.group(1), line_number, "process RSS", integer=True)
+            row = {"type": "process", "baseline_run": current["run"], "metric": "max_rss_kb", "value": value}
+            current["process"].append(row)
+            rows.append(row)
+            continue
+        if "Maximum resident set size (kbytes):" in stripped:
+            raise ContractError(f"line {line_number}: malformed process RSS line")
+        if not stripped.startswith("PERF_"):
+            continue
+
+        tokens = stripped.split()
+        kind = tokens[0]
+        if kind == "PERF_BUILD_CACHE":
+            data = fields(tokens[1:], line_number, kind)
+            require(data, {"exact_hit"}, line_number, kind)
+            if data["exact_hit"] not in {"true", "false"}:
+                raise ContractError(f"line {line_number}: PERF_BUILD_CACHE exact_hit must be true or false")
+            if build_cache_seen:
+                raise ContractError(f"line {line_number}: duplicate PERF_BUILD_CACHE")
+            build_cache_seen = True
+            rows.append({"type": "build_cache", "exact_hit": data["exact_hit"]})
+            continue
+        if kind == "PERF_FORMAT":
+            if current is None:
+                raise ContractError(f"line {line_number}: PERF_FORMAT appeared before PERF_BASELINE_RUN")
+            # PERF_FORMAT is printed at the start of EACH resource test, so on a
+            # real log it legitimately appears after the previous operation's
+            # PERF_RUN_COMPLETE (tests run alphabetically: read completes before
+            # the write test starts). Only reject it once every operation has
+            # completed for this baseline run.
+            if len(current["completions"]) == len(OPERATIONS):
+                raise ContractError(f"line {line_number}: PERF_FORMAT appeared after all operations completed")
+            data = fields(tokens[1:], line_number, kind)
+            require(data, {"version"}, line_number, kind)
+            numeric(data["version"], line_number, "PERF_FORMAT version", integer=True)
+            if data["version"] != "1":
+                raise ContractError(f"line {line_number}: unsupported PERF_FORMAT version {data['version']}")
+            format_count += 1
+            continue
+        if kind == "PERF_METRIC":
+            if len(tokens) < 2 or "=" in tokens[1] or not tokens[1]:
+                raise ContractError(f"line {line_number}: malformed {kind} name")
+            data = fields(tokens[2:], line_number, kind)
+            require(data, {"actual", "expected"}, line_number, kind)
+            metric_numeric(data["actual"], line_number, "PERF_METRIC actual")
+            metric_numeric(data["expected"], line_number, "PERF_METRIC expected")
+            continue
+        if kind == "PERF_BASELINE_RUN":
+            data = fields(tokens[1:], line_number, kind)
+            require(data, {"run", "total"}, line_number, kind)
+            numeric(data["run"], line_number, "baseline run", integer=True)
+            numeric(data["total"], line_number, "baseline total", integer=True)
+            positive(data, "run", line_number, kind)
+            positive(data, "total", line_number, kind)
+            if current is not None:
+                finish_baseline(line_number)
+            expected_run = len(baselines) + 1
+            if int(data["run"]) != expected_run:
+                raise ContractError(
+                    f"line {line_number}: baseline run numbers must be contiguous; expected {expected_run}, got {data['run']}"
+                )
+            if baselines and int(data["total"]) != baselines[0]["total"]:
+                raise ContractError(f"line {line_number}: baseline total changed between runs")
+            current = {
+                "type": "baseline_run",
+                "run": int(data["run"]),
+                "total": int(data["total"]),
+                "samples": {operation: [] for operation in OPERATIONS},
+                "summaries": {operation: [] for operation in OPERATIONS},
+                "completions": set(),
+                "process": [],
+            }
+            continue
+        if current is None:
+            raise ContractError(f"line {line_number}: {kind} appeared before PERF_BASELINE_RUN")
+        if kind == "PERF_RESOURCE_SAMPLE":
+            data = fields(tokens[1:], line_number, kind)
+            required = {"operation", "run", "elapsed_ms", "throughput_mib_s", "user_cpu_ms", "system_cpu_ms", "max_rss_kb", "total_size_mib", "iterations"}
+            require(data, required, line_number, kind)
+            operation = data["operation"]
+            if operation not in OPERATIONS:
+                raise ContractError(f"line {line_number}: unknown resource operation {operation!r}")
+            if operation in current["completions"]:
+                raise ContractError(f"line {line_number}: {kind} for {operation} appeared after PERF_RUN_COMPLETE")
+            numeric(data["run"], line_number, "sample run", integer=True)
+            positive(data, "run", line_number, kind)
+            for name in ("elapsed_ms", "throughput_mib_s", "user_cpu_ms", "system_cpu_ms", "max_rss_kb", "total_size_mib"):
+                numeric(data[name], line_number, name)
+            numeric(data["iterations"], line_number, "iterations", integer=True)
+            positive(data, "iterations", line_number, kind)
+            row = {"type": "sample", "baseline_run": current["run"], "operation": operation}
+            row.update({name: data[name] for name in ("run", "elapsed_ms", "throughput_mib_s", "user_cpu_ms", "system_cpu_ms", "max_rss_kb", "total_size_mib", "iterations")})
+            current["samples"][operation].append(row)
+            rows.append(row)
+            continue
+        if kind == "PERF_RESOURCE":
+            if len(tokens) < 2 or "=" in tokens[1] or "." not in tokens[1]:
+                raise ContractError(f"line {line_number}: malformed {kind} name")
+            name = tokens[1]
+            operation, metric = name.split(".", 1)
+            if operation not in OPERATIONS or metric not in RESOURCE_METRICS:
+                raise ContractError(f"line {line_number}: unknown resource metric {name!r}")
+            if operation in current["completions"]:
+                raise ContractError(f"line {line_number}: {kind} for {operation} appeared after PERF_RUN_COMPLETE")
+            if any(row["name"] == name for row in current["summaries"][operation]):
+                raise ContractError(f"line {line_number}: duplicate {kind} metric {name}")
+            data = fields(tokens[2:], line_number, kind)
+            required = {"value", "size_mib", "runs", "iterations", "throughput_floor_mib_s", "config"}
+            require(data, required, line_number, kind)
+            for field_name in ("value", "size_mib", "throughput_floor_mib_s"):
+                numeric(data[field_name], line_number, field_name)
+            for field_name in ("runs", "iterations"):
+                numeric(data[field_name], line_number, field_name, integer=True)
+                positive(data, field_name, line_number, kind)
+            row = {"type": "summary", "baseline_run": current["run"], "name": name}
+            row.update({name: data[name] for name in ("value", "size_mib", "runs", "iterations", "throughput_floor_mib_s")})
+            current["summaries"][operation].append(row)
+            rows.append(row)
+            continue
+        if kind == "PERF_RUN_COMPLETE":
+            data = fields(tokens[1:], line_number, kind)
+            require(data, {"operation"}, line_number, kind)
+            operation = data["operation"]
+            if operation not in OPERATIONS:
+                raise ContractError(f"line {line_number}: unknown completion operation {operation!r}")
+            if operation in current["completions"]:
+                raise ContractError(f"line {line_number}: duplicate PERF_RUN_COMPLETE for {operation}")
+            if not current["samples"][operation] or not current["summaries"][operation]:
+                raise ContractError(f"line {line_number}: PERF_RUN_COMPLETE for {operation} appeared before its resource rows")
+            current["completions"].add(operation)
+            continue
+        if kind == "PERF_WRITE_PROFILE":
+            data = fields(tokens[1:], line_number, kind)
+            required = {"stage", "median_ms", "throughput_mib_s", "size_mib", "runs", "chunks"}
+            require(data, required, line_number, kind)
+            for field_name in ("median_ms", "throughput_mib_s", "size_mib"):
+                numeric(data[field_name], line_number, field_name)
+            for field_name in ("runs", "chunks"):
+                numeric(data[field_name], line_number, field_name, integer=True)
+                positive(data, field_name, line_number, kind)
+            rows.append({"type": "write_profile", "baseline_run": current["run"], "stage": data["stage"], "median_ms": data["median_ms"], "throughput_mib_s": data["throughput_mib_s"], "size_mib": data["size_mib"], "runs": data["runs"], "chunks": data["chunks"]})
+            continue
+        raise ContractError(f"line {line_number}: unrecognized PERF row {kind!r}")
+
+    if current is not None:
+        finish_baseline(len(lines) + 1)
+    if not baselines:
+        raise ContractError("no PERF_BASELINE_RUN rows found")
+    total = baselines[0]["total"]
+    if len(baselines) != total:
+        raise ContractError(f"expected {total} baseline runs, found {len(baselines)}")
+    return rows
+
+
+def json_number_line(row: dict[str, Any]) -> str:
+    def quote(value: str) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
+    row_type = row["type"]
+    if row_type == "build_cache":
+        return '{"type":"build_cache","exact_hit":' + row["exact_hit"] + "}"
+    if row_type == "sample":
+        names = ("baseline_run", "operation", "run", "elapsed_ms", "throughput_mib_s", "user_cpu_ms", "system_cpu_ms", "max_rss_kb", "total_size_mib", "iterations")
+    elif row_type == "summary":
+        names = ("baseline_run", "name", "value", "size_mib", "runs", "iterations", "throughput_floor_mib_s")
+    elif row_type == "write_profile":
+        names = ("baseline_run", "stage", "median_ms", "throughput_mib_s", "size_mib", "runs", "chunks")
+    else:
+        names = ("baseline_run", "metric", "value")
+    parts = [quote("type") + ":" + quote(row_type)]
+    for name in names:
+        value = row[name]
+        rendered = str(value) if isinstance(value, (int, float)) or name not in {"operation", "name", "stage", "metric"} else quote(value)
+        if name in {"operation", "name", "stage", "metric"}:
+            rendered = quote(value)
+        parts.append(quote(name) + ":" + rendered)
+    return "{" + ",".join(parts) + "}"
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(f"usage: {Path(sys.argv[0]).name} resource-performance.log", file=sys.stderr)
+        return 2
+    try:
+        rows = parse_log(Path(sys.argv[1]))
+    except ContractError as error:
+        print(f"parse-resource-performance: {error}", file=sys.stderr)
+        return 1
+    for row in rows:
+        print(json_number_line(row))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

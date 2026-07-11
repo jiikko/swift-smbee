@@ -1,6 +1,6 @@
 # 053 perf: PERF_* ログ形式を契約化し解析失敗を fail-closed にする
 
-状態: **open**
+状態: **done**
 起票: 2026-07-12
 優先度: **P1**
 コスト: **L**
@@ -23,13 +23,13 @@ resource performance の測定ログは `bin/ci/run-resource-performance` が出
 
 ## 完了条件
 
-- [ ] PERF ログ形式と version marker、run 完了 marker が文書化され、producer と consumer が同じ parser を使用する。
-- [ ] 必須フィールド欠落、不正数値、malformed 行、形式バージョン不一致、完了 marker 欠落で各解析スクリプトが非ゼロ終了する。
-- [ ] 成功 run では期待 sample 数を検証し、欠落時に artifact や `Unavailable` summary を成功扱いしない。
-- [ ] 境界値（throughput が floor と同値、RSS が 512 MiB と同値、duration が 200 ms と同値）が仕様どおり判定される。
-- [ ] 複数 baseline run の fixture が全 run の sample と metadata を検証する。`PERF_BASELINE_RUN` の欠落・重複・run 番号の不連続も異常として検出する。
-- [ ] 期待 sample 数は operation ごと（read_stream / write_stream 各々）に検証し、片方だけ欠落したケースを見逃さない。
-- [ ] 必須行（`PERF_RESOURCE_SAMPLE` / `PERF_RESOURCE`）と任意行（`PERF_BUILD_CACHE` / `PERF_WRITE_PROFILE`）の区別が契約として文書化されている。
-- [ ] workflow の `if: always()` 後段ステップで parse failure が job failure に伝播することを確認する。
-- [ ] `bin/ci/test-performance-scripts` が正常系・異常系 fixture を実行して green になる。
+- [x] PERF ログ形式と version marker、run 完了 marker が文書化され、producer と consumer が同じ parser を使用する。
+- [x] 必須フィールド欠落、不正数値、malformed 行、形式バージョン不一致、完了 marker 欠落で各解析スクリプトが非ゼロ終了する。
+- [x] 成功 run では期待 sample 数を検証し、欠落時に artifact や `Unavailable` summary を成功扱いしない。
+- [x] 境界値（throughput が floor と同値、RSS が 512 MiB と同値、duration が 200 ms と同値）が仕様どおり判定される。
+- [x] 複数 baseline run の fixture が全 run の sample と metadata を検証する。`PERF_BASELINE_RUN` の欠落・重複・run 番号の不連続も異常として検出する。
+- [x] 期待 sample 数は operation ごと（read_stream / write_stream 各々）に検証し、片方だけ欠落したケースを見逃さない。
+- [x] 必須行（`PERF_RESOURCE_SAMPLE` / `PERF_RESOURCE`）と任意行（`PERF_BUILD_CACHE` / `PERF_WRITE_PROFILE`）の区別が契約として文書化されている。
+- [x] workflow の `if: always()` 後段ステップで parse failure が job failure に伝播することを確認する。
+- [x] `bin/ci/test-performance-scripts` が正常系・異常系 fixture を実行して green になる。
 

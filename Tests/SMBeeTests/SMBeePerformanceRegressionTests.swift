@@ -157,6 +157,7 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
 
     func testSyntheticReadStreamResourceUsage() async throws {
         try requireReleaseConfiguration()
+        print("PERF_FORMAT version=1")
         _ = try await measureRead(size: 1024 * 1024)
         var samples: [ResourcePerformanceSample] = []
         for _ in 0..<measuredRuns {
@@ -167,16 +168,19 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
             samples.append(ResourcePerformanceSample.combining(iterations))
         }
         assertAndPrint(samples: samples, operation: "read_stream", iterationsPerSample: readIterationsPerSample)
+        print("PERF_RUN_COMPLETE operation=read_stream")
     }
 
     func testSyntheticWriteStreamResourceUsage() async throws {
         try requireReleaseConfiguration()
+        print("PERF_FORMAT version=1")
         _ = try await measureWrite(size: 1024 * 1024)
         var samples: [ResourcePerformanceSample] = []
         for _ in 0..<measuredRuns {
             samples.append(try await measureWrite(size: payloadSize))
         }
         assertAndPrint(samples: samples, operation: "write_stream", iterationsPerSample: 1)
+        print("PERF_RUN_COMPLETE operation=write_stream")
     }
 
     func testSyntheticWriteStageProfile() async throws {

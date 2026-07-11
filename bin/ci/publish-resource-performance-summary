@@ -14,105 +14,120 @@ SUMMARY_FILE="${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
   echo
   echo '| Operation | Metric | Result | Value | Better | Guardrail | Aggregation | Workload |'
   echo '|---|---|:---:|---:|:---:|---|---|---|'
-  if [ -f "${LOG_FILE}" ]; then
-    awk '
-      /^PERF_RESOURCE / {
-        full_name = $2
-        split(full_name, name_parts, ".")
-        operation = name_parts[1]
-        metric = full_name
-        sub("^" operation "\\.", "", metric)
-        value = size = runs = iterations = throughput_floor = ""
-        for (field_index = 3; field_index <= NF; field_index++) {
-          split($field_index, pair, "=")
-          if (pair[1] == "value") value = pair[2]
-          if (pair[1] == "size_mib") size = pair[2]
-          if (pair[1] == "runs") runs = pair[2]
-          if (pair[1] == "iterations") iterations = pair[2]
-          if (pair[1] == "throughput_floor_mib_s") throughput_floor = pair[2]
-        }
-        label = metric
-        display_value = value
-        direction = "—"
-        guardrail = "Observation only"
-        aggregation = "Median"
-        result = "ℹ️ Observe"
-        if (metric == "throughput_mib_s") {
-          label = "Throughput"
-          display_value = value " MiB/s"
-          direction = "Higher ↑"
-          guardrail = "> " throughput_floor " MiB/s"
-          result = (value + 0 > throughput_floor + 0) ? "✅ Pass" : "❌ Fail"
-        } else if (metric == "user_cpu_ms") {
-          label = "User CPU"
-          display_value = value " ms"
-          direction = "Lower ↓"
-        } else if (metric == "system_cpu_ms") {
-          label = "System CPU"
-          display_value = value " ms"
-          direction = "Lower ↓"
-        } else if (metric == "sample_elapsed_ms") {
-          label = "Measured duration"
-          display_value = value " ms"
-          direction = "Stable window"
-          guardrail = "≥ 200 ms"
-          result = (value + 0 >= 200) ? "✅ Pass" : "❌ Too short"
-        } else if (metric == "max_rss_kb") {
-          label = "Process max RSS"
-          display_value = sprintf("%.1f MiB", (value + 0) / 1024)
-          direction = "Lower ↓"
-          guardrail = "< 512 MiB"
-          aggregation = "Peak"
-          result = (value + 0 < 524288) ? "✅ Pass" : "❌ Fail"
-        }
-        printf "| `%s` | %s | %s | %s | %s | %s | %s | %s MiB × %s runs × %s iterations |\n", operation, label, result, display_value, direction, guardrail, aggregation, size, runs, iterations
-        found = 1
-      }
-      END {
-        if (!found) print "| — | Metrics unavailable | ⚠️ Unavailable | — | — | — | — | — |"
-      }
-    ' "${LOG_FILE}"
-  else
+
+  if [ ! -f "${LOG_FILE}" ]; then
     echo '| — | Metrics unavailable | ⚠️ Unavailable | — | — | — | — | — |'
-  fi
-  echo
-  echo '### How to read this'
-  echo
-  echo '- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; calibrated catastrophic floors are shown per operation.'
-  echo '- **User/System CPU:** CPU consumed during the measured transfer. Lower is better, but currently informational because hosted-runner variance needs more history.'
-  echo '- **Process max RSS:** peak memory for the entire XCTest process, not a per-operation allocation delta. It can repeat across read/write rows; the job fails at 512 MiB or above.'
-  echo '- **Measured duration:** each aggregated sample must cover at least 200 ms of transfer-only intervals to reduce timer and scheduler noise.'
-  echo '- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.'
-  if [ -f "${LOG_FILE}" ] && grep -q '^PERF_WRITE_PROFILE ' "${LOG_FILE}"; then
     echo
-    echo '### Write stage profile'
+    echo '### How to read this'
     echo
-    echo '| Stage | Median | Effective throughput | Interpretation |'
-    echo '|---|---:|---:|---|'
-    awk '
-      /^PERF_WRITE_PROFILE / {
-        stage = elapsed = throughput = ""
-        for (field_index = 2; field_index <= NF; field_index++) {
-          split($field_index, pair, "=")
-          if (pair[1] == "stage") stage = pair[2]
-          if (pair[1] == "median_ms") elapsed = pair[2]
-          if (pair[1] == "throughput_mib_s") throughput = pair[2]
-        }
-        interpretation = stage == "signing_only" ? "AES-CMAC cost" : (stage == "session_no_outbound_retention" ? "Session + transport, discard writes" : (stage == "full_synthetic" ? "End-to-end synthetic write" : "WRITE encoding only"))
-        gsub("_", " ", stage)
-        printf "| %s | %s ms | %s MiB/s | %s |\n", stage, elapsed, throughput, interpretation
-      }
-    ' "${LOG_FILE}"
-  fi
-  if [ -f "${LOG_FILE}" ]; then
-    process_rss="$(awk -F: '/Maximum resident set size \(kbytes\)/ { value=$2; gsub(/[[:space:]]/, "", value) } END { print value }' "${LOG_FILE}")"
-    if [ -n "${process_rss}" ]; then
+    echo '- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; calibrated catastrophic floors are shown per operation.'
+    echo '- **User/System CPU:** CPU consumed during the measured transfer. Lower is better, but currently informational because hosted-runner variance needs more history.'
+    echo '- **Process max RSS:** peak memory for the entire XCTest process, not a per-operation allocation delta. It can repeat across read/write rows; the job fails at 512 MiB or above.'
+    echo '- **Measured duration:** each aggregated sample must cover at least 200 ms of transfer-only intervals to reduce timer and scheduler noise.'
+    echo '- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.'
+  else
+    temporary="$(mktemp -d)"
+    trap 'rm -rf "${temporary}"' EXIT
+    validated_jsonl="${temporary}/resource-performance.jsonl"
+    if ! "${SCRIPT_DIR}/parse-resource-performance" "${LOG_FILE}" > "${validated_jsonl}"; then
+      echo '| — | Metrics unavailable | ❌ Parse failed | — | — | — | — | — |'
       echo
-      # Literal Markdown backticks must not become shell command substitution.
-      # shellcheck disable=SC2016
-      echo '### Whole `swift test` process tree'
-      echo
-      printf -- '- Compiler + XCTest maximum RSS: **%.1f MiB** (%s KiB). This is CI cost, not an operation allocation metric.\n' "$((process_rss / 1024))" "${process_rss}"
+      echo '- **Parse failed:** resource-performance.log violated the log contract. This step exits non-zero to fail the job.'
+      exit 1
     fi
+
+    python3 - "${validated_jsonl}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+from decimal import Decimal
+
+
+def fixed(value: str) -> str:
+    return f"{Decimal(value):.3f}"
+
+
+def general(value: str) -> str:
+    rendered = format(Decimal(value), "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered or "0"
+
+
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+summaries = [row for row in rows if row.get("type") == "summary"]
+
+for row in summaries:
+    operation, metric = row["name"].split(".", 1)
+    value = row["value"]
+    label = metric
+    display_value = value
+    direction = "—"
+    guardrail = "Observation only"
+    aggregation = "Median"
+    result = "ℹ️ Observe"
+    if metric == "throughput_mib_s":
+        label = "Throughput"
+        display_value = fixed(value) + " MiB/s"
+        direction = "Higher ↑"
+        guardrail = "> " + general(row["throughput_floor_mib_s"]) + " MiB/s"
+        result = "✅ Pass" if Decimal(value) > Decimal(row["throughput_floor_mib_s"]) else "❌ Fail"
+    elif metric == "user_cpu_ms":
+        label = "User CPU"
+        display_value = fixed(value) + " ms"
+        direction = "Lower ↓"
+    elif metric == "system_cpu_ms":
+        label = "System CPU"
+        display_value = fixed(value) + " ms"
+        direction = "Lower ↓"
+    elif metric == "sample_elapsed_ms":
+        label = "Measured duration"
+        display_value = fixed(value) + " ms"
+        direction = "Stable window"
+        guardrail = "≥ 200 ms"
+        result = "✅ Pass" if Decimal(value) >= 200 else "❌ Too short"
+    elif metric == "max_rss_kb":
+        label = "Process max RSS"
+        display_value = f"{Decimal(value) / 1024:.1f} MiB"
+        direction = "Lower ↓"
+        guardrail = "< 512 MiB"
+        aggregation = "Peak"
+        result = "✅ Pass" if Decimal(value) < 524288 else "❌ Fail"
+    print(f"| `{operation}` | {label} | {result} | {display_value} | {direction} | {guardrail} | {aggregation} | {row['size_mib']} MiB × {row['runs']} runs × {row['iterations']} iterations |")
+
+print()
+print("### How to read this")
+print()
+print("- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; calibrated catastrophic floors are shown per operation.")
+print("- **User/System CPU:** CPU consumed during the measured transfer. Lower is better, but currently informational because hosted-runner variance needs more history.")
+print("- **Process max RSS:** peak memory for the entire XCTest process, not a per-operation allocation delta. It can repeat across read/write rows; the job fails at 512 MiB or above.")
+print("- **Measured duration:** each aggregated sample must cover at least 200 ms of transfer-only intervals to reduce timer and scheduler noise.")
+print("- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.")
+
+profiles = [row for row in rows if row.get("type") == "write_profile"]
+if profiles:
+    print()
+    print("### Write stage profile")
+    print()
+    print("| Stage | Median | Effective throughput | Interpretation |")
+    print("|---|---:|---:|---|")
+    for row in profiles:
+        stage = row["stage"]
+        interpretation = {
+            "signing_only": "AES-CMAC cost",
+            "session_no_outbound_retention": "Session + transport, discard writes",
+            "full_synthetic": "End-to-end synthetic write",
+        }.get(stage, "WRITE encoding only")
+        print(f"| {stage.replace('_', ' ')} | {fixed(row['median_ms'])} ms | {fixed(row['throughput_mib_s'])} MiB/s | {interpretation} |")
+
+process_rows = [row for row in rows if row.get("type") == "process"]
+if process_rows:
+    process_rss = process_rows[-1]["value"]
+    print()
+    print("### Whole `swift test` process tree")
+    print()
+    print(f"- Compiler + XCTest maximum RSS: **{int(Decimal(process_rss) / 1024):.1f} MiB** ({process_rss} KiB). This is CI cost, not an operation allocation metric.")
+PY
   fi
 } >> "${SUMMARY_FILE}"

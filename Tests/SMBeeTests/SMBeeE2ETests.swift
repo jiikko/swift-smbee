@@ -742,6 +742,132 @@ final class SMBeeE2ETests: XCTestCase {
         await contender.close()
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: path)
     }
+
+    func testCancelledChangeNotifyCompletesWithinDeadline() async throws {
+        let details = try e2eConnectionDetails()
+        let (host, port, credential, share) = (details.host, details.port, details.credential, details.share)
+        let session = try await awaitWithTimeout {
+            try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        }
+        defer { Task { await session.close() } }
+
+        let watcher = Task {
+            try await session.withChangeNotifications(path: "") { _ in }
+        }
+        // Give the server enough time to register the long-poll request.
+        try await Task.sleep(for: .milliseconds(250))
+        watcher.cancel()
+
+        do {
+            _ = try await awaitWithTimeout { try await watcher.value }
+            XCTFail("cancelled CHANGE_NOTIFY unexpectedly completed successfully")
+        } catch is E2ETestTimeout {
+            XCTFail("cancelled CHANGE_NOTIFY did not complete before the deadline")
+        } catch {
+            // CancellationError (or the transport's cancellation-equivalent) is expected.
+        }
+
+        do {
+            _ = try await awaitWithTimeout { try await session.list() }
+        } catch {
+            XCTFail("session.list after cancelled CHANGE_NOTIFY failed: \(error)")
+        }
+        await session.close()
+    }
+
+    func testCancelledUploadAllowsSubsequentOperations() async throws {
+        let details = try e2eConnectionDetails()
+        let (host, port, credential, share) = (details.host, details.port, details.credential, details.share)
+        let session = try await awaitWithTimeout {
+            try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        }
+        defer { Task { await session.close() } }
+        let suffix = UUID().uuidString
+        let largePath = "smbee-e2e-cancel-upload-\(suffix).bin"
+        let smallPath = "smbee-e2e-cancel-upload-\(suffix)-small.txt"
+        defer {
+            Task {
+                try? await SMBee.delete(host: host, port: port, credential: credential, share: share, path: largePath)
+                try? await SMBee.delete(host: host, port: port, credential: credential, share: share, path: smallPath)
+            }
+        }
+
+        let upload = Task {
+            try await session.upload(path: largePath, data: Array(repeating: UInt8(0x5A), count: 4 * 1024 * 1024))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        upload.cancel()
+        do {
+            _ = try await awaitWithTimeout { try await upload.value }
+        } catch is E2ETestTimeout {
+            XCTFail("cancelled upload did not complete before the deadline")
+        } catch {
+            // A cancellation or an interrupted write is expected here.
+        }
+
+        do {
+            _ = try await awaitWithTimeout { try await session.list() }
+        } catch {
+            XCTFail("session.list after cancelled upload failed: \(error)")
+        }
+        try await awaitWithTimeout {
+            try await session.upload(path: smallPath, data: Array("after cancel\n".utf8))
+        }
+        await session.close()
+    }
+
+    func testSessionCloseDuringKeepAliveAgainstRealServer() async throws {
+        let details = try e2eConnectionDetails()
+        let (host, port, credential, share) = (details.host, details.port, details.credential, details.share)
+        let session = try await awaitWithTimeout {
+            try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        }
+        try await session.startKeepAlive(interval: .milliseconds(100))
+        try await Task.sleep(for: .milliseconds(350))
+        try await awaitWithTimeout { await session.close() }
+    }
+
+    private struct E2EConnectionDetails {
+        let host: String
+        let port: UInt16
+        let credential: SMBCredential
+        let share: String
+    }
+
+    private func e2eConnectionDetails() throws -> E2EConnectionDetails {
+        guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
+            throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
+        }
+        let environment = ProcessInfo.processInfo.environment
+        let portString = environment["SMBEE_E2E_PORT"] ?? "445"
+        guard let port = UInt16(portString) else {
+            XCTFail("SMBEE_E2E_PORT must be a valid UInt16, got \(portString)")
+            throw E2ETestTimeout()
+        }
+        return E2EConnectionDetails(
+            host: environment["SMBEE_E2E_HOST"] ?? "127.0.0.1",
+            port: port,
+            credential: SMBCredential(username: environment["SMBEE_E2E_USERNAME"] ?? "smbee", password: environment["SMBEE_E2E_PASSWORD"] ?? "smbee"),
+            share: environment["SMBEE_E2E_SHARE"] ?? "public"
+        )
+    }
+}
+
+private struct E2ETestTimeout: Error {}
+
+private func awaitWithTimeout<T: Sendable>(
+    timeout: Duration = .seconds(10),
+    operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(for: timeout)
+            throw E2ETestTimeout()
+        }
+        defer { group.cancelAll() }
+        return try await group.next()!
+    }
 }
 
 private actor LargeReadAccumulator {

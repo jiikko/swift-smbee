@@ -4,8 +4,30 @@ import Foundation
 import Network
 
 public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
-    private var connection: NWConnection?
+    private let connectionLock = NSLock()
+    private var connectionStorage: NWConnection?
     private let queue = DispatchQueue(label: "dev.smbee.nwconnection")
+
+    private var connection: NWConnection? {
+        get {
+            connectionLock.lock()
+            defer { connectionLock.unlock() }
+            return connectionStorage
+        }
+        set {
+            connectionLock.lock()
+            connectionStorage = newValue
+            connectionLock.unlock()
+        }
+    }
+
+    private func takeConnection() -> NWConnection? {
+        connectionLock.lock()
+        let connection = connectionStorage
+        connectionStorage = nil
+        connectionLock.unlock()
+        return connection
+    }
 
     public init() {}
 
@@ -88,8 +110,7 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
     }
 
     public func close() {
-        connection?.cancel()
-        connection = nil
+        takeConnection()?.cancel()
     }
 }
 

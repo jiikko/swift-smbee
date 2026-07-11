@@ -8,6 +8,12 @@ COVERAGE_REPORT="${COVERAGE_REPORT:-.build/code-coverage-report.txt}"
 COVERAGE_MD="${COVERAGE_MD:-.build/code-coverage.md}"
 IGNORE_FILENAME_REGEX="${IGNORE_FILENAME_REGEX:-(/Tests/|/.build/)}"
 LLVM_COV="${LLVM_COV:-llvm-cov}"
+# Ratchet floors: measured local values (2026-07-11) minus a ~5pt margin for
+# runner variance. Raise (never lower) as coverage improves. Override as
+# `path=percent,path=percent`.
+# Measured: SMBClient 69.95, SMB2ReadCodecs 95.84, SMB2Header 93.63,
+#           POSIXSocketTransport 89.08, SMBCrypto 100.00, AESCCM 95.77
+CRITICAL_FILE_FLOORS="${CRITICAL_FILE_FLOORS:-SMBClient.swift=65,SMB2ReadCodecs.swift=90,SMB2Header.swift=88,POSIXSocketTransport.swift=84,SMBCrypto.swift=95,AESCCM.swift=90}"
 
 if ! command -v "$LLVM_COV" >/dev/null 2>&1; then
   swift_bin=$(command -v swift)
@@ -84,14 +90,26 @@ echo "CODE_COVERAGE_INFO test_binary=$test_binary"
   -ignore-filename-regex "$IGNORE_FILENAME_REGEX" \
   > "$COVERAGE_JSON"
 
-python3 - "$COVERAGE_JSON" "$MIN_LINE_COVERAGE" "$MIN_FUNCTION_COVERAGE" "$COVERAGE_MD" <<'PY'
+python3 - "$COVERAGE_JSON" "$MIN_LINE_COVERAGE" "$MIN_FUNCTION_COVERAGE" "$COVERAGE_MD" "$CRITICAL_FILE_FLOORS" <<'PY'
 import json
 import os
 import sys
 
-coverage_json, min_line_raw, min_function_raw, markdown_path = sys.argv[1:5]
+coverage_json, min_line_raw, min_function_raw, markdown_path, critical_floors_raw = sys.argv[1:6]
 min_line = float(min_line_raw)
 min_function = float(min_function_raw)
+
+critical_floors = {}
+for item in critical_floors_raw.split(","):
+    item = item.strip()
+    if not item:
+        continue
+    try:
+        filename, floor = item.rsplit("=", 1)
+        critical_floors[filename.strip()] = float(floor)
+    except ValueError:
+        print(f"CODE_COVERAGE_ERROR invalid CRITICAL_FILE_FLOORS entry: {item!r}", file=sys.stderr)
+        sys.exit(1)
 
 with open(coverage_json, "r", encoding="utf-8") as handle:
     payload = json.load(handle)
@@ -148,6 +166,8 @@ md.append("")
 md.append("| File | Lines % | Functions % | Regions % |")
 md.append("| --- | ---: | ---: | ---: |")
 files = data[0].get("files", []) or []
+critical_results = []
+files_by_basename = {os.path.basename(entry.get("filename", "")): entry for entry in files}
 for entry in sorted(files, key=lambda f: float(f.get("summary", {}).get("lines", {}).get("percent", 0.0))):
     summary = entry.get("summary", {})
     fl = float(summary.get("lines", {}).get("percent", 0.0))
@@ -155,6 +175,23 @@ for entry in sorted(files, key=lambda f: float(f.get("summary", {}).get("lines",
     fr = float(summary.get("regions", {}).get("percent", 0.0))
     md.append(f"| {short_name(entry.get('filename', '?'))} | {fl:.2f} | {ff:.2f} | {fr:.2f} |")
 md.append(f"| **TOTAL** | **{line_percent:.2f}** | **{function_percent:.2f}** | **{region_percent:.2f}** |")
+
+md.append("")
+md.append("### Critical file line-coverage floors")
+md.append("")
+md.append("| File | Lines % | Floor % | Status |")
+md.append("| --- | ---: | ---: | :--- |")
+for filename, floor in critical_floors.items():
+    entry = files_by_basename.get(os.path.basename(filename))
+    if entry is None:
+        actual = 0.0
+        status = "❌ missing"
+        print(f"CODE_COVERAGE_ERROR critical file {filename} was not found in coverage export (actual=missing floor={floor:.2f}%)", file=sys.stderr)
+    else:
+        actual = float(entry.get("summary", {}).get("lines", {}).get("percent", 0.0))
+        status = "✅ pass" if actual >= floor else "❌ below threshold"
+    critical_results.append((filename, actual, floor, entry is not None and actual >= floor))
+    md.append(f"| {filename} | {actual:.2f} | {floor:.2f} | {status} |")
 md_text = "\n".join(md) + "\n"
 
 with open(markdown_path, "w", encoding="utf-8") as handle:
@@ -184,6 +221,13 @@ if min_function > 0 and function_percent < min_function:
         file=sys.stderr,
     )
     failed = True
+for filename, actual, floor, passed in critical_results:
+    if not passed:
+        print(
+            f"CODE_COVERAGE_ERROR critical file {filename} line coverage {actual:.2f}% is below floor {floor:.2f}%",
+            file=sys.stderr,
+        )
+        failed = True
 
 if failed:
     sys.exit(1)

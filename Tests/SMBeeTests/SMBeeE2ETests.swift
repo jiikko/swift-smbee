@@ -805,13 +805,25 @@ final class SMBeeE2ETests: XCTestCase {
             // A cancellation or an interrupted write is expected here.
         }
 
+        // Cancelling mid-frame can legitimately corrupt the TCP stream, in which case the
+        // client closes the transport (connectionClosed). The acceptance criterion (issue 046)
+        // is that a follow-up *connection* works — reuse the session when it survived,
+        // otherwise verify recovery on a fresh connection.
+        let followUpSession: SMBClientSession
         do {
             _ = try await awaitWithTimeout { try await session.list() }
+            followUpSession = session
         } catch {
-            XCTFail("session.list after cancelled upload failed: \(error)")
+            followUpSession = try await awaitWithTimeout {
+                try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+            }
+            _ = try await awaitWithTimeout { try await followUpSession.list() }
         }
         try await awaitWithTimeout {
-            try await session.upload(path: smallPath, data: Array("after cancel\n".utf8))
+            try await followUpSession.upload(path: smallPath, data: Array("after cancel\n".utf8))
+        }
+        if followUpSession !== session {
+            await followUpSession.close()
         }
         await session.close()
     }

@@ -8,6 +8,13 @@ SWIFT_IMAGE="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"
 LOG_FILE="${RESOURCE_PERFORMANCE_LOG:-${REPO_ROOT}/.build/resource-performance.log}"
 RESOURCE_BASELINE_RUNS="${RESOURCE_BASELINE_RUNS:-1}"
 RESOURCE_SKIP_BUILD="${RESOURCE_SKIP_BUILD:-false}"
+DEFAULT_LOG_FILE="${REPO_ROOT}/.build/resource-performance.log"
+
+if [ "${LOG_FILE}" != "${DEFAULT_LOG_FILE}" ]; then
+  # The container is fixed to /workspace/.build, and later scripts read that path.
+  echo "RESOURCE_PERFORMANCE_LOG must be the default path (${DEFAULT_LOG_FILE}); custom paths are not supported because the container writes to /workspace/.build/resource-performance.log" >&2
+  exit 2
+fi
 
 if ! [[ "${RESOURCE_BASELINE_RUNS}" =~ ^[0-9]+$ ]] ||
     [ "${RESOURCE_BASELINE_RUNS}" -lt 1 ] || [ "${RESOURCE_BASELINE_RUNS}" -gt 20 ]; then

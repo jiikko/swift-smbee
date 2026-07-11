@@ -34,6 +34,57 @@ fi
 
 temporary="$(mktemp -d)"
 trap 'rm -rf "${temporary}"' EXIT
+
+docker_stub_marker="${temporary}/docker-stub-called"
+cat > "${temporary}/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+touch "${DOCKER_STUB_MARKER}"
+EOF
+chmod +x "${temporary}/docker"
+
+run_resource_performance_without_docker() {
+  PATH="${temporary}:${PATH}" \
+  SWIFT_IMAGE=swift:test \
+  DOCKER_STUB_MARKER="${docker_stub_marker}" \
+    "$@"
+}
+
+rm -f "${docker_stub_marker}"
+if ! (
+  unset RESOURCE_PERFORMANCE_LOG
+  run_resource_performance_without_docker \
+    "${SCRIPT_DIR}/run-resource-performance" \
+    >"${temporary}/default-unset.out" 2>"${temporary}/default-unset.err"
+); then
+  echo 'run-resource-performance unexpectedly rejected an unset log path' >&2
+  exit 1
+fi
+test -e "${docker_stub_marker}"
+
+rm -f "${docker_stub_marker}"
+if ! RESOURCE_PERFORMANCE_LOG="${REPO_ROOT}/.build/resource-performance.log" \
+  run_resource_performance_without_docker \
+  "${SCRIPT_DIR}/run-resource-performance" \
+  >"${temporary}/default-explicit.out" 2>"${temporary}/default-explicit.err"; then
+  echo 'run-resource-performance unexpectedly rejected the default log path' >&2
+  exit 1
+fi
+test -e "${docker_stub_marker}"
+
+rm -f "${docker_stub_marker}"
+custom_log="${temporary}/custom/resource.log"
+if RESOURCE_PERFORMANCE_LOG="${custom_log}" \
+  run_resource_performance_without_docker \
+  "${SCRIPT_DIR}/run-resource-performance" \
+  >"${temporary}/custom.out" 2>"${temporary}/custom.err"; then
+  echo 'run-resource-performance unexpectedly accepted a custom log path' >&2
+  exit 1
+fi
+grep -F 'RESOURCE_PERFORMANCE_LOG must be the default path' "${temporary}/custom.err"
+grep -F 'custom paths are not supported' "${temporary}/custom.err"
+test ! -e "${docker_stub_marker}"
+
 log_file="${temporary}/resource.log"
 summary_file="${temporary}/summary.md"
 

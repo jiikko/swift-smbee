@@ -106,3 +106,8 @@ cache hit時の結果は検証runをここへ追記する。
 
 初回cache検証run `29157834623`ではDocker root所有のSwift index/ModuleCacheをActionsのtarが読めず保存に失敗した。
 container終了前に`.build`へread/traverseだけを付与し（write権限は追加しない）、cache保存可能に補正した。
+
+exact cache hit run `29158173179`はcache 156 MiBを復元したが、checkout後のsource timestampにより自packageを再compileし、
+buildは109.00秒（cold 193.51秒比43.7%減）だった。そこでcommit SHAまで一致したexact hitに限り
+`swift test --skip-build`を使う。別commitからのprefix restoreは`cache-hit=false`なので必ず通常buildし、古いbinaryを
+実行しない。exact hit skip-buildの最終値は検証runをここへ追記する。

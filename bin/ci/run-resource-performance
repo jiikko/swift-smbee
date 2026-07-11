@@ -7,10 +7,15 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SWIFT_IMAGE="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"
 LOG_FILE="${RESOURCE_PERFORMANCE_LOG:-${REPO_ROOT}/.build/resource-performance.log}"
 RESOURCE_BASELINE_RUNS="${RESOURCE_BASELINE_RUNS:-1}"
+RESOURCE_SKIP_BUILD="${RESOURCE_SKIP_BUILD:-false}"
 
 if ! [[ "${RESOURCE_BASELINE_RUNS}" =~ ^[0-9]+$ ]] ||
     [ "${RESOURCE_BASELINE_RUNS}" -lt 1 ] || [ "${RESOURCE_BASELINE_RUNS}" -gt 20 ]; then
   echo "RESOURCE_BASELINE_RUNS must be an integer from 1 through 20" >&2
+  exit 2
+fi
+if [ "${RESOURCE_SKIP_BUILD}" != true ] && [ "${RESOURCE_SKIP_BUILD}" != false ]; then
+  echo "RESOURCE_SKIP_BUILD must be true or false" >&2
   exit 2
 fi
 
@@ -19,6 +24,7 @@ mkdir -p "$(dirname "${LOG_FILE}")"
 
 docker run --rm \
   -e RESOURCE_BASELINE_RUNS \
+  -e RESOURCE_SKIP_BUILD \
   -v "${REPO_ROOT}:/workspace" \
   -w /workspace \
   "${SWIFT_IMAGE}" \
@@ -28,13 +34,18 @@ docker run --rm \
     apt-get install -y -qq time >/dev/null
     mkdir -p .build
     : > .build/resource-performance.log
+    test_arguments=(-c release)
+    if [ "${RESOURCE_SKIP_BUILD}" = true ]; then
+      test_arguments+=(--skip-build)
+    fi
+    echo "PERF_BUILD_CACHE exact_hit=${RESOURCE_SKIP_BUILD}"
     for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
       {
         echo "PERF_BASELINE_RUN run=${baseline_run} total=${RESOURCE_BASELINE_RUNS}"
         if [ "${baseline_run}" -eq 1 ]; then
-          /usr/bin/time -v swift test -c release --filter "SMBee(PerformanceRegression|ResourcePerformance)Tests"
+          /usr/bin/time -v swift test "${test_arguments[@]}" --filter "SMBee(PerformanceRegression|ResourcePerformance)Tests"
         else
-          /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests
+          /usr/bin/time -v swift test "${test_arguments[@]}" --filter SMBeeResourcePerformanceTests
         fi
       } 2>&1 | tee -a .build/resource-performance.log
     done

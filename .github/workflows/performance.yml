@@ -34,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Restore SwiftPM performance build
+        id: swiftpm-cache
         uses: actions/cache@v4
         with:
           path: .build
@@ -42,6 +43,8 @@ jobs:
             performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', 'Package.resolved') }}-
       - name: Deterministic contracts and Release resource metrics
         timeout-minutes: 15
+        env:
+          RESOURCE_SKIP_BUILD: ${{ steps.swiftpm-cache.outputs.cache-hit == 'true' }}
         run: bin/ci/run-resource-performance
       - name: Build resource metrics artifact
         if: always()

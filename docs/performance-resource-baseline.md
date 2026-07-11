@@ -96,5 +96,10 @@ profileは`PERF_WRITE_PROFILE`としてlog、Summary、JSONL artifactへ保存�
 
 従来はdeterministic contractsとresource metricsが別runnerでそれぞれSwift packageをbuildしていた。
 両方を同じRelease invocationへ統合し、resource testのための重複job/buildを1つ削除した。baseline収集時は初回だけ
-contractsも実行し、2回目以降はresource testのみ同じ`.build`を再利用する。この変更のhosted-runner wall timeは
-統合後のActions runで記録し、cold runner全体で50%に届かない場合はSwiftPM dependency cacheを次候補とする。
+contractsも実行し、2回目以降はresource testのみ同じ`.build`を再利用する。
+
+統合前run `29155413131`のbuild合計は276.87秒（debug contracts 82.43秒 + Release resource 194.44秒）、
+統合後run `29156285604`は193.51秒で、CPU build timeは30.1%減だった。50%目標には届かなかったため、`.build`を
+OS、arch、Swift version、`Package.resolved`、commit SHAでkeyしたActions cacheを追加した。SHAを含むexact hitは
+同一commitの再測定に使い、prefix restore後もSwiftPM自身がsource変更を検査して必要なtargetを再buildする。
+cache hit時の結果は検証runをここへ追記する。

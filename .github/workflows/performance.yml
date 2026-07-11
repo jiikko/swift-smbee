@@ -33,6 +33,13 @@ jobs:
       RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '1' }}
     steps:
       - uses: actions/checkout@v5
+      - name: Restore SwiftPM performance build
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', 'Package.resolved') }}-${{ github.sha }}
+          restore-keys: |
+            performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', 'Package.resolved') }}-
       - name: Deterministic contracts and Release resource metrics
         timeout-minutes: 15
         run: bin/ci/run-resource-performance

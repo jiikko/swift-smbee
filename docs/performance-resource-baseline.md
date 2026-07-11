@@ -103,3 +103,6 @@ contractsも実行し、2回目以降はresource testのみ同じ`.build`を再�
 OS、arch、Swift version、`Package.resolved`、commit SHAでkeyしたActions cacheを追加した。SHAを含むexact hitは
 同一commitの再測定に使い、prefix restore後もSwiftPM自身がsource変更を検査して必要なtargetを再buildする。
 cache hit時の結果は検証runをここへ追記する。
+
+初回cache検証run `29157834623`ではDocker root所有のSwift index/ModuleCacheをActionsのtarが読めず保存に失敗した。
+container終了前に`.build`へread/traverseだけを付与し（write権限は追加しない）、cache保存可能に補正した。

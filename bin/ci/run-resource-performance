@@ -38,4 +38,5 @@ docker run --rm \
         fi
       } 2>&1 | tee -a .build/resource-performance.log
     done
+    chmod -R a+rX .build
   '

@@ -12,6 +12,7 @@ mkdir -p "$(dirname "${OUTPUT_FILE}")"
 commit_sha="${GITHUB_SHA:-$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || printf unknown)}"
 runner_os="${RUNNER_OS:-$(uname -s)}"
 runner_arch="${RUNNER_ARCH:-$(uname -m)}"
+baseline_runs="${RESOURCE_BASELINE_RUNS:-1}"
 
 # These metadata values come from controlled CI/git identifiers. Strip quotes so the
 # line remains valid JSON even when the script is exercised with custom local values.
@@ -20,14 +21,20 @@ runner_os="${runner_os//\"/}"
 runner_arch="${runner_arch//\"/}"
 SWIFT_IMAGE="${SWIFT_IMAGE//\"/}"
 
-printf '{"type":"metadata","commit_sha":"%s","swift_image":"%s","runner_os":"%s","runner_arch":"%s"}\n' \
-  "${commit_sha}" "${SWIFT_IMAGE}" "${runner_os}" "${runner_arch}" > "${OUTPUT_FILE}"
+printf '{"type":"metadata","commit_sha":"%s","swift_image":"%s","runner_os":"%s","runner_arch":"%s","baseline_runs":%s}\n' \
+  "${commit_sha}" "${SWIFT_IMAGE}" "${runner_os}" "${runner_arch}" "${baseline_runs}" > "${OUTPUT_FILE}"
 
 if [ ! -f "${LOG_FILE}" ]; then
   exit 0
 fi
 
 awk '
+  /^PERF_BASELINE_RUN / {
+    for (field_index = 2; field_index <= NF; field_index++) {
+      split($field_index, pair, "=")
+      if (pair[1] == "run") baseline_run = pair[2]
+    }
+  }
   /^PERF_RESOURCE_SAMPLE / {
     operation = run = elapsed = throughput = user = system_cpu = rss = size = iterations = ""
     for (field_index = 2; field_index <= NF; field_index++) {
@@ -42,7 +49,7 @@ awk '
       if (pair[1] == "total_size_mib") size = pair[2]
       if (pair[1] == "iterations") iterations = pair[2]
     }
-    printf "{\"type\":\"sample\",\"operation\":\"%s\",\"run\":%s,\"elapsed_ms\":%s,\"throughput_mib_s\":%s,\"user_cpu_ms\":%s,\"system_cpu_ms\":%s,\"max_rss_kb\":%s,\"total_size_mib\":%s,\"iterations\":%s}\n", operation, run, elapsed, throughput, user, system_cpu, rss, size, iterations
+    printf "{\"type\":\"sample\",\"baseline_run\":%s,\"operation\":\"%s\",\"run\":%s,\"elapsed_ms\":%s,\"throughput_mib_s\":%s,\"user_cpu_ms\":%s,\"system_cpu_ms\":%s,\"max_rss_kb\":%s,\"total_size_mib\":%s,\"iterations\":%s}\n", baseline_run, operation, run, elapsed, throughput, user, system_cpu, rss, size, iterations
   }
   /^PERF_RESOURCE [^ ]+ value=/ {
     name = $2
@@ -54,10 +61,10 @@ awk '
       if (pair[1] == "runs") runs = pair[2]
       if (pair[1] == "iterations") iterations = pair[2]
     }
-    printf "{\"type\":\"summary\",\"name\":\"%s\",\"value\":%s,\"size_mib\":%s,\"runs\":%s,\"iterations\":%s}\n", name, value, size, runs, iterations
+    printf "{\"type\":\"summary\",\"baseline_run\":%s,\"name\":\"%s\",\"value\":%s,\"size_mib\":%s,\"runs\":%s,\"iterations\":%s}\n", baseline_run, name, value, size, runs, iterations
   }
   /Maximum resident set size \(kbytes\)/ {
     value = $NF
-    printf "{\"type\":\"process\",\"metric\":\"max_rss_kb\",\"value\":%s}\n", value
+    printf "{\"type\":\"process\",\"baseline_run\":%s,\"metric\":\"max_rss_kb\",\"value\":%s}\n", baseline_run, value
   }
 ' "${LOG_FILE}" >> "${OUTPUT_FILE}"

@@ -6,11 +6,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SWIFT_IMAGE="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"
 LOG_FILE="${RESOURCE_PERFORMANCE_LOG:-${REPO_ROOT}/.build/resource-performance.log}"
+RESOURCE_BASELINE_RUNS="${RESOURCE_BASELINE_RUNS:-1}"
+
+if ! [[ "${RESOURCE_BASELINE_RUNS}" =~ ^[0-9]+$ ]] ||
+    [ "${RESOURCE_BASELINE_RUNS}" -lt 1 ] || [ "${RESOURCE_BASELINE_RUNS}" -gt 20 ]; then
+  echo "RESOURCE_BASELINE_RUNS must be an integer from 1 through 20" >&2
+  exit 2
+fi
 
 cd "${REPO_ROOT}"
 mkdir -p "$(dirname "${LOG_FILE}")"
 
 docker run --rm \
+  -e RESOURCE_BASELINE_RUNS \
   -v "${REPO_ROOT}:/workspace" \
   -w /workspace \
   "${SWIFT_IMAGE}" \
@@ -19,6 +27,11 @@ docker run --rm \
     apt-get update -qq
     apt-get install -y -qq time >/dev/null
     mkdir -p .build
-    /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests 2>&1 \
-      | tee .build/resource-performance.log
+    : > .build/resource-performance.log
+    for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
+      {
+        echo "PERF_BASELINE_RUN run=${baseline_run} total=${RESOURCE_BASELINE_RUNS}"
+        /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests
+      } 2>&1 | tee -a .build/resource-performance.log
+    done
   '

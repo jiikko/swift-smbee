@@ -1,7 +1,9 @@
 import XCTest
 @testable import SMBee
 
+// swiftlint:disable:next type_body_length
 final class SMBeeE2ETests: XCTestCase {
+    // swiftlint:disable:next function_body_length
     func testProbeNegotiatesExpectedProfile() async throws {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
             throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
@@ -40,6 +42,7 @@ final class SMBeeE2ETests: XCTestCase {
         }
     }
 
+    // swiftlint:disable:next function_body_length
     func testAuthenticatedTreeConnectAndListShowsKnownFile() async throws {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
             throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")
@@ -305,6 +308,7 @@ final class SMBeeE2ETests: XCTestCase {
         }
     }
 
+    // swiftlint:disable:next function_body_length
     func testAuthenticatedWriteOperations() async throws {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E"] == "1" else {
             throw XCTSkip("Set SMBEE_E2E=1 to run Samba-backed E2E tests")

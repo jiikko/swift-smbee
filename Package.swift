@@ -29,6 +29,10 @@ let package = Package(
             ],
             plugins: [.plugin(name: "SwiftLintBuildToolPlugin", package: "SwiftLintPlugins")]
         ),
-        .testTarget(name: "SMBeeTests", dependencies: ["SMBee", "smbcli"]),
+        .testTarget(
+            name: "SMBeeTests",
+            dependencies: ["SMBee", "smbcli"],
+            plugins: [.plugin(name: "SwiftLintBuildToolPlugin", package: "SwiftLintPlugins")]
+        ),
     ]
 )

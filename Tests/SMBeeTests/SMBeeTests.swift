@@ -581,6 +581,7 @@ private final class TestContinuationResumer<Success: Sendable>: @unchecked Senda
 }
 #endif
 
+// swiftlint:disable:next type_body_length
 final class SMBeeTests: XCTestCase {
     // These tests model a server with enough negotiated credits for one large request.
     fileprivate let negotiatedServerCredits: UInt32 = 64
@@ -1423,7 +1424,7 @@ final class SMBeeTests: XCTestCase {
         let ace = aceBytes(type: 0, flags: 0, accessMask: 0x001f_01ff, sid: everyone)
         var acl = Array(repeating: UInt8(0), count: 8)
         acl[0] = 2  // AclRevision
-        writeUInt16LE(UInt16(8 + ace.count), to: &acl, at: 2)  // AclSize
+    writeUInt16LE(UInt16(8 + ace.count), to: &acl, at: 2)  // AclSize
         writeUInt16LE(1, to: &acl, at: 4)  // AceCount
         acl.append(contentsOf: ace)
 
@@ -2101,7 +2102,7 @@ final class SMBeeTests: XCTestCase {
         ])
         ack.append(contentsOf: hexBytes("045d888aeb1cc9119fe808002b104860"))
         ack.append(contentsOf: [0x02, 0x00, 0x00, 0x00])
-        writeUInt16LE(UInt16(ack.count), to: &ack, at: 8)
+    writeUInt16LE(UInt16(ack.count), to: &ack, at: 8)
 
         XCTAssertNoThrow(try DCERPC.decodeBindAck(ack))
     }
@@ -2351,7 +2352,7 @@ final class SMBeeTests: XCTestCase {
             alternatePath: nil,
             networkAddress: "\\\\target\\share"
         )
-        writeUInt16LE(UInt16(entry.count + 2), to: &entry, at: 16)
+    writeUInt16LE(UInt16(entry.count + 2), to: &entry, at: 16)
 
         XCTAssertThrowsError(try SMB2DfsReferral.decodeResponse(makeDfsReferralResponse(entries: [entry]))) { error in
             XCTAssertEqual(error as? SMBCodecError, .truncated)
@@ -4283,7 +4284,7 @@ final class SMBeeTests: XCTestCase {
         let userSID = sidBytes(authority: 5, subAuthorities: [21, 1000, 1001, 1002])
         var acl = Array(repeating: UInt8(0), count: 8)
         acl[0] = 2
-        writeUInt16LE(UInt16(8 + 8 + everyoneSID.count + 8 + userSID.count), to: &acl, at: 2)
+    writeUInt16LE(UInt16(8 + 8 + everyoneSID.count + 8 + userSID.count), to: &acl, at: 2)
         writeUInt16LE(2, to: &acl, at: 4)
         acl.append(contentsOf: aceBytes(type: 0, flags: 0, accessMask: 0x001f_01ff, sid: everyoneSID))
         acl.append(contentsOf: aceBytes(type: 1, flags: 0x10, accessMask: 0x0001_0000, sid: userSID))
@@ -6544,18 +6545,18 @@ final class SMBeeTests: XCTestCase {
         writeUInt16LE(0, to: &entry, at: 32)
 
         if let dfsPath {
-            writeUInt16LE(UInt16(entry.count), to: &entry, at: 12)
+    writeUInt16LE(UInt16(entry.count), to: &entry, at: 12)
             appendNullTerminatedUTF16LE(dfsPath, to: &entry)
         }
         if let alternatePath {
-            writeUInt16LE(UInt16(entry.count), to: &entry, at: 14)
+    writeUInt16LE(UInt16(entry.count), to: &entry, at: 14)
             appendNullTerminatedUTF16LE(alternatePath, to: &entry)
         }
         if let networkAddress {
-            writeUInt16LE(UInt16(entry.count), to: &entry, at: 16)
+    writeUInt16LE(UInt16(entry.count), to: &entry, at: 16)
             appendNullTerminatedUTF16LE(networkAddress, to: &entry)
         }
-        writeUInt16LE(UInt16(entry.count), to: &entry, at: 2)
+    writeUInt16LE(UInt16(entry.count), to: &entry, at: 2)
         return entry
     }
 
@@ -6899,7 +6900,7 @@ final class SMBeeTests: XCTestCase {
         appendUInt16LE(0, to: &response)
         appendUInt16LE(0, to: &response)
         response.append(contentsOf: stub)
-        writeUInt16LE(UInt16(response.count), to: &response, at: 8)
+    writeUInt16LE(UInt16(response.count), to: &response, at: 8)
         return response
     }
 
@@ -7073,7 +7074,7 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(1_048_576, to: &response, at: 92)
         writeUInt32LE(1_048_576, to: &response, at: 96)
         writeUInt32LE(1_048_576, to: &response, at: 100)
-        writeUInt16LE(UInt16(response.count), to: &response, at: 116)
+    writeUInt16LE(UInt16(response.count), to: &response, at: 116)
         writeUInt16LE(0, to: &response, at: 118)
         return response
     }
@@ -7090,7 +7091,7 @@ final class SMBeeTests: XCTestCase {
         response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
         writeUInt16LE(9, to: &response, at: 64)
         writeUInt16LE(72, to: &response, at: 68)
-        writeUInt16LE(UInt16(blob.count), to: &response, at: 70)
+    writeUInt16LE(UInt16(blob.count), to: &response, at: 70)
         response.append(contentsOf: blob)
         return response
     }
@@ -7113,4 +7114,5 @@ final class SMBeeTests: XCTestCase {
         }
         return frames
     }
+// swiftlint:disable:next file_length
 }

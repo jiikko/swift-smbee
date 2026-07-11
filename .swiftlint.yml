@@ -15,7 +15,10 @@ custom_rules:
     name: "No trapping UInt16 length cast"
     # UInt16(<expr>.count) / UInt16(<expr>Size) は overflow で fatalError する。
     # 入力由来の可変長は `writer.writeUInt16LE(count:of:)` (throw) を使う (issues/011)。
+    # Tests は固定サイズの synthetic fixture しか扱わず overflow し得ないため対象外
+    # (production の length 計算だけを守る rule)。
     regex: 'writeUInt16LE\(UInt16\([^)]*(\.count|[sS]ize)\)'
+    excluded: ".*Tests.*"
     message: "Use writeUInt16LE(count:of:) for variable-length fields; UInt16(Int) traps on overflow (issues/011)"
     severity: error
 

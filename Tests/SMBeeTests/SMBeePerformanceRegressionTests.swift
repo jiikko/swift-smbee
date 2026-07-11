@@ -3,6 +3,8 @@ import XCTest
 @testable import SMBee
 
 final class SMBeePerformanceRegressionTests: XCTestCase {
+    // This fixture represents a server after negotiation with ample credits.
+    fileprivate let negotiatedServerCredits: UInt32 = 64
     private let credential = SMBCredential(username: "user", password: "pass")
     private let fileId = Array(UInt8(0)..<UInt8(16))
     private let treeId: UInt32 = 0x3344
@@ -23,7 +25,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
                 + [try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: UInt64(2 + expectedChunks), treeId: treeId)]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound)
-        let clientSession = makeClientSession(transport: transport, initialCredits: 64)
+        let clientSession = makeClientSession(transport: transport, initialCredits: negotiatedServerCredits)
         let sink = CountingChunkSink()
 
         try await clientSession.withReadStream(path: "large.bin") { chunk in

@@ -582,6 +582,8 @@ private final class TestContinuationResumer<Success: Sendable>: @unchecked Senda
 #endif
 
 final class SMBeeTests: XCTestCase {
+    // These tests model a server with enough negotiated credits for one large request.
+    fileprivate let negotiatedServerCredits: UInt32 = 64
     func testVersionIsNotEmpty() {
         XCTAssertFalse(SMBee.version.isEmpty)
     }
@@ -1672,6 +1674,24 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(balanceAfterReserve, 0)
         let finalBalance = await window.balance
         XCTAssertEqual(finalBalance, 0)
+    }
+
+    func testSMB2CreditWindowAccountsForChargeTwoGrant() async throws {
+        let window = SMB2CreditWindow(initialCredits: 1)
+
+        let parked = Task { try await window.reserve(charge: 2) }
+        while await window.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+        let balanceBeforeGrant = await window.balance
+        XCTAssertEqual(balanceBeforeGrant, 1)
+
+        let balanceAfterGrant = await window.grant(2)
+        XCTAssertEqual(balanceAfterGrant, 1)
+        let parkedBalance = try await parked.value
+        XCTAssertEqual(parkedBalance, 1)
+        let balanceAfterSecondReserve = try await window.reserve(charge: 1)
+        XCTAssertEqual(balanceAfterSecondReserve, 0)
     }
 
     func testSMB2CreditWindowReserveIsCancellable() async throws {
@@ -3680,7 +3700,7 @@ final class SMBeeTests: XCTestCase {
             signingKey: Array(repeating: UInt8(0x11), count: 16),
             // 65 537 bytes must go out as ONE charge-2 WRITE (flush fixture is at messageId 3);
             // the credit-window chunk cap would split it if the server had only granted 1 credit.
-            initialCredits: 64
+            initialCredits: negotiatedServerCredits
         )
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
         let progress = TransferProgressCollector()
@@ -3710,7 +3730,7 @@ final class SMBeeTests: XCTestCase {
             transport: transport,
             signingKey: Array(repeating: UInt8(0x11), count: 16),
             // Same as the progress test above: keep the >64KiB payload a single charge-2 WRITE.
-            initialCredits: 64
+            initialCredits: negotiatedServerCredits
         )
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
         let payload = (0..<firstChunkSize).map { UInt8($0 % 251) }
@@ -6602,8 +6622,8 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(UInt32((value >> 32) & 0xffff_ffff), to: &bytes, at: offset + 4)
     }
 
-    private func smb2StatusResponse(status: UInt32, command: UInt16, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
-        try SMB2Header(status: status, command: command, messageId: messageId, treeId: treeId).encode()
+    private func smb2StatusResponse(status: UInt32, command: UInt16, messageId: UInt64, treeId: UInt32, credits: UInt16 = 1) throws -> [UInt8] {
+        try SMB2Header(status: status, command: command, credits: credits, messageId: messageId, treeId: treeId).encode()
     }
 
     private func smb2EchoResponse(messageId: UInt64) throws -> [UInt8] {
@@ -6764,16 +6784,16 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
-    private func smb2CreateResponse(fileId: [UInt8], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.create, messageId: messageId, treeId: treeId).encode()
+    private func smb2CreateResponse(fileId: [UInt8], messageId: UInt64, treeId: UInt32, credits: UInt16 = 1) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.create, credits: credits, messageId: messageId, treeId: treeId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 88))
         writeUInt16LE(89, to: &response, at: 64)
         response.replaceSubrange(128..<144, with: fileId)
         return response
     }
 
-    private func smb2ReadResponse(_ payload: [UInt8], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.read, messageId: messageId, treeId: treeId).encode()
+    private func smb2ReadResponse(_ payload: [UInt8], messageId: UInt64, treeId: UInt32, credits: UInt16 = 1) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.read, credits: credits, messageId: messageId, treeId: treeId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
         writeUInt16LE(17, to: &response, at: 64)
         response[66] = 80
@@ -6820,8 +6840,8 @@ final class SMBeeTests: XCTestCase {
         return stub
     }
 
-    private func smb2WriteResponse(count: Int, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.write, messageId: messageId, treeId: treeId).encode()
+    private func smb2WriteResponse(count: Int, messageId: UInt64, treeId: UInt32, credits: UInt16 = 1) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.write, credits: credits, messageId: messageId, treeId: treeId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
         writeUInt16LE(17, to: &response, at: 64)
         writeUInt32LE(UInt32(count), to: &response, at: 68)

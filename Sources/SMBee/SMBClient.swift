@@ -40,6 +40,16 @@ private func smbReplaceItem(at destination: URL, with source: URL, fileManager: 
 #endif
 }
 
+func makeSMBDownloadTemporaryFile(in directory: URL) throws -> (url: URL, handle: FileHandle) {
+    let fileManager = FileManager.default
+    for _ in 0..<8 {
+        let url = directory.appendingPathComponent(".smbee-\(UUID().uuidString).part")
+        guard !fileManager.fileExists(atPath: url.path), fileManager.createFile(atPath: url.path, contents: nil) else { continue }
+        return (url, try FileHandle(forWritingTo: url))
+    }
+    throw SMBCodecError.invalidValue("unable to create unique temporary download file")
+}
+
 private func smbGlobMatches(_ pattern: String, _ value: String) -> Bool {
     fnmatch(pattern, value, 0) == 0
 }
@@ -1007,13 +1017,10 @@ public actor SMBClientSession {
         }
         let fileManager = FileManager.default
         let temporary = localFile.deletingLastPathComponent()
-            .appendingPathComponent(".smbee-\(UUID().uuidString).part")
-        guard !fileManager.fileExists(atPath: temporary.path),
-              fileManager.createFile(atPath: temporary.path, contents: nil) else {
-            throw SMBCodecError.invalidValue("temporary download path already exists")
-        }
-        defer { try? fileManager.removeItem(at: temporary) }
-        let handle = try FileHandle(forWritingTo: temporary)
+        let temporaryFile = try makeSMBDownloadTemporaryFile(in: temporary)
+        let temporaryURL = temporaryFile.url
+        defer { try? fileManager.removeItem(at: temporaryURL) }
+        let handle = temporaryFile.handle
         defer { try? handle.close() }
         let sink = SMBDownloadSink(handle: handle, onProgress: onProgress)
         try await withReadStream(path: path) { chunk in
@@ -1023,9 +1030,9 @@ public actor SMBClientSession {
         }
         try handle.close()
         if fileManager.fileExists(atPath: localFile.path) {
-            try smbReplaceItem(at: localFile, with: temporary, fileManager: fileManager)
+            try smbReplaceItem(at: localFile, with: temporaryURL, fileManager: fileManager)
         } else {
-            try fileManager.moveItem(at: temporary, to: localFile)
+            try fileManager.moveItem(at: temporaryURL, to: localFile)
         }
     }
 

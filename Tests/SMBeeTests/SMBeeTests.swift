@@ -4288,6 +4288,21 @@ final class SMBeeTests: XCTestCase {
         ))
     }
 
+    func testDownloadTemporaryFilesAreUniqueAndCleanable() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let first = try makeSMBDownloadTemporaryFile(in: directory)
+        let second = try makeSMBDownloadTemporaryFile(in: directory)
+        XCTAssertNotEqual(first.url, second.url)
+        try first.handle.close()
+        try second.handle.close()
+        try FileManager.default.removeItem(at: first.url)
+        try FileManager.default.removeItem(at: second.url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: first.url.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: second.url.path))
+    }
+
     func testSetInfoRejectsOutOfRangeFiletimeWithoutTrapping() {
         let fileId = Array(repeating: UInt8(0), count: 16)
         XCTAssertThrowsError(try SMB2SetInfo.encodeBasicInfoRequest(

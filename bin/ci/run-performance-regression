@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+SWIFT_IMAGE="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"
+
+cd "${REPO_ROOT}"
+docker run --rm "${SWIFT_IMAGE}" swift --version
+docker run --rm \
+  -v "${REPO_ROOT}:/workspace" \
+  -w /workspace \
+  "${SWIFT_IMAGE}" \
+  swift test --filter SMBeePerformanceRegressionTests

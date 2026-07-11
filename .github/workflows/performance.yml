@@ -1,0 +1,43 @@
+name: Performance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci-script-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test performance CI scripts
+        run: bin/ci/test-performance-scripts
+
+  performance-regression:
+    needs: ci-script-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Deterministic performance contracts
+        timeout-minutes: 10
+        run: bin/ci/run-performance-regression
+
+  resource-performance:
+    needs: ci-script-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Release resource performance metrics
+        timeout-minutes: 15
+        run: bin/ci/run-resource-performance
+      - name: Publish resource metrics to job summary
+        if: always()
+        run: bin/ci/publish-resource-performance-summary

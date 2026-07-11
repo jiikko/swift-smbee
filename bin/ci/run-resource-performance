@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+SWIFT_IMAGE="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"
+LOG_FILE="${RESOURCE_PERFORMANCE_LOG:-${REPO_ROOT}/.build/resource-performance.log}"
+
+cd "${REPO_ROOT}"
+mkdir -p "$(dirname "${LOG_FILE}")"
+
+docker run --rm \
+  -v "${REPO_ROOT}:/workspace" \
+  -w /workspace \
+  "${SWIFT_IMAGE}" \
+  bash -c '
+    set -euo pipefail
+    apt-get update -qq
+    apt-get install -y -qq time >/dev/null
+    mkdir -p .build
+    /usr/bin/time -v swift test -c release --filter SMBeeResourcePerformanceTests 2>&1 \
+      | tee .build/resource-performance.log
+  '

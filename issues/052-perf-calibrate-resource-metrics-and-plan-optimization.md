@@ -2,7 +2,7 @@
 
 状態: **open**
 起票: 2026-07-11
-関連: `issues/done/004-ci-throughput-cpu-memory-regression-metrics.md` / `issues/003-ci-performance-regression-metrics.md` / `Tests/SMBeeTests/SMBeePerformanceRegressionTests.swift` / `.github/workflows/test.yml`
+関連: `issues/done/004-ci-throughput-cpu-memory-regression-metrics.md` / `issues/003-ci-performance-regression-metrics.md` / `Tests/SMBeeTests/SMBeePerformanceRegressionTests.swift` / `.github/workflows/performance.yml`
 観測run: https://github.com/jiikko/swift-smbee/actions/runs/29151622490
 
 ## 背景

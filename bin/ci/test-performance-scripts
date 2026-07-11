@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+for script in \
+  "${SCRIPT_DIR}/swift-image" \
+  "${SCRIPT_DIR}/run-performance-regression" \
+  "${SCRIPT_DIR}/run-resource-performance" \
+  "${SCRIPT_DIR}/publish-resource-performance-summary"; do
+  bash -n "${script}"
+done
+
+expected_image="swift:$(tr -d '[:space:]' < "${REPO_ROOT}/.swift-version")"
+actual_image="$("${SCRIPT_DIR}/swift-image")"
+if [ "${actual_image}" != "${expected_image}" ]; then
+  echo "swift-image mismatch: expected ${expected_image}, got ${actual_image}" >&2
+  exit 1
+fi
+
+temporary="$(mktemp -d)"
+trap 'rm -rf "${temporary}"' EXIT
+log_file="${temporary}/resource.log"
+summary_file="${temporary}/summary.md"
+
+cat > "${log_file}" <<'EOF'
+PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=8 runs=3 config=release
+PERF_RESOURCE read_stream.user_cpu_ms value=9.861 size_mib=8 runs=3 config=release
+PERF_RESOURCE write_stream.max_rss_kb value=286048 size_mib=8 runs=3 config=release
+EOF
+
+RESOURCE_PERFORMANCE_LOG="${log_file}" \
+GITHUB_STEP_SUMMARY="${summary_file}" \
+  "${SCRIPT_DIR}/publish-resource-performance-summary"
+
+# Literal Markdown backticks are intentional; expanding them would execute commands.
+# shellcheck disable=SC2016
+grep -F '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | Higher ↑ | > 5 MiB/s | Median | 8 MiB × 3 runs |' "${summary_file}"
+# shellcheck disable=SC2016
+grep -F '| `read_stream` | User CPU | ℹ️ Observe | 9.861 ms | Lower ↓ | Observation only | Median | 8 MiB × 3 runs |' "${summary_file}"
+# shellcheck disable=SC2016
+grep -F '| `write_stream` | Process max RSS | ✅ Pass | 279.3 MiB | Lower ↓ | < 512 MiB | Peak | 8 MiB × 3 runs |' "${summary_file}"
+
+missing_summary="${temporary}/missing-summary.md"
+RESOURCE_PERFORMANCE_LOG="${temporary}/missing.log" \
+GITHUB_STEP_SUMMARY="${missing_summary}" \
+  "${SCRIPT_DIR}/publish-resource-performance-summary"
+grep -F '⚠️ Unavailable' "${missing_summary}"
+
+echo 'Performance CI script tests passed.'

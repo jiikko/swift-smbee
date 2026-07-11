@@ -276,8 +276,10 @@ jobs:
           {
             echo '## SMBee resource performance'
             echo
-            echo '| Operation | Metric | Value | Size (MiB) | Runs |'
-            echo '|---|---|---:|---:|---:|'
+            echo '> **Healthy means:** guarded metrics show **✅ Pass**. CPU metrics are **ℹ️ Observe** until enough CI history exists for a stable threshold.'
+            echo
+            echo '| Operation | Metric | Result | Value | Better | Guardrail | Aggregation | Workload |'
+            echo '|---|---|:---:|---:|:---:|---|---|---|'
             if [ -f .build/resource-performance.log ]; then
               awk '
                 /^PERF_RESOURCE / {
@@ -293,14 +295,49 @@ jobs:
                     if (pair[1] == "size_mib") size = pair[2]
                     if (pair[1] == "runs") runs = pair[2]
                   }
-                  printf "| `%s` | `%s` | %s | %s | %s |\n", operation, metric, value, size, runs
+                  label = metric
+                  display_value = value
+                  direction = "—"
+                  guardrail = "Observation only"
+                  aggregation = "Median"
+                  result = "ℹ️ Observe"
+                  if (metric == "throughput_mib_s") {
+                    label = "Throughput"
+                    display_value = value " MiB/s"
+                    direction = "Higher ↑"
+                    guardrail = "> 5 MiB/s"
+                    result = (value + 0 > 5) ? "✅ Pass" : "❌ Fail"
+                  } else if (metric == "user_cpu_ms") {
+                    label = "User CPU"
+                    display_value = value " ms"
+                    direction = "Lower ↓"
+                  } else if (metric == "system_cpu_ms") {
+                    label = "System CPU"
+                    display_value = value " ms"
+                    direction = "Lower ↓"
+                  } else if (metric == "max_rss_kb") {
+                    label = "Process max RSS"
+                    display_value = sprintf("%.1f MiB", (value + 0) / 1024)
+                    direction = "Lower ↓"
+                    guardrail = "< 512 MiB"
+                    aggregation = "Peak"
+                    result = (value + 0 < 524288) ? "✅ Pass" : "❌ Fail"
+                  }
+                  printf "| `%s` | %s | %s | %s | %s | %s | %s | %s MiB × %s runs |\n", operation, label, result, display_value, direction, guardrail, aggregation, size, runs
                   found = 1
                 }
                 END {
-                  if (!found) print "| — | Metrics unavailable | — | — | — |"
+                  if (!found) print "| — | Metrics unavailable | ⚠️ Unavailable | — | — | — | — | — |"
                 }
               ' .build/resource-performance.log
             else
-              echo '| — | Metrics unavailable | — | — | — |'
+              echo '| — | Metrics unavailable | ⚠️ Unavailable | — | — | — | — | — |'
             fi
+            echo
+            echo '### How to read this'
+            echo
+            echo '- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; the job fails at 5 MiB/s or below.'
+            echo '- **User/System CPU:** CPU consumed during the measured transfer. Lower is better, but currently informational because hosted-runner variance needs more history.'
+            echo '- **Process max RSS:** peak memory for the entire XCTest process, not a per-operation allocation delta. It can repeat across read/write rows; the job fails at 512 MiB or above.'
+            echo '- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.'
           } >> "$GITHUB_STEP_SUMMARY"

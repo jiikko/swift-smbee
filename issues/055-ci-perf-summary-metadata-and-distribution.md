@@ -16,7 +16,11 @@ job summary だけでは、異なる環境や実行条件の値を比較する�
 
 また、whole `swift test` の RSS 表示では、`printf "%.1f"` に整数除算した `$((process_rss / 1024))` を渡しているため、小数精度がない。
 
+なお `bin/ci/summarize-resource-baseline` は既に median/p10/p90/MAD/min/max を計算できるが、job summary はこのスクリプトを利用していない。
+
 ## 対応方針
+
+前提: `issues/053-ci-perf-log-contract-fail-closed.md` の共通 parser を先行させ、本 issue は parser の出力契約（検証済み JSONL）に依存する形で実装する。
 
 - job summary の先頭に commit SHA、Swift image、runner、baseline run 数、sample 数、cache hit を表示する。
 - metric ごとに median に加えて MAD、min–max または p10–p90、raw sample 数を表示する。aggregation の単位と対象も明示する。

@@ -12,7 +12,7 @@
 
 ## 問題
 
-`bin/ci/run-performance-regression` は workflow から呼ばれておらず、`test-performance-scripts` でも実行結果を検証していない。また、実行コマンドに `-c release` がないため、`052` の resource 測定経路（Linux Release build）と実行条件が一致しない。
+`bin/ci/run-performance-regression` は workflow から呼ばれておらず、`test-performance-scripts` でも実行結果を検証していない。また、実行コマンドに `-c release` がないため、resource performance の契約として再利用する場合には `052` の測定経路（Linux Release build）と実行条件が一致しない。standalone の Debug deterministic contract 用として維持するなら Debug 実行自体は合理的であり、目的の明記が主眼である。
 
 ## 対応方針
 

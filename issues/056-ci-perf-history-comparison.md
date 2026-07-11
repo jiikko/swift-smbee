@@ -16,7 +16,8 @@
 
 ## 対応方針
 
-- `bin/ci/compare-resource-performance` を追加し、GitHub API（`actions:read`）で前回 master 成功 run の resource-performance JSONL artifact を取得する。
+- `bin/ci/compare-resource-performance` を追加し、GitHub API（`actions:read`）で前回 master 成功 run の resource-performance JSONL artifact を取得する。比較対象は「同一 workflow の `push` イベント run かつ `conclusion == success`」に限定し、artifact 名と保持期限（30日）を選択条件に含める。
+- 比較する RSS は XCTest process の `max_rss_kb`（`PERF_RESOURCE` 由来）に固定し、`/usr/bin/time` の process tree RSS とは混同しない。workload の照合は summary 行の `size_mib`/`runs`/`iterations` を正とする（metadata 行には workload が無い）。
 - swift image、runner、workload の metadata が一致する場合だけ throughput、CPU、RSS の median 増減率を計算し、job Summary に advisory として表示する。
 - 初回、fork PR、artifact 期限切れ、取得失敗、metadata 不一致など比較不能な場合は `No comparable baseline` と明示する。
 - 比較結果は failure 条件や guardrail に使わず、`052` の決定を維持する。

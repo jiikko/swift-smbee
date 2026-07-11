@@ -17,7 +17,8 @@ resource performance のログには throughput、elapsed、user CPU、system CP
 ## 対応方針
 
 - Observe-only の metric として、user/system CPU ms per MiB、CPU utilization（`(user + system) / elapsed`）、write stage profile ごとの比率を Summary と JSONL に追加する。
-- 単位、分母（workload bytes または measured elapsed）、ゼロ除算時の扱いを契約化する。
+- 単位、分母、ゼロ除算時の扱いを契約化する。特に (a) write stage 比率の分母は `full_synthetic median_ms` に固定する、(b) CPU per MiB は read 160 MiB/sample・write 8 MiB/sample と workload が異なるため、sample の `total_size_mib` を分母とし operation 間の直接比較はしない、を明記する。
+- Summary の統計表示（median/MAD 等の表現）は `issues/055-ci-perf-summary-metadata-and-distribution.md` に委ね、本 issue は新規 metric の定義・生成に限定する。
 - これらの metric を guardrail の failure 条件には昇格させず、`052` の決定を維持する。
 
 ## 完了条件

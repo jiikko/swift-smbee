@@ -14,7 +14,9 @@
 
 JSONL metadata に Swift version 全文、Docker image digest、kernel、CPU model/vCPU、`GITHUB_RUN_ID`/`GITHUB_RUN_ATTEMPT`、cache hit がないため、同じ image 名でも実行環境の差を後から特定できない可能性がある。image 名だけでは取得した image の digest を識別できない。
 
-また、毎 run の `apt-get update` と `apt-get install time` が測定 job の実行経路に含まれている。これらの時間は測定結果の再現性や job cost の解釈に影響する可能性がある。
+また、毎 run の `apt-get update` と `apt-get install time` が測定 job の実行経路に含まれている。これらは `/usr/bin/time swift test` の計測区間外だが、job の実行コストと外部依存（apt repository 到達性）を増やし、環境の再現性に影響する。
+
+コストは image digest 固定・`time` 同梱 image・metadata 拡張まで含めると M〜L 相当。
 
 ## 対応方針
 

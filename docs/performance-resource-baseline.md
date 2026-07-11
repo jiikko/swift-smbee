@@ -110,4 +110,10 @@ container終了前に`.build`へread/traverseだけを付与し（write権限は
 exact cache hit run `29158173179`はcache 156 MiBを復元したが、checkout後のsource timestampにより自packageを再compileし、
 buildは109.00秒（cold 193.51秒比43.7%減）だった。そこでcommit SHAまで一致したexact hitに限り
 `swift test --skip-build`を使う。別commitからのprefix restoreは`cache-hit=false`なので必ず通常buildし、古いbinaryを
-実行しない。exact hit skip-buildの最終値は検証runをここへ追記する。
+実行しない。
+
+最終exact-hit run `29158482813`では156 MiB cacheがcommit SHA完全一致で復元され、logにも
+`PERF_BUILD_CACHE exact_hit=true`と`swift test -c release --skip-build`を記録した。`swift test` wall timeは
+19.60秒、resource jobは統合直後run `29156285604`の4分10秒から1分8秒へ72.8%短縮した。cold build
+193.51秒に対する再buildは0秒となり、50%削減目標を満たした。同runのwrite throughputは12.558 MiB/sで、
+cacheによって測定対象が省略されていないことも確認した。

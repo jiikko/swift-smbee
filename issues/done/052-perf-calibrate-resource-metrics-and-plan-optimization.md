@@ -1,6 +1,6 @@
 # 052 perf: resource metricsを校正し、測定根拠に基づく改善計画を作る
 
-状態: **in progress**
+状態: **done**
 起票: 2026-07-11
 関連: `issues/done/004-ci-throughput-cpu-memory-regression-metrics.md` / `issues/003-ci-performance-regression-metrics.md` / `Tests/SMBeeTests/SMBeePerformanceRegressionTests.swift` / `.github/workflows/performance.yml`
 観測run: https://github.com/jiikko/swift-smbee/actions/runs/29151622490
@@ -209,6 +209,6 @@ run `29151622490`ではbenchmark数秒に対してbuildが194秒なので、buil
 - [x] write経路をcodec/signing/session/fullの段階に分けてprofileする。
 - [x] profile根拠付きの最適化候補とA/B測定結果を作る。
 - [x] XCTest RSSとjob全体RSSをSummary上で区別する。
-- [ ] resource-performanceのbuild時間を50%以上削減する案を検証する。
+- [x] resource-performanceのbuild時間を50%以上削減する案を検証する。
 
 測定値、guardrail根拠、profileとA/B結果は`docs/performance-resource-baseline.md`に記録する。

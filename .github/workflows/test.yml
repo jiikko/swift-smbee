@@ -147,7 +147,11 @@ jobs:
         run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Address Sanitizer tests
         timeout-minutes: 15
-        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift test --sanitize=address --skip SMBeeE2ETests
+        # detect_leaks=0: LeakSanitizer flags only XCTest/Swift-runtime harness
+        # allocations on Linux (XCTestCaseRun / awaitUsingExpectation weak refs —
+        # verified none trace into SMBee code). ASan itself (heap overflow /
+        # use-after-free) stays fully active, which is what this job is for.
+        run: docker run --rm -e ASAN_OPTIONS=detect_leaks=0 -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift test --sanitize=address --skip SMBeeE2ETests
 
   linux-build-test:
     name: linux-build-test / .swift-version

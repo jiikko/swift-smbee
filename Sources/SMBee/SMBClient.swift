@@ -593,7 +593,9 @@ public actor SMBClientSession {
     public func close() async {
         guard !isClosed else { return }
         isClosed = true
-        stopKeepAlive()
+        keepAliveTask?.cancel()
+        await keepAliveTask?.value
+        keepAliveTask = nil
         await session.disconnect(treeId: treeId)
     }
 
@@ -3299,6 +3301,7 @@ private struct SMBPendingResponse {
     let expectedTreeId: UInt32
     var pendingCount: Int = 0
     let continuation: CheckedContinuation<SMBReceivedFrame, Error>
+    var sendTask: Task<Void, Never>?
 }
 
 /// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
@@ -4511,9 +4514,10 @@ actor SMBSession {
                 expectedCommand: requestHeader.command,
                 expectedSessionId: requestHeader.sessionId,
                 expectedTreeId: requestHeader.treeId,
-                continuation: continuation
+                continuation: continuation,
+                sendTask: nil
             )
-            Task {
+            let sendTask = Task {
                 do {
                     try await send(packet)
                     self.markRequestSent(messageId: requestHeader.messageId)
@@ -4521,6 +4525,7 @@ actor SMBSession {
                     self.failPendingResponse(messageId: requestHeader.messageId, error: error)
                 }
             }
+            pendingResponses[requestHeader.messageId]?.sendTask = sendTask
         }
     }
 
@@ -4741,6 +4746,7 @@ actor SMBSession {
 
     private func failPendingResponse(messageId: UInt64, error: Error) {
         guard let pending = pendingResponses.removeValue(forKey: messageId) else { return }
+        pending.sendTask?.cancel()
         // Cancel releases pending state, but the wire response is unfinished — retain
         // sentResponseMessageIds until its final response so credit grants remain observable.
         pending.continuation.resume(throwing: error)
@@ -4752,6 +4758,7 @@ actor SMBSession {
         sentResponseMessageIds.removeAll()
         orphanResponses.removeAll()
         for waiter in pending.values {
+            waiter.sendTask?.cancel()
             waiter.continuation.resume(throwing: error)
         }
         // Credit waiters are only ever resumed by grants from received responses; once the

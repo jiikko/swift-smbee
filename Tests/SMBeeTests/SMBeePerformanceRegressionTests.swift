@@ -149,6 +149,7 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
     private let measuredRuns = 5
     private let payloadSize = 8 * 1024 * 1024
     private let readIterationsPerSample = 20
+    private let writeIterationsPerSample = 14
     private let treeId: UInt32 = 0x3344
     private let fileId = Array(UInt8(0)..<UInt8(16))
     private let credential = SMBCredential(username: "user", password: "pass")
@@ -177,9 +178,13 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         _ = try await measureWrite(size: 1024 * 1024)
         var samples: [ResourcePerformanceSample] = []
         for _ in 0..<measuredRuns {
-            samples.append(try await measureWrite(size: payloadSize))
+            var iterations: [ResourcePerformanceSample] = []
+            for _ in 0..<writeIterationsPerSample {
+                iterations.append(try await measureWrite(size: payloadSize))
+            }
+            samples.append(ResourcePerformanceSample.combining(iterations))
         }
-        assertAndPrint(samples: samples, operation: "write_stream", iterationsPerSample: 1)
+        assertAndPrint(samples: samples, operation: "write_stream", iterationsPerSample: writeIterationsPerSample)
         print("PERF_RUN_COMPLETE operation=write_stream")
     }
 
@@ -195,11 +200,18 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
             )
         }
 
+        // Warm every measured path with the complete workload before collecting samples.
+        _ = try signPackets(packets, usingPureSwiftBackend: false)
+        _ = try signPackets(packets, usingPureSwiftBackend: true)
+        _ = try await measureWriteSample(size: 1024 * 1024, retainOutbound: false)
+        _ = try await measureWriteSample(size: 1024 * 1024, retainOutbound: true)
+
         var codecSamples: [Double] = []
         var signingSamples: [Double] = []
+        var pureSwiftSigningSamples: [Double] = []
         var sessionSamples: [Double] = []
         var fullSamples: [Double] = []
-        for _ in 0..<measuredRuns {
+        for run in 0..<measuredRuns {
             var encodedBytes = 0
             var start = ContinuousClock.now
             for (index, length) in chunks.enumerated() {
@@ -211,24 +223,111 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
             codecSamples.append(start.duration(to: ContinuousClock.now).secondsAsDouble * 1000)
             XCTAssertGreaterThan(encodedBytes, payloadSize)
 
-            var signatureBytes = 0
-            start = ContinuousClock.now
-            for packet in packets {
-                signatureBytes += try SMBSessionSigning.signature(
-                    algorithm: .aesCMAC, key: signingKey, packet: packet, sender: .client
-                ).count
-            }
-            signingSamples.append(start.duration(to: ContinuousClock.now).secondsAsDouble * 1000)
-            XCTAssertEqual(signatureBytes, chunks.count * 16)
+            sessionSamples.append(
+                try await measureWriteSample(size: payloadSize, retainOutbound: false).elapsedMilliseconds
+            )
+            fullSamples.append(
+                try await measureWriteSample(size: payloadSize, retainOutbound: true).elapsedMilliseconds
+            )
 
-            sessionSamples.append(try await measureWriteElapsed(size: payloadSize, retainOutbound: false))
-            fullSamples.append(try await measureWriteElapsed(size: payloadSize, retainOutbound: true))
+            // Alternate the backend order so clock/thermal drift is not assigned to one side.
+            let backendOrder = run.isMultiple(of: 2) ? [false, true] : [true, false]
+            for usePureSwift in backendOrder {
+                start = ContinuousClock.now
+                let signatureBytes = try signPackets(packets, usingPureSwiftBackend: usePureSwift)
+                let elapsed = start.duration(to: ContinuousClock.now).secondsAsDouble * 1000
+                XCTAssertEqual(signatureBytes, chunks.count * 16)
+                if usePureSwift {
+                    pureSwiftSigningSamples.append(elapsed)
+                } else {
+                    signingSamples.append(elapsed)
+                }
+            }
         }
 
         printWriteProfile(stage: "codec_only", samples: codecSamples)
         printWriteProfile(stage: "signing_only", samples: signingSamples)
+        printWriteProfile(stage: "pure_swift_signing_only", samples: pureSwiftSigningSamples)
         printWriteProfile(stage: "session_no_outbound_retention", samples: sessionSamples)
         printWriteProfile(stage: "full_synthetic", samples: fullSamples)
+    }
+
+    func testSyntheticCMACScalingProfile() throws {
+        try requireReleaseConfiguration()
+        let chunkSize = 64 * 1024
+        for sizeMiB in [4, 8, 16] {
+            let size = sizeMiB * 1024 * 1024
+            let payload = Array(repeating: UInt8(0xa5), count: chunkSize)
+            let packets = try chunkLengths(fileSize: size, chunkSize: chunkSize).enumerated().map { index, length in
+                try SMB2Write.encodeRequest(
+                    messageId: UInt64(index), sessionId: 1, treeId: treeId, fileId: fileId,
+                    offset: UInt64(index * chunkSize), data: length == chunkSize ? payload : Array(payload.prefix(length))
+                )
+            }
+            let iterations = 512 / sizeMiB
+            _ = try signPackets(packets, usingPureSwiftBackend: false)
+            var samples: [CMACScalingSample] = []
+            for run in 1...measuredRuns {
+                let rssBefore = ResourceUsageSnapshot.currentRSSKilobytes()
+                let before = ResourceUsageSnapshot.current()
+                let start = ContinuousClock.now
+                var signatureBytes = 0
+                for _ in 0..<iterations {
+                    signatureBytes += try signPackets(packets, usingPureSwiftBackend: false)
+                }
+                let elapsed = start.duration(to: ContinuousClock.now).secondsAsDouble * 1000
+                let after = ResourceUsageSnapshot.current()
+                let rssAfter = ResourceUsageSnapshot.currentRSSKilobytes()
+                XCTAssertEqual(signatureBytes, packets.count * 16 * iterations)
+                let sample = CMACScalingSample(
+                    elapsedMilliseconds: elapsed,
+                    userCPUMilliseconds: Double(after.userMicroseconds - before.userMicroseconds) / 1000,
+                    currentRSSBeforeKilobytes: rssBefore,
+                    currentRSSAfterKilobytes: rssAfter,
+                    maxRSSKilobytes: after.maxRSSKilobytes
+                )
+                samples.append(sample)
+                let totalSizeMiB = sizeMiB * iterations
+                print(
+                    "PERF_CMAC_SCALING_SAMPLE size_mib=\(sizeMiB) chunks=\(packets.count) "
+                        + "iterations=\(iterations) run=\(run) elapsed_ms=\(format(sample.elapsedMilliseconds)) "
+                        + "throughput_mib_s=\(format(Double(totalSizeMiB) / (sample.elapsedMilliseconds / 1000))) "
+                        + "user_cpu_ms=\(format(sample.userCPUMilliseconds)) "
+                        + "current_rss_before_kb=\(sample.currentRSSBeforeKilobytes) "
+                        + "current_rss_after_kb=\(sample.currentRSSAfterKilobytes) max_rss_kb=\(sample.maxRSSKilobytes)"
+                )
+            }
+            let elapsed = median(samples.map(\.elapsedMilliseconds))
+            let userCPU = median(samples.map(\.userCPUMilliseconds))
+            let rssBefore = median(samples.map { Double($0.currentRSSBeforeKilobytes) })
+            let rssAfter = median(samples.map { Double($0.currentRSSAfterKilobytes) })
+            let peakRSS = samples.map(\.maxRSSKilobytes).max() ?? 0
+            let throughput = Double(sizeMiB * iterations) / (elapsed / 1000)
+            print(
+                "PERF_CMAC_SCALING size_mib=\(sizeMiB) chunks=\(packets.count) iterations=\(iterations) "
+                    + "runs=\(measuredRuns) median_ms=\(format(elapsed)) throughput_mib_s=\(format(throughput)) "
+                    + "user_cpu_ms=\(format(userCPU)) current_rss_before_kb=\(Int64(rssBefore)) "
+                    + "current_rss_after_kb=\(Int64(rssAfter)) max_rss_kb=\(peakRSS)"
+            )
+        }
+    }
+
+    private func signPackets(_ packets: [[UInt8]], usingPureSwiftBackend: Bool) throws -> Int {
+        var signatureBytes = 0
+        for packet in packets {
+            if usingPureSwiftBackend {
+                var normalized = packet
+                normalized.replaceSubrange(48..<64, with: repeatElement(0, count: 16))
+                signatureBytes += try AESCMAC.pureSwiftAuthenticationCode(
+                    key: signingKey, message: normalized
+                ).count
+            } else {
+                signatureBytes += try SMBSessionSigning.signature(
+                    algorithm: .aesCMAC, key: signingKey, packet: packet, sender: .client
+                ).count
+            }
+        }
+        return signatureBytes
     }
 
     private func measureRead(size: Int) async throws -> ResourcePerformanceSample {
@@ -276,15 +375,10 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
     }
 
     private func measureWrite(size: Int) async throws -> ResourcePerformanceSample {
-        let before = ResourceUsageSnapshot.current()
-        let elapsedMilliseconds = try await measureWriteElapsed(size: size, retainOutbound: true)
-        let after = ResourceUsageSnapshot.current()
-        return ResourcePerformanceSample(
-            size: size, elapsedSeconds: elapsedMilliseconds / 1000, before: before, after: after
-        )
+        try await measureWriteSample(size: size, retainOutbound: true)
     }
 
-    private func measureWriteElapsed(size: Int, retainOutbound: Bool) async throws -> Double {
+    private func measureWriteSample(size: Int, retainOutbound: Bool) async throws -> ResourcePerformanceSample {
         let chunkSize = 64 * 1024
         let lengths = chunkLengths(fileSize: size, chunkSize: chunkSize)
         let inbound = try framed(
@@ -313,11 +407,13 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         )
         let client = SMBClientSession(session: session, treeId: treeId)
         let payload = Array(repeating: UInt8(0xa5), count: size)
+        let before = ResourceUsageSnapshot.current()
         let start = ContinuousClock.now
         try await client.upload(path: "resource.bin", data: payload)
-        let elapsed = start.duration(to: ContinuousClock.now).secondsAsDouble * 1000
+        let elapsed = start.duration(to: ContinuousClock.now).secondsAsDouble
+        let after = ResourceUsageSnapshot.current()
         XCTAssertGreaterThan(transport.sentByteCount, size)
-        return elapsed
+        return ResourcePerformanceSample(size: size, elapsedSeconds: elapsed, before: before, after: after)
     }
 
     private func printWriteProfile(stage: String, samples: [Double]) {
@@ -387,9 +483,44 @@ private struct ResourceUsageSnapshot {
         )
     }
 
+    static func currentRSSKilobytes() -> Int64 {
+#if os(Linux)
+        guard
+            let statm = try? String(contentsOfFile: "/proc/self/statm", encoding: .utf8),
+            let residentPages = Int64(statm.split(separator: " ").dropFirst().first ?? ""),
+            residentPages >= 0
+        else { return 0 }
+        return residentPages * Int64(sysconf(Int32(_SC_PAGESIZE))) / 1024
+#else
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size
+        )
+        let result = withUnsafeMutablePointer(to: &info) { infoPointer in
+            infoPointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { integerPointer in
+                task_info(
+                    mach_task_self_,
+                    task_flavor_t(MACH_TASK_BASIC_INFO),
+                    integerPointer,
+                    &count
+                )
+            }
+        }
+        return result == KERN_SUCCESS ? Int64(info.resident_size) / 1024 : 0
+#endif
+    }
+
     private static func micros(_ value: timeval) -> Int64 {
         Int64(value.tv_sec) * 1_000_000 + Int64(value.tv_usec)
     }
+}
+
+private struct CMACScalingSample {
+    let elapsedMilliseconds: Double
+    let userCPUMilliseconds: Double
+    let currentRSSBeforeKilobytes: Int64
+    let currentRSSAfterKilobytes: Int64
+    let maxRSSKilobytes: Int64
 }
 
 private struct ResourcePerformanceSample {

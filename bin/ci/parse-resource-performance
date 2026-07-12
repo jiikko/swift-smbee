@@ -12,9 +12,12 @@ The log contract (version 1) is deliberately fail-closed:
   All five resource metrics are required for each operation.
 * Each operation must end with exactly one
   ``PERF_RUN_COMPLETE operation=<operation>`` after its samples and summaries.
-* ``PERF_ENV``, ``PERF_BUILD_CACHE``, ``PERF_METRIC``, ``PERF_WRITE_PROFILE``, and the
-  ``/usr/bin/time`` process RSS line are optional, but are validated when
-  present.  Other ``PERF_*`` rows are malformed and cause failure.
+* ``PERF_ENV``, ``PERF_BUILD_CACHE``, ``PERF_METRIC``, ``PERF_WRITE_PROFILE``,
+  ``PERF_CMAC_SCALING_SAMPLE``, ``PERF_CMAC_SCALING``, and the ``/usr/bin/time``
+  process RSS line are optional, but are validated when present. A CMAC scaling
+  profile is optional as a whole; once any scaling row is present, every
+  baseline invocation must contain the same complete workloads. Other
+  ``PERF_*`` rows are malformed and cause failure.
 
 Only after the complete file passes validation are JSONL rows written to
 stdout.  Numeric lexemes are retained so existing artifact consumers keep the
@@ -41,6 +44,18 @@ RESOURCE_METRICS = (
     "sample_elapsed_ms",
     "max_rss_kb",
 )
+CMAC_SCALING_COMMON_FIELDS = {
+    "size_mib",
+    "chunks",
+    "iterations",
+    "throughput_mib_s",
+    "user_cpu_ms",
+    "current_rss_before_kb",
+    "current_rss_after_kb",
+    "max_rss_kb",
+}
+CMAC_SCALING_SAMPLE_FIELDS = CMAC_SCALING_COMMON_FIELDS | {"run", "elapsed_ms"}
+CMAC_SCALING_SUMMARY_FIELDS = CMAC_SCALING_COMMON_FIELDS | {"runs", "median_ms"}
 NUMBER_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
 METRIC_NUMBER_RE = re.compile(r"[+-]?(?:(?:0|[1-9][0-9]*)(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z")
 INT_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
@@ -70,6 +85,13 @@ def require(data: dict[str, str], names: set[str], line_number: int, label: str)
     missing = sorted(names - data.keys())
     if missing:
         raise ContractError(f"line {line_number}: {label} missing required field(s): {', '.join(missing)}")
+
+
+def require_exact(data: dict[str, str], names: set[str], line_number: int, label: str) -> None:
+    require(data, names, line_number, label)
+    unexpected = sorted(data.keys() - names)
+    if unexpected:
+        raise ContractError(f"line {line_number}: {label} has unexpected field(s): {', '.join(unexpected)}")
 
 
 def numeric(value: str, line_number: int, field_name: str, *, integer: bool = False) -> str:
@@ -108,6 +130,11 @@ def elapsed_seconds(value: str, line_number: int) -> str:
 def positive(data: dict[str, str], name: str, line_number: int, label: str) -> None:
     value = int(data[name])
     if value < 1:
+        raise ContractError(f"line {line_number}: {label} field {name!r} must be positive")
+
+
+def positive_decimal(data: dict[str, str], name: str, line_number: int, label: str) -> None:
+    if Decimal(data[name]) <= 0:
         raise ContractError(f"line {line_number}: {label} field {name!r} must be positive")
 
 
@@ -169,12 +196,13 @@ def append_derived_rows(rows: list[dict[str, Any]], baselines: list[dict[str, An
             continue
         stage_median = decimal_value(profile.get("median_ms"))
         full_median = decimal_value(full.get("median_ms"))
+        share = None if profile["stage"] == "pure_swift_signing_only" else derived_value(stage_median, full_median)
         rows.append(
             {
                 "type": "derived_stage",
                 "baseline_run": profile["baseline_run"],
                 "stage": profile["stage"],
-                "share_of_full_synthetic": derived_value(stage_median, full_median),
+                "share_of_full_synthetic": share,
             }
         )
 
@@ -228,6 +256,29 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
             sample_runs = [int(row["run"]) for row in samples]
             if sorted(sample_runs) != list(range(1, expected + 1)):
                 raise ContractError(f"line {line_number}: baseline run {current['run']} {operation} sample run numbers are not 1..{expected}")
+
+        scaling_samples = current["cmac_scaling_samples"]
+        scaling_summaries = current["cmac_scaling_summaries"]
+        scaling_sizes = set(scaling_samples) | set(scaling_summaries)
+        for size in scaling_sizes:
+            size_samples = scaling_samples.get(size, [])
+            size_summary = scaling_summaries.get(size)
+            label = f"baseline run {current['run']} CMAC scaling size {size} MiB"
+            if not size_samples:
+                raise ContractError(f"line {line_number}: {label} has no samples")
+            if size_summary is None:
+                raise ContractError(f"line {line_number}: {label} has no summary")
+            expected = int(size_summary["runs"])
+            if len(size_samples) != expected:
+                raise ContractError(
+                    f"line {line_number}: {label} has {len(size_samples)} samples, expected {expected}"
+                )
+            sample_runs = [int(row["run"]) for row in size_samples]
+            if sorted(sample_runs) != list(range(1, expected + 1)):
+                raise ContractError(f"line {line_number}: {label} sample run numbers are not 1..{expected}")
+            expected_workload = (size_summary["chunks"], size_summary["iterations"])
+            if any((row["chunks"], row["iterations"]) != expected_workload for row in size_samples):
+                raise ContractError(f"line {line_number}: {label} has inconsistent workload fields")
         baselines.append(current)
         format_count = 0
 
@@ -339,6 +390,8 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
                 "summaries": {operation: [] for operation in OPERATIONS},
                 "completions": set(),
                 "process": [],
+                "cmac_scaling_samples": {},
+                "cmac_scaling_summaries": {},
             }
             continue
         if current is None:
@@ -399,6 +452,78 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
                 raise ContractError(f"line {line_number}: PERF_RUN_COMPLETE for {operation} appeared before its resource rows")
             current["completions"].add(operation)
             continue
+        if kind in {"PERF_CMAC_SCALING_SAMPLE", "PERF_CMAC_SCALING"}:
+            data = fields(tokens[1:], line_number, kind)
+            is_sample = kind == "PERF_CMAC_SCALING_SAMPLE"
+            required = CMAC_SCALING_SAMPLE_FIELDS if is_sample else CMAC_SCALING_SUMMARY_FIELDS
+            require_exact(data, required, line_number, kind)
+            for field_name in (
+                "size_mib",
+                "elapsed_ms" if is_sample else "median_ms",
+                "throughput_mib_s",
+                "user_cpu_ms",
+            ):
+                numeric(data[field_name], line_number, field_name)
+            positive_decimal(data, "size_mib", line_number, kind)
+            positive_decimal(data, "elapsed_ms" if is_sample else "median_ms", line_number, kind)
+            positive_decimal(data, "throughput_mib_s", line_number, kind)
+            for field_name in (
+                "chunks",
+                "iterations",
+                "run" if is_sample else "runs",
+                "current_rss_before_kb",
+                "current_rss_after_kb",
+                "max_rss_kb",
+            ):
+                numeric(data[field_name], line_number, field_name, integer=True)
+            for field_name in ("chunks", "iterations", "run" if is_sample else "runs"):
+                positive(data, field_name, line_number, kind)
+
+            size = Decimal(data["size_mib"])
+            if is_sample:
+                if size in current["cmac_scaling_summaries"]:
+                    raise ContractError(f"line {line_number}: {kind} appeared after its size summary")
+                if any(row["run"] == data["run"] for row in current["cmac_scaling_samples"].get(size, [])):
+                    raise ContractError(
+                        f"line {line_number}: duplicate {kind} run {data['run']} for size {data['size_mib']}"
+                    )
+                row = {"type": "cmac_scaling_sample", "baseline_run": current["run"]}
+                for field_name in (
+                    "size_mib",
+                    "chunks",
+                    "iterations",
+                    "run",
+                    "elapsed_ms",
+                    "throughput_mib_s",
+                    "user_cpu_ms",
+                    "current_rss_before_kb",
+                    "current_rss_after_kb",
+                    "max_rss_kb",
+                ):
+                    row[field_name] = data[field_name]
+                current["cmac_scaling_samples"].setdefault(size, []).append(row)
+            else:
+                if size in current["cmac_scaling_summaries"]:
+                    raise ContractError(f"line {line_number}: duplicate {kind} for size {data['size_mib']}")
+                if not current["cmac_scaling_samples"].get(size):
+                    raise ContractError(f"line {line_number}: {kind} appeared before its size samples")
+                row = {"type": "cmac_scaling", "baseline_run": current["run"]}
+                for field_name in (
+                    "size_mib",
+                    "chunks",
+                    "iterations",
+                    "runs",
+                    "median_ms",
+                    "throughput_mib_s",
+                    "user_cpu_ms",
+                    "current_rss_before_kb",
+                    "current_rss_after_kb",
+                    "max_rss_kb",
+                ):
+                    row[field_name] = data[field_name]
+                current["cmac_scaling_summaries"][size] = row
+            rows.append(row)
+            continue
         if kind == "PERF_WRITE_PROFILE":
             data = fields(tokens[1:], line_number, kind)
             required = {"stage", "median_ms", "throughput_mib_s", "size_mib", "runs", "chunks"}
@@ -419,6 +544,22 @@ def parse_log(path: Path) -> list[dict[str, Any]]:
     total = baselines[0]["total"]
     if len(baselines) != total:
         raise ContractError(f"expected {total} baseline runs, found {len(baselines)}")
+    scaling_presence = [bool(baseline["cmac_scaling_summaries"]) for baseline in baselines]
+    if any(scaling_presence) and not all(scaling_presence):
+        raise ContractError("CMAC scaling profile is missing from one or more baseline runs")
+    if all(scaling_presence):
+        reference = baselines[0]["cmac_scaling_summaries"]
+        for baseline in baselines[1:]:
+            summaries = baseline["cmac_scaling_summaries"]
+            if set(summaries) != set(reference):
+                raise ContractError("CMAC scaling sizes changed between baseline runs")
+            for size, reference_row in reference.items():
+                row = summaries[size]
+                if (row["chunks"], row["iterations"]) != (
+                    reference_row["chunks"],
+                    reference_row["iterations"],
+                ):
+                    raise ContractError(f"CMAC scaling workload changed for size {size} MiB")
     append_derived_rows(rows, baselines)
     return rows
 
@@ -440,6 +581,34 @@ def json_number_line(row: dict[str, Any]) -> str:
         names = ("baseline_run", "name", "value", "size_mib", "runs", "iterations", "throughput_floor_mib_s")
     elif row_type == "write_profile":
         names = ("baseline_run", "stage", "median_ms", "throughput_mib_s", "size_mib", "runs", "chunks")
+    elif row_type == "cmac_scaling_sample":
+        names = (
+            "baseline_run",
+            "size_mib",
+            "chunks",
+            "iterations",
+            "run",
+            "elapsed_ms",
+            "throughput_mib_s",
+            "user_cpu_ms",
+            "current_rss_before_kb",
+            "current_rss_after_kb",
+            "max_rss_kb",
+        )
+    elif row_type == "cmac_scaling":
+        names = (
+            "baseline_run",
+            "size_mib",
+            "chunks",
+            "iterations",
+            "runs",
+            "median_ms",
+            "throughput_mib_s",
+            "user_cpu_ms",
+            "current_rss_before_kb",
+            "current_rss_after_kb",
+            "max_rss_kb",
+        )
     elif row_type == "derived":
         names = ("baseline_run", "operation", "user_cpu_ms_per_mib", "system_cpu_ms_per_mib", "cpu_utilization")
     elif row_type == "derived_stage":

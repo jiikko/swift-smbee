@@ -2487,6 +2487,37 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testAESCMACBoundaryLengthsMatchReferenceImplementation() throws {
+        let key = Array(UInt8(0)..<UInt8(16))
+        for length in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 65_536] {
+            let message = (0..<length).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ 7) }
+            XCTAssertEqual(
+                try AESCMAC.authenticationCode(key: key, message: message),
+                try referenceAESCMAC(key: key, message: message),
+                "AES-CMAC mismatch at message length \(length)"
+            )
+            XCTAssertEqual(
+                try AESCMAC.pureSwiftAuthenticationCode(key: key, message: message),
+                try AESCMAC.authenticationCode(key: key, message: message),
+                "pure Swift and CryptoExtras differ at message length \(length)"
+            )
+        }
+    }
+
+    func testAESCMACConcurrentOneShotSigningMatchesReference() async throws {
+        let key = Array(UInt8(0)..<UInt8(16))
+        let message = (0..<65_536).map { UInt8(truncatingIfNeeded: $0 &* 17 &+ 3) }
+        let expected = try referenceAESCMAC(key: key, message: message)
+        try await withThrowingTaskGroup(of: [UInt8].self) { group in
+            for _ in 0..<64 {
+                group.addTask { try AESCMAC.authenticationCode(key: key, message: message) }
+            }
+            for try await signature in group {
+                XCTAssertEqual(signature, expected)
+            }
+        }
+    }
+
     func testAESCCMRFC3610Vector() throws {
         let key = hexBytes("c0c1c2c3c4c5c6c7c8c9cacbcccdcecf")
         let nonce = hexBytes("00000003020100a0a1a2a3a4a5")
@@ -7135,6 +7166,46 @@ final class SMBeeTests: XCTestCase {
         let signature = try SMBSessionSigning.signature(algorithm: algorithm, key: key, packet: signed, sender: sender)
         signed.replaceSubrange(48..<64, with: signature)
         return signed
+    }
+
+    private func referenceAESCMAC(key: [UInt8], message: [UInt8]) throws -> [UInt8] {
+        func doubled(_ input: [UInt8]) -> [UInt8] {
+            var output = [UInt8](repeating: 0, count: 16)
+            var carry: UInt8 = 0
+            for index in stride(from: 15, through: 0, by: -1) {
+                output[index] = (input[index] << 1) | carry
+                carry = input[index] & 0x80 == 0 ? 0 : 1
+            }
+            if carry != 0 { output[15] ^= 0x87 }
+            return output
+        }
+
+        let expandedKey = try AES128.expandedKey(key)
+        let l = try AES128.encryptBlock(expandedKey: expandedKey, block: [UInt8](repeating: 0, count: 16))
+        let k1 = doubled(l)
+        let k2 = doubled(k1)
+        let blockCount = max(1, (message.count + 15) / 16)
+        let complete = !message.isEmpty && message.count % 16 == 0
+        var last = [UInt8](repeating: 0, count: 16)
+        let lastStart = (blockCount - 1) * 16
+        if complete {
+            last = Array(message[lastStart..<(lastStart + 16)])
+            for index in 0..<16 { last[index] ^= k1[index] }
+        } else {
+            if lastStart < message.count {
+                for index in lastStart..<message.count { last[index - lastStart] = message[index] }
+            }
+            last[message.count - lastStart] = 0x80
+            for index in 0..<16 { last[index] ^= k2[index] }
+        }
+        var chaining = [UInt8](repeating: 0, count: 16)
+        for blockIndex in 0..<max(0, blockCount - 1) {
+            var block = Array(message[(blockIndex * 16)..<(blockIndex * 16 + 16)])
+            for index in 0..<16 { block[index] ^= chaining[index] }
+            chaining = try AES128.encryptBlock(expandedKey: expandedKey, block: block)
+        }
+        for index in 0..<16 { last[index] ^= chaining[index] }
+        return try AES128.encryptBlock(expandedKey: expandedKey, block: last)
     }
 
     private func negotiateResponse(messageId: UInt64, dialect: UInt16 = SMBNegotiateConstants.dialect302) throws -> [UInt8] {

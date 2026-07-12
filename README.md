@@ -6,8 +6,9 @@
 A pure-Swift SMB2/3 client.
 
 SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing は本ライブラリで
-**自作**し、AES-GCM / HMAC / SHA などの暗号プリミティブの計算は
-[swift-crypto](https://github.com/apple/swift-crypto) と in-repo pure-Swift 実装に委ねる
+**自作**し、AES-CMAC / AES-GCM / HMAC / SHA などの暗号プリミティブの計算は
+CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift-crypto)（Linuxを含む）、
+および検証用のin-repo pure-Swift実装に委ねる
 （`libsmb2` のような vendored C 依存は持たない）。
 
 ## スコープ (MVP)

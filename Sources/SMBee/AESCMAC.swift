@@ -1,4 +1,10 @@
 import Foundation
+#if canImport(CommonCrypto)
+import CommonCrypto
+#elseif canImport(CryptoExtras)
+import Crypto
+import CryptoExtras
+#endif
 
 enum AES128 {
     static func encryptBlock(key: [UInt8], block: [UInt8]) throws -> [UInt8] {
@@ -20,17 +26,24 @@ enum AES128 {
             throw SMBCodecError.invalidValue("AES-128 requires an expanded key and 16-byte block")
         }
         var state = block
-        addRoundKey(&state, Array(roundKeys[0..<16]))
+        try encryptBlockInPlace(expandedKey: roundKeys, state: &state)
+        return state
+    }
+
+    static func encryptBlockInPlace(expandedKey roundKeys: [UInt8], state: inout [UInt8]) throws {
+        guard roundKeys.count == 176, state.count == 16 else {
+            throw SMBCodecError.invalidValue("AES-128 requires an expanded key and 16-byte block")
+        }
+        addRoundKey(&state, roundKeys, offset: 0)
         for round in 1..<10 {
             subBytes(&state)
             shiftRows(&state)
             mixColumns(&state)
-            addRoundKey(&state, Array(roundKeys[(round * 16)..<((round + 1) * 16)]))
+            addRoundKey(&state, roundKeys, offset: round * 16)
         }
         subBytes(&state)
         shiftRows(&state)
-        addRoundKey(&state, Array(roundKeys[160..<176]))
-        return state
+        addRoundKey(&state, roundKeys, offset: 160)
     }
 
     private static func expandKey(_ key: [UInt8]) -> [UInt8] {
@@ -56,8 +69,8 @@ enum AES128 {
         return expanded
     }
 
-    private static func addRoundKey(_ state: inout [UInt8], _ key: [UInt8]) {
-        for index in 0..<16 { state[index] ^= key[index] }
+    private static func addRoundKey(_ state: inout [UInt8], _ key: [UInt8], offset: Int) {
+        for index in 0..<16 { state[index] ^= key[offset + index] }
     }
 
     private static func subBytes(_ state: inout [UInt8]) {
@@ -65,10 +78,12 @@ enum AES128 {
     }
 
     private static func shiftRows(_ state: inout [UInt8]) {
-        let old = state
-        state[1] = old[5]; state[5] = old[9]; state[9] = old[13]; state[13] = old[1]
-        state[2] = old[10]; state[6] = old[14]; state[10] = old[2]; state[14] = old[6]
-        state[3] = old[15]; state[7] = old[3]; state[11] = old[7]; state[15] = old[11]
+        let row1 = (state[1], state[5], state[9], state[13])
+        state[1] = row1.1; state[5] = row1.2; state[9] = row1.3; state[13] = row1.0
+        let row2 = (state[2], state[6], state[10], state[14])
+        state[2] = row2.2; state[6] = row2.3; state[10] = row2.0; state[14] = row2.1
+        let row3 = (state[3], state[7], state[11], state[15])
+        state[3] = row3.3; state[7] = row3.0; state[11] = row3.1; state[15] = row3.2
     }
 
     private static func mixColumns(_ state: inout [UInt8]) {
@@ -118,9 +133,70 @@ enum AES128 {
 public enum AESCMAC {
     public static func authenticationCode(key: [UInt8], message: [UInt8]) throws -> [UInt8] {
         guard key.count == 16 else { throw SMBCodecError.invalidValue("AES-CMAC requires a 16-byte key") }
+        // Keep the context one-shot: session close/reconnect must not leave expanded key state behind.
+        // Apple uses its system AES implementation; Linux uses swift-crypto's BoringSSL-backed CMAC.
+        #if canImport(CommonCrypto)
+        return try commonCryptoAuthenticationCode(key: key, message: message)
+        #elseif canImport(CryptoExtras)
+        var authenticator = try AES.CMAC(key: SymmetricKey(data: key))
+        message.withUnsafeBytes { authenticator.update(bufferPointer: $0) }
+        return Array(authenticator.finalize())
+        #else
+        return try pureSwiftAuthenticationCode(key: key, message: message)
+        #endif
+    }
+
+    #if canImport(CommonCrypto)
+    private static func commonCryptoAuthenticationCode(key: [UInt8], message: [UInt8]) throws -> [UInt8] {
+        var l = [UInt8](repeating: 0, count: 16)
+        try commonCryptoEncryptInPlace(key: key, input: &l, options: CCOptions(kCCOptionECBMode))
+        let subkey = !message.isEmpty && message.count % 16 == 0 ? dbl(l) : dbl(dbl(l))
+
+        var input = message
+        if input.isEmpty || input.count % 16 != 0 {
+            input.append(0x80)
+            input.append(contentsOf: repeatElement(0, count: (16 - input.count % 16) % 16))
+        }
+        let lastBlockOffset = input.count - 16
+        for index in 0..<16 { input[lastBlockOffset + index] ^= subkey[index] }
+
+        try commonCryptoEncryptInPlace(key: key, input: &input, options: 0)
+        return Array(input.suffix(16))
+    }
+
+    private static func commonCryptoEncryptInPlace(
+        key: [UInt8], input: inout [UInt8], options: CCOptions
+    ) throws {
+        let inputCount = input.count
+        var moved = 0
+        let status = input.withUnsafeMutableBufferPointer { inputPointer in
+            key.withUnsafeBufferPointer { keyPointer in
+                CCCrypt(
+                    CCOperation(kCCEncrypt),
+                    CCAlgorithm(kCCAlgorithmAES),
+                    options,
+                    keyPointer.baseAddress,
+                    key.count,
+                    nil,
+                    inputPointer.baseAddress,
+                    inputCount,
+                    inputPointer.baseAddress,
+                    inputCount,
+                    &moved
+                )
+            }
+        }
+        guard status == kCCSuccess, moved == inputCount else {
+            throw SMBCodecError.invalidValue("AES-CMAC CommonCrypto operation failed: \(status)")
+        }
+    }
+    #endif
+
+    static func pureSwiftAuthenticationCode(key: [UInt8], message: [UInt8]) throws -> [UInt8] {
+        guard key.count == 16 else { throw SMBCodecError.invalidValue("AES-CMAC requires a 16-byte key") }
         let expandedKey = try AES128.expandedKey(key)
-        let zero = [UInt8](repeating: 0, count: 16)
-        let l = try AES128.encryptBlock(expandedKey: expandedKey, block: zero)
+        var l = [UInt8](repeating: 0, count: 16)
+        try AES128.encryptBlockInPlace(expandedKey: expandedKey, state: &l)
         let k1 = dbl(l)
         let k2 = dbl(k1)
         let blockCount = max(1, (message.count + 15) / 16)
@@ -128,26 +204,26 @@ public enum AESCMAC {
         var last = [UInt8](repeating: 0, count: 16)
         let lastStart = (blockCount - 1) * 16
         if complete {
-            last = Array(message[lastStart..<lastStart + 16])
+            for index in 0..<16 { last[index] = message[lastStart + index] }
             xor(&last, k1)
         } else {
             if lastStart < message.count {
-                let tail = Array(message[lastStart..<message.count])
-                for index in 0..<tail.count { last[index] = tail[index] }
+                for index in 0..<(message.count - lastStart) { last[index] = message[lastStart + index] }
             }
             last[message.count - lastStart] = 0x80
             xor(&last, k2)
         }
-        var x = [UInt8](repeating: 0, count: 16)
+        var state = [UInt8](repeating: 0, count: 16)
         if blockCount > 1 {
             for blockIndex in 0..<(blockCount - 1) {
-                var y = Array(message[(blockIndex * 16)..<(blockIndex * 16 + 16)])
-                xor(&y, x)
-                x = try AES128.encryptBlock(expandedKey: expandedKey, block: y)
+                let start = blockIndex * 16
+                for index in 0..<16 { state[index] ^= message[start + index] }
+                try AES128.encryptBlockInPlace(expandedKey: expandedKey, state: &state)
             }
         }
-        xor(&last, x)
-        return try AES128.encryptBlock(expandedKey: expandedKey, block: last)
+        xor(&last, state)
+        try AES128.encryptBlockInPlace(expandedKey: expandedKey, state: &last)
+        return last
     }
 
     private static func dbl(_ input: [UInt8]) -> [UInt8] {

@@ -47,6 +47,8 @@ def main() -> None:
     metadata = next((row for row in rows if row.get("type") == "metadata"), {})
     summaries = [row for row in rows if row.get("type") == "summary"]
     samples = [row for row in rows if row.get("type") == "sample"]
+    profiles = [row for row in rows if row.get("type") == "write_profile"]
+    scaling = [row for row in rows if row.get("type") == "cmac_scaling"]
     process_rows = [row for row in rows if row.get("type") == "process" and row.get("metric") == "max_rss_kb"]
     baseline_runs = len({row["baseline_run"] for row in samples})
 
@@ -90,6 +92,47 @@ def main() -> None:
             f"{format_number(result['mad'])} | {result['cv']:.4f} | "
             f"{format_number(result['min'])} | {format_number(result['max'])} |"
         )
+
+    if profiles:
+        print()
+        print("## Write stage median distribution")
+        print()
+        print("| Stage | N | Median ms | p10 | p90 | MAD | CV | Min | Max |")
+        print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for stage in sorted({row["stage"] for row in profiles}):
+            values = [float(row["median_ms"]) for row in profiles if row["stage"] == stage]
+            result = statistics_for(values)
+            print(
+                f"| `{stage}` | {len(values)} | {format_number(result['median'])} | "
+                f"{format_number(result['p10'])} | {format_number(result['p90'])} | "
+                f"{format_number(result['mad'])} | {result['cv']:.4f} | "
+                f"{format_number(result['min'])} | {format_number(result['max'])} |"
+            )
+
+    if scaling:
+        print()
+        print("## AES-CMAC scaling distribution")
+        print()
+        print("| Payload | Workload | N | Median ms | p10 | p90 | MAD | Throughput median | User CPU median | Current RSS before→after (delta) | Process peak RSS |")
+        print("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for size in sorted({float(row["size_mib"]) for row in scaling}):
+            size_rows = [row for row in scaling if float(row["size_mib"]) == size]
+            elapsed = statistics_for([float(row["median_ms"]) for row in size_rows])
+            throughput = statistics.median(float(row["throughput_mib_s"]) for row in size_rows)
+            user_cpu = statistics.median(float(row["user_cpu_ms"]) for row in size_rows)
+            rss_before = statistics.median(float(row["current_rss_before_kb"]) for row in size_rows)
+            rss_after = statistics.median(float(row["current_rss_after_kb"]) for row in size_rows)
+            peak_rss = statistics.median(float(row["max_rss_kb"]) for row in size_rows)
+            workload = size_rows[0]
+            print(
+                f"| {format_number(size)} MiB | {workload['chunks']} chunks × {workload['iterations']} iterations | "
+                f"{len(size_rows)} | {format_number(elapsed['median'])} | {format_number(elapsed['p10'])} | "
+                f"{format_number(elapsed['p90'])} | {format_number(elapsed['mad'])} | "
+                f"{format_number(throughput)} MiB/s | {format_number(user_cpu)} ms | "
+                f"{format_number(rss_before / 1024)}→{format_number(rss_after / 1024)} MiB "
+                f"({format_number((rss_after - rss_before) / 1024)} MiB) | "
+                f"{format_number(peak_rss / 1024)} MiB |"
+            )
 
     if process_rows:
         process_values = [float(row["value"]) for row in process_rows]

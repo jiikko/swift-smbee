@@ -114,14 +114,19 @@ PERF_RESOURCE write_stream.sample_elapsed_ms value=1096.000 size_mib=8 runs=5 it
 PERF_RESOURCE write_stream.max_rss_kb value=286048 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
 PERF_RUN_COMPLETE operation=write_stream
 EOF
-    if [ "${baseline_run}" -eq 1 ]; then
-      cat >> "${log_file}" <<'EOF'
+    cat >> "${log_file}" <<'EOF'
+PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=1 elapsed_ms=222.000 throughput_mib_s=2306.306 user_cpu_ms=221.000 current_rss_before_kb=27000 current_rss_after_kb=27016 max_rss_kb=27016
+PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=2 elapsed_ms=224.000 throughput_mib_s=2285.714 user_cpu_ms=223.000 current_rss_before_kb=27016 current_rss_after_kb=27016 max_rss_kb=27016
+PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=3 elapsed_ms=223.000 throughput_mib_s=2295.964 user_cpu_ms=222.000 current_rss_before_kb=27016 current_rss_after_kb=27016 max_rss_kb=27016
+PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=4 elapsed_ms=221.000 throughput_mib_s=2316.742 user_cpu_ms=220.000 current_rss_before_kb=27016 current_rss_after_kb=27016 max_rss_kb=27016
+PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=5 elapsed_ms=225.000 throughput_mib_s=2275.556 user_cpu_ms=224.000 current_rss_before_kb=27016 current_rss_after_kb=27016 max_rss_kb=27016
+PERF_CMAC_SCALING size_mib=4 chunks=64 iterations=128 runs=5 median_ms=223.000 throughput_mib_s=2295.964 user_cpu_ms=222.000 current_rss_before_kb=27016 current_rss_after_kb=27016 max_rss_kb=27016
 PERF_WRITE_PROFILE stage=codec_only median_ms=10.000 throughput_mib_s=800.000 size_mib=8 runs=5 chunks=128
 PERF_WRITE_PROFILE stage=signing_only median_ms=640.369 throughput_mib_s=12.493 size_mib=8 runs=5 chunks=128
+PERF_WRITE_PROFILE stage=pure_swift_signing_only median_ms=1280.738 throughput_mib_s=6.247 size_mib=8 runs=5 chunks=128
 PERF_WRITE_PROFILE stage=session_no_outbound_retention median_ms=658.768 throughput_mib_s=12.153 size_mib=8 runs=5 chunks=128
 PERF_WRITE_PROFILE stage=full_synthetic median_ms=659.644 throughput_mib_s=12.128 size_mib=8 runs=5 chunks=128
 EOF
-    fi
     printf '\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:42.50\n' >> "${log_file}"
     printf '\tMaximum resident set size (kbytes): 682080\n' >> "${log_file}"
   done
@@ -324,9 +329,9 @@ test_summary_happy_path() {
     '- CPU model / count: `Genuine Intel(R) CPU` / `4`' \
     '- Baseline runs: **2**' \
     '- Raw samples: **read_stream=10, write_stream=10**' \
-    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | 1.84× / +84.3% | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 MiB/s; 737.364 MiB/s–737.364 MiB/s | 2 |' \
-    '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | — | Lower ↓ | Observation only | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 200.000 ms–200.000 ms | 2 |' \
-    '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | — | Stable window | ≥ 200 ms | Median | 160 MiB × 5 runs × 20 iterations | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' \
+    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | 1.84× / +84.3% | Higher ↑ | > 400 MiB/s | Median | 8 MiB/iteration × 20 iterations/sample × 5 samples (160 MiB/sample) | MAD 0.000 MiB/s; 737.364 MiB/s–737.364 MiB/s | 2 |' \
+    '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | — | Lower ↓ | Observation only | Median | 8 MiB/iteration × 20 iterations/sample × 5 samples (160 MiB/sample) | MAD 0.000 ms; 200.000 ms–200.000 ms | 2 |' \
+    '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | — | Stable window | ≥ 200 ms | Median | 8 MiB/iteration × 20 iterations/sample × 5 samples (160 MiB/sample) | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' \
     '- ✅ **1/1 passed**' \
     '### CPU efficiency (Observe-only)' \
     'These derived metrics are Observe-only and do not affect guardrail results or exit status.' \
@@ -335,9 +340,12 @@ test_summary_happy_path() {
     'XCTest process peak RSS: **279.3 MiB** · ✅ Pass (`< 512 MiB` guardrail).' \
     'Whole `swift test` process-tree peak RSS: **666.1 MiB** (682080 KiB).' \
     '`swift test` wall time: **42.50 s**.' \
-    '| Stage | Median | Effective throughput | Share of full synthetic | Interpretation |' \
-    '| signing only | 640.369 ms | 12.493 MiB/s | 97.1% | AES-CMAC cost |' \
-    '| full synthetic | 659.644 ms | 12.128 MiB/s | 100.0% | End-to-end synthetic write |'
+    '| Stage | Median | Effective throughput | Share of full synthetic | Spread | N | Interpretation |' \
+    '| signing only | 640.369 ms | 12.493 MiB/s | 97.1% | MAD 0.000 ms; 640.369–640.369 ms | 2 | AES-CMAC cost |' \
+    '| pure swift signing only | 1280.738 ms | 6.247 MiB/s | n/a | MAD 0.000 ms; 1280.738–1280.738 ms | 2 | Pure Swift AES-CMAC comparison |' \
+    '| full synthetic | 659.644 ms | 12.128 MiB/s | 100.0% | MAD 0.000 ms; 659.644–659.644 ms | 2 | End-to-end synthetic write |' \
+    '### AES-CMAC scaling profile (Observe-only)' \
+    '| 4 MiB | 64 chunks × 128 iterations | 223.000 ms | 2295.964 MiB/s | 222.000 ms | 26.383 → 26.383 MiB (0.000 MiB) | 26.383 MiB | MAD 0.000 ms; 223.000–223.000 ms | 2 |'
 
   local single_run_log="${scenario_dir}/single-run.log"
   awk '/^PERF_BASELINE_RUN run=2 / { exit } { print }' "${log_file}" \
@@ -357,7 +365,7 @@ test_summary_happy_path() {
   expect_contains "${single_run_summary}" \
     '- Baseline runs: **1**' \
     '- Raw samples: **read_stream=5, write_stream=5**' \
-    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | 1.84× / +84.3% | Higher ↑ | > 400 MiB/s | Median | 160 MiB × 5 runs × 20 iterations | 653.061 MiB/s–653.061 MiB/s | 5 |'
+    '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | 1.84× / +84.3% | Higher ↑ | > 400 MiB/s | Median | 8 MiB/iteration × 20 iterations/sample × 5 samples (160 MiB/sample) | 653.061 MiB/s–653.061 MiB/s | 5 |'
 }
 
 test_artifact_jsonl() {
@@ -393,10 +401,13 @@ test_artifact_jsonl() {
     '"type":"derived","baseline_run":1,"operation":"read_stream","user_cpu_ms_per_mib":1.250,"system_cpu_ms_per_mib":0.025,"cpu_utilization":0.833' \
     '"type":"derived","baseline_run":1,"operation":"write_stream","user_cpu_ms_per_mib":137.750,"system_cpu_ms_per_mib":0.000,"cpu_utilization":1.005' \
     '"type":"derived_stage","baseline_run":1,"stage":"signing_only","share_of_full_synthetic":0.971' \
+    '"type":"derived_stage","baseline_run":1,"stage":"pure_swift_signing_only","share_of_full_synthetic":null' \
     '"type":"derived_stage","baseline_run":1,"stage":"full_synthetic","share_of_full_synthetic":1.000' \
     '"type":"process","baseline_run":1,"metric":"max_rss_kb","value":682080' \
     '"type":"process","baseline_run":1,"metric":"elapsed_seconds","value":42.50' \
     '"type":"write_profile","baseline_run":1,"stage":"signing_only","median_ms":640.369' \
+    '"type":"cmac_scaling_sample","baseline_run":1,"size_mib":4,"chunks":64,"iterations":128,"run":1,"elapsed_ms":222.000' \
+    '"type":"cmac_scaling","baseline_run":1,"size_mib":4,"chunks":64,"iterations":128,"runs":5,"median_ms":223.000' \
     '"type":"sample","baseline_run":2,"operation":"read_stream","run":1,"elapsed_ms":245.000' \
     '"type":"sample","baseline_run":2,"operation":"write_stream","run":1,"elapsed_ms":1096.000'
   local operation metric
@@ -516,6 +527,8 @@ PY
   expect_contains "${baseline_summary}" \
     '# SMBee resource performance baseline' \
     '| `read_stream.throughput_mib_s` | 2 | 737.364 | 737.364 | 737.364 | 0.000 | 0.0000 | 737.364 | 737.364 |' \
+    '| `pure_swift_signing_only` | 2 | 1280.738 | 1280.738 | 1280.738 | 0.000 | 0.0000 | 1280.738 | 1280.738 |' \
+    '| 4.000 MiB | 64 chunks × 128 iterations | 2 | 223.000 | 223.000 | 223.000 | 0.000 | 2295.964 MiB/s | 222.000 ms | 26.383→26.383 MiB (0.000 MiB) | 26.383 MiB |' \
     '- first invocation (includes Release build): 666.1 MiB' \
     '- baseline invocations: 2'
 }
@@ -561,6 +574,18 @@ test_parser_rejects_malformed() {
   expect_parser_failure "${scenario_dir}" noncontinuous-baseline "${scenario_dir}/noncontinuous-baseline.log"
   grep -v 'write_stream' "${log_file}" > "${scenario_dir}/missing-operation.log"
   expect_parser_failure "${scenario_dir}" missing-operation "${scenario_dir}/missing-operation.log"
+  awk '/PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=5 / { seen++; if (seen == 1) next } { print }' \
+    "${log_file}" > "${scenario_dir}/missing-cmac-sample.log"
+  expect_parser_failure "${scenario_dir}" missing-cmac-sample "${scenario_dir}/missing-cmac-sample.log"
+  awk '/^PERF_CMAC_SCALING size_mib=4 / && !seen { print $0 " unexpected=1"; seen=1; next } { print }' \
+    "${log_file}" > "${scenario_dir}/unexpected-cmac-field.log"
+  expect_parser_failure "${scenario_dir}" unexpected-cmac-field "${scenario_dir}/unexpected-cmac-field.log"
+  awk '
+    /^PERF_BASELINE_RUN run=2 / { second=1 }
+    second && /^PERF_CMAC_SCALING/ { next }
+    { print }
+  ' "${log_file}" > "${scenario_dir}/missing-cmac-baseline.log"
+  expect_parser_failure "${scenario_dir}" missing-cmac-baseline "${scenario_dir}/missing-cmac-baseline.log"
   cp "${log_file}" "${scenario_dir}/duplicate-env.log"
   echo 'PERF_ENV kernel Duplicate kernel value' >> "${scenario_dir}/duplicate-env.log"
   expect_parser_failure "${scenario_dir}" duplicate-env "${scenario_dir}/duplicate-env.log"
@@ -603,7 +628,7 @@ test_summary_edge_cases() {
   GITHUB_STEP_SUMMARY="${missing_full_summary}" \
     "${SCRIPT_DIR}/publish-resource-performance-summary"
   expect_contains "${missing_full_summary}" \
-    '| signing only | 640.369 ms | 12.493 MiB/s | n/a | AES-CMAC cost |'
+    '| signing only | 640.369 ms | 12.493 MiB/s | n/a | MAD 0.000 ms; 640.369–640.369 ms | 2 | AES-CMAC cost |'
 
   local boundary_log="${scenario_dir}/boundary.log"
   sed \

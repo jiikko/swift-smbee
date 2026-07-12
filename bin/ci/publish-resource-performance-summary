@@ -125,8 +125,8 @@ def fixed(value: Decimal) -> str:
     return f"{value:.3f}"
 
 
-def general(value: str) -> str:
-    rendered = format(Decimal(value), "f")
+def general(value: str | Decimal) -> str:
+    rendered = format(Decimal(str(value)), "f")
     if "." in rendered:
         rendered = rendered.rstrip("0").rstrip(".")
     return rendered or "0"
@@ -215,7 +215,13 @@ for (operation, metric), metric_rows in summary_metrics.items():
         guardrail = "≥ 200 ms"
         result = "✅ Pass" if display_value_number >= 200 else "❌ Too short"
     workload = metric_rows[0]
-    workload_text = f"{workload['size_mib']} MiB × {workload['runs']} runs × {workload['iterations']} iterations"
+    total_size = Decimal(workload["size_mib"])
+    iterations = int(workload["iterations"])
+    per_iteration_size = total_size / Decimal(iterations)
+    workload_text = (
+        f"{general(per_iteration_size)} MiB/iteration × {iterations} iterations/sample × "
+        f"{workload['runs']} samples ({general(total_size)} MiB/sample)"
+    )
     print(f"| `{operation}` | {label} | {result} | {display_value} | {headroom} | {direction} | {guardrail} | {aggregation} | {workload_text} | {spread_value} | {n_value} |")
 
 contracts = [row for row in rows if row.get("type") == "contract"]
@@ -282,18 +288,70 @@ if profiles:
     print()
     print("### Write stage profile")
     print()
-    print("| Stage | Median | Effective throughput | Share of full synthetic | Interpretation |")
-    print("|---|---:|---:|---:|---|")
+    print("Per-invocation medians are aggregated across baseline invocations.")
+    print()
+    print("| Stage | Median | Effective throughput | Share of full synthetic | Spread | N | Interpretation |")
+    print("|---|---:|---:|---:|---|---:|---|")
+    profile_groups = {}
     for row in profiles:
-        stage = row["stage"]
+        profile_groups.setdefault(row["stage"], []).append(row)
+    for stage, stage_rows in profile_groups.items():
         interpretation = {
             "signing_only": "AES-CMAC cost",
+            "pure_swift_signing_only": "Pure Swift AES-CMAC comparison",
             "session_no_outbound_retention": "Session + transport, discard writes",
             "full_synthetic": "End-to-end synthetic write",
         }.get(stage, "WRITE encoding only")
-        share = stage_shares.get((row["baseline_run"], stage))
-        share_display = f"{Decimal(str(share)) * 100:.1f}%" if share is not None else "n/a"
-        print(f"| {stage.replace('_', ' ')} | {fixed(Decimal(row['median_ms']))} ms | {fixed(Decimal(row['throughput_mib_s']))} MiB/s | {share_display} | {interpretation} |")
+        elapsed_values = [Decimal(row["median_ms"]) for row in stage_rows]
+        throughput_values = [Decimal(row["throughput_mib_s"]) for row in stage_rows]
+        elapsed_median = median(elapsed_values)
+        elapsed_mad = median([abs(value - elapsed_median) for value in elapsed_values])
+        share_values = [
+            Decimal(str(share))
+            for row in stage_rows
+            if (share := stage_shares.get((row["baseline_run"], stage))) is not None
+        ]
+        share_display = f"{median(share_values) * 100:.1f}%" if share_values else "n/a"
+        elapsed_spread = (
+            f"MAD {fixed(elapsed_mad)} ms; {fixed(min(elapsed_values))}–{fixed(max(elapsed_values))} ms"
+        )
+        print(
+            f"| {stage.replace('_', ' ')} | {fixed(elapsed_median)} ms | "
+            f"{fixed(median(throughput_values))} MiB/s | {share_display} | {elapsed_spread} | "
+            f"{len(stage_rows)} | {interpretation} |"
+        )
+
+scaling_rows = [row for row in rows if row.get("type") == "cmac_scaling"]
+if scaling_rows:
+    print()
+    print("### AES-CMAC scaling profile (Observe-only)")
+    print()
+    print("Current RSS is sampled immediately around signing; process max RSS remains a lifetime high-water mark.")
+    print()
+    print("| Payload | Workload | Median elapsed | Throughput | User CPU | Current RSS before → after (delta) | Median process max RSS | Elapsed spread | N |")
+    print("|---:|---|---:|---:|---:|---:|---:|---|---:|")
+    scaling_groups = {}
+    for row in scaling_rows:
+        scaling_groups.setdefault(Decimal(str(row["size_mib"])), []).append(row)
+    for size, size_rows in sorted(scaling_groups.items()):
+        elapsed_values = [Decimal(str(row["median_ms"])) for row in size_rows]
+        throughput_values = [Decimal(str(row["throughput_mib_s"])) for row in size_rows]
+        user_values = [Decimal(str(row["user_cpu_ms"])) for row in size_rows]
+        before_values = [Decimal(str(row["current_rss_before_kb"])) for row in size_rows]
+        after_values = [Decimal(str(row["current_rss_after_kb"])) for row in size_rows]
+        delta_values = [after - before for before, after in zip(before_values, after_values)]
+        max_values = [Decimal(str(row["max_rss_kb"])) for row in size_rows]
+        elapsed_median = median(elapsed_values)
+        elapsed_mad = median([abs(value - elapsed_median) for value in elapsed_values])
+        row = size_rows[0]
+        print(
+            f"| {general(size)} MiB | {row['chunks']} chunks × {row['iterations']} iterations | "
+            f"{fixed(elapsed_median)} ms | {fixed(median(throughput_values))} MiB/s | "
+            f"{fixed(median(user_values))} ms | {fixed(median(before_values) / Decimal(1024))} → "
+            f"{fixed(median(after_values) / Decimal(1024))} MiB ({fixed(median(delta_values) / Decimal(1024))} MiB) | "
+            f"{fixed(median(max_values) / Decimal(1024))} MiB | MAD {fixed(elapsed_mad)} ms; "
+            f"{fixed(min(elapsed_values))}–{fixed(max(elapsed_values))} ms | {len(size_rows)} |"
+        )
 
 process_rows = [row for row in rows if row.get("type") == "process"]
 rss_rows = [row for row in process_rows if row.get("metric") == "max_rss_kb"]

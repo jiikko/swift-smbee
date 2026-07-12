@@ -24,7 +24,8 @@
 各 operation の全 `assertAndPrint` 完了後に `PERF_RUN_COMPLETE operation=<operation>` を出力する。
 baseline run は1から連続し、重複や欠落は失敗扱いとする。
 
-`PERF_ENV`、`PERF_BUILD_CACHE`、`PERF_METRIC`、`PERF_WRITE_PROFILE`、`Maximum resident set size (kbytes):` は任意行だが、
+`PERF_ENV`、`PERF_BUILD_CACHE`、`PERF_METRIC`、`PERF_WRITE_PROFILE`、
+`PERF_CMAC_SCALING_SAMPLE` / `PERF_CMAC_SCALING`、`Maximum resident set size (kbytes):` は任意行だが、
 存在する場合も数値とフィールドを parser が検証する。未知の `PERF_*` 行、必須フィールド欠落、
 形式 version 不一致、完了 marker 欠落は解析失敗となる。artifact と job summary はこの共通 parser
 の検証済み JSONL のみを利用する。`PERF_ENV <key> <自由テキスト>` の key は
@@ -43,10 +44,16 @@ parser は検証済みの summary 行と write profile 行から、producer の�
   read の 160 MiB/sample と write の 8 MiB/sample は異なるため、ms/MiB を operation 間で直接比較しない。
 - `{"type":"derived_stage","baseline_run":N,"stage":...}` は、同一 baseline の
   `PERF_WRITE_PROFILE` の `median_ms` を `full_synthetic` の `median_ms` で割った比率を持つ。
-  `full_synthetic` がない場合はこの派生行を出力しない。分母が 0 の場合は比率を JSON `null` とする。
+  `full_synthetic` がない場合はこの派生行を出力しない。分母が 0、またはpipeline外の比較用
+  `pure_swift_signing_only`では比率をJSON `null`とする。
 
 CPU efficiency と write stage の比率は Observe-only であり、guardrail の判定、workflow の exit status、
 既存の throughput/RSS 判定を変更しない。
+
+CMAC scalingは4 / 8 / 16 MiBの各payloadについて、1 sampleが512 MiBの署名処理になるようiterationを
+調整する。sample raw値とinvocation内medianをartifactへ保存し、current RSSは署名区間の直前・直後、
+max RSSはprocess lifetime high-waterとして区別する。いずれもObserve-onlyである。resource workloadの
+`size_mib`は全iterationの合計であり、Summaryは`MiB/iteration × iterations/sample × samples`に分解して表示する。
 
 ## Per-invocation representative metrics
 

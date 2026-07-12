@@ -4,7 +4,7 @@ import Foundation
 /// SMBee 🐝 — a pure-Swift SMB2/3 client.
 ///
 /// SMB protocol / framing / NTLMv2 flow / SMB3 crypto framing は本ライブラリで
-/// 自作し、暗号プリミティブの計算は swift-crypto と in-repo pure-Swift 実装に委ねる。
+/// 自作し、暗号プリミティブの計算はCommonCrypto、swift-crypto、検証用pure-Swift実装に委ねる。
 /// 対象サーバは SMB 3.x サーバ (macOS SMBX / Windows SMB Server / Samba)。
 /// 自動 E2E は Samba、手動 smoke は実サーバで確認する。
 public enum SMBee {

@@ -54,7 +54,7 @@ protocol SMBTransport            // TCP 445 上の双方向バイトストリー
 | `SMBTransport`（protocol）+ 実装 | TCP バイトストリーム。platform 差はここだけ |
 | `Protocol/` | SMB2 header / command codec / framing |
 | `Auth/` | NTLMv2 / SPNEGO |
-| `Crypto/` | preauth / KDF / signing / encryption。3.1.1 は GMAC/GCM を swift-crypto で扱う。3.0.2 は in-repo pure-Swift AES-CMAC/AES-CCM で扱う |
+| `Crypto/` | preauth / KDF / signing / encryption。3.1.1 は GMAC/GCM をswift-cryptoで扱う。3.0.2 CMACはCommonCrypto（Apple）/ CryptoExtras（Linux）、CCMはCommonCrypto（Apple）/ pure Swift（Linux）で扱う |
 | `Session/` | `SMBSession`（actor）: 接続シーケンス・直列化・再接続・cancellation |
 | `API/` | 公開 API（list/stat/read/write/mkdir/rename/delete）。型は path/offset/length/attrs |
 | `smbcli` | CLI（probe/ls/stat/cat/put/...） |
@@ -67,5 +67,6 @@ SMBee を薄くラップする）。
 - macOS SMBX は macOS 26.5.1（最新）でも negotiated dialect が **0x0302 (SMB 3.0.2)** で上限。
   3.1.1 は喋らない。
 - Samba 等の 3.1.1 対応サーバでは **0x0311 (SMB 3.1.1)** も対象。
-- 3.1.1 は AES-GMAC / AES-GCM を swift-crypto で扱う。3.0.2 は AES-CMAC / AES-128-CCM が必要で、
-  in-repo pure-Swift 実装（RFC4493 / RFC3610 / SP800-38C）で扱う。CommonCrypto は Linux 非対応なので使わない。
+- 3.1.1はAES-GMAC / AES-GCMをswift-cryptoで扱う。3.0.2のAES-CMACはCommonCrypto（Apple）と
+  swift-crypto CryptoExtras（Linux）を使い、同一RFC 4493 vectorで結果を照合する。pure-Swift CMACは
+  differential test用に残す。AES-128-CCMはCommonCrypto（Apple）/ in-repo pure Swift（Linux）で扱う。

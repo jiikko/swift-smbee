@@ -11,14 +11,24 @@ let package = Package(
     dependencies: [
         // 暗号プリミティブ (AES-GCM / HMAC / SHA) は自作せず swift-crypto に委ねる。
         // SMB protocol / framing は SMBee 自身で実装する。
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "4.0.0"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
         .package(url: "https://github.com/SimplyDanny/SwiftLintPlugins", from: "0.63.0"),
     ],
     targets: [
         .target(
             name: "SMBee",
-            dependencies: [.product(name: "Crypto", package: "swift-crypto")],
+            dependencies: [
+                .product(name: "Crypto", package: "swift-crypto"),
+                // CommonCrypto provides the CMAC backend on Apple platforms.
+                // CryptoExtras supplies the BoringSSL-backed implementation on Linux only,
+                // avoiding an otherwise duplicate BoringSSL link in macOS products.
+                .product(
+                    name: "CryptoExtras",
+                    package: "swift-crypto",
+                    condition: .when(platforms: [.linux])
+                ),
+            ],
             plugins: [.plugin(name: "SwiftLintBuildToolPlugin", package: "SwiftLintPlugins")]
         ),
         .executableTarget(

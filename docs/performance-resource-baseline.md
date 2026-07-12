@@ -34,6 +34,11 @@ job summary の先頭には commit、Swift image、image digest、GitHub run ID/
 kernel、CPU、runner、baseline run 数、operation 別 raw sample 数、build cache exact hit と、metric ごとの
 代表値／分布（MAD・min–max・N）が表示される。
 
+`Performance evaluation at a glance`ではRead I/O、Write I/O、CPU efficiency、memory、AES-CMAC signing、
+payload scaling、measurement confidenceを独立して評価する。各行はstatusだけでなく、そのrunの根拠値と
+「何が強化済みか／何がObserve-onlyか／次に何を測るか」を表示する。通常pushの1 invocationはhealth snapshot
+として`Provisional`、5 invocation以上は`Baseline-backed`とし、catastrophic floorを改善目標とは扱わない。
+
 parser は検証済みの summary 行と write profile 行から、producer のログには現れない派生行も JSONL に追加する。
 これらはログ形式 version 1 の producer 契約を変更しない parser 生成データである。
 

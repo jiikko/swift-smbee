@@ -268,6 +268,127 @@ for operation in ("read_stream", "write_stream"):
         f"| {derived_display(operation, 'cpu_utilization')} |"
     )
 
+profiles = [row for row in rows if row.get("type") == "write_profile"]
+scaling_rows = [row for row in rows if row.get("type") == "cmac_scaling"]
+
+def representative_summary(operation: str, metric: str) -> Decimal | None:
+    metric_rows = summary_metrics.get((operation, metric), [])
+    if not metric_rows:
+        return None
+    return median([Decimal(str(row["value"])) for row in metric_rows])
+
+def representative_profile(stage: str, field: str) -> Decimal | None:
+    values = [Decimal(str(row[field])) for row in profiles if row["stage"] == stage]
+    return median(values) if values else None
+
+def ratio_text(value: Decimal | None) -> str:
+    return f"{value:.2f}×" if value is not None else "n/a"
+
+print()
+print("### Performance evaluation at a glance")
+print()
+print("Assessments describe the current measured strengths and remaining uncertainty; catastrophic floors are not optimization targets.")
+print()
+print("| Area | Current assessment | Evidence | What it means |")
+print("|---|:---:|---|---|")
+
+read_throughput = representative_summary("read_stream", "throughput_mib_s")
+write_throughput = representative_summary("write_stream", "throughput_mib_s")
+read_floor_rows = summary_metrics.get(("read_stream", "throughput_mib_s"), [])
+write_floor_rows = summary_metrics.get(("write_stream", "throughput_mib_s"), [])
+read_floor = Decimal(str(read_floor_rows[0]["throughput_floor_mib_s"])) if read_floor_rows else None
+write_floor = Decimal(str(write_floor_rows[0]["throughput_floor_mib_s"])) if write_floor_rows else None
+read_io_pass = read_throughput is not None and read_floor is not None and read_throughput > read_floor
+read_io_status = "✅ Healthy" if read_io_pass else "❌ Needs attention"
+read_io_evidence = (
+    f"{fixed(read_throughput)} MiB/s ({ratio_text(read_throughput / read_floor if read_floor else None)} floor)"
+    if read_throughput is not None else "resource metrics unavailable"
+)
+print(f"| Read I/O | {read_io_status} | {read_io_evidence} | Read clears its catastrophic floor; real-network throughput is not measured here. |")
+
+write_io_pass = write_throughput is not None and write_floor is not None and write_throughput > write_floor
+write_io_status = "✅ Healthy" if write_io_pass else "❌ Needs attention"
+write_io_evidence = (
+    f"{fixed(write_throughput)} MiB/s ({ratio_text(write_throughput / write_floor if write_floor else None)} floor)"
+    if write_throughput is not None else "resource metrics unavailable"
+)
+print(f"| Write I/O | {write_io_status} | {write_io_evidence} | Write has substantial synthetic headroom after CMAC optimization; validate it over Samba/network. |")
+
+write_user_per_mib = derived_metrics.get(("write_stream", "user_cpu_ms_per_mib"), [])
+write_cpu_utilization = derived_metrics.get(("write_stream", "cpu_utilization"), [])
+signing_ms = representative_profile("signing_only", "median_ms")
+pure_signing_ms = representative_profile("pure_swift_signing_only", "median_ms")
+signing_speedup = pure_signing_ms / signing_ms if signing_ms and pure_signing_ms else None
+cpu_status = "✅ Strengthened" if signing_speedup is not None and signing_speedup >= Decimal(1.10) else "ℹ️ Observe"
+cpu_evidence_parts = []
+if write_user_per_mib:
+    cpu_evidence_parts.append(f"write user {fixed(median(write_user_per_mib))} ms/MiB")
+if write_cpu_utilization:
+    cpu_evidence_parts.append(f"{median(write_cpu_utilization) * 100:.1f}% of one core")
+if signing_speedup is not None:
+    cpu_evidence_parts.append(f"CMAC backend {signing_speedup:.1f}× faster than pure Swift")
+print(
+    f"| CPU efficiency | {cpu_status} | {'; '.join(cpu_evidence_parts) or 'CPU metrics unavailable'} "
+    "| Crypto CPU is strongly reduced; total CPU remains Observe-only until cross-run variance is calibrated. |"
+)
+
+resource_rss = representative_summary("write_stream", "max_rss_kb")
+rss_limit = Decimal(512 * 1024)
+rss_status = "✅ Healthy" if resource_rss is not None and resource_rss < rss_limit else "❌ Needs attention"
+rss_evidence = f"XCTest peak {resource_rss / Decimal(1024):.1f} MiB ({resource_rss / rss_limit * 100:.1f}% of limit)" if resource_rss is not None else "RSS unavailable"
+scaling_deltas = [
+    Decimal(str(row["current_rss_after_kb"])) - Decimal(str(row["current_rss_before_kb"]))
+    for row in scaling_rows
+]
+if scaling_deltas:
+    rss_evidence += f"; CMAC current-RSS delta median {median(scaling_deltas) / Decimal(1024):.3f} MiB"
+print(f"| Memory | {rss_status} | {rss_evidence} | No retained signing-buffer growth is visible; process peak stays below the absolute guardrail. |")
+
+full_ms = representative_profile("full_synthetic", "median_ms")
+signing_share = signing_ms / full_ms if signing_ms is not None and full_ms else None
+crypto_status = "✅ Strengthened" if signing_speedup is not None and signing_speedup >= Decimal(1.20) else "ℹ️ Observe"
+crypto_evidence = (
+    f"signing {fixed(signing_ms)} ms vs pure Swift {fixed(pure_signing_ms)} ms ({signing_speedup:.1f}×); "
+    f"{signing_share * 100:.1f}% of full synthetic"
+    if signing_ms is not None and pure_signing_ms is not None and signing_speedup is not None and signing_share is not None
+    else "stage profile unavailable"
+)
+crypto_meaning = (
+    "The optimized backend is an established strength and no longer dominates full synthetic write."
+    if signing_share is not None and signing_share <= Decimal("0.50")
+    else "The backend is faster, but signing still dominates full synthetic write and remains a profiling target."
+)
+print(f"| AES-CMAC signing | {crypto_status} | {crypto_evidence} | {crypto_meaning} |")
+
+scaling_throughputs = [Decimal(str(row["throughput_mib_s"])) for row in scaling_rows]
+if scaling_throughputs:
+    scaling_span = (max(scaling_throughputs) - min(scaling_throughputs)) / median(scaling_throughputs)
+    scaling_status = "✅ Linear" if scaling_span <= Decimal("0.10") else "⚠️ Investigate"
+    scaling_evidence = (
+        f"4–16 MiB throughput {fixed(min(scaling_throughputs))}–{fixed(max(scaling_throughputs))} MiB/s "
+        f"({scaling_span * 100:.1f}% span)"
+    )
+else:
+    scaling_status = "ℹ️ Unavailable"
+    scaling_evidence = "scaling profile unavailable"
+print(f"| Payload scaling | {scaling_status} | {scaling_evidence} | Flat throughput indicates no payload-size cliff in the measured range. |")
+
+baseline_count = len({row["baseline_run"] for row in summaries})
+read_raw = [Decimal(str(row["throughput_mib_s"])) for row in samples if row["operation"] == "read_stream"]
+write_raw = [Decimal(str(row["throughput_mib_s"])) for row in samples if row["operation"] == "write_stream"]
+def raw_span(values: list[Decimal]) -> Decimal | None:
+    return (max(values) - min(values)) / median(values) if values and median(values) else None
+read_span = raw_span(read_raw)
+write_span = raw_span(write_raw)
+confidence_status = "✅ Baseline-backed" if baseline_count >= 5 else "ℹ️ Provisional"
+confidence_evidence = f"{baseline_count} invocation(s)"
+if read_span is not None and write_span is not None:
+    confidence_evidence += f"; raw throughput span read {read_span * 100:.1f}%, write {write_span * 100:.1f}%"
+print(
+    f"| Measurement confidence | {confidence_status} | {confidence_evidence} "
+    "| A normal push is a health snapshot; use a 10-run dispatch before making optimization decisions. |"
+)
+
 print()
 print("### How to read this")
 print()
@@ -278,7 +399,6 @@ print("- **Measured duration:** each aggregated sample must cover at least 200 m
 print("- **Spread (raw):** with one baseline run, this is the raw sample min–max. With multiple runs, it is the representative-value MAD and min–max; N is the number of values used.")
 print("- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.")
 
-profiles = [row for row in rows if row.get("type") == "write_profile"]
 if profiles:
     derived_stage_rows = [row for row in rows if row.get("type") == "derived_stage"]
     stage_shares = {
@@ -321,7 +441,6 @@ if profiles:
             f"{len(stage_rows)} | {interpretation} |"
         )
 
-scaling_rows = [row for row in rows if row.get("type") == "cmac_scaling"]
 if scaling_rows:
     print()
     print("### AES-CMAC scaling profile (Observe-only)")

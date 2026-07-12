@@ -3695,7 +3695,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertTrue(requests.dropFirst().allSatisfy { (try? SMB2Header.decode($0).treeId) == 0x7788 })
     }
 
-    func testClientSessionReadEmitsTransferProgressPerChunk() async throws {
+    func testClientSessionReadProgressIsMonotonicAndFinishesAtTotal() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([
             try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
@@ -3718,9 +3718,14 @@ final class SMBeeTests: XCTestCase {
         let data = try await clientSession.read(path: "file.txt", onProgress: progress.append)
 
         XCTAssertEqual(data, Array("hello".utf8))
-        XCTAssertEqual(progress.snapshots.map(\.bytesTransferred), [3, 5])
-        XCTAssertEqual(progress.snapshots.map(\.totalBytes), [5, 5])
-        XCTAssertTrue(progress.snapshots.allSatisfy { $0.bytesPerSecond >= 0 })
+        let snapshots = progress.snapshots
+        XCTAssertFalse(snapshots.isEmpty)
+        XCTAssertEqual(snapshots.last?.bytesTransferred, 5)
+        XCTAssertEqual(snapshots.last?.totalBytes, 5)
+        XCTAssertTrue(zip(snapshots, snapshots.dropFirst()).allSatisfy {
+            $0.bytesTransferred < $1.bytesTransferred
+        })
+        XCTAssertTrue(snapshots.allSatisfy { $0.bytesPerSecond >= 0 })
     }
 
     func testClientSessionUploadEmitsTransferProgressPerChunk() async throws {

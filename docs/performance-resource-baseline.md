@@ -170,3 +170,104 @@ buildは109.00秒（cold 193.51秒比43.7%減）だった。そこでcommit SHA�
 19.60秒、resource jobは統合直後run `29156285604`の4分10秒から1分8秒へ72.8%短縮した。cold build
 193.51秒に対する再buildは0秒となり、50%削減目標を満たした。同runのwrite throughputは12.558 MiB/sで、
 cacheによって測定対象が省略されていないことも確認した。
+
+## Issue 060: AES-CMAC profile and optimization
+
+### Measurement identity
+
+- before commit: `24f81d079b8831625315ee739fb6750ac9e393f2`
+- before 10-run: https://github.com/jiikko/swift-smbee/actions/runs/29174853295
+- after commit: `e91809a370f073f07155ee56526fc4101ba68fdf`
+- after 10-run: https://github.com/jiikko/swift-smbee/actions/runs/29184222552
+- Swift image（before/after共通）:
+  `swift:6.2@sha256:dd349c6dfc3cd3040910a84ab3e5bd5d08efdd547e5fb9f77b765abed16fe5ff`
+- runner（before/after共通）: GitHub-hosted `Linux/X64`
+- stage workload: Release、8 MiB、128 × 64 KiB chunks、warmup後5 samples/invocation、10 invocations
+
+beforeのresource representative値はwrite throughput 11.937 MiB/s（MAD 0.061）、user CPU
+669.979 ms（MAD 2.516）、elapsed 670.204 ms（MAD 3.402）、XCTest max RSS 128,412 KiBだった。
+afterはbenchmark自体を高速化後も200 ms以上に保つため8 MiB × 14 iteration（112 MiB/sample）へ変更し、
+CPU snapshotをelapsedと同じtransfer-only区間へ補正した。このためresourceの絶対CPU/elapsedはbeforeとの
+同一contract A/Bには使わず、同じ8 MiB stage profileを採用判断の正本とする。after resource値はwrite
+334.014 MiB/s（MAD 2.282）、user CPU 341.676 ms / 112 MiB（MAD 3.883）、elapsed 335.317 ms
+（MAD 2.293）だった。
+
+### Profile evidence
+
+macOS Time Profilerで変更前後の同じ8 MiB signing testを記録した。変更前6,347 samplesのうち
+AES stackが6,156（97.0%）、AES stack上のallocation/copy symbolを含むsampleが1,987（31.3%）だった。
+top leafには`_xzm_free` 602、`xzm_malloc_zone_size` 516、`_platform_memset` 321、
+`mixColumns` 317、`swift_slowAllocTyped` 227、`malloc` 208が現れた。候補A後は1,995 samples中
+AES stack 1,777（89.1%）、allocation/copy sample 35（1.8%）となり、top leafは`mixColumns` 323、
+`subBytes` 278、bounds check 245、`addRoundKey` 231、`shiftRows` 169へ移った。
+
+変更前のsourceとworkloadから数えられる8 MiBあたりのcopy-prone eventは次のとおり。
+
+| Source | Count | Copied-byte proxy |
+|---|---:|---:|
+| AES round-key slices | 5,778,432 | 88.17 MiB |
+| `shiftRows` Array CoW candidates | 5,253,120 | 80.16 MiB |
+| CMAC message-block Arrays | 525,184 | 8.01 MiB |
+| AES state CoW candidates | 525,312 | 8.02 MiB |
+| SMB signature normalization | 128 | 8.01 MiB |
+| **Total** | **12,082,176** | **約192.4 MiB** |
+
+候補Aはround-key slice、message-block slice、`shiftRows` whole-state copyを除去し、AES stateをin-placeで
+再利用した。候補Cの最終Apple backendもCBC出力を同じbufferへ書くため、CMAC内でpacket-sized bufferは
+message copy 1本だけであり、別のciphertext全量bufferを作らない。最終Allocations traceは
+`xcrun xctrace record --template Allocations`で採取し、CIではより再現可能なcurrent RSS before/afterと
+process high-waterをJSONLへ保存する。
+
+### Candidate decisions
+
+| Candidate | Metric | Before median / MAD | After median / MAD | Change | Decision |
+|---|---|---:|---:|---:|---|
+| A: pure-Swift temporary allocation removal | signing-only（macOS） | 407.257 / 4.761 ms | 118.585 / 1.643 ms | -70.9% | adopt |
+| A | full synthetic（macOS） | 424.344 / 12.201 ms | 133.676 / 0.868 ms | -68.5% | adopt |
+| B: session expanded-key cache | AES block/key expansion call ratio | 525,312 / 128 | — | key expansion <0.024% of calls | reject before implementation |
+| C: platform backend（Linux 10-run） | signing-only | 224.298 / 0.047 ms（optimized pure Swift） | 9.095 / 0.032 ms | -95.9% | adopt |
+| C + A（Linux 10-run） | full synthetic | 669.927 / 1.409 ms（original） | 23.797 / 1.213 ms | **-96.4%** | adopt |
+
+候補Bは10%事前条件を満たさず、176-byte expanded keyをsession寿命まで延ばすsecurity costもあるため
+実装しなかった。候補CはAppleでCommonCrypto、Linuxでswift-crypto 4のstable `CryptoExtras.AES.CMAC`
+（BoringSSL）を使う。unsupported platformではoptimized pure-Swift implementationへfallbackする。
+AppleにCryptoExtrasをlinkするとcold build 63.99秒、`smbcli` 8,166,376 bytesまで増えたため、dependencyを
+Linux条件付きにした。最終Apple cold buildは29.37秒、binaryは5,290,056 bytesで、beforeの37.03秒、
+5,292,568 bytesに対してbinary増加はなく（-0.05%）、buildも悪化していない。
+
+### CPU and RSS scaling
+
+after 10-runは各sampleの総処理量を512 MiBに揃えた。payloadが増えてもthroughputとCPU効率はほぼ一定で、
+署名区間のcurrent RSS delta medianは全sizeで0だった。payload fixtureを含むcurrent RSSは4→8 MiBで
++4.13 MiB、8→16 MiBで+8.15 MiBと線形に増え、超線形成長はない。
+
+| Payload | Iterations | Elapsed median / MAD | Throughput | User CPU | Current RSS before→after | Process peak |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 MiB | 128 | 570.869 / 0.806 ms | 896.878 MiB/s | 570.719 ms | 32.689→32.689 MiB | 120.145 MiB |
+| 8 MiB | 64 | 576.349 / 1.562 ms | 888.351 MiB/s | 576.255 ms | 36.822→36.822 MiB | 120.145 MiB |
+| 16 MiB | 32 | 581.282 / 0.786 ms | 880.812 MiB/s | 581.224 ms | 44.967→44.967 MiB | 120.145 MiB |
+
+afterのwarm `swift test` process RSS medianは120.9 MiB（120.5–130.2 MiB）で、beforeの127.0 MiB
+（123.6–128.8 MiB）から悪化していない。
+
+### Correctness and security
+
+- RFC 4493 vectors、0/1/15/16/17/31/32/33/63/64/65/65,536-byte boundary differential tests
+- 64 concurrent one-shot CMAC contextsと独立reference implementationの一致
+- full unit suite: 312 tests、18 skipped、0 failures
+- deterministic performance contracts: 8/8 pass
+- local `make smoke`: SMB 3.0.2 encrypted-required / SMB 3.1.1 signing-requiredともpass
+- GitHub Actions: Test `29182627772`、E2E `29182627762`、Performance `29182627747`ともpass
+
+backend contextは呼び出しlocalで、sessionへexpanded keyやmutable CMAC stateを追加していない。
+CommonCrypto cryptorはone-shot、CryptoExtras contextはfinalize後に解放され、BoringSSLはCMAC subkey/blockを
+cleanseする。既存のsession key寿命、close/reconnect/cancellation、GMAC/encryption、wire packet、message ID、
+credit accountingは変更していない。E2Eで次の署名付きrequestを含む実通信も検証済みである。
+
+再現command:
+
+```sh
+swift test -c release --filter SMBeeResourcePerformanceTests
+bin/ci/test-performance-scripts
+make smoke
+```

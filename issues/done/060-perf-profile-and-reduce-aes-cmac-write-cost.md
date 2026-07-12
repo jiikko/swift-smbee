@@ -1,6 +1,6 @@
 # 060 perf: AES-CMAC write costを測定し、根拠がある場合だけ最適化する
 
-状態: **open**
+状態: **done**
 起票: 2026-07-12
 関連: `issues/done/052-perf-calibrate-resource-metrics-and-plan-optimization.md` / `docs/performance-resource-baseline.md` / `Sources/SMBee/AESCMAC.swift` / `Sources/SMBee/SMBSessionCrypto.swift` / `Tests/SMBeeTests/SMBeePerformanceRegressionTests.swift`
 観測run: https://github.com/jiikko/swift-smbee/actions/runs/29172586105
@@ -142,14 +142,30 @@ safety constraints:
 
 ## 完了条件
 
-- [ ] 同一条件10 invocations以上のbefore baselineを保存する。
-- [ ] signing内部のCPU比率、allocation、copy回数をprofileする。
-- [ ] full writeの10%以上を占める候補だけをA/B評価する。
-- [ ] 候補Aのallocation除去を評価し、採用または棄却理由を記録する。
-- [ ] 候補Bは鍵展開比率が事前条件を満たす場合だけ評価する。
-- [ ] 候補CはA/B後もsigningが支配的な場合だけ評価する。
-- [ ] before/afterのmedian、MAD、変化率、runner metadataを記録する。
-- [ ] 採用変更でfull writeまたはCPU効率がnoiseを超えて改善する。
-- [ ] RSS scalingが悪化していないことを確認する。
-- [ ] cryptographic vectors、full unit suite、Samba E2Eを通す。
-- [ ] data integrity、署名強度、cancellation、cleanup semanticsを弱めていないことを確認する。
+- [x] 同一条件10 invocations以上のbefore baselineを保存する。
+- [x] signing内部のCPU比率、allocation、copy回数をprofileする。
+- [x] full writeの10%以上を占める候補だけをA/B評価する。
+- [x] 候補Aのallocation除去を評価し、採用または棄却理由を記録する。
+- [x] 候補Bは鍵展開比率が事前条件を満たす場合だけ評価する。
+- [x] 候補CはA/B後もsigningが支配的な場合だけ評価する。
+- [x] before/afterのmedian、MAD、変化率、runner metadataを記録する。
+- [x] 採用変更でfull writeまたはCPU効率がnoiseを超えて改善する。
+- [x] RSS scalingが悪化していないことを確認する。
+- [x] cryptographic vectors、full unit suite、Samba E2Eを通す。
+- [x] data integrity、署名強度、cancellation、cleanup semanticsを弱めていないことを確認する。
+
+## 実施結果
+
+実装・測定・採否の詳細は`docs/performance-resource-baseline.md`の
+「Issue 060: AES-CMAC profile and optimization」に記録した。
+
+- before 10-run: https://github.com/jiikko/swift-smbee/actions/runs/29174853295
+- after 10-run: https://github.com/jiikko/swift-smbee/actions/runs/29184222552
+- profileでoriginal signingがfull syntheticの約97%を占め、copy/allocation symbolを含むsampleが31.3%だった。
+- 候補Aを採用し、pure-Swift signing medianをmacOSで70.9%短縮した。
+- 候補Bはkey expansionがAES block call countの0.024%未満で10%事前条件を満たさず、実装せず棄却した。
+- 候補Cを採用し、AppleはCommonCrypto、LinuxはCryptoExtras/BoringSSL、その他はoptimized pure Swiftとした。
+- Linux同一runner 10-runでsigning-onlyは653.962→9.095 ms、full syntheticは669.927→23.797 ms。
+- 4 / 8 / 16 MiB scalingはcurrent RSS delta 0、fixture RSS増分はpayloadに対して線形だった。
+- RFC 4493・boundary・concurrency・312 unit tests・deterministic 8/8・Samba 3.0.2/3.1.1 smokeを通した。
+- backend contextはone-shotで、session key cacheや共有mutable stateを追加していない。

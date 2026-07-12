@@ -4652,6 +4652,12 @@ actor SMBSession {
     }
 
     private func sendUnsigned(_ packet: [UInt8]) async throws {
+        // Deliberately NOT patched here. sendUnsigned carries the NEGOTIATE / SESSION_SETUP
+        // preauth messages (via unsignedWireTransaction), whose exact sent bytes must match
+        // the copies folded into the SMB 3.1.1 preauth-integrity hash (see setup path). A
+        // CreditRequest patch here would desync client/server key derivation and fail every
+        // signed/encrypted op. Post-auth traffic is patched in sendSigned before it delegates
+        // here for anonymous (unsigned) sessions.
         try Task.checkCancellation()
         let reservedCharge = try await reserveCredit(packet)
         do {
@@ -4664,6 +4670,13 @@ actor SMBSession {
     }
 
     private func sendSigned(_ packet: [UInt8]) async throws {
+        // Single credit-patch point for all post-auth traffic: sendSigned handles every
+        // signedWireTransaction op and delegates to sendEncrypted / sendUnsigned below, so
+        // patching once here (before signing/sealing) covers signed, encrypted, and anonymous
+        // paths while leaving the preauth NEGOTIATE/SESSION_SETUP messages (sent directly via
+        // sendUnsigned) untouched for 3.1.1 preauth-integrity.
+        var packet = packet
+        await applyCreditRequest(to: &packet)
         try Task.checkCancellation()
         if encryptionKey != nil {
             try await sendEncrypted(packet)
@@ -4697,6 +4710,7 @@ actor SMBSession {
     }
 
     private func sendEncrypted(_ packet: [UInt8]) async throws {
+        // packet is already credit-patched by sendSigned (the sole caller); do not re-patch.
         guard let encryptionKey else { throw SMBCodecError.invalidValue("missing SMB encryption key") }
         let nonceLength = encryptionAlgorithm == .aes128GCM ? 12 : 11
         let nonce = nextTransformNonce(length: nonceLength)
@@ -4924,6 +4938,11 @@ actor SMBSession {
         let balance = try await creditWindow.reserve(charge: effectiveCharge)
         debugLine("SMB credit charge=\(effectiveCharge) balance=\(balance)")
         return effectiveCharge
+    }
+
+    private func applyCreditRequest(to packet: inout [UInt8]) async {
+        let balance = await creditWindow.balance
+        SMB2Credit.patchCreditRequest(into: &packet, balance: balance, target: SMB2Credit.targetWindowCredits)
     }
 
     private func refundCredit(charge: UInt16) async {

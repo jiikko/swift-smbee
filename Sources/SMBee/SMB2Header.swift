@@ -99,6 +99,36 @@ public struct SMB2Header: Equatable, Sendable {
 
 enum SMB2Credit {
     static let unitSize = 65_536
+    // 256 credits permits approximately 16 MiB of outstanding read capacity while
+    // remaining comfortably below typical per-connection server limits.
+    static let targetWindowCredits: UInt32 = 256
+
+    static func creditRequest(balance: UInt32, charge: UInt16, target: UInt32) -> UInt16 {
+        guard balance < target else { return charge }
+        let deficit = target - balance
+        let requested = max(UInt32(charge), deficit)
+        return UInt16(min(requested, min(target, UInt32(UInt16.max))))
+    }
+
+    // SMB2 header field offsets (little-endian): CreditCharge=6, Command=12, CreditRequest=14.
+    static let creditChargeFieldOffset = 6
+    static let commandFieldOffset = 12
+    static let creditRequestFieldOffset = 14
+
+    /// Patch the CreditRequest field (offset 14, UInt16 LE) of an outgoing *plaintext*
+    /// SMB2 request toward `target`, so the credit window grows past its starved initial
+    /// value. Returns without mutating when the packet is too short, or for CANCEL
+    /// (credit-exempt, MS-SMB2 §3.2.4.1.2). Reads CreditCharge (offset 6) and Command
+    /// (offset 12) but never mutates them. Must run *before* signing/encryption.
+    static func patchCreditRequest(into packet: inout [UInt8], balance: UInt32, target: UInt32) {
+        guard packet.count >= creditRequestFieldOffset + 2 else { return }
+        let command = UInt16(packet[commandFieldOffset]) | (UInt16(packet[commandFieldOffset + 1]) << 8)
+        guard command != SMB2Commands.cancel else { return }
+        let charge = UInt16(packet[creditChargeFieldOffset]) | (UInt16(packet[creditChargeFieldOffset + 1]) << 8)
+        let request = creditRequest(balance: balance, charge: charge, target: target)
+        packet[creditRequestFieldOffset] = UInt8(request & 0xff)
+        packet[creditRequestFieldOffset + 1] = UInt8((request >> 8) & 0xff)
+    }
 
     static func charge(forPayloadLength length: UInt64) -> UInt16 {
         let charge = max(1, (length + UInt64(unitSize) - 1) / UInt64(unitSize))

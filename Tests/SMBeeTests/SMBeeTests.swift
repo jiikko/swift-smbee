@@ -6300,6 +6300,73 @@ final class SMBeeTests: XCTestCase {
         )
     }
 
+    func testCreditRequestGrowsWindowTowardTarget() {
+        XCTAssertEqual(SMB2Credit.creditRequest(balance: 1, charge: 1, target: 256), 255)
+        XCTAssertEqual(SMB2Credit.creditRequest(balance: 256, charge: 1, target: 256), 1)
+        XCTAssertEqual(SMB2Credit.creditRequest(balance: 300, charge: 16, target: 256), 16)
+        XCTAssertEqual(SMB2Credit.creditRequest(balance: 1, charge: 16, target: 256), 255)
+    }
+
+    func testPatchCreditRequestWritesFieldWithoutTouchingCharge() throws {
+        // READ request header: command=8, creditCharge=1, credits(CreditRequest)=1.
+        var packet = try SMB2Header(creditCharge: 1, command: SMB2Commands.read, credits: 1,
+                                    messageId: 0, treeId: 0, sessionId: 0).encode()
+        SMB2Credit.patchCreditRequest(into: &packet, balance: 1, target: 256)
+        // CreditRequest (offset 14, LE) grown to deficit 255.
+        XCTAssertEqual(UInt16(packet[14]) | (UInt16(packet[15]) << 8), 255)
+        // CreditCharge (offset 6) and Command (offset 12) untouched.
+        XCTAssertEqual(UInt16(packet[6]) | (UInt16(packet[7]) << 8), 1)
+        XCTAssertEqual(UInt16(packet[12]) | (UInt16(packet[13]) << 8), SMB2Commands.read)
+    }
+
+    func testPatchCreditRequestPreservesLargeChargeAndHold() throws {
+        // A 1 MiB read charges 16; below target it should still request the deficit.
+        var big = try SMB2Header(creditCharge: 16, command: SMB2Commands.read, credits: 16,
+                                 messageId: 0, treeId: 0, sessionId: 0).encode()
+        SMB2Credit.patchCreditRequest(into: &big, balance: 1, target: 256)
+        XCTAssertEqual(UInt16(big[14]) | (UInt16(big[15]) << 8), 255)
+        XCTAssertEqual(UInt16(big[6]) | (UInt16(big[7]) << 8), 16)
+        // At/above target it holds net-zero (request == charge).
+        var held = try SMB2Header(creditCharge: 16, command: SMB2Commands.read, credits: 16,
+                                  messageId: 0, treeId: 0, sessionId: 0).encode()
+        SMB2Credit.patchCreditRequest(into: &held, balance: 256, target: 256)
+        XCTAssertEqual(UInt16(held[14]) | (UInt16(held[15]) << 8), 16)
+    }
+
+    func testPatchCreditRequestSkipsCancel() throws {
+        var cancel = try SMB2Header(creditCharge: 1, command: SMB2Commands.cancel, credits: 0,
+                                    messageId: 0, treeId: 0, sessionId: 0).encode()
+        SMB2Credit.patchCreditRequest(into: &cancel, balance: 1, target: 256)
+        // CANCEL is credit-exempt: CreditRequest field must be left as encoded (0).
+        XCTAssertEqual(UInt16(cancel[14]) | (UInt16(cancel[15]) << 8), 0)
+    }
+
+    func testPatchCreditRequestIgnoresShortPacket() {
+        var shortPacket: [UInt8] = [0xfe, 0x53, 0x4d, 0x42, 0x40, 0x00]
+        let before = shortPacket
+        SMB2Credit.patchCreditRequest(into: &shortPacket, balance: 1, target: 256)
+        XCTAssertEqual(shortPacket, before)
+    }
+
+    func testCreditWindowChunkSizeExpandsWithGrantedCredits() {
+        XCTAssertEqual(
+            SMBTransferLimits.creditWindowChunkSize(
+                localLimit: 1_048_576,
+                negotiatedLimit: 1_048_576,
+                availableCredits: 1
+            ),
+            64 * 1024
+        )
+        XCTAssertEqual(
+            SMBTransferLimits.creditWindowChunkSize(
+                localLimit: 1_048_576,
+                negotiatedLimit: 1_048_576,
+                availableCredits: 16
+            ),
+            1_048_576
+        )
+    }
+
     func testSetInfoRenameRequestUsesFileRenameInformationBuffer() throws {
         let fileId = (0..<16).map(UInt8.init)
         let request = try SMB2SetInfo.encodeRenameRequest(

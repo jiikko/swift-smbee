@@ -3475,10 +3475,11 @@ actor SMBSession {
             messageId: nextMessageId(),
             offeredDialects: SMBNegotiateCodec.authenticatedDialects
         )
-        var preauthMessages = [negotiate]
+        var preauthMessages: [[UInt8]] = []
         debugDump("NEGOTIATE request", negotiate)
-        let negotiateResponse = try await unsignedWireTransaction(packet: negotiate, responseLabel: "NEGOTIATE response")
-        preauthMessages.append(negotiateResponse)
+        let negotiateResponse = try await sendPreauthRequest(
+            negotiate, responseLabel: "NEGOTIATE response",
+            preauthMessages: &preauthMessages, foldResponse: true)
         let result = try SMBNegotiateCodec.decodeResponse(negotiateResponse)
         signingRequired = result.signingRequired
         maxReadSize = result.maxReadSize
@@ -3509,9 +3510,9 @@ actor SMBSession {
             signed: false
         )
         debugLine("SESSION_SETUP#1 request length=\(challengePacket.count)")
-        preauthMessages.append(challengePacket)
-        let challengeResponse = try await unsignedWireTransaction(packet: challengePacket, responseLabel: "SESSION_SETUP#1 response")
-        preauthMessages.append(challengeResponse)
+        let challengeResponse = try await sendPreauthRequest(
+            challengePacket, responseLabel: "SESSION_SETUP#1 response",
+            preauthMessages: &preauthMessages, foldResponse: true)
         let challengeHeader = try SMB2Header.decode(challengeResponse)
         guard challengeHeader.status == SMB2Status.moreProcessingRequired else {
             throw SMBErrorMapper.map(status: challengeHeader.status, operation: "SESSION_SETUP#1")
@@ -3536,12 +3537,13 @@ actor SMBSession {
             signed: false
         )
         debugLine("SESSION_SETUP#2 request length=\(authPacket.count)")
-        preauthMessages.append(authPacket)
-        // MS-SMB2 §3.2.5.3.1: preauth integrity hash for key derivation covers messages
-        // up to the final SESSION_SETUP *request*. The terminal STATUS_SUCCESS response is
-        // NOT folded into the hash — including it derives a signing/encryption key that
-        // differs from the server's, so every signed/encrypted 3.1.1 op fails verification.
-        let authResponse = try await unsignedWireTransaction(packet: authPacket, responseLabel: "SESSION_SETUP#2 response")
+        // foldResponse: false — MS-SMB2 §3.2.5.3.1: the preauth integrity hash covers
+        // messages up to the final SESSION_SETUP *request*. Folding the terminal
+        // STATUS_SUCCESS response would derive a signing/encryption key that differs from
+        // the server's, so every signed/encrypted 3.1.1 op would fail verification.
+        let authResponse = try await sendPreauthRequest(
+            authPacket, responseLabel: "SESSION_SETUP#2 response",
+            preauthMessages: &preauthMessages, foldResponse: false)
         let authHeader = try SMB2Header.decode(authResponse)
         try SMBErrorMapper.throwIfFailure(status: authHeader.status, operation: "SESSION_SETUP")
         sessionId = authHeader.sessionId
@@ -4576,6 +4578,35 @@ actor SMBSession {
             longPoll: false,
             send: sendUnsigned
         ).bytes
+    }
+
+    /// Sends a NEGOTIATE / SESSION_SETUP request during connection setup, binding
+    /// "fold request into the preauth hash → send it → fold the response" into a single
+    /// path so the SMB 3.1.1 preauth-integrity hash always covers the exact bytes sent.
+    ///
+    /// This is a structural guard against the class of bug where a pre-send copy is
+    /// appended to `preauthMessages` while a *different* (e.g. credit-patched) byte string
+    /// goes on the wire: the derived signing/encryption keys then desync from the server's
+    /// and every signed op fails verification. Preauth requests go out via sendUnsigned,
+    /// which therefore must not mutate the packet (credit patching happens post-auth in
+    /// sendSigned). Do not append a request to `preauthMessages` separately from this call.
+    ///
+    /// `foldResponse` folds the response into the hash for all but the terminal
+    /// SESSION_SETUP#2: MS-SMB2 §3.2.5.3.1 covers messages up to the final SESSION_SETUP
+    /// *request*, so folding its STATUS_SUCCESS response would derive keys the server does
+    /// not use.
+    private func sendPreauthRequest(
+        _ packet: [UInt8],
+        responseLabel: String,
+        preauthMessages: inout [[UInt8]],
+        foldResponse: Bool
+    ) async throws -> [UInt8] {
+        preauthMessages.append(packet)
+        let response = try await unsignedWireTransaction(packet: packet, responseLabel: responseLabel)
+        if foldResponse {
+            preauthMessages.append(response)
+        }
+        return response
     }
 
     private func signedWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {

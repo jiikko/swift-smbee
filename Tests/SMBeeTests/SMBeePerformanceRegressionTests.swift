@@ -127,6 +127,42 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         counter.assertMetric("persistent_session.commands.TREE_CONNECT", command: SMB2Commands.treeConnect, expected: 1)
     }
 
+    func testPreauthMessagesAreSentWithUnpatchedCreditRequest() async throws {
+        let inbound = try framed([
+            try negotiateResponse(messageId: 0),
+            try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try smb2TreeConnectResponse(treeId: treeId),
+            try smb2CreateResponse(fileId: fileId, messageId: 4, treeId: treeId),
+            try smb2QueryInfoResponse(size: 3, messageId: 5, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId),
+        ])
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: credential,
+            makeTransport: { transport }
+        )
+
+        _ = try await session.stat(path: "a.txt")
+
+        let headers = try unframed(transport.outbound).map { try SMB2Header.decode($0) }
+        let preauthHeaders = headers.filter {
+            $0.command == SMBNegotiateConstants.commandNegotiate || $0.command == SMB2Commands.sessionSetup
+        }
+        XCTAssertFalse(preauthHeaders.isEmpty)
+        let preauthDefaultCredits = preauthHeaders[0].credits
+
+        // Preauth bytes feed the SMB 3.1.1 integrity hash, so credit patching here
+        // would desynchronize the signing key. This is a Docker-free regression guard.
+        XCTAssertTrue(preauthHeaders.allSatisfy { $0.credits == preauthDefaultCredits })
+        XCTAssertEqual(preauthDefaultCredits, 1)
+
+        let treeConnect = try XCTUnwrap(headers.first { $0.command == SMB2Commands.treeConnect })
+        XCTAssertGreaterThan(treeConnect.credits, preauthDefaultCredits)
+    }
+
     private func makeClientSession(transport: PerformanceInMemoryTransport, initialCredits: UInt32 = 1) -> SMBClientSession {
         let session = SMBSession(host: "server", port: 445, credential: credential, transport: transport, signingKey: signingKey, initialCredits: initialCredits)
         return SMBClientSession(session: session, treeId: treeId)

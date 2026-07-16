@@ -859,6 +859,33 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testInMemoryTransportSupportsConcurrentSendAndReceive() async throws {
+        let bytes = Array(UInt8(0)..<UInt8(128))
+        let transport = InMemoryTransport(inbound: bytes)
+
+        async let sent: Void = withThrowingTaskGroup(of: Void.self) { group in
+            for byte in bytes {
+                group.addTask { try await transport.send([byte]) }
+            }
+            try await group.waitForAll()
+        }
+        async let received: [UInt8] = withThrowingTaskGroup(of: UInt8.self, returning: [UInt8].self) { group in
+            for _ in bytes {
+                group.addTask { try await transport.receive(maxLength: 1).first! }
+            }
+            var result: [UInt8] = []
+            for try await byte in group {
+                result.append(byte)
+            }
+            return result
+        }
+
+        try await sent
+        let receivedBytes = try await received
+        XCTAssertEqual(transport.outbound.sorted(), bytes)
+        XCTAssertEqual(receivedBytes.sorted(), bytes)
+    }
+
 #if canImport(Network)
     func testNWConnectionTransportConnectSendReceiveOverLoopback() async throws {
         let server = try LoopbackNWServer(echo: true)

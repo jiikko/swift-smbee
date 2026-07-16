@@ -15,8 +15,18 @@ public protocol SMBTransport: Sendable {
 }
 
 public final class InMemoryTransport: SMBTransport, @unchecked Sendable {
+    // `SMBTransport` is Sendable and the multi-flight session can call send/receive
+    // from separate tasks. Keep this test transport honest too: callers commonly
+    // inspect `outbound` while a response loop is still running.
+    private let lock = NSLock()
     private var inbound: [UInt8]
-    private(set) var outbound: [UInt8] = []
+    private var outboundStorage: [UInt8] = []
+
+    public var outbound: [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        return outboundStorage
+    }
 
     public init(inbound: [UInt8] = []) {
         self.inbound = inbound
@@ -30,15 +40,22 @@ public final class InMemoryTransport: SMBTransport, @unchecked Sendable {
 
     public func send(_ bytes: [UInt8]) async throws {
         try Task.checkCancellation()
-        outbound.append(contentsOf: bytes)
+        lock.withLock {
+            outboundStorage.append(contentsOf: bytes)
+        }
     }
 
     public func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
-        guard !inbound.isEmpty else { return [] }
-        let count = min(maxLength, inbound.count)
-        let chunk = Array(inbound.prefix(count))
-        inbound.removeFirst(count)
+        let chunk = lock.withLock { () -> [UInt8] in
+            if inbound.isEmpty {
+                return []
+            }
+            let count = min(maxLength, inbound.count)
+            let chunk = Array(inbound.prefix(count))
+            inbound.removeFirst(count)
+            return chunk
+        }
         try Task.checkCancellation()
         return chunk
     }

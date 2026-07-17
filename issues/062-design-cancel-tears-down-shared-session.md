@@ -181,3 +181,46 @@ interruptBlockingIO とも 0 回) だが、健全時の挙動が確定した:
 観測ビルド (obaket が SMBEE_OBS062 対応 smbee bd5cf64 に pin、`SMBEE_OBS062=1 make dev-fg`) を
 維持し、**再発した瞬間の [obs062] + connection-lost 前後のログ**で真因 (送信途中 teardown or
 drain 漏れ) を確定する。それまで修正実装はしない。
+
+## 実 NAS 観測 #2 (2026-07-17) — 真因確定 (smoking gun)
+
+再発時のログ:
+
+```
+[obs062] cancelInFlightRequest id=8024 wasSent=false pendingExists=true
+[obs062] failPendingResponse id=8024 sentAlready=false cancellingSendTask=true
+[obs062] interruptBlockingIO shutdown+close (SHARED SOCKET TEARDOWN)
+[obs062] receiveLoop exit-by-error error=connectionClosed sentIds=[8008] pending=[8008]
+→ [smb-session] discarded reason=connection-lost
+```
+
+### 確定した真因
+
+**送信中 (`transport.send` がブロック中 = sendStarted だが markRequestSent 前 = `wasSent=false`) の
+sendTask を `failPendingResponse` が cancel すると、`POSIXSocketTransport.send` の
+`withTaskCancellationHandler onCancel: interruptBlockingIO()` (shutdown+close) が共有ソケットを
+破壊し、別の in-flight READ (id=8008) ごと receiveLoop が connectionClosed で死ぬ。**
+
+- container で再現しなかった理由も確定: localhost は send が即完了し「送信中」の窓がほぼゼロ。
+  実 NAS では大 READ 応答が帯域を食い TCP バックプレッシャで send がブロックし、窓が広い。
+- 健全時 (観測 #1) の `wasSent=true → drained cancelled response` / `wasSent=false (送信未開始) → 無害破棄`
+  はどちらも正しく動いている。壊れるのは**送信開始〜完了の窓だけ**。
+- **アプローチ 2 (状態機械) は方向として正しかった**可能性が高い (まさにこの窓を塞ぐ修正)。当時
+  E2E で落ちたのは旧 reproducer 自身のバグ (EOF offset) のためで、修正の妥当性を誤判定していた。
+
+### 修正方針 (確定診断ベース)
+
+session 層 (SMBClient actor) で完結させる:
+
+1. pendingResponse に `sendStarted` を持ち、transport.send 呼び出し直前に立てる (actor 内)
+2. `failPendingResponse` / `cancelInFlightRequest` は **sendStarted かつ未完了の sendTask を cancel しない**
+   (caller の continuation は即 CancellationError で解放してよい)
+3. send 完走後: cancellation が要求済みなら markRequestSent + SMB CANCEL 送信 → 既存 drain
+   (`completed cancelled SMB response`) に乗せる — drain は実 NAS で実証済み
+4. transport 層は変更しない (使い捨て session の cancel 即応性は維持)
+
+### unit 再現が可能になった
+
+「send がブロックする窓」は mock transport (send を明示 release まで block) で再現できる:
+block 中に request を cancel → transport が shutdown されないこと + release 後に同一 transport で
+次の request が成功することを assert。localhost E2E に依存しない回帰ガードにする。

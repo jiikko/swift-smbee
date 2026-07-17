@@ -40,8 +40,8 @@ public enum SMBProbe {
                 Data("NEGOTIATE request (\(request.count) bytes): \(SMBDebug.packetSummary(request, traceWire: traceWire))\n".utf8)
             )
         }
-        try await DirectTCPFraming.send(request, via: transport)
-        let (_, response) = try await DirectTCPFraming.receive(from: transport)
+        try await transport.send(DirectTCPFraming.frame(request))
+        let response = try await receiveFramedMessage(from: transport)
         if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {
             let traceWire = ProcessInfo.processInfo.environment["SMBEE_TRACE_WIRE"] == "1"
             FileHandle.standardError.write(
@@ -51,6 +51,22 @@ public enum SMBProbe {
         return try SMBNegotiateCodec.decodeResponse(response)
     }
 
+    private static func receiveFramedMessage(from transport: SMBTransport) async throws -> [UInt8] {
+        let header = try await receiveExactly(4, from: transport)
+        let length = try DirectTCPFraming.length(from: header)
+        return try await receiveExactly(length, from: transport)
+    }
+
+    private static func receiveExactly(_ count: Int, from transport: SMBTransport) async throws -> [UInt8] {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(count)
+        while bytes.count < count {
+            let chunk = try await transport.receive(maxLength: count - bytes.count)
+            guard !chunk.isEmpty else { throw SMBTransportError.connectionClosed }
+            bytes.append(contentsOf: chunk)
+        }
+        return bytes
+    }
 }
 
 public enum SMBURLParser {

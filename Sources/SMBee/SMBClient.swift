@@ -4692,12 +4692,11 @@ actor SMBSession {
         try Task.checkCancellation()
         let reservedCharge = try await reserveCredit(packet)
         do {
-            try await transport.send(DirectTCPFraming.frame(packet))
+            try await DirectTCPFraming.send(packet, via: transport)
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
         }
-        try Task.checkCancellation()
     }
 
     private func sendSigned(_ packet: [UInt8]) async throws {
@@ -4732,12 +4731,11 @@ actor SMBSession {
         signed.replaceSubrange(48..<64, with: signature)
         let reservedCharge = try await reserveCredit(signed)
         do {
-            try await transport.send(DirectTCPFraming.frame(signed))
+            try await DirectTCPFraming.send(signed, via: transport)
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
         }
-        try Task.checkCancellation()
     }
 
     private func sendEncrypted(_ packet: [UInt8]) async throws {
@@ -4775,12 +4773,11 @@ actor SMBSession {
         try Task.checkCancellation()
         let reservedCharge = try await reserveCredit(packet)
         do {
-            try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
+            try await DirectTCPFraming.send(try header.encode() + sealed.ciphertext, via: transport)
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
         }
-        try Task.checkCancellation()
     }
 
     private func verifySigned(_ frame: SMBReceivedFrame) throws {
@@ -4806,10 +4803,8 @@ actor SMBSession {
     }
 
     private func receiveDecryptedFrame(label: String) async throws -> SMBReceivedFrame {
-        let header = try await receiveExactly(4)
-        let length = try DirectTCPFraming.length(from: header)
-        debugDump("\(label) direct-TCP header length=\(length)", header)
-        let body = try await receiveExactly(length)
+        let (header, body) = try await DirectTCPFraming.receive(from: transport)
+        debugDump("\(label) direct-TCP header length=\(body.count)", header)
         debugDump(label, body)
         let decryptedFromTransform = body.starts(with: SMB3TransformHeader.protocolId)
         let packet = decryptedFromTransform ? try decryptTransform(body) : body
@@ -5023,18 +5018,6 @@ actor SMBSession {
         )
         debugDump("decrypted \(packet.count)-byte SMB3 transform", plaintext)
         return plaintext
-    }
-
-    private func receiveExactly(_ count: Int) async throws -> [UInt8] {
-        var bytes: [UInt8] = []
-        while bytes.count < count {
-            try Task.checkCancellation()
-            let chunk = try await transport.receive(maxLength: count - bytes.count)
-            guard !chunk.isEmpty else { throw SMBTransportError.connectionClosed }
-            bytes += chunk
-        }
-        try Task.checkCancellation()
-        return bytes
     }
 
     /// MS-SMB2 §3.2.4.1.6: the next MessageId must advance by the CreditCharge of the

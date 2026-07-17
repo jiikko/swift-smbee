@@ -36,6 +36,103 @@ private struct SMBTestTimeoutError: Error, CustomStringConvertible {
     var description: String { "test await '\(label)' timed out after \(seconds)s (likely wire-transaction ordering deadlock)" }
 }
 
+private final class FrameCancellationTransport: SMBTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var inbound: [UInt8]
+    private var offset = 0
+    private var receiveCount = 0
+    private var bodyContinuation: CheckedContinuation<Void, Never>?
+    private var bodyReleaseRequested = false
+    private var sendContinuation: CheckedContinuation<Void, Never>?
+    private var sendReleaseRequested = false
+    private let bodyReceiveStarted: @Sendable () -> Void
+    private let sendStarted: @Sendable () -> Void
+
+    init(
+        inbound: [UInt8],
+        bodyReceiveStarted: @escaping @Sendable () -> Void,
+        sendStarted: @escaping @Sendable () -> Void = {}
+    ) {
+        self.inbound = inbound
+        self.bodyReceiveStarted = bodyReceiveStarted
+        self.sendStarted = sendStarted
+    }
+
+    func connect(host: String, port: UInt16) async throws {
+        _ = host
+        _ = port
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        _ = bytes
+        sendStarted()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let resumeImmediately = lock.withLock { () -> Bool in
+                if sendReleaseRequested {
+                    sendReleaseRequested = false
+                    return true
+                }
+                sendContinuation = continuation
+                return false
+            }
+            if resumeImmediately { continuation.resume() }
+        }
+    }
+
+    func receive(maxLength: Int) async throws -> [UInt8] {
+        let isBodyReceive = lock.withLock { () -> Bool in
+            receiveCount += 1
+            return receiveCount == 2
+        }
+        if isBodyReceive {
+            bodyReceiveStarted()
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let resumeImmediately = lock.withLock { () -> Bool in
+                    if bodyReleaseRequested {
+                        bodyReleaseRequested = false
+                        return true
+                    }
+                    bodyContinuation = continuation
+                    return false
+                }
+                if resumeImmediately { continuation.resume() }
+            }
+        }
+        return lock.withLock {
+            let count = min(maxLength, inbound.count - offset)
+            let chunk = Array(inbound[offset..<(offset + count)])
+            offset += count
+            return chunk
+        }
+    }
+
+    func releaseBody() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            guard let bodyContinuation else {
+                bodyReleaseRequested = true
+                return nil
+            }
+            self.bodyContinuation = nil
+            return bodyContinuation
+        }
+        continuation?.resume()
+    }
+
+    func releaseSend() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            guard let sendContinuation else {
+                sendReleaseRequested = true
+                return nil
+            }
+            self.sendContinuation = nil
+            return sendContinuation
+        }
+        continuation?.resume()
+    }
+
+    func close() {}
+}
+
 private final class TransferProgressCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [SMBTransferProgress] = []
@@ -585,6 +682,50 @@ private final class TestContinuationResumer<Success: Sendable>: @unchecked Senda
 final class SMBeeTests: XCTestCase {
     // These tests model a server with enough negotiated credits for one large request.
     fileprivate let negotiatedServerCredits: UInt32 = 64
+
+    func testDirectTCPFrameReceiveDrainsFrameAfterCancellation() async throws {
+        let first = [UInt8(0x01), 0x02, 0x03]
+        let second = [UInt8(0xa1), 0xa2]
+        let bodyReceiveStarted = expectation(description: "frame body receive started")
+        let transport = FrameCancellationTransport(
+            inbound: try DirectTCPFraming.frame(first) + DirectTCPFraming.frame(second),
+            bodyReceiveStarted: { bodyReceiveStarted.fulfill() }
+        )
+
+        let task = Task { try await DirectTCPFraming.receive(from: transport) }
+        await fulfillment(of: [bodyReceiveStarted], timeout: 1)
+        task.cancel()
+        transport.releaseBody()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancelled frame receive unexpectedly completed")
+        } catch is CancellationError {
+        }
+
+        let next = try await DirectTCPFraming.receive(from: transport)
+        XCTAssertEqual(next.1, second)
+    }
+
+    func testDirectTCPFrameSendCompletesAfterCancellation() async throws {
+        let sendStarted = expectation(description: "frame send started")
+        let transport = FrameCancellationTransport(
+            inbound: [],
+            bodyReceiveStarted: {},
+            sendStarted: { sendStarted.fulfill() }
+        )
+        let task = Task {
+            try await DirectTCPFraming.send([0x01, 0x02], via: transport)
+        }
+
+        // The transport deliberately holds the completed frame so cancellation
+        // is requested while the frame send is in progress.
+        await fulfillment(of: [sendStarted], timeout: 1)
+        task.cancel()
+        transport.releaseSend()
+        try await task.value
+    }
+
     func testVersionIsNotEmpty() {
         XCTAssertFalse(SMBee.version.isEmpty)
     }

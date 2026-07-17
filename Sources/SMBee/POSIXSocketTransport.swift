@@ -83,6 +83,9 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     // fd を close する。fd は奪わず残すので、blocked syscall は自分が握る fd 値から
     // 正常にエラー復帰できる (その後 close() が実際の解放を行う)。
     private func interruptBlockingIO() {
+        if ProcessInfo.processInfo.environment["SMBEE_OBS062"] == "1" {
+            FileHandle.standardError.write(Data("[obs062] interruptBlockingIO shutdown+close (SHARED SOCKET TEARDOWN)\n".utf8))
+        }
         if let descriptor = currentSocketFileDescriptor() {
             DarwinOrGlibc.shutdown(descriptor)
         }

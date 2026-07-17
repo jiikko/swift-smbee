@@ -224,3 +224,13 @@ session 層 (SMBClient actor) で完結させる:
 「send がブロックする窓」は mock transport (send を明示 release まで block) で再現できる:
 block 中に request を cancel → transport が shutdown されないこと + release 後に同一 transport で
 次の request が成功することを assert。localhost E2E に依存しない回帰ガードにする。
+
+## 完了記録 (2026-07-17)
+
+- 修正: commit `48acbba` — 送信中の sendTask を cancel しない tombstone 設計 (詳細は commit 本文)。
+  codex 2並列レビュー P1×2 P2×2 P3×1 反映済み
+- 検証: unit 323 green (blocking-send mock の回帰テスト含む) / container E2E reproducer 2 green /
+  smoke ×2 プロファイル green / **実 NAS 実機確認 OK** — 危険窓 (`sendStarted=true` の cancel) を
+  6+ 回通過しても interruptBlockingIO / connection-lost が 0 回、再生・スキップとも正常
+- obs062 計測は役目を終えたため除去 (本 commit)。再発時は git 履歴 (bd5cf64) から復元可能
+- reproducer (`SMBeeSharedSessionRangedReadE2ETests`) は恒久の回帰ガードとして残置

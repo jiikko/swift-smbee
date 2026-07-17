@@ -200,6 +200,100 @@ private final class BlockingReceiveTransport: SMBTransport, @unchecked Sendable 
     }
 }
 
+private final class BlockingSendTransport: SMBTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var inbound: [UInt8]
+    private var sendContinuation: CheckedContinuation<Void, Error>?
+    private var firstSend = true
+    private var sendStarted = false
+    private var sendCancellationObserved = false
+    private var outboundStorage: [UInt8] = []
+    private var receiveContinuation: CheckedContinuation<[UInt8], Error>?
+    private var receiveLimit = 0
+
+    init(inbound: [UInt8]) {
+        self.inbound = inbound
+    }
+
+    var isSendStarted: Bool { lock.withLock { sendStarted } }
+    var didObserveSendCancellation: Bool { lock.withLock { sendCancellationObserved } }
+    var outbound: [UInt8] { lock.withLock { outboundStorage } }
+
+    func connect(host: String, port: UInt16) async throws {
+        _ = host
+        _ = port
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        let shouldBlock = lock.withLock { () -> Bool in
+            sendStarted = true
+            if firstSend {
+                firstSend = false
+                return true
+            }
+            return false
+        }
+        if shouldBlock {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.withLock { sendContinuation = continuation }
+            }
+            if Task.isCancelled {
+                lock.withLock { sendCancellationObserved = true }
+                throw CancellationError()
+            }
+        }
+        lock.withLock { outboundStorage.append(contentsOf: bytes) }
+    }
+
+    func releaseBlockedSend() {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            let continuation = sendContinuation
+            sendContinuation = nil
+            return continuation
+        }
+        continuation?.resume()
+    }
+
+    func appendInbound(_ bytes: [UInt8]) {
+        let result = lock.withLock { () -> (CheckedContinuation<[UInt8], Error>?, [UInt8]?) in
+            inbound.append(contentsOf: bytes)
+            let continuation = receiveContinuation
+            receiveContinuation = nil
+            guard let continuation else { return (nil, nil) }
+            let count = min(receiveLimit, inbound.count)
+            let chunk = Array(inbound.prefix(count))
+            inbound.removeFirst(count)
+            receiveLimit = 0
+            return (continuation, chunk)
+        }
+        if let continuation = result.0, let chunk = result.1 {
+            continuation.resume(returning: chunk)
+        }
+    }
+
+    func receive(maxLength: Int) async throws -> [UInt8] {
+        try Task.checkCancellation()
+        return try await withCheckedThrowingContinuation { continuation in
+            let chunk = lock.withLock { () -> [UInt8]? in
+                guard !inbound.isEmpty else {
+                    receiveContinuation = continuation
+                    receiveLimit = maxLength
+                    return nil
+                }
+                let count = min(maxLength, inbound.count)
+                let chunk = Array(inbound.prefix(count))
+                inbound.removeFirst(count)
+                return chunk
+            }
+            if let chunk {
+                continuation.resume(returning: chunk)
+            }
+        }
+    }
+
+    func close() {}
+}
+
 private final class FailingReceiveTransport: SMBTransport, @unchecked Sendable {
     let failure: Error
 
@@ -857,6 +951,60 @@ final class SMBeeTests: XCTestCase {
         } catch {
             XCTFail("expected CancellationError, got \(error)")
         }
+    }
+
+    func testCancellingBlockedSendDoesNotCancelSharedSessionSendTask() async throws {
+        let transport = BlockingSendTransport(inbound: [])
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            initialCredits: 2
+        )
+
+        let request = Task { try await session.echo() }
+        for _ in 0..<100 where !transport.isSendStarted {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue(transport.isSendStarted)
+
+        request.cancel()
+        XCTAssertTrue(transport.outbound.isEmpty, "cancel while transport.send is blocked must not emit a frame")
+        do {
+            try await awaitWithTimeout("cancelled blocked send") { try await request.value }
+            XCTFail("expected CancellationError")
+        } catch is CancellationError {
+        }
+        XCTAssertFalse(transport.didObserveSendCancellation)
+
+        transport.releaseBlockedSend()
+        for _ in 0..<100 where transport.outbound.isEmpty {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertFalse(transport.didObserveSendCancellation)
+
+        var outboundFrames: [[UInt8]] = []
+        for _ in 0..<100 {
+            outboundFrames = try unframed(transport.outbound)
+            if outboundFrames.count >= 2 { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(outboundFrames.count, 2)
+        let requestHeader = try SMB2Header.decode(outboundFrames[0])
+        let cancelHeader = try SMB2Header.decode(outboundFrames[1])
+        XCTAssertEqual(requestHeader.command, SMB2Commands.echo)
+        XCTAssertEqual(cancelHeader.command, SMB2Commands.cancel)
+        XCTAssertEqual(cancelHeader.messageId, requestHeader.messageId)
+
+        // Let the cancelled request's response drain, then satisfy the next request.
+        transport.appendInbound(try framed([
+            try smb2EchoResponse(messageId: requestHeader.messageId),
+            try smb2EchoResponse(messageId: requestHeader.messageId + 1),
+        ]))
+
+        try await session.echo()
+        XCTAssertFalse(transport.didObserveSendCancellation)
     }
 
     func testInMemoryTransportSupportsConcurrentSendAndReceive() async throws {

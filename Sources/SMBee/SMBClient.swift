@@ -3404,6 +3404,9 @@ private struct SMBPendingResponse {
     var pendingCount: Int = 0
     let continuation: CheckedContinuation<SMBReceivedFrame, Error>
     var sendTask: Task<Void, Never>?
+    var sendStarted = false
+    var cancellationRequested = false
+    var continuationResumed = false
 }
 
 /// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
@@ -4576,7 +4579,7 @@ actor SMBSession {
             packet: packet,
             responseLabel: responseLabel,
             longPoll: false,
-            send: sendUnsigned
+            send: { packet, messageId in try await self.sendUnsigned(packet, messageId: messageId) }
         ).bytes
     }
 
@@ -4616,7 +4619,7 @@ actor SMBSession {
                 packet: packet,
                 responseLabel: responseLabel,
                 longPoll: false,
-                send: sendSigned
+                send: { packet, messageId in try await self.sendSigned(packet, messageId: messageId) }
             )
         } onCancel: {
             Task {
@@ -4638,7 +4641,7 @@ actor SMBSession {
                 packet: packet,
                 responseLabel: responseLabel,
                 longPoll: true,
-                send: sendSigned
+                send: { packet, messageId in try await self.sendSigned(packet, messageId: messageId) }
             )
         } onCancel: {
             Task {
@@ -4657,7 +4660,7 @@ actor SMBSession {
         packet: [UInt8],
         responseLabel: String,
         longPoll: Bool,
-        send: @escaping ([UInt8]) async throws -> Void
+        send: @escaping ([UInt8], UInt64) async throws -> Void
     ) async throws -> SMBReceivedFrame {
         let requestHeader = try SMB2Header.decode(packet)
         return try await withCheckedThrowingContinuation { continuation in
@@ -4668,12 +4671,18 @@ actor SMBSession {
                 expectedSessionId: requestHeader.sessionId,
                 expectedTreeId: requestHeader.treeId,
                 continuation: continuation,
-                sendTask: nil
+                sendTask: nil,
+                sendStarted: false,
+                cancellationRequested: false,
+                continuationResumed: false
             )
             let sendTask = Task {
                 do {
-                    try await send(packet)
-                    self.markRequestSent(messageId: requestHeader.messageId)
+                    try await send(packet, requestHeader.messageId)
+                    let shouldSendCancel = self.markRequestSent(messageId: requestHeader.messageId)
+                    if shouldSendCancel {
+                        await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+                    }
                 } catch {
                     self.failPendingResponse(messageId: requestHeader.messageId, error: error)
                 }
@@ -4682,7 +4691,7 @@ actor SMBSession {
         }
     }
 
-    private func sendUnsigned(_ packet: [UInt8]) async throws {
+    private func sendUnsigned(_ packet: [UInt8], messageId: UInt64? = nil) async throws {
         // Deliberately NOT patched here. sendUnsigned carries the NEGOTIATE / SESSION_SETUP
         // preauth messages (via unsignedWireTransaction), whose exact sent bytes must match
         // the copies folded into the SMB 3.1.1 preauth-integrity hash (see setup path). A
@@ -4691,16 +4700,19 @@ actor SMBSession {
         // here for anonymous (unsigned) sessions.
         try Task.checkCancellation()
         let reservedCharge = try await reserveCredit(packet)
+        if let messageId, !markSendStarted(messageId: messageId) {
+            await refundCredit(charge: reservedCharge)
+            throw CancellationError()
+        }
         do {
             try await transport.send(DirectTCPFraming.frame(packet))
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
         }
-        try Task.checkCancellation()
     }
 
-    private func sendSigned(_ packet: [UInt8]) async throws {
+    private func sendSigned(_ packet: [UInt8], messageId: UInt64? = nil) async throws {
         // Single credit-patch point for all post-auth traffic: sendSigned handles every
         // signedWireTransaction op and delegates to sendEncrypted / sendUnsigned below, so
         // patching once here (before signing/sealing) covers signed, encrypted, and anonymous
@@ -4710,14 +4722,14 @@ actor SMBSession {
         await applyCreditRequest(to: &packet)
         try Task.checkCancellation()
         if encryptionKey != nil {
-            try await sendEncrypted(packet)
+            try await sendEncrypted(packet, messageId: messageId)
             return
         }
         // No signing key means an anonymous/guest session (NTLM anonymous yields no session key
         // material). Such sessions cannot sign; the server granted access without requiring signing
         // (signingRequired was false at NEGOTIATE), so send the packet unsigned.
         guard let signingKey else {
-            try await sendUnsigned(packet)
+            try await sendUnsigned(packet, messageId: messageId)
             return
         }
         var signed = packet
@@ -4731,16 +4743,19 @@ actor SMBSession {
         )
         signed.replaceSubrange(48..<64, with: signature)
         let reservedCharge = try await reserveCredit(signed)
+        if let messageId, !markSendStarted(messageId: messageId) {
+            await refundCredit(charge: reservedCharge)
+            throw CancellationError()
+        }
         do {
             try await transport.send(DirectTCPFraming.frame(signed))
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
         }
-        try Task.checkCancellation()
     }
 
-    private func sendEncrypted(_ packet: [UInt8]) async throws {
+    private func sendEncrypted(_ packet: [UInt8], messageId: UInt64? = nil) async throws {
         // packet is already credit-patched by sendSigned (the sole caller); do not re-patch.
         guard let encryptionKey else { throw SMBCodecError.invalidValue("missing SMB encryption key") }
         let nonceLength = encryptionAlgorithm == .aes128GCM ? 12 : 11
@@ -4774,13 +4789,16 @@ actor SMBSession {
         header.signature = sealed.tag
         try Task.checkCancellation()
         let reservedCharge = try await reserveCredit(packet)
+        if let messageId, !markSendStarted(messageId: messageId) {
+            await refundCredit(charge: reservedCharge)
+            throw CancellationError()
+        }
         do {
             try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
         }
-        try Task.checkCancellation()
     }
 
     private func verifySigned(_ frame: SMBReceivedFrame) throws {
@@ -4887,7 +4905,10 @@ actor SMBSession {
             pending.pendingCount += 1
             if !pending.longPoll && pending.pendingCount > SMB2AsyncInterim.maxPendingResponses {
                 pendingResponses.removeValue(forKey: header.messageId)
-                pending.continuation.resume(throwing: SMBCodecError.invalidValue("too many interim SMB2 STATUS_PENDING responses"))
+                if !pending.continuationResumed {
+                    pending.continuationResumed = true
+                    pending.continuation.resume(throwing: SMBCodecError.invalidValue("too many interim SMB2 STATUS_PENDING responses"))
+                }
                 return
             }
             pendingResponses[header.messageId] = pending
@@ -4896,33 +4917,69 @@ actor SMBSession {
         }
         pendingResponses.removeValue(forKey: header.messageId)
         sentResponseMessageIds.remove(header.messageId)
-        pending.continuation.resume(returning: frame)
+        if !pending.continuationResumed {
+            pending.continuationResumed = true
+            pending.continuation.resume(returning: frame)
+        }
     }
 
-    private func markRequestSent(messageId: UInt64) {
-        guard pendingResponses[messageId] != nil else {
+    private func markSendStarted(messageId: UInt64) -> Bool {
+        guard var pending = pendingResponses[messageId] else {
+            obs062("markSendStarted SKIPPED id=\(messageId) (pending already gone)")
+            return false
+        }
+        pending.sendStarted = true
+        pendingResponses[messageId] = pending
+        return true
+    }
+
+    @discardableResult
+    private func markRequestSent(messageId: UInt64) -> Bool {
+        guard let pending = pendingResponses[messageId] else {
             obs062("markRequestSent SKIPPED id=\(messageId) (pending already gone)")
-            return
+            return false
         }
         sentResponseMessageIds.insert(messageId)
+        if pending.cancellationRequested {
+            pendingResponses.removeValue(forKey: messageId)
+        }
         if let orphan = orphanResponses.removeValue(forKey: messageId) {
             do {
                 try dispatchReceivedPacket(orphan)
             } catch {
                 failPendingResponse(messageId: messageId, error: error)
-                return
+                return false
             }
         }
         startReceiveLoopIfNeeded()
+        // An orphan can be the final response. In that case dispatchReceivedPacket
+        // already consumed it, so there is no wire request left to cancel.
+        return pending.cancellationRequested && sentResponseMessageIds.contains(messageId)
     }
 
     private func failPendingResponse(messageId: UInt64, error: Error) {
-        guard let pending = pendingResponses.removeValue(forKey: messageId) else { return }
-        obs062("failPendingResponse id=\(messageId) sentAlready=\(sentResponseMessageIds.contains(messageId)) cancellingSendTask=\(pending.sendTask != nil)")
-        pending.sendTask?.cancel()
+        guard var pending = pendingResponses[messageId] else { return }
+        obs062("failPendingResponse id=\(messageId) sentAlready=\(sentResponseMessageIds.contains(messageId)) sendStarted=\(pending.sendStarted) cancellingSendTask=\(pending.sendTask != nil)")
+        if pending.sendStarted {
+            if error is CancellationError {
+                pending.cancellationRequested = true
+                pendingResponses[messageId] = pending
+            } else {
+                pendingResponses.removeValue(forKey: messageId)
+            }
+        } else {
+            pendingResponses.removeValue(forKey: messageId)
+            pending.sendTask?.cancel()
+        }
         // Cancel releases pending state, but the wire response is unfinished — retain
         // sentResponseMessageIds until its final response so credit grants remain observable.
-        pending.continuation.resume(throwing: error)
+        if !pending.continuationResumed {
+            pending.continuationResumed = true
+            pending.continuation.resume(throwing: error)
+            if pending.sendStarted, pending.cancellationRequested {
+                pendingResponses[messageId] = pending
+            }
+        }
     }
 
     private func cancelInFlightRequest(messageId: UInt64) -> Bool {
@@ -4937,7 +4994,15 @@ actor SMBSession {
         pendingResponses.removeAll()
         sentResponseMessageIds.removeAll()
         orphanResponses.removeAll()
-        for waiter in pending.values {
+        for var waiter in pending.values {
+            // A cancellation tombstone may have already resumed its continuation;
+            // wire failure must not resume it a second time.
+            if waiter.continuationResumed { continue }
+            waiter.continuationResumed = true
+            // failAllPendingResponses is only reached after the receive side has
+            // declared the shared wire dead. Cancelling a send that already started
+            // is therefore safe: the transport/socket is being torn down as a unit,
+            // and it prevents a blocked send task from surviving session failure.
             waiter.sendTask?.cancel()
             waiter.continuation.resume(throwing: error)
         }

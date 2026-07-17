@@ -120,3 +120,46 @@ unit だけ緑になる。
 M-obs: reproducer に MessageId 単位の観測を仕込み、E2E で timeout の停止地点と 5 前提を確定 (実装は
 main agent が container で回す)。→ M1: 確定結果に基づき案1 を実装 (tombstone drain)。→ 案2 drain
 timeout を fallback で追加。全て reproducer (cancel-storm の skip 解除) と全 unit + smoke を oracle にする。
+
+## 観測結果 (M-obs、2026-07-17) — 重要: container では再現しない
+
+SMBEE_DEBUG=1 で MessageId 単位の状態遷移を仕込み、cancel-storm を container Samba
+(smb302-encrypted-required) で観測した結果:
+
+- 最初の reproducer は **バグを再現していなかった** (2 つの欠陥): (a) follow-up の nextOffset が
+  ファイルサイズ (EOF) に到達し 0 byte read で assert 失敗、(b) localhost で read が速すぎて cancel が
+  **chunk 境界で観測**され wire transaction 途中に当たらず、cancel 経路自体が発火していなかった。
+- reproducer を obaket 忠実版 (64 MiB ファイル + 「offset..末尾」の大 range read + first chunk 直後
+  cancel + offset は範囲内) に修正して再観測すると、cancel 経路は**発火した**:
+  `cancelInFlightRequest id=N wasSent=true` → `failPendingResponse cancellingSendTask=true` →
+  `completed cancelled SMB response message id N` (receiveLoop が cancel 済み READ の最終応答をドレイン)。
+  **しかし `interruptBlockingIO` は 0 回、`connection-lost` も 0 回、テストは PASS**。
+
+### 結論 (仮説の否定)
+
+- 「cancel → sendTask.cancel → transport `interruptBlockingIO` (shutdown) で共有ソケット破壊」という
+  **当初の root-cause 仮説は container では成立しない**。localhost では cancel 時点で READ 応答が
+  ほぼ届いており (send は tiny で即完了 = `sendTask?.cancel()` は no-op)、receiveLoop が応答を
+  クリーンにドレインして socket は整列したまま。→ **container Samba では obaket の実 NAS バグを再現できない**。
+- 実 NAS の `connection-lost` は **latency 依存 / サーバ実装依存** (SMB CANCEL への応答タイミング、
+  大 READ 応答のストリーミング中に次 READ を送る wire interleave 等) と考えられ、localhost では
+  window が出ない。
+
+### 次にやるべきこと (方針転換)
+
+緑の local テストに案1 を盲目実装しても実バグを直す保証がない。**実 NAS の wire 挙動を捕まえる**のが先:
+
+1. **実 NAS で観測**: SMBEE_DEBUG=1 相当の obs (MessageId 状態遷移 + interruptBlockingIO 呼び出し +
+   receiveLoop 終了理由) を obaket に載せた debug ビルドで、ユーザーがスキップ連打を再現し、
+   `connection-lost` が出る瞬間の wire ログを採取する。どこで socket が壊れるか (send 途中の
+   sendTask.cancel か / SMB CANCEL と次 read の interleave か / 大 READ 応答の途中打ち切りか) を確定。
+2. 確定後に案1 (tombstone drain) or 別対処を実装し、実 NAS で検証。
+3. reproducer (`testSharedSessionRangedReadCancelStorm`) は container では PASS のまま active guard
+   として残す (cancel 経路が socket を壊さないこと + Task.detached 退行の guard)。実 NAS 再現条件が
+   分かれば、それを container で再現する profile (遅延注入 transport 等) の追加も検討。
+
+### 暫定回避 (obaket 側、実 NAS 修正までのブリッジ)
+
+obaket の SMB 動画スキップで「前の range read を即 cancel」する頻度を下げる緩和が有効な可能性:
+debounce (スキップ確定まで cancel を遅らせる) / cancel せず現 read を最後まで走らせて次 range を
+逐次化 / SMB provider だけスキップ時の即 cancel を抑制。本質修正ではないが体感スタールを消せる。

@@ -35,6 +35,10 @@ SAMBA_CONFIG=test/e2e/smb/smb311-encrypted-required.conf bin/e2e/container-samba
 profile の使い分け・SMB 3.1.1 だけ確認する起動例・wire trace は [docs/testing.md](docs/testing.md)
 「ローカル実行 — Apple container / macOS」が正本。
 
+> ⚠️ **この Mac に Docker Desktop / colima / podman は無い。探さない・入れない。**
+> コンテナは常に Apple の `container` CLI (`brew install container`)。`docker` コマンドが
+> 見つからないのは正常であり、Docker をインストールする方向に進まないこと (2026-07-17 指摘)。
+
 ### 変更したら「その箇所をどうカバーするか」を必ず検討する
 
 コードを変更したら、**変更した箇所の退行を捕まえるテストを追加できないか**を毎回検討する。

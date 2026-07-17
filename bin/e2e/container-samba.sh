@@ -20,9 +20,12 @@ SMBEE_E2E_SKIP_CLI_SMOKE="${SMBEE_E2E_SKIP_CLI_SMOKE:-0}"
 
 cd "${REPO_ROOT}"
 
+# NOTE: この環境のコンテナランタイムは Apple `container` CLI のみ。Docker Desktop /
+# colima / podman は使わない (インストールもしない)。`docker` が無いのは正常。
 if ! command -v container >/dev/null 2>&1; then
   printf 'Apple container CLI is required but was not found in PATH.\n' >&2
   printf 'Install it with: brew install container\n' >&2
+  printf '(Do NOT install Docker Desktop; this repo uses Apple container only.)\n' >&2
   exit 1
 fi
 

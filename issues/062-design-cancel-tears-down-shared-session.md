@@ -163,3 +163,21 @@ SMBEE_DEBUG=1 で MessageId 単位の状態遷移を仕込み、cancel-storm を
 obaket の SMB 動画スキップで「前の range read を即 cancel」する頻度を下げる緩和が有効な可能性:
 debounce (スキップ確定まで cancel を遅らせる) / cancel せず現 read を最後まで走らせて次 range を
 逐次化 / SMB provider だけスキップ時の即 cancel を抑制。本質修正ではないが体感スタールを消せる。
+
+## 実 NAS 観測 #1 (2026-07-17、SMBEE_OBS062=1、健全時ベースライン)
+
+ユーザーが実 NAS で後方シーク連打を実施 (obs 有効)。**バグは未発火** (connection-lost /
+interruptBlockingIO とも 0 回) だが、健全時の挙動が確定した:
+
+- `wasSent=true` の cancel → 後で `drained cancelled response id=N` — キャンセル済み READ の
+  最終応答を receiveLoop が消費し、ソケット整列が維持される (現行コードの drain は実 NAS でも機能する)
+- `wasSent=false` の cancel (送信前に cancel が勝つ) → wire に出る前に破棄。正常
+- 再生は滑らか (「前みたいなカクカクしなくなった」)
+
+**cancel storm は後方シークに集中する** (前方は read-ahead が食うため cancel 不要が多い —
+`finish-ok via=read-ahead`)。ユーザー観察と一致。
+
+→ バグは間欠 (昨日の connection-lost と同一コードで今日は出ない = NAS/ネットワーク状態依存)。
+観測ビルド (obaket が SMBEE_OBS062 対応 smbee bd5cf64 に pin、`SMBEE_OBS062=1 make dev-fg`) を
+維持し、**再発した瞬間の [obs062] + connection-lost 前後のログ**で真因 (送信途中 teardown or
+drain 漏れ) を確定する。それまで修正実装はしない。

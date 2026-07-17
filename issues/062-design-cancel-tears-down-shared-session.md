@@ -63,3 +63,60 @@ container Samba E2E (`SMBEE_E2E=1`, `bin/e2e/container-samba.sh`) で再現。
 構造修正が入るまで、obaket の SMB では「スキップ連打で前の range read を即 cancel」を避ける緩和も
 検討可 (例: cancel せず現 chunk を捨てて次 range を張る / debounce)。ただし本質は smbee 側の
 transport cancel 契約なので、恒久対処は本 issue で行う。
+
+## 設計壁打ち結論 (codex D1、2026-07-17)
+
+### 推奨: 案1 (session 所有 frame-safe I/O coordinator + 論理 cancel + tombstone drain) + 案2 の drain timeout を fallback
+
+核心: **`Task.cancel()` を transport の `shutdown(fd)+close()` に直結させない**。
+
+- `Task.cancel()` = **論理的な request cancellation** (この read だけ中断)
+- `close()` / 明示 `abort()` = **物理的な socket teardown**
+- 使い捨て session は cancel 後に明示 `abort()` してよい (owner の最適化)。**transport の共通契約から「cancel = socket 破壊」を除く**
+
+#### cancel の流れ (案1)
+
+1. request を actor 内で pending 登録
+2. **frame 送信前** の cancel: frame を送らず pending 解放 + credit refund。SMB CANCEL は送らない
+3. **frame 送信開始後** の cancel: send task は cancel せず frame 完走 → `wireSent` 確定 → caller の
+   continuation は即 `CancellationError` で解放 → request は **tombstone として保持** → 同 MessageId の
+   SMB CANCEL 送信
+4. receiveLoop が元 request の最終 response を受信: `STATUS_PENDING` は捨てて tombstone 保持、
+   最終 `STATUS_CANCELLED` (or 遅延通常 response) を捨てた時点で tombstone と `sentResponseMessageIds`
+   を削除。**`STATUS_CANCELLED` は CANCEL request の応答ではなく、CANCEL 対象だった元 READ の最終応答**
+5. credit: frame 送信済み request は cancel でも refund しない。response 受信時に grant 反映。tombstone の
+   MessageId は再利用しない。**`markRequestSent` は必ず frame 完了後に実行** (send 後の checkCancellation で飛ばさない)
+
+案2 (cancel barrier / quarantine) は初期安定化に有効だが、follow-up read が CANCEL response 待ちで
+stall しうる (サーバが CANCEL response を遅延/欠落させると顕在)。→ 案1 を本命、案2 の drain timeout を
+「サーバが CANCEL response を返さない場合の quarantine」fallback にする。
+
+案3 (session lifetime で transport cancel policy を分ける) は transport に policy が漏れ、選び忘れで
+再発。単体では frame 送信開始位置を判断できず不十分。
+
+### 実装前に必ず観測する (instrument-before-second-fix)
+
+アプローチ2 (状態機械) が unit 緑・E2E timeout だった差は「実 socket / 実 receiveLoop 特有」。実装前に
+**MessageId 単位の状態遷移** (`registered → sendStarted → wireSent → cancelRequested → cancelSent →
+drained`) と、E2E timeout 時の一括 dump (`pendingResponses / sentResponseMessageIds / orphanResponses /
+receiveLoopRunning / wireFailure / credit balance・waiter / 各 send task phase`) を仕込み、**timeout の
+停止地点**を確定させてから案1 を実装する。
+
+最有力仮説: `transport.send` 完了 → `sendSigned` の `checkCancellation()` → `markRequestSent()` の窓で
+send task が cancel されると、frame は socket に出たが `sentResponseMessageIds` に入らず receiveLoop が
+起動/継続せず、response が orphan 化 → follow-up read も timeout。InMemoryTransport は window が極小で
+unit だけ緑になる。
+
+### 確定させる 5 前提 (MessageId 単位で観測)
+
+1. Samba が cancel 対象 READ に必ず最終 `STATUS_CANCELLED` を返すか
+2. E2E timeout の停止地点 = follow-up read の response 待ち or cancel 済み read の `Task.value` 待ち
+3. アプローチ2 で partial send 後に `markRequestSent` が欠落していたか
+4. `sendCancelWithoutGate` と通常 send が実 socket 上で並行していたか
+5. cancel 対象 request の credit をいつ返しているか
+
+### 次のマイルストーン
+
+M-obs: reproducer に MessageId 単位の観測を仕込み、E2E で timeout の停止地点と 5 前提を確定 (実装は
+main agent が container で回す)。→ M1: 確定結果に基づき案1 を実装 (tombstone drain)。→ 案2 drain
+timeout を fallback で追加。全て reproducer (cancel-storm の skip 解除) と全 unit + smoke を oracle にする。

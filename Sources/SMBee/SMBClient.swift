@@ -4848,7 +4848,6 @@ actor SMBSession {
                 let frame = try await receiveDecryptedFrame(label: "SMB response")
                 try dispatchReceivedPacket(frame)
             } catch {
-                obs062("receiveLoop exit-by-error error=\(error) sentIds=\(sentResponseMessageIds.sorted()) pending=\(pendingResponses.keys.sorted())")
                 failWire(error: error)
                 receiveLoopRunning = false
                 return
@@ -4877,7 +4876,6 @@ actor SMBSession {
                 }
                 sentResponseMessageIds.remove(header.messageId)
                 debugLine("completed cancelled SMB response message id \(header.messageId)")
-                obs062("drained cancelled response id=\(header.messageId)")
                 return
             }
             // Bound the orphan queue: spurious/duplicate server responses whose messageId is
@@ -4925,7 +4923,6 @@ actor SMBSession {
 
     private func markSendStarted(messageId: UInt64) -> Bool {
         guard var pending = pendingResponses[messageId] else {
-            obs062("markSendStarted SKIPPED id=\(messageId) (pending already gone)")
             return false
         }
         pending.sendStarted = true
@@ -4936,7 +4933,6 @@ actor SMBSession {
     @discardableResult
     private func markRequestSent(messageId: UInt64) -> Bool {
         guard let pending = pendingResponses[messageId] else {
-            obs062("markRequestSent SKIPPED id=\(messageId) (pending already gone)")
             return false
         }
         sentResponseMessageIds.insert(messageId)
@@ -4959,7 +4955,6 @@ actor SMBSession {
 
     private func failPendingResponse(messageId: UInt64, error: Error) {
         guard var pending = pendingResponses[messageId] else { return }
-        obs062("failPendingResponse id=\(messageId) sentAlready=\(sentResponseMessageIds.contains(messageId)) sendStarted=\(pending.sendStarted) cancellingSendTask=\(pending.sendTask != nil)")
         if pending.sendStarted {
             if error is CancellationError {
                 pending.cancellationRequested = true
@@ -4984,7 +4979,6 @@ actor SMBSession {
 
     private func cancelInFlightRequest(messageId: UInt64) -> Bool {
         let wasSent = sentResponseMessageIds.contains(messageId)
-        obs062("cancelInFlightRequest id=\(messageId) wasSent=\(wasSent) pendingExists=\(pendingResponses[messageId] != nil)")
         failPendingResponse(messageId: messageId, error: CancellationError())
         return wasSent
     }
@@ -5192,13 +5186,6 @@ actor SMBSession {
     private func debugLine(_ message: String) {
         guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
         FileHandle.standardError.write(Data("\(message)\n".utf8))
-    }
-
-    // issue 062 の実 NAS wire 観測用 (SMBEE_OBS062=1)。SMBEE_DEBUG の全パケット
-    // ダンプと違い、cancel/desync 経路の状態遷移だけを出す。062 解決時に除去する。
-    private func obs062(_ message: String) {
-        guard ProcessInfo.processInfo.environment["SMBEE_OBS062"] == "1" else { return }
-        FileHandle.standardError.write(Data("[obs062] \(message)\n".utf8))
     }
 }
 

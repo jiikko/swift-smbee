@@ -6,7 +6,7 @@
 
 ## 監査時点
 
-- 最終更新: 2026-07-04
+- 最終更新: 2026-07-18
 - 対象 branch: `master`
 - 正本仕様:
   - MS-SMB2: SMB2/3 command、dialect、signing/encryption、credit、durable handle、CHANGE_NOTIFY
@@ -54,7 +54,7 @@
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
 | sparse file operations | partial | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse` は実装済み。allocation size stat 表示と preservation policy が残る。 |
 | ECHO / keepalive | implemented | `echo` / `smbcli ping` / opt-in keepalive 実装済み。reconnect policy との統合は未決。 |
-| SMB CANCEL | implemented | watch / READ / IOCTL 等の通常 transaction cancellation で SMB2 CANCEL を送る。 |
+| SMB CANCEL / shared-session READ cancellation | implemented-but-underverified | watch / READ / IOCTL 等の通常 transaction cancellation で SMB2 CANCEL を送る。送信中 task を cancel せず response を drain する修正は blocking-send unit、Samba E2E、実 NAS の cancel-storm で確認済み。Windows / 他 NAS matrix は残る。 |
 | byte-range lock | implemented-but-underverified | library API `SMBClientSession.withFileLock`。CLI surface は未提供。Windows 実測は matrix 側。 |
 
 ## P0: 0.1.0 前の release blocker
@@ -62,6 +62,8 @@
 ### P0-1. 互換 matrix を実サーバで埋める
 
 状態: `partial` / `implemented-but-underverified`
+
+Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。現時点では Windows クライアント対応を意味せず、Linux/macOS client からの server interoperability を確認する作業を指す。
 
 現状:
 
@@ -129,18 +131,21 @@
 - READ/WRITE の CreditCharge / CreditRequest、response grant tracking、credit-aware chunk planner は実装済み。
 - `SMB2CreditWindow` actor と messageId keyed demux は実装済み。
 - multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグは修正済み。
-- 残件は `issues/done/012` の後続相当: local chunk cap 64KiB 超の大 IO E2E。
+- local read/write chunk cap は 1 MiB へ引き上げ済み。
+- PR/push には 4GiB 境界 range-read E2E があり、週次 `Large-file E2E` workflow は sparse 4GiB+ fixture で read-stream と EOF を検証する。
+- 残件は multi-credit WRITE、SMB 3.1.1 encrypted session、copychunk を含む大 IO の実サーバ E2E と性能回帰監視。
 
 やること:
 
 - copychunk と encryption overhead を含む chunk planner の E2E 検証を広げる。
-- 1MiB 超、4GiB 境界、encrypted session で large file read/write を実行する。
+- SMB 3.1.1 encrypted session で 1 MiB chunk の large file read/write を実行する。
+- multi-credit WRITE と offload-capable server の copychunk を実測する。
 - throughput regression を command count / byte count / chunk count で監視する。
 
 完了条件:
 
 - large transfer で credit 不足・不正 CreditCharge が出ない。
-- encrypted session でも large IO が安定する。
+- SMB 3.1.1 encrypted session の large READ/WRITE が安定する。
 
 ### P1-2. multi-share / multi-tree session model
 
@@ -434,6 +439,7 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - byte-level resume / verify: 実装済み。残件は sparse preservation / allocation size。
 - operation timeout: CLI には実装済み。残件は public API 化の判断。
 - durable handle: 現時点では unsupported として明記する。
+- shared-session READ cancel: 送信中 task を cancel せず response を drain する修正済み。blocking-send unit / Samba E2E / 実 NAS 確認あり。Windows / 他 NAS の互換確認は残る。
 
 ## README に書くべき limitations
 
@@ -453,7 +459,7 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 ## 推奨実装順
 
 1. P0-1 compatibility matrix の実サーバ結果埋め。Windows / NAS / macOS SMBX re-run。
-2. P1-1 credit accounting / multi-credit large IO E2E。
+2. P1-1 multi-credit WRITE / SMB 3.1.1 encrypted large IO E2E。
 3. P1-2 multi-tree session model。
 4. P1-3 DFS real E2E + optional auto-follow。
 5. P0-2 API stability / packaging。

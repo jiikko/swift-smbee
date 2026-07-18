@@ -40,8 +40,8 @@ jobs:
             test_filter: SMBeeE2ETests.testAuthenticatedFastSmoke
           - swift_version: "6.2"
             profile: smb311-encrypted-required
-            scope: authenticated-smoke
-            test_filter: SMBeeE2ETests.testAuthenticatedFastSmoke
+            scope: encrypted-large-io
+            test_filter: SMB311EncryptedLargeIOE2ETests.testSMB311EncryptedLargeReadWrite
           - swift_version: "6.2"
             profile: guest
             scope: anonymous-smoke

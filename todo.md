@@ -39,6 +39,8 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - persistent session API
 - scoped multi-tree API `withTree(share:)`
 - graceful TREE_DISCONNECT / LOGOFF
+- 1 MiB local read/write chunk、credit-aware multi-flight I/O、週次 4GiB+ read-stream E2E
+- shared session 上の in-flight READ cancel 後の response drain（実 NAS で再利用確認済み）
 - socket timeout / operation timeout / per-file timeout
 - progress callback / CLI progress
 - JSON output / structured error output
@@ -54,6 +56,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 | path handling | implemented-but-underverified | validation は実装済み。Unicode normalization の実測が残る。 |
 | ACL / owner / group / SID lookup | implemented-but-underverified | Samba では実測済み。AD / Samba AD / Windows での実測が残る。 |
 | CHANGE_NOTIFY reconnect | implemented-but-underverified | unit + Samba E2E あり。Windows / NAS での挙動確認が残る。 |
+| shared-session READ cancellation | implemented-but-underverified | blocking-send unit、Samba E2E、実 NAS の cancel-storm 確認あり。Windows / 他 NAS での matrix は残る。 |
 | reparse / readlink | implemented-but-underverified | unit coverage あり。Samba / Windows / macOS SMBX smoke が残る。 |
 | byte-range lock | implemented-but-underverified | library API あり。CLI surface と Windows 挙動確認が残る。 |
 
@@ -62,6 +65,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 ### P0: release blocker
 
 1. **compatibility matrix を実サーバで埋める**
+   - Windows SMB Server 対応は **pending**（実サーバ smoke 環境待ち）。実装可否の判断は matrix 結果に基づく。
    - Samba は CI / compat workflow で確認済み。
    - macOS SMBX は基本 smoke 記録あり。
    - Windows SMB Server / Windows Pro / Synology / QNAP / 古い Samba 系 NAS が未実測。
@@ -78,8 +82,9 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 ### P1: smbclient 中核残件
 
 1. **SMB2 credit / multi-credit large IO E2E**
-   - credit accounting / `SMB2CreditWindow` / messageId demux は実装済み。
-   - 残りは 1MiB 超、4GiB 境界、encrypted session の large IO E2E。
+   - credit accounting / `SMB2CreditWindow` / messageId demux と 1 MiB local chunk は実装済み。
+   - 4GiB+ read-stream E2E は weekly workflow で実行する。PR/push には 4GiB 境界 range-read E2E がある。
+   - 残りは multi-credit WRITE、SMB 3.1.1 encrypted session、copychunk を含む large IO の実測と throughput regression の継続監視。
 
 2. **multi-share / multi-tree session model**
    - `withTree(share:)` は実装済み。
@@ -138,6 +143,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - byte-level resume / `--verify size|hash` は実装済み。
 - sparse FSCTL は実装済み。残りは preservation / allocation size。
 - operation timeout は CLI 実装済み。残りは public API 化判断。
+- shared session の READ cancel は、送信中 task を cancel せず response を drain するよう修正済み。残りは Windows / 他 NAS の互換確認。
 - durable handle は未実装ではなく、現時点では unsupported として扱う。
 
 ## 0.1.0 の完了条件
@@ -151,7 +157,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 ## 推奨順
 
 1. compatibility matrix の実サーバ結果埋め。
-2. multi-credit large IO E2E。
+2. multi-credit WRITE / SMB 3.1.1 encrypted large IO E2E。
 3. multi-tree session model 整理。
 4. DFS real E2E + optional auto-follow。
 5. API stability / packaging。

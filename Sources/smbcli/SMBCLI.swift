@@ -640,9 +640,7 @@ struct Sparse: AsyncParsableCommand {
                     let stat = try await session.stat(path: endpoint.path)
                     let ranges = try await session.allocatedRanges(path: endpoint.path, length: stat.size)
                     if json {
-                        let objects = ranges.map { ["offset": $0.offset, "length": $0.length] }
-                        let data = try JSONSerialization.data(withJSONObject: objects, options: [.sortedKeys])
-                        print(String(decoding: data, as: UTF8.self))
+                        print(try sparseRangesJSONString(ranges))
                     } else {
                         for range in ranges {
                             print("offset=\(range.offset) length=\(range.length)")
@@ -1770,6 +1768,12 @@ func errorJSONString(_ error: Error) throws -> String {
         throw ValidationError("failed to encode JSON")
     }
     return string
+}
+
+func sparseRangesJSONString(_ ranges: [SMBAllocatedRange]) throws -> String {
+    let objects = ranges.map { ["offset": $0.offset, "length": $0.length] }
+    let data = try JSONSerialization.data(withJSONObject: objects, options: [.sortedKeys])
+    return String(decoding: data, as: UTF8.self)
 }
 
 final class TransferProgressWriter: @unchecked Sendable {

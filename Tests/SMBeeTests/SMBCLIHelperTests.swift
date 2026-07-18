@@ -131,6 +131,14 @@ final class SMBCLIHelperTests: XCTestCase {
         }
     }
 
+    func testOperationAndPerFileDurationsRejectInvalidValues() {
+        for option in ["--operation-timeout", "--per-file-timeout"] {
+            for value in ["0", "-1", "nan", "inf", "999999999"] {
+                XCTAssertThrowsError(try TransportOptions.parse([option, value]))
+            }
+        }
+    }
+
     func testSuccessJSONStringShape() throws {
         let data = try XCTUnwrap(successJSONString(command: "put", path: "dir\\file.txt").data(using: .utf8))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -149,5 +157,18 @@ final class SMBCLIHelperTests: XCTestCase {
         XCTAssertEqual(object["category"] as? String, "smb")
         XCTAssertEqual(object["exitCode"] as? Int, Int(SMBCLIExitCode.notFound))
         XCTAssertNotNil(object["error"] as? String)
+    }
+
+    func testSparseRangesJSONStringUsesStableNumericShape() throws {
+        let json = try sparseRangesJSONString([
+            SMBAllocatedRange(offset: 4096, length: 8192),
+            SMBAllocatedRange(offset: 16384, length: 256),
+        ])
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]])
+        XCTAssertEqual(value.count, 2)
+        XCTAssertEqual(value[0]["offset"] as? Int, 4096)
+        XCTAssertEqual(value[0]["length"] as? Int, 8192)
+        XCTAssertEqual(value[1]["offset"] as? Int, 16384)
+        XCTAssertEqual(value[1]["length"] as? Int, 256)
     }
 }

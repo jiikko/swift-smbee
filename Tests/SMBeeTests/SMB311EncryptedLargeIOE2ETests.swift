@@ -28,6 +28,11 @@ final class SMB311EncryptedLargeIOE2ETests: XCTestCase {
         let accumulator = SMB311LargeReadAccumulator()
 
         do {
+            // Keep the authenticated fast-smoke coverage in this encrypted profile:
+            // ECHO and QUERY_DIRECTORY must remain healthy alongside large I/O.
+            try await SMBee.echo(host: host, port: port, credential: credential, share: share)
+            let entries = try await SMBee.list(host: host, port: port, credential: credential, share: share)
+            XCTAssertTrue(entries.contains { $0.name == "known.txt" && !$0.isDirectory })
             try await SMBee.upload(host: host, port: port, credential: credential, share: share, path: path, data: payload)
             let stat = try await SMBee.stat(host: host, port: port, credential: credential, share: share, path: path)
             XCTAssertEqual(stat.size, UInt64(payload.count))

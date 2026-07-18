@@ -780,6 +780,25 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testOperationDeadlineCancelsTimedOutOperation() async throws {
+        let operation = Task {
+            try await SMBOperationDeadline.run(timeout: .milliseconds(10)) {
+                while true {
+                    try await Task.sleep(for: .seconds(5))
+                }
+                return 1
+            }
+        }
+
+        do {
+            _ = try await operation.value
+            XCTFail("operation unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        } catch {
+            XCTFail("unexpected deadline error: \(error)")
+        }
+    }
+
     func testReadURLParserKeepsUserInfoPassword() throws {
         let endpoint = try SMBURLParser.parseReadURL("smb://user:pass@server:1445/share/path/to/file.txt")
 

@@ -67,10 +67,11 @@ container run -d --name "${CONTAINER_NAME}" -p "${SMBEE_E2E_HOST}:${SMBEE_E2E_PO
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends samba
     cp /tmp/smbee-smb.conf /etc/samba/smb.conf
-    mkdir -p /srv/smbee/public
+    mkdir -p /srv/smbee/public /srv/smbee/dfsroot
     useradd -M -s /usr/sbin/nologin smbee
     printf "smbee\nsmbee\n" | smbpasswd -a -s smbee
     printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
+    ln -s "msdfs:127.0.0.1\\public" /srv/smbee/dfsroot/public-link
     # Sparse boundary fixture for testReadRangesAround4GiBBoundary (no real 4GiB I/O).
     truncate -s 4295032833 /srv/smbee/public/large-4gib-plus.bin
     chown -R smbee:smbee /srv/smbee

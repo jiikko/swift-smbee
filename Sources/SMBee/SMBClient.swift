@@ -783,9 +783,9 @@ public actor SMBClientSession {
         }
     }
 
-    /// Resolve DFS referral metadata through a scoped IPC$ tree on this session.
-    public func dfsReferral(path: String) async throws -> SMBDfsReferralResult {
-        try await withTree(share: "IPC$") { tree in
+    /// Resolve DFS referral metadata through a scoped DFS-root tree on this session.
+    public func dfsReferral(share: String, path: String) async throws -> SMBDfsReferralResult {
+        try await withTree(share: share) { tree in
             try await tree.dfsReferral(path: path)
         }
     }
@@ -1403,6 +1403,14 @@ public actor SMBClientTreeSession {
 }
 
 public enum SMBClient {
+    private static func dfsShare(from path: String) throws -> String {
+        let components = path.split(separator: "\\", omittingEmptySubsequences: true)
+        guard components.count >= 2 else {
+            throw SMBCodecError.invalidValue("DFS referral path must be in \\\\server\\share[\\path] form")
+        }
+        return try SMBShareName(String(components[1])).rawValue
+    }
+
     static func resolvedTransportFactory(
         _ makeTransport: (@Sendable () -> SMBTransport)?,
         timeout: Duration?
@@ -1630,12 +1638,13 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBDfsReferralResult {
+        let share = try dfsShare(from: path)
         let session = try await connect(
-            host: host, port: port, share: "IPC$", credential: credential,
+            host: host, port: port, share: share, credential: credential,
             timeout: timeout, makeTransport: makeTransport
         )
         defer { Task { await session.close() } }
-        return try await session.dfsReferral(path: path)
+        return try await session.dfsReferral(share: share, path: path)
     }
 
     public static func dfsReferral(

@@ -23,11 +23,13 @@ final class SMBDfsReferralE2ETests: XCTestCase {
         let session = try await SMBee.connect(host: host, port: port, credential: credential, share: "public")
         defer { Task { await session.close() } }
 
-        let result = try await session.dfsReferral(path: "\\\\(host)\\dfsroot\\public-link")
+        let result = try await session.dfsReferral(
+            share: "dfsroot", path: "\\\\\(host)\\dfsroot\\public-link"
+        )
         XCTAssertFalse(result.referrals.isEmpty)
         XCTAssertTrue(result.referrals.contains { referral in
             referral.networkAddress?.lowercased().contains("public") == true
-        })
+        }, "unexpected DFS referrals: \(result.referrals.map { $0.networkAddress })")
         XCTAssertGreaterThan(result.pathConsumed, 0)
     }
 }

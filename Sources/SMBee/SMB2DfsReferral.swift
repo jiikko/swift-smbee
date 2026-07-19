@@ -87,11 +87,22 @@ enum SMB2DfsReferral {
 
     private static func decodeReferralString(bytes: [UInt8], entryOffset: Int, entrySize: Int, stringOffset: Int) throws -> String? {
         guard stringOffset != 0 else { return nil }
-        guard stringOffset >= referralV3V4FixedSize, stringOffset < entrySize else { throw SMBCodecError.truncated }
-        let absoluteOffset = entryOffset + stringOffset
-        let entryEnd = entryOffset + entrySize
+        guard stringOffset >= referralV3V4FixedSize else { throw SMBCodecError.truncated }
+        // Synthetic fixtures commonly pack strings inside the referral entry. Samba
+        // emits strings after the fixed-size entry, but the offsets remain relative
+        // to the referral entry.
+        let absoluteOffset: Int
+        let stringEnd: Int
+        if stringOffset < entrySize {
+            absoluteOffset = entryOffset + stringOffset
+            stringEnd = entryOffset + entrySize
+        } else {
+            absoluteOffset = entryOffset + stringOffset
+            stringEnd = bytes.count
+        }
+        guard absoluteOffset < stringEnd else { throw SMBCodecError.truncated }
         var cursor = absoluteOffset
-        while cursor + 1 < entryEnd {
+        while cursor + 1 < stringEnd {
             if bytes[cursor] == 0 && bytes[cursor + 1] == 0 {
                 return decodeUTF16LE(Array(bytes[absoluteOffset..<cursor]))
             }

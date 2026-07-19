@@ -154,7 +154,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 状態: `implemented-but-underverified`（scoped tree API で実装済み）
 
-更新: `SMBClientSession.listShares()` と `SMBClientTreeSession.listShares()` を追加し、IPC$ share discovery を同一認証 session の scoped tree として実行できるようにした。`withTree(share:)` で public / 別 share も同一 session 上で扱え、child tree tracking と session close 時の全 tree 切断にも対応した。
+更新: `SMBClientSession.listShares()` と `SMBClientTreeSession.listShares()` を追加し、IPC$ share discovery を同一認証 session の scoped tree として実行できるようにした。`withTree(share:)` で public / 別 share も同一 session 上で扱え、child tree tracking と session close 時の全 tree 切断にも対応した。DFS referral は scoped DFS-root tree 上で実行する。
 
 状態: `partial`
 

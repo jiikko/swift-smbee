@@ -765,6 +765,16 @@ public actor SMBClientSession {
         }
     }
 
+    /// Enumerate shares over IPC$ using this authenticated session.
+    ///
+    /// The temporary IPC$ tree is disconnected when enumeration completes; the
+    /// session's original tree remains usable for subsequent operations.
+    public func listShares() async throws -> [SMBShareInfo] {
+        try await withTree(share: "IPC$") { tree in
+            try await tree.listShares()
+        }
+    }
+
     public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
         let collector = SMBDirectoryEntryCollector()
         try await withDirectoryStream(path: path) { entry in
@@ -1356,6 +1366,13 @@ public actor SMBClientTreeSession {
             await session.bestEffortClose(treeId: treeId, fileId: fileId)
             throw error
         }
+    }
+
+    /// Enumerate server shares through the SRVSVC named pipe on this tree.
+    /// This is intended for an IPC$ tree returned by `SMBClientSession.withTree`.
+    public func listShares() async throws -> [SMBShareInfo] {
+        try ensureOpen()
+        return try await session.listShares(treeId: treeId)
     }
 
     private func ensureOpen() throws {

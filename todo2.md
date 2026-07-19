@@ -152,7 +152,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P1-2. multi-share / multi-tree session model
 
-次の着手候補。
+更新: `SMBClientSession.listShares()` と `SMBClientTreeSession.listShares()` を追加し、IPC$ share discovery を同一認証 session の scoped tree として実行できるようにした。`withTree(share:)` で public / 別 share も同一 session 上で扱える。
 
 状態: `partial`
 
@@ -160,7 +160,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 - `SMBClientSession.withTree(share:)` と `SMBClientTreeSession` は実装済み。
 - 同じ authenticated session 上で追加 TREE_CONNECT し、closure 終了時に tree 単位で disconnect できる。
-- `listShares` / `dfsReferral` はまだ IPC$ へ別途 one-shot 接続する箇所が残る。
+- `dfsReferral` など一部 helper はまだ IPC$ へ別途 one-shot 接続する箇所が残る。
 - full `SMBServerSession` / `SMBTreeSession` 分離と session close 時の複数 tree tracking は未実装。
 
 やること:

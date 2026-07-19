@@ -131,6 +131,7 @@ public struct SMBDirectoryEntry: Equatable, Sendable {
 
 public struct SMBFileStat: Equatable, Sendable {
     public var size: UInt64
+    public var allocationSize: UInt64?
     public var creationTime: Date?
     public var lastAccessTime: Date?
     public var modifiedTime: Date?
@@ -152,12 +153,14 @@ public struct SMBFileStat: Equatable, Sendable {
         modifiedTime: Date?,
         isDirectory: Bool,
         attributes: UInt32 = 0,
+        allocationSize: UInt64? = nil,
         creationTime: Date? = nil,
         lastAccessTime: Date? = nil,
         changeTime: Date? = nil,
         reparseTag: UInt32? = nil
     ) {
         self.size = size
+        self.allocationSize = allocationSize
         self.creationTime = creationTime
         self.lastAccessTime = lastAccessTime
         self.modifiedTime = modifiedTime

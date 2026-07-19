@@ -314,7 +314,7 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-4. sparse file preservation / allocation size
 
-状態: `partial`
+状態: `partial`（allocation size の stat/JSON 表示は実装済み）
 
 現状:
 
@@ -323,7 +323,7 @@ Linux/macOS smbclient として必要な理由:
 
 残:
 
-- allocation size を `stat` / JSON に出すか決める。
+- `SMBFileStat.allocationSize` と `stat --json` の `allocationSize` は実装済み。実サーバごとの差異確認は残る。
 - copy/get/put で sparse hole を保存する policy を決める。
 - ローカル FS 側の sparse write と SMB 側 allocated ranges の対応を検証する。
 

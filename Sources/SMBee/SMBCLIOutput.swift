@@ -173,6 +173,7 @@ private struct DirectoryEntryJSON: Encodable {
 
 private struct FileStatJSON: Encodable {
     var size: UInt64
+    var allocationSize: UInt64?
     var isDirectory: Bool
     var attributes: String
     var reparseTag: String?
@@ -184,6 +185,7 @@ private struct FileStatJSON: Encodable {
 
     init(_ stat: SMBFileStat) {
         size = stat.size
+        allocationSize = stat.allocationSize
         isDirectory = stat.isDirectory
         attributes = SMBCLIOutput.hex(stat.attributes, width: 8)
         reparseTag = stat.reparseTag.map { SMBCLIOutput.hex($0, width: 8) }

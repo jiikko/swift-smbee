@@ -55,6 +55,7 @@ final class SMBCLIOutputTests: XCTestCase {
             modifiedTime: date,
             isDirectory: false,
             attributes: 0x0000_0080,
+            allocationSize: 4096,
             creationTime: date,
             lastAccessTime: date,
             changeTime: date
@@ -63,6 +64,7 @@ final class SMBCLIOutputTests: XCTestCase {
         let object = try jsonObject(SMBCLIOutput.jsonData(for: stat))
 
         XCTAssertEqual(object["size"] as? Int, 123)
+        XCTAssertEqual(object["allocationSize"] as? Int, 4096)
         XCTAssertEqual(object["isDirectory"] as? Bool, false)
         XCTAssertEqual(object["attributes"] as? String, "0x00000080")
         XCTAssertEqual(object["creationTime"] as? String, "2024-01-01T00:00:00.125Z")

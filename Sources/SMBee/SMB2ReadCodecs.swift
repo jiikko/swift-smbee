@@ -473,6 +473,7 @@ enum SMB2QueryInfo {
         let lastAccessTime = readUInt64LE(data, at: 8)
         let lastWriteTime = readUInt64LE(data, at: 16)
         let changeTime = readUInt64LE(data, at: 24)
+        let allocationSize = readUInt64LE(data, at: 32)
         let endOfFile = readUInt64LE(data, at: 40)
         let attributes = readUInt32LE(data, at: 48)
         return SMBFileStat(
@@ -480,6 +481,7 @@ enum SMB2QueryInfo {
             modifiedTime: filetimeToDate(lastWriteTime),
             isDirectory: (attributes & 0x10) != 0,
             attributes: attributes,
+            allocationSize: allocationSize,
             creationTime: filetimeToDate(creationTime),
             lastAccessTime: filetimeToDate(lastAccessTime),
             changeTime: filetimeToDate(changeTime)

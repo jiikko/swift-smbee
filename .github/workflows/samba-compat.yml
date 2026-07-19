@@ -74,6 +74,7 @@ jobs:
           bash test/e2e/run-swift-in-container.sh '
             swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
             swift test --filter SMBeeE2ETests
+            swift test --filter SMBOperationalCoverageE2ETests
           '
 
       - name: Samba logs and teardown

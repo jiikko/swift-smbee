@@ -78,6 +78,8 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   `smb311-signing-required` は authenticated fast smoke、`smb311-encrypted-required` は
   ECHO/list を含む 2MiB 超の encrypted large-I/O smoke で回す。これにより PR / push でも
   3.1.1 の GMAC signing-only path と GCM encrypted path を最低 1 本ずつ通す。
+- API E2E と compatibility matrix は `SMBOperationalCoverageE2ETests` も実行し、実サーバの
+  allocation size、単一 read deadline、lock CLI（CLI smoke）を検証する。
 - `.github/workflows/samba-compat.yml` は重い互換性 matrix。`workflow_dispatch` と週次 schedule で、
   distro-provided Samba、Swift 6.0 / 6.2、`test/e2e/smb/*.conf` profile の代表組み合わせを回す。
 

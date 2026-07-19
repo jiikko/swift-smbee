@@ -74,6 +74,7 @@ jobs:
           bash test/e2e/run-swift-in-container.sh '
             swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
             swift test --filter "${TEST_FILTER}"
+            swift test --filter SMBOperationalCoverageE2ETests
             if [ "${SMBEE_E2E_PROFILE}" = guest ]; then
               swift run smbcli ls "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public"
               swift run smbcli cat "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public/known.txt" --guest

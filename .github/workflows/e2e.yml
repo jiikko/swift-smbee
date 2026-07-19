@@ -46,6 +46,10 @@ jobs:
             profile: guest
             scope: anonymous-smoke
             test_filter: SMBeeE2ETests.testGuestAnonymousSmoke
+          - swift_version: "6.2"
+            profile: msdfs
+            scope: dfs-referral
+            test_filter: SMBDfsReferralE2ETests
     env:
       SAMBA_CONTAINER: smbee-samba-api-${{ matrix.profile }}-${{ matrix.swift_version }}
       SAMBA_BASE_IMAGE: ubuntu:24.04

@@ -100,7 +100,8 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 
 3. **DFS referral real E2E + optional auto-follow**
    - `SMBee.dfsReferral` / `smbcli dfs` は実装済み。
-   - 実 msdfs サーバ E2E と auto-follow policy が未実装。
+   - Samba msdfs link の実 wire referral decode は push CI E2E で検証する。
+   - auto-follow policy は未実装。
 
 4. **Kerberos / GSS / SPNEGO(Kerberos mech)**
    - 現状は NTLMv2 / NT hash / anonymous。

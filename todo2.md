@@ -183,7 +183,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 現状:
 
 - `SMBee.dfsReferral` / `smbcli dfs` はある。
-- 実 msdfs サーバ E2E は未実施。
+- Samba msdfs link の実 wire E2E を push CI に追加した。
 - 現在の API は referral metadata を返すだけで、target へ reconnect して path を辿る処理は呼び出し側責務。
 
 やること:

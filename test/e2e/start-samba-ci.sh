@@ -27,9 +27,12 @@ docker run -d --name "${SAMBA_CONTAINER}" -p "${SMBEE_E2E_PORT}:445" \
     # read-only ファイルに書けず失敗するため、install 後に書き込み可能な場所へ cp する。
     cp /tmp/smbee-smb.conf /etc/samba/smb.conf
     mkdir -p /srv/smbee/public
+    mkdir -p /srv/smbee/dfsroot
     useradd -M -s /usr/sbin/nologin smbee
     printf "smbee\nsmbee\n" | smbpasswd -a -s smbee
     printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
+    # Samba msdfs links are symlinks whose target uses the msdfs: prefix.
+    ln -s "msdfs:127.0.0.1\\public" /srv/smbee/dfsroot/public-link
     # Keep the boundary-range smoke fixture sparse; SMBee never uploads 4GiB.
     truncate -s 4295032833 /srv/smbee/public/large-4gib-plus.bin
     chown -R smbee:smbee /srv/smbee

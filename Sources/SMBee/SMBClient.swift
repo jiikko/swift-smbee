@@ -783,6 +783,13 @@ public actor SMBClientSession {
         }
     }
 
+    /// Resolve DFS referral metadata through a scoped IPC$ tree on this session.
+    public func dfsReferral(path: String) async throws -> SMBDfsReferralResult {
+        try await withTree(share: "IPC$") { tree in
+            try await tree.dfsReferral(path: path)
+        }
+    }
+
     public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
         let collector = SMBDirectoryEntryCollector()
         try await withDirectoryStream(path: path) { entry in
@@ -1383,6 +1390,11 @@ public actor SMBClientTreeSession {
         return try await session.listShares(treeId: treeId)
     }
 
+    public func dfsReferral(path: String) async throws -> SMBDfsReferralResult {
+        try ensureOpen()
+        return try await session.dfsReferral(treeId: treeId, path: path)
+    }
+
     private func ensureOpen() throws {
         if isClosed {
             throw SMBError.connectionLost(operation: "TREE")
@@ -1618,18 +1630,12 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBDfsReferralResult {
-        let makeTransport = resolvedTransportFactory(makeTransport, timeout: timeout)
-        let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
-        do {
-            try await session.connect()
-            let treeId = try await session.treeConnect(share: "IPC$")
-            let result = try await session.dfsReferral(treeId: treeId, path: path)
-            await session.disconnect(treeId: treeId)
-            return result
-        } catch {
-            await session.closeTransport()
-            throw error
-        }
+        let session = try await connect(
+            host: host, port: port, share: "IPC$", credential: credential,
+            timeout: timeout, makeTransport: makeTransport
+        )
+        defer { Task { await session.close() } }
+        return try await session.dfsReferral(path: path)
     }
 
     public static func dfsReferral(

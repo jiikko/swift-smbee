@@ -93,7 +93,8 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 
 2. **multi-share / multi-tree session model**
    - `SMBClientSession.listShares()` が同一認証セッション上で IPC$ を一時接続し、既存 tree を維持する。
-   - `withTree(share:)` で public / 別 share を同じ session から扱える。残りは複数 tree の永続 tracking と helper 統合。
+   - `withTree(share:)` で public / 別 share を同じ session から扱え、child tree を tracking して session close 時に全 tree を切断する。
+   - 残りは DFS など一部 helper の統合。
    - `withTree(share:)` は実装済み。
    - 残りは full server/tree session split、IPC$ helper 統合、複数 tree tracking。
 

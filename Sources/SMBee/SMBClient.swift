@@ -618,6 +618,7 @@ public actor SMBClientSession {
 
     private var session: SMBSession
     private var treeId: UInt32
+    private var childTreeIds: Set<UInt32> = []
     private let reconnectInfo: ReconnectInfo?
     private var keepAliveTask: Task<Void, Never>?
     private var isClosed = false
@@ -664,6 +665,10 @@ public actor SMBClientSession {
         keepAliveTask?.cancel()
         await keepAliveTask?.value
         keepAliveTask = nil
+        for childTreeId in childTreeIds {
+            try? await session.treeDisconnect(treeId: childTreeId)
+        }
+        childTreeIds.removeAll()
         await session.disconnect(treeId: treeId)
     }
 
@@ -754,13 +759,16 @@ public actor SMBClientSession {
     ) async throws -> T {
         try ensureOpen()
         let childTreeId = try await session.treeConnect(share: share)
+        childTreeIds.insert(childTreeId)
         let child = SMBClientTreeSession(session: session, treeId: childTreeId)
         do {
             let result = try await operation(child)
             await child.close()
+            childTreeIds.remove(childTreeId)
             return result
         } catch {
             await child.close()
+            childTreeIds.remove(childTreeId)
             throw error
         }
     }

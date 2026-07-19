@@ -16,6 +16,7 @@ Commands with stable JSON output:
 - `acl --json`
 - `dfs --json`
 - `watch --json`
+- `sparse --query --json`
 
 `stat --json` includes the server-reported `allocationSize` when available.
 

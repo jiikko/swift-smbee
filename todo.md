@@ -144,7 +144,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - SID lookup は LSARPC lookup 実装済み。残りは AD / Samba AD 実測。
 - owner/group write は実装済み。SACL は scope 外。
 - byte-level resume / `--verify size|hash` は実装済み。
-- sparse FSCTL は実装済み。残りは preservation / allocation size。
+- sparse FSCTL と allocation size 表示は実装済み。残りは転送時の hole preservation。
 - operation timeout は CLI 実装済み。残りは public API 化判断。
 - `SMBee.read(..., operationTimeout:)` は実装済み。残りは write/recursive API への展開判断。
 - shared session の READ cancel は、送信中 task を cancel せず response を drain するよう修正済み。残りは Windows / 他 NAS の互換確認。

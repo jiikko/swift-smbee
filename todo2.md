@@ -133,7 +133,8 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグは修正済み。
 - local read/write chunk cap は 1 MiB へ引き上げ済み。
 - PR/push には 4GiB 境界 range-read E2E があり、週次 `Large-file E2E` workflow は sparse 4GiB+ fixture で read-stream と EOF を検証する。
-- 残件は multi-credit WRITE、SMB 3.1.1 encrypted session、copychunk を含む大 IO の実サーバ E2E と性能回帰監視。
+   - SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
+   - 残件は offload-capable server の copychunk 実測と性能回帰監視。
 
 やること:
 

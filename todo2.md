@@ -126,6 +126,8 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 状態: `partial`
 
+更新: SMB 3.1.1 encrypted の 2MiB+ READ/WRITE と multi-credit WRITE は push CI E2E で検証済み。残りは copychunk 実測と性能回帰監視。
+
 現状:
 
 - READ/WRITE の CreditCharge / CreditRequest、response grant tracking、credit-aware chunk planner は実装済み。
@@ -149,6 +151,8 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - SMB 3.1.1 encrypted session の large READ/WRITE が安定する。
 
 ### P1-2. multi-share / multi-tree session model
+
+次の着手候補。
 
 状態: `partial`
 

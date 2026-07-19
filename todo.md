@@ -85,12 +85,14 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 ### P1: smbclient 中核残件
 
 1. **SMB2 credit / multi-credit large IO E2E**
+   - 状態: `implemented-but-underverified`（暗号化 large READ/WRITE は CI E2E 済み）
    - credit accounting / `SMB2CreditWindow` / messageId demux と 1 MiB local chunk は実装済み。
    - 4GiB+ read-stream E2E は weekly workflow で実行する。PR/push には 4GiB 境界 range-read E2E がある。
    - SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
    - 残りは offload-capable server の copychunk 実測と throughput regression の継続監視。
 
 2. **multi-share / multi-tree session model**
+   - 次の着手候補。
    - `withTree(share:)` は実装済み。
    - 残りは full server/tree session split、IPC$ helper 統合、複数 tree tracking。
 

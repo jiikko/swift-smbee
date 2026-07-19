@@ -49,7 +49,7 @@
 | security descriptor read / DACL / owner / group write | implemented-but-underverified | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。SACL は scope 外。AD / Samba AD 実測が残る。 |
 | SID name resolution | implemented-but-underverified | well-known SID table + LSARPC `LsarLookupSids`。AD / Samba AD 実測と issue 整理が残る。 |
 | change notification | implemented-but-underverified | `withChangeNotifications(autoReconnect:)` / `smbcli watch --json --reconnect`。Samba E2E + reconnect unit あり。Windows/NAS 実測が残る。 |
-| DFS referral metadata | implemented-but-underverified | `SMBee.dfsReferral` / `smbcli dfs`、multi-hop `resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS`。loop detection、TTL cache、suffix rewrite は unit + Samba msdfs E2E 済み。Windows DFS 実測が残る。 |
+| DFS referral metadata | implemented-but-underverified | `SMBee.dfsReferral` / `smbcli dfs`、multi-hop `resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS`。loop detection、credential-scoped / bounded TTL cache、suffix rewrite は unit + Samba msdfs E2E 済み。Windows DFS 実測が残る。 |
 | reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。実サーバ smoke が残る。 |
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
 | sparse file operations | partial | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse`、allocation size stat 表示、Samba FSCTL E2E は実装済み。通常 transfer の hole preservation policy が残る。 |
@@ -182,7 +182,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 - `SMBee.dfsReferral` / `smbcli dfs` はある。
 - Samba msdfs link の実 wire E2E を push CI と Apple Container ローカル E2E で確認した。
-- `resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS` は target 再接続、multi-hop、loop detection、TTL cache、path suffix rewrite を行う。Samba chain link の list/read E2E 済み。
+- `resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS` は target 再接続、multi-hop、loop detection、credential-scoped / bounded TTL cache、path suffix rewrite を行う。`connectFollowingDFS` は session と最終 relative path を `SMBDfsConnection` で返す。Samba chain link の list/read E2E 済み。
 
 完了条件:
 

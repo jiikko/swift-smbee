@@ -1411,12 +1411,11 @@ public enum SMBClient {
         return try SMBShareName(String(components[1])).rawValue
     }
 
-    static func dfsTarget(from networkAddress: String) throws -> (host: String, share: String) {
-        let components = networkAddress.split(separator: "\\", omittingEmptySubsequences: true)
-        guard components.count >= 2, !components[0].isEmpty else {
+    static func dfsTarget(from networkAddress: String) throws -> SMBDfsReferralTarget {
+        guard let target = SMBDfsReferralTarget(networkAddress: networkAddress) else {
             throw SMBCodecError.invalidValue("DFS referral target must be in \\\\server\\share form")
         }
-        return (String(components[0]), try SMBShareName(String(components[1])).rawValue)
+        return target
     }
 
     static func resolvedTransportFactory(
@@ -1670,10 +1669,9 @@ public enum SMBClient {
             host: host, port: port, credential: credential, path: path,
             timeout: timeout, makeTransport: makeTransport
         )
-        guard let networkAddress = referral.referrals.lazy.compactMap(\.networkAddress).first else {
+        guard let target = referral.targets.first else {
             throw SMBCodecError.invalidValue("DFS referral did not include a share target")
         }
-        let target = try dfsTarget(from: networkAddress)
         return try await connect(
             host: target.host, port: port, share: target.share, credential: credential,
             timeout: timeout, makeTransport: makeTransport

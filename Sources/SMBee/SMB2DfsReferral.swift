@@ -4,6 +4,36 @@ public struct SMBDfsReferralResult: Sendable {
     public let pathConsumed: Int
     public let headerFlags: UInt32
     public let referrals: [SMBDfsReferral]
+
+    /// Referral targets with a parseable `\\server\share` network address, in
+    /// server-provided priority order.
+    public var targets: [SMBDfsReferralTarget] {
+        referrals.compactMap(\.target)
+    }
+}
+
+public struct SMBDfsReferralTarget: Sendable, Equatable {
+    public let host: String
+    public let share: String
+
+    public init(host: String, share: String) throws {
+        guard !host.isEmpty else {
+            throw SMBCodecError.invalidValue("DFS referral target host must not be empty")
+        }
+        self.host = host
+        self.share = try SMBShareName(share).rawValue
+    }
+
+    init?(networkAddress: String?) {
+        guard let networkAddress else { return nil }
+        let components = networkAddress.split(separator: "\\", omittingEmptySubsequences: true)
+        guard components.count >= 2, !components[0].isEmpty,
+              let share = try? SMBShareName(String(components[1])).rawValue else {
+            return nil
+        }
+        self.host = String(components[0])
+        self.share = share
+    }
 }
 
 public struct SMBDfsReferral: Sendable {
@@ -14,6 +44,10 @@ public struct SMBDfsReferral: Sendable {
     public let dfsPath: String?
     public let alternatePath: String?
     public let networkAddress: String?
+
+    public var target: SMBDfsReferralTarget? {
+        SMBDfsReferralTarget(networkAddress: networkAddress)
+    }
 }
 
 enum SMB2DfsReferral {

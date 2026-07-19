@@ -2526,6 +2526,10 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(decoded.referrals[1].serverType, 1)
         XCTAssertEqual(decoded.referrals[1].alternatePath, nil)
         XCTAssertEqual(decoded.referrals[1].networkAddress, "\\\\target-b\\share")
+        XCTAssertEqual(decoded.targets, [
+            try SMBDfsReferralTarget(host: "target-a", share: "share"),
+            try SMBDfsReferralTarget(host: "target-b", share: "share"),
+        ])
     }
 
     func testSMB2DfsReferralResponseSkipsUnknownVersionBySize() throws {

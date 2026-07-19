@@ -189,7 +189,6 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - auto-follow policy を設計する:
   - multi-hop / loop detection
   - referral TTL cache
-  - custom target selection
 - path suffix rewrite を含む transparent referral を追加するか決める。
 
 完了条件:

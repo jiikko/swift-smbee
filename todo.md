@@ -61,7 +61,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 | CHANGE_NOTIFY reconnect | implemented-but-underverified | unit + Samba E2E あり。Windows / NAS での挙動確認が残る。 |
 | shared-session READ cancellation | implemented-but-underverified | blocking-send unit、Samba E2E、実 NAS の cancel-storm 確認あり。Windows / 他 NAS での matrix は残る。 |
 | reparse / readlink | implemented-but-underverified | unit coverage あり。Samba / Windows / macOS SMBX smoke が残る。 |
-| byte-range lock | implemented-but-underverified | library API あり。CLI surface と Windows 挙動確認が残る。 |
+| byte-range lock | implemented-but-underverified | library API と `smbcli lock` の Samba CLI smoke は実装済み。Windows / NAS の挙動確認が残る。 |
 
 ## 現在の未解決タスク
 
@@ -120,7 +120,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - path Unicode normalization smoke（Samba は実施済み。macOS SMBX / Windows / NAS が残る）
 - share discovery / volume / ACL / SID lookup の実サーバ smoke
 - reparse / readlink の実サーバ smoke
-- sparse file preservation / allocation size 表示
+- sparse file preservation（allocation size 表示と Samba sparse FSCTL E2E は実装済み。通常 transfer の hole preservation policy が残る）
 - operation-level deadline の public API 化判断
 - keepalive と reconnect policy の統合
 - byte-range lock CLI surface

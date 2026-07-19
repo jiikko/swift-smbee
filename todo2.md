@@ -6,7 +6,7 @@
 
 ## 監査時点
 
-- 最終更新: 2026-07-18
+- 最終更新: 2026-07-19
 - 対象 branch: `master`
 - 正本仕様:
   - MS-SMB2: SMB2/3 command、dialect、signing/encryption、credit、durable handle、CHANGE_NOTIFY
@@ -437,7 +437,7 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - SID lookup: LSARPC lookup 実装済み。残件は AD / Samba AD 実測と issue 更新。
 - owner/group write: 実装済み。SACL は scope 外。
 - byte-level resume / verify: 実装済み。残件は sparse preservation / allocation size。
-- operation timeout: CLI には実装済み。残件は public API 化の判断。
+- operation timeout: CLI と `SMBee.read(..., operationTimeout:)` に実装済み。残件は write/recursive API への展開判断。
 - durable handle: 現時点では unsupported として明記する。
 - shared-session READ cancel: 送信中 task を cancel せず response を drain する修正済み。blocking-send unit / Samba E2E / 実 NAS 確認あり。Windows / 他 NAS の互換確認は残る。
 

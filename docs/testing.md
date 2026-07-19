@@ -75,9 +75,9 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   `test/e2e/smb/smb302-encrypted-required.conf` を使い、macOS SMBX mirror として
   SMB 3.0.2 + signing mandatory + encryption required を維持する。
 - `.github/workflows/e2e.yml` の API E2E matrix は `smb302-encrypted-required` を full scope で回し、
-  `smb311-signing-required` と `smb311-encrypted-required` は authenticated fast smoke
-  (connect / list / write / stat / read / delete) で回す。これにより PR / push でも 3.1.1 の
-  GMAC signing-only path と GCM encrypted path を最低 1 本ずつ通す。
+  `smb311-signing-required` は authenticated fast smoke、`smb311-encrypted-required` は
+  ECHO/list を含む 2MiB 超の encrypted large-I/O smoke で回す。これにより PR / push でも
+  3.1.1 の GMAC signing-only path と GCM encrypted path を最低 1 本ずつ通す。
 - `.github/workflows/samba-compat.yml` は重い互換性 matrix。`workflow_dispatch` と週次 schedule で、
   distro-provided Samba、Swift 6.0 / 6.2、`test/e2e/smb/*.conf` profile の代表組み合わせを回す。
 

@@ -49,13 +49,13 @@
 | security descriptor read / DACL / owner / group write | implemented-but-underverified | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。SACL は scope 外。AD / Samba AD 実測が残る。 |
 | SID name resolution | implemented-but-underverified | well-known SID table + LSARPC `LsarLookupSids`。AD / Samba AD 実測と issue 整理が残る。 |
 | change notification | implemented-but-underverified | `withChangeNotifications(autoReconnect:)` / `smbcli watch --json --reconnect`。Samba E2E + reconnect unit あり。Windows/NAS 実測が残る。 |
-| DFS referral metadata | partial | `SMBee.dfsReferral` / `smbcli dfs`。unit fixture + 仕様精読あり。実 msdfs E2E と auto-follow は未実装。 |
+| DFS referral metadata | partial | `SMBee.dfsReferral` / `smbcli dfs`。unit fixture + Samba msdfs 実 wire E2E あり。auto-follow は未実装。 |
 | reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。実サーバ smoke が残る。 |
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
 | sparse file operations | partial | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse` は実装済み。allocation size stat 表示と preservation policy が残る。 |
 | ECHO / keepalive | implemented | `echo` / `smbcli ping` / opt-in keepalive 実装済み。reconnect policy との統合は未決。 |
 | SMB CANCEL / shared-session READ cancellation | implemented-but-underverified | watch / READ / IOCTL 等の通常 transaction cancellation で SMB2 CANCEL を送る。送信中 task を cancel せず response を drain する修正は blocking-send unit、Samba E2E、実 NAS の cancel-storm で確認済み。Windows / 他 NAS matrix は残る。 |
-| byte-range lock | implemented-but-underverified | library API `SMBClientSession.withFileLock`。CLI surface は未提供。Windows 実測は matrix 側。 |
+| byte-range lock | implemented-but-underverified | library API `SMBClientSession.withFileLock` と `smbcli lock`。Windows 実測は matrix 側。 |
 
 ## P0: 0.1.0 前の release blocker
 
@@ -98,7 +98,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P0-2. API stability / packaging
 
-状態: `partial`
+状態: `implemented-but-underverified`（scoped tree API で実装済み）
 
 現状:
 
@@ -162,7 +162,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 - `SMBClientSession.withTree(share:)` と `SMBClientTreeSession` は実装済み。
 - 同じ authenticated session 上で追加 TREE_CONNECT し、closure 終了時に tree 単位で disconnect できる。
-- `dfsReferral` など一部 helper はまだ IPC$ へ別途 one-shot 接続する箇所が残る。
+- share discovery は scoped IPC$ tree、DFS referral は scoped DFS-root tree を使用する。
 - full `SMBServerSession` / `SMBTreeSession` 型分離は未実装（現 API の scoped tree で要件を満たす）。
 
 やること:
@@ -183,7 +183,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 現状:
 
 - `SMBee.dfsReferral` / `smbcli dfs` はある。
-- Samba msdfs link の実 wire E2E を push CI に追加した。
+- Samba msdfs link の実 wire E2E を push CI と Apple Container ローカル E2E で確認した。
 - 現在の API は referral metadata を返すだけで、target へ reconnect して path を辿る処理は呼び出し側責務。
 
 やること:
@@ -345,7 +345,7 @@ Linux/macOS smbclient として必要な理由:
 
 残:
 
-- `SMBee.read(..., operationTimeout:)` を追加済み。主要な write/recursive API へ広げるか決める。
+- `SMBee.read(..., operationTimeout:)` を追加済み。write/recursive API への展開は、ブロック中の transport receive を deadline cancellation で確実に中断できるようにしてから行う。
 - timeout error taxonomy を固定する。
 
 ### P2-6. keepalive と reconnect policy の統合

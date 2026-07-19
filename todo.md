@@ -96,7 +96,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
    - `withTree(share:)` で public / 別 share を同じ session から扱え、child tree を tracking して session close 時に全 tree を切断する。
    - DFS referral も同一 session の scoped DFS-root tree 経由に統合済み。
    - `withTree(share:)` は実装済み。
-   - 残りは full server/tree session split、IPC$ helper 統合、複数 tree tracking。
+   - scoped tree API で必要な multi-share 利用・helper 統合・child tree tracking は完了。full server/tree 型分離は任意の API 整理として扱う。
 
 3. **DFS referral real E2E + optional auto-follow**
    - `SMBee.dfsReferral` / `smbcli dfs` は実装済み。

@@ -4,6 +4,9 @@ import XCTest
 final class SMBOperationalCoverageE2ETests: XCTestCase {
     func testStatReportsAllocationSizeOnRealServer() async throws {
         let details = try connectionDetails()
+        if ProcessInfo.processInfo.environment["SMBEE_E2E_PROFILE"] == "guest" {
+            throw XCTSkip("allocation-size stat coverage requires an authenticated Samba profile")
+        }
         let stat = try await SMBee.stat(
             host: details.host, port: details.port, credential: details.credential,
             share: details.share, path: "known.txt"

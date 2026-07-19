@@ -171,4 +171,17 @@ final class SMBCLIHelperTests: XCTestCase {
         XCTAssertEqual(value[1]["offset"] as? Int, 16384)
         XCTAssertEqual(value[1]["length"] as? Int, 256)
     }
+
+    func testByteRangeLockCommandParsesItsSafetyOptions() throws {
+        let command = try ByteRangeLock.parse([
+            "smb://user@host/share/file.bin", "--offset", "128", "--length", "64",
+            "--shared", "--wait", "--hold-seconds", "1.5", "--json"
+        ])
+        XCTAssertEqual(command.offset, 128)
+        XCTAssertEqual(command.length, 64)
+        XCTAssertTrue(command.shared)
+        XCTAssertTrue(command.wait)
+        XCTAssertEqual(command.holdSeconds, 1.5)
+        XCTAssertTrue(command.json)
+    }
 }

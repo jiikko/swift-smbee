@@ -357,11 +357,11 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-7. CLI surface follow-up
 
-状態: `partial`
+状態: `partial`（byte-range lock surface は実装済み）
 
 残:
 
-- byte-range lock の CLI surface を出すか決める。
+- byte-range lock CLI (`smbcli lock`) は実装済み。実サーバ matrix での CLI smoke は残る。
 - mget/mput の確認 prompt を実装するか、`--dry-run` で代替すると明記する。
 - JSON schema が増えたら `docs/smbcli-json.md` を更新する。
 

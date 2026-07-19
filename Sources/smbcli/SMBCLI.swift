@@ -17,7 +17,7 @@ struct SMBCLI: AsyncParsableCommand {
         subcommands: [
             Probe.self, Ping.self, Shares.self, List.self, Stat.self, Readlink.self, ACL.self, DiskFree.self, Cat.self, Get.self,
             MGet.self, MakeDirectory.self, Put.self, MPut.self, Copy.self, Move.self, Remove.self, Watch.self, Dfs.self,
-            SetACL.self, Sparse.self
+            SetACL.self, Sparse.self, ByteRangeLock.self
         ]
     )
 }
@@ -655,6 +655,73 @@ struct Sparse: AsyncParsableCommand {
                 throw error
             }
         }
+    }
+}
+
+struct ByteRangeLock: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "lock",
+        abstract: "Acquire and release an SMB byte-range lock"
+    )
+
+    @Argument(help: "smb://user@host[:445]/share/path")
+    var url: String
+
+    @Option(help: "Byte offset")
+    var offset: UInt64
+
+    @Option(help: "Number of bytes to lock")
+    var length: UInt64
+
+    @Flag(help: "Use a shared (read) lock")
+    var shared = false
+
+    @Flag(help: "Wait for the lock instead of failing immediately")
+    var wait = false
+
+    @Option(help: "Hold the lock for this many seconds before releasing it")
+    var holdSeconds: Double?
+
+    @Flag(help: "Print JSON success output")
+    var json = false
+
+    @OptionGroup
+    var auth: AuthOptions
+
+    @OptionGroup
+    var transport: TransportOptions
+
+    @OptionGroup
+    var debug: DebugOptions
+
+    func run() async throws {
+        debug.apply()
+        guard length > 0 else { throw ValidationError("--length must be greater than zero") }
+        if let holdSeconds, (!holdSeconds.isFinite || holdSeconds < 0) {
+            throw ValidationError("--hold-seconds must be finite and non-negative")
+        }
+        let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
+        try await transport.withOperationDeadline {
+            let session = try await SMBee.connect(
+                host: endpoint.host, port: endpoint.port, credential: credential,
+                share: endpoint.share, timeout: transport.duration
+            )
+            do {
+                _ = try await session.withFileLock(
+                    path: endpoint.path, offset: offset, length: length,
+                    shared: shared, failImmediately: !wait
+                ) {
+                    if let holdSeconds, holdSeconds > 0 {
+                        try await Task.sleep(for: .milliseconds(Int64((holdSeconds * 1000).rounded())))
+                    }
+                }
+                await session.close()
+            } catch {
+                await session.close()
+                throw error
+            }
+        }
+        if json { print(try successJSONString(command: "lock", path: endpoint.path)) }
     }
 }
 

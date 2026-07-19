@@ -184,4 +184,10 @@ final class SMBCLIHelperTests: XCTestCase {
         XCTAssertEqual(command.holdSeconds, 1.5)
         XCTAssertTrue(command.json)
     }
+
+    func testByteRangeLockCommandRejectsUnboundedHoldDuration() throws {
+        XCTAssertThrowsError(try ByteRangeLock.validateOptions(length: 1, holdSeconds: 999999999))
+        XCTAssertThrowsError(try ByteRangeLock.validateOptions(length: 0, holdSeconds: 1))
+        XCTAssertNoThrow(try ByteRangeLock.validateOptions(length: 1, holdSeconds: 7 * 24 * 60 * 60))
+    }
 }

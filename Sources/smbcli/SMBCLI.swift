@@ -694,12 +694,16 @@ struct ByteRangeLock: AsyncParsableCommand {
     @OptionGroup
     var debug: DebugOptions
 
+    static func validateOptions(length: UInt64, holdSeconds: Double?) throws {
+        guard length > 0 else { throw ValidationError("--length must be greater than zero") }
+        if let holdSeconds, (!holdSeconds.isFinite || holdSeconds < 0 || holdSeconds > 7 * 24 * 60 * 60) {
+            throw ValidationError("--hold-seconds must be finite, non-negative, and at most 7 days")
+        }
+    }
+
     func run() async throws {
         debug.apply()
-        guard length > 0 else { throw ValidationError("--length must be greater than zero") }
-        if let holdSeconds, (!holdSeconds.isFinite || holdSeconds < 0) {
-            throw ValidationError("--hold-seconds must be finite and non-negative")
-        }
+        try Self.validateOptions(length: length, holdSeconds: holdSeconds)
         let (endpoint, credential) = try makeEndpointAndCredential(url: url, auth: auth)
         try await transport.withOperationDeadline {
             let session = try await SMBee.connect(

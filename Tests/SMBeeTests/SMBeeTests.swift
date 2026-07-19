@@ -2487,6 +2487,13 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(input[(input.count - 2)..<input.count]), [0, 0])
     }
 
+    func testDfsTargetParsesUncShareAddress() throws {
+        let target = try SMBClient.dfsTarget(from: "\\\\target.example\\public")
+        XCTAssertEqual(target.host, "target.example")
+        XCTAssertEqual(target.share, "public")
+        XCTAssertThrowsError(try SMBClient.dfsTarget(from: "not-a-unc-target"))
+    }
+
     func testSMB2DfsReferralResponseDecodesV3Entries() throws {
         let response = makeDfsReferralResponse(entries: [
             makeDfsReferralV3Entry(

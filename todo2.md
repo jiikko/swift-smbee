@@ -49,7 +49,7 @@
 | security descriptor read / DACL / owner / group write | implemented-but-underverified | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。SACL は scope 外。AD / Samba AD 実測が残る。 |
 | SID name resolution | implemented-but-underverified | well-known SID table + LSARPC `LsarLookupSids`。AD / Samba AD 実測と issue 整理が残る。 |
 | change notification | implemented-but-underverified | `withChangeNotifications(autoReconnect:)` / `smbcli watch --json --reconnect`。Samba E2E + reconnect unit あり。Windows/NAS 実測が残る。 |
-| DFS referral metadata | partial | `SMBee.dfsReferral` / `smbcli dfs`。unit fixture + Samba msdfs 実 wire E2E あり。auto-follow は未実装。 |
+| DFS referral metadata | partial | `SMBee.dfsReferral` / `smbcli dfs` と one-hop `connectFollowingDFS`。unit fixture + Samba msdfs E2E あり。multi-hop auto-follow は未実装。 |
 | reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。実サーバ smoke が残る。 |
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
 | sparse file operations | partial | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse`、allocation size stat 表示、Samba FSCTL E2E は実装済み。通常 transfer の hole preservation policy が残る。 |
@@ -182,19 +182,15 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 - `SMBee.dfsReferral` / `smbcli dfs` はある。
 - Samba msdfs link の実 wire E2E を push CI と Apple Container ローカル E2E で確認した。
-- 現在の API は referral metadata を返すだけで、target へ reconnect して path を辿る処理は呼び出し側責務。
+- `connectFollowingDFS` は最初の target へ同 credential で再接続する。Samba link target の list/read E2E 済み。
 
 やること:
 
-- Samba msdfs profile を作る。
-- `SMBeeE2ETests` に DFS referral E2E を足す。
 - auto-follow policy を設計する:
-  - opt-in / default on
-  - credential reuse
-  - loop detection
+  - multi-hop / loop detection
   - referral TTL cache
-  - target selection
-- `SMBClient` に `resolveAndConnect` か path open 時の transparent referral を追加するか決める。
+  - custom target selection
+- path suffix rewrite を含む transparent referral を追加するか決める。
 
 完了条件:
 

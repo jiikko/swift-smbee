@@ -31,5 +31,15 @@ final class SMBDfsReferralE2ETests: XCTestCase {
             referral.networkAddress?.lowercased().contains("public") == true
         }, "unexpected DFS referrals: \(result.referrals.map { $0.networkAddress })")
         XCTAssertGreaterThan(result.pathConsumed, 0)
+
+        let targetSession = try await SMBee.connectFollowingDFS(
+            host: host, port: port, credential: credential,
+            path: "\\\\\(host)\\dfsroot\\public-link"
+        )
+        defer { Task { await targetSession.close() } }
+        let entries = try await targetSession.list()
+        XCTAssertTrue(entries.contains { $0.name == "known.txt" })
+        let data = try await targetSession.read(path: "known.txt")
+        XCTAssertEqual(data, Array("hello from SMBee E2E\n".utf8))
     }
 }

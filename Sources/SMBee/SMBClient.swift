@@ -1411,6 +1411,14 @@ public enum SMBClient {
         return try SMBShareName(String(components[1])).rawValue
     }
 
+    static func dfsTarget(from networkAddress: String) throws -> (host: String, share: String) {
+        let components = networkAddress.split(separator: "\\", omittingEmptySubsequences: true)
+        guard components.count >= 2, !components[0].isEmpty else {
+            throw SMBCodecError.invalidValue("DFS referral target must be in \\\\server\\share form")
+        }
+        return (String(components[0]), try SMBShareName(String(components[1])).rawValue)
+    }
+
     static func resolvedTransportFactory(
         _ makeTransport: (@Sendable () -> SMBTransport)?,
         timeout: Duration?
@@ -1645,6 +1653,31 @@ public enum SMBClient {
         )
         defer { Task { await session.close() } }
         return try await session.dfsReferral(share: share, path: path)
+    }
+
+    /// Resolve `path`, select its first share referral target, and connect using the
+    /// same credential. This follows one DFS namespace hop; callers can inspect
+    /// `dfsReferral` when they need custom target selection or multi-hop policy.
+    public static func connectFollowingDFS(
+        host: String,
+        port: UInt16 = 445,
+        credential: SMBCredential,
+        path: String,
+        timeout: Duration? = nil,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws -> SMBClientSession {
+        let referral = try await dfsReferral(
+            host: host, port: port, credential: credential, path: path,
+            timeout: timeout, makeTransport: makeTransport
+        )
+        guard let networkAddress = referral.referrals.lazy.compactMap(\.networkAddress).first else {
+            throw SMBCodecError.invalidValue("DFS referral did not include a share target")
+        }
+        let target = try dfsTarget(from: networkAddress)
+        return try await connect(
+            host: target.host, port: port, share: target.share, credential: credential,
+            timeout: timeout, makeTransport: makeTransport
+        )
     }
 
     public static func dfsReferral(

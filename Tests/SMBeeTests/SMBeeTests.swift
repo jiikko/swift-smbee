@@ -2496,7 +2496,8 @@ final class SMBeeTests: XCTestCase {
 
     func testDfsReferralCacheHonorsTTL() async throws {
         let cache = SMBDfsReferralCache()
-        let key = SMBDfsReferralCache.Key(host: "SERVER", port: 445, path: "\\\\server\\dfsroot\\link")
+        let credential = SMBCredential(username: "user", password: "pass", domain: "DOMAIN")
+        let key = SMBDfsReferralCache.Key(host: "SERVER", port: 445, path: "\\\\server\\dfsroot\\link", credential: credential)
         let referral = SMBDfsReferralResult(pathConsumed: 0, headerFlags: 0, referrals: [])
 
         await cache.put(referral, for: key, ttl: 1)
@@ -2506,6 +2507,34 @@ final class SMBeeTests: XCTestCase {
         await cache.put(referral, for: key, ttl: 0)
         let expired = await cache.get(key)
         XCTAssertNil(expired)
+    }
+
+    func testDfsReferralCacheKeySeparatesCredentialIdentities() {
+        let path = "\\\\server\\dfsroot\\link"
+        let passwordCredential = SMBCredential(username: "user", password: "pass", domain: "DOMAIN")
+        let otherUser = SMBCredential(username: "other", password: "pass", domain: "DOMAIN")
+        let ntHashCredential = try? SMBCredential(username: "user", ntHash: Array(repeating: 0x11, count: 16), domain: "DOMAIN")
+
+        let passwordKey = SMBDfsReferralCache.Key(host: "server", port: 445, path: path, credential: passwordCredential)
+        XCTAssertNotEqual(passwordKey, SMBDfsReferralCache.Key(host: "server", port: 445, path: path, credential: otherUser))
+        XCTAssertNotEqual(passwordKey, SMBDfsReferralCache.Key(host: "server", port: 445, path: path, credential: ntHashCredential!))
+    }
+
+    func testDfsReferralCacheBoundsEntryCount() async throws {
+        let cache = SMBDfsReferralCache(maximumEntries: 1)
+        let credential = SMBCredential(username: "user", password: "pass")
+        let first = SMBDfsReferralCache.Key(host: "server", port: 445, path: "\\\\server\\dfsroot\\one", credential: credential)
+        let second = SMBDfsReferralCache.Key(host: "server", port: 445, path: "\\\\server\\dfsroot\\two", credential: credential)
+        let referral = SMBDfsReferralResult(pathConsumed: 0, headerFlags: 0, referrals: [])
+
+        await cache.put(referral, for: first, ttl: 1)
+        await cache.put(referral, for: second, ttl: 60)
+        let count = await cache.count
+        let firstEntry = await cache.get(first)
+        let secondEntry = await cache.get(second)
+        XCTAssertEqual(count, 1)
+        XCTAssertNil(firstEntry)
+        XCTAssertNotNil(secondEntry)
     }
 
     func testDfsPathSuffixAccountsForUncPathConsumedConvention() throws {

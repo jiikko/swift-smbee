@@ -563,11 +563,18 @@ actor SMBDfsReferralCache {
         let host: String
         let port: UInt16
         let path: String
+        let credentialIdentity: String
 
-        init(host: String, port: UInt16, path: String) {
+        init(host: String, port: UInt16, path: String, credential: SMBCredential) {
             self.host = host.lowercased()
             self.port = port
             self.path = path.lowercased()
+            if credential.isAnonymous {
+                credentialIdentity = "anonymous"
+            } else {
+                let mechanism = credential.ntHash == nil ? "password" : "nt-hash"
+                credentialIdentity = "\(mechanism):\(credential.domain.lowercased()):\(credential.username.lowercased())"
+            }
         }
     }
 
@@ -576,7 +583,13 @@ actor SMBDfsReferralCache {
         let expiresAt: Date
     }
 
+    private let maximumEntries: Int
     private var entries: [Key: Entry] = [:]
+
+    init(maximumEntries: Int = 256) {
+        precondition(maximumEntries > 0)
+        self.maximumEntries = maximumEntries
+    }
 
     func get(_ key: Key) -> SMBDfsReferralResult? {
         guard let entry = entries[key] else { return nil }
@@ -588,8 +601,16 @@ actor SMBDfsReferralCache {
     }
 
     func put(_ referral: SMBDfsReferralResult, for key: Key, ttl: UInt32) {
+        let now = Date()
+        entries = entries.filter { $0.value.expiresAt > now }
+        if entries[key] == nil, entries.count >= maximumEntries,
+           let evictionKey = entries.min(by: { $0.value.expiresAt < $1.value.expiresAt })?.key {
+            entries.removeValue(forKey: evictionKey)
+        }
         entries[key] = Entry(referral: referral, expiresAt: Date().addingTimeInterval(TimeInterval(ttl)))
     }
+
+    var count: Int { entries.count }
 }
 
 private final class SMBDirectoryEntryCollector: @unchecked Sendable {

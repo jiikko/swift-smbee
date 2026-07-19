@@ -41,11 +41,12 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 - 認証済み操作は SMB 3.x only。SMB 2.0.2 / 2.1 は probe-only で、接続時は診断付きエラーにする。
 - Kerberos / GSS は未対応。現状は NTLMv2 password / NT hash / anonymous を対象にする。
 - Windows SMB Server / NAS の実サーバ smoke は未完了。Samba と一部 macOS SMBX の確認が中心。
-- durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) のみ (CLI 非対応)。
+- durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) と `smbcli lock` に対応するが、resilient/durable reconnect は未対応。
 - CHANGE_NOTIFY は `--reconnect` で接続断時の再購読に対応 (取りこぼし分は overflow で通知)。
 - DFS referral は metadata 取得のみ。target への auto-follow は未対応。
 - reparse point / symlink / mount point / LX symlink の target は `readlink` API で扱える。DFS/NFS の reparse data は MS-FSCC 上 opaque (client 解釈対象外) で、DFS link の解決は `smbcli dfs` (FSCTL_DFS_GET_REFERRALS)。実サーバ readlink smoke は未完了。
-- single-file download/upload の byte-level resume と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file は `smbcli sparse` (SET_SPARSE / hole punch / allocated-range query) に対応 (FS 依存)。転送時の hole preservation は未対応。
+- single-file download/upload の byte-level resume と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file は `smbcli sparse` (SET_SPARSE / hole punch / allocated-range query) と `stat`/JSON の `allocationSize` に対応 (FS 依存)。転送時の hole preservation は未対応。
+- `SMBee.read(..., operationTimeout:)` で単一 read の operation deadline を指定できる。write/recursive API への展開は未整理。
 - macOS resource fork / xattr / named stream preservation は未対応。通常の data fork 転送を対象にする。
 - SMB1 / NetBIOS port 139 / printer share / SMB Direct(RDMA) / SMB over QUIC / multichannel / compression は未対応。
 

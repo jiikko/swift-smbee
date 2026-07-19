@@ -17,6 +17,8 @@ Commands with stable JSON output:
 - `dfs --json`
 - `watch --json`
 
+`stat --json` includes the server-reported `allocationSize` when available.
+
 `watch --json` prints newline-delimited JSON. Each line is either a `changes`
 event with file change entries or an `overflow` event with `rescanRequired`.
 
@@ -29,6 +31,10 @@ Mutating commands with stable success JSON output:
 - `mv`
 - `rm`
 - `setacl`
+- `lock`
+
+`sparse --query --json` emits an array of `{offset,length}` ranges. `lock` emits
+the standard success object after the lock is acquired and released.
 
 Recursive runs (`get -r` / `put -r` / `cp -r` / `rm -r`) with `--json` print
 each action as newline-delimited JSON on stdout, followed by the success

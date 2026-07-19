@@ -32,11 +32,13 @@ final class SMBDfsReferralE2ETests: XCTestCase {
         }, "unexpected DFS referrals: \(result.referrals.map { $0.networkAddress })")
         XCTAssertGreaterThan(result.pathConsumed, 0)
 
-        let targetSession = try await SMBee.connectFollowingDFS(
+        let connection = try await SMBee.connectFollowingDFS(
             host: host, port: port, credential: credential,
             path: "\\\\\(host)\\dfsroot\\public-link"
         )
+        let targetSession = connection.session
         defer { Task { await targetSession.close() } }
+        XCTAssertEqual(connection.path, "")
         let entries = try await targetSession.list()
         XCTAssertTrue(entries.contains { $0.name == "known.txt" })
         let data = try await targetSession.read(path: "known.txt")
@@ -48,6 +50,13 @@ final class SMBDfsReferralE2ETests: XCTestCase {
         XCTAssertEqual(resolved.share, "public")
         XCTAssertEqual(resolved.path, "known.txt")
         XCTAssertEqual(resolved.hops, 2)
+        let chainedConnection = try await SMBee.connectFollowingDFS(
+            host: host, port: port, credential: credential, path: chainedPath
+        )
+        defer { Task { await chainedConnection.session.close() } }
+        XCTAssertEqual(chainedConnection.path, "known.txt")
+        let connectionData = try await chainedConnection.session.read(path: chainedConnection.path)
+        XCTAssertEqual(connectionData, Array("hello from SMBee E2E\n".utf8))
         let chainedData = try await SMBee.readFollowingDFS(
             host: host, port: port, credential: credential, path: chainedPath
         )

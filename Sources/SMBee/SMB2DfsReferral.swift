@@ -43,6 +43,12 @@ public struct SMBDfsResolvedPath: Sendable, Equatable {
     public let hops: Int
 }
 
+public struct SMBDfsConnection: Sendable {
+    public let session: SMBClientSession
+    public let path: String
+    public let hops: Int
+}
+
 public struct SMBDfsReferral: Sendable {
     public let versionNumber: UInt16
     public let serverType: UInt16

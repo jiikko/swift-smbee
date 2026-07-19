@@ -101,15 +101,15 @@ public enum SMBee {
         try await SMBClient.dfsReferral(host: host, port: port, credential: credential, path: path, timeout: timeout)
     }
 
-    /// Resolve a DFS path and connect to its first referral target with the same credential.
-    /// This follows one namespace hop; use `dfsReferral` for custom target selection.
+    /// Resolve a DFS path through referrals and connect with the same credential.
+    /// Use the returned relative path with the returned session to retain a DFS suffix.
     public static func connectFollowingDFS(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         path: String,
         timeout: Duration? = nil
-    ) async throws -> SMBClientSession {
+    ) async throws -> SMBDfsConnection {
         try await SMBClient.connectFollowingDFS(
             host: host, port: port, credential: credential, path: path, timeout: timeout
         )

@@ -1548,7 +1548,7 @@ public enum SMBClient {
         host: String, port: UInt16, credential: SMBCredential, path: String,
         timeout: Duration?, makeTransport: (@Sendable () -> SMBTransport)?
     ) async throws -> SMBDfsReferralResult {
-        let key = SMBDfsReferralCache.Key(host: host, port: port, path: path)
+        let key = SMBDfsReferralCache.Key(host: host, port: port, path: path, credential: credential)
         if let cached = await dfsReferralCache.get(key) { return cached }
         let referral = try await dfsReferral(
             host: host, port: port, credential: credential, path: path,
@@ -1796,9 +1796,9 @@ public enum SMBClient {
         return try await session.dfsReferral(share: share, path: path)
     }
 
-    /// Resolve `path`, select its first share referral target, and connect using the
-    /// same credential. This follows one DFS namespace hop; callers can inspect
-    /// `dfsReferral` when they need custom target selection or multi-hop policy.
+    /// Resolve `path` through DFS referrals and connect using the same credential.
+    /// The returned relative path must be used with the returned session for the
+    /// original DFS suffix (for example, `link\\file`).
     public static func connectFollowingDFS(
         host: String,
         port: UInt16 = 445,
@@ -1806,15 +1806,16 @@ public enum SMBClient {
         path: String,
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
-    ) async throws -> SMBClientSession {
+    ) async throws -> SMBDfsConnection {
         let target = try await resolveDFSPath(
             host: host, port: port, credential: credential, path: path,
             timeout: timeout, makeTransport: makeTransport, maxHops: 8
         )
-        return try await connect(
+        let session = try await connect(
             host: target.host, port: port, share: target.share, credential: credential,
             timeout: timeout, makeTransport: makeTransport
         )
+        return SMBDfsConnection(session: session, path: target.path, hops: target.hops)
     }
 
     public static func resolveDFS(

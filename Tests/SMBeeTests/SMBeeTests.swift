@@ -2494,6 +2494,27 @@ final class SMBeeTests: XCTestCase {
         XCTAssertThrowsError(try SMBClient.dfsTarget(from: "not-a-unc-target"))
     }
 
+    func testDfsReferralCacheHonorsTTL() async throws {
+        let cache = SMBDfsReferralCache()
+        let key = SMBDfsReferralCache.Key(host: "SERVER", port: 445, path: "\\\\server\\dfsroot\\link")
+        let referral = SMBDfsReferralResult(pathConsumed: 0, headerFlags: 0, referrals: [])
+
+        await cache.put(referral, for: key, ttl: 1)
+        let cached = await cache.get(key)
+        XCTAssertEqual(cached?.pathConsumed, 0)
+
+        await cache.put(referral, for: key, ttl: 0)
+        let expired = await cache.get(key)
+        XCTAssertNil(expired)
+    }
+
+    func testDfsPathSuffixAccountsForUncPathConsumedConvention() throws {
+        let path = "\\\\127.0.0.1\\dfsroot\\chain-link\\known.txt"
+        // Samba reports 58 bytes for the 30 UTF-16 code units through chain-link,
+        // excluding one leading UNC separator.
+        XCTAssertEqual(try SMBClient.dfsPathSuffix(path, consumedUTF16Bytes: 58), "\\known.txt")
+    }
+
     func testSMB2DfsReferralResponseDecodesV3Entries() throws {
         let response = makeDfsReferralResponse(entries: [
             makeDfsReferralV3Entry(

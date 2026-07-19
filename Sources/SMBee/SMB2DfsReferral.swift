@@ -36,6 +36,13 @@ public struct SMBDfsReferralTarget: Sendable, Equatable {
     }
 }
 
+public struct SMBDfsResolvedPath: Sendable, Equatable {
+    public let host: String
+    public let share: String
+    public let path: String
+    public let hops: Int
+}
+
 public struct SMBDfsReferral: Sendable {
     public let versionNumber: UInt16
     public let serverType: UInt16

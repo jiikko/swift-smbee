@@ -41,5 +41,26 @@ final class SMBDfsReferralE2ETests: XCTestCase {
         XCTAssertTrue(entries.contains { $0.name == "known.txt" })
         let data = try await targetSession.read(path: "known.txt")
         XCTAssertEqual(data, Array("hello from SMBee E2E\n".utf8))
+
+        let chainedPath = "\\\\\(host)\\dfsroot\\chain-link\\known.txt"
+        let resolved = try await SMBee.resolveDFS(host: host, port: port, credential: credential, path: chainedPath)
+        XCTAssertEqual(resolved.host, host)
+        XCTAssertEqual(resolved.share, "public")
+        XCTAssertEqual(resolved.path, "known.txt")
+        XCTAssertEqual(resolved.hops, 2)
+        let chainedData = try await SMBee.readFollowingDFS(
+            host: host, port: port, credential: credential, path: chainedPath
+        )
+        XCTAssertEqual(chainedData, Array("hello from SMBee E2E\n".utf8))
+
+        do {
+            _ = try await SMBee.resolveDFS(
+                host: host, port: port, credential: credential,
+                path: "\\\\\(host)\\dfsroot\\loop-a", maxHops: 8
+            )
+            XCTFail("DFS loop unexpectedly resolved")
+        } catch let error as SMBCodecError {
+            XCTAssertEqual(error, .invalidValue("DFS referral loop detected"))
+        }
     }
 }

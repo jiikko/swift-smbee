@@ -115,6 +115,36 @@ public enum SMBee {
         )
     }
 
+    public static func resolveDFS(
+        host: String, port: UInt16 = 445, credential: SMBCredential, path: String,
+        timeout: Duration? = nil, maxHops: Int = 8
+    ) async throws -> SMBDfsResolvedPath {
+        try await SMBClient.resolveDFS(
+            host: host, port: port, credential: credential, path: path,
+            timeout: timeout, maxHops: maxHops
+        )
+    }
+
+    public static func listFollowingDFS(
+        host: String, port: UInt16 = 445, credential: SMBCredential, path: String,
+        timeout: Duration? = nil, maxHops: Int = 8
+    ) async throws -> [SMBDirectoryEntry] {
+        try await SMBClient.listFollowingDFS(
+            host: host, port: port, credential: credential, path: path,
+            timeout: timeout, maxHops: maxHops
+        )
+    }
+
+    public static func readFollowingDFS(
+        host: String, port: UInt16 = 445, credential: SMBCredential, path: String,
+        range: SMBReadRange? = nil, timeout: Duration? = nil, maxHops: Int = 8
+    ) async throws -> [UInt8] {
+        try await SMBClient.readFollowingDFS(
+            host: host, port: port, credential: credential, path: path,
+            range: range, timeout: timeout, maxHops: maxHops
+        )
+    }
+
     /// Resolve a DFS namespace path to referral targets. This returns referral
     /// metadata only; reconnecting to a target and rewriting paths is left to callers.
     public static func dfsReferral(

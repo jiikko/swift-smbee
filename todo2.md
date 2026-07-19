@@ -49,7 +49,7 @@
 | security descriptor read / DACL / owner / group write | implemented-but-underverified | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。SACL は scope 外。AD / Samba AD 実測が残る。 |
 | SID name resolution | implemented-but-underverified | well-known SID table + LSARPC `LsarLookupSids`。AD / Samba AD 実測と issue 整理が残る。 |
 | change notification | implemented-but-underverified | `withChangeNotifications(autoReconnect:)` / `smbcli watch --json --reconnect`。Samba E2E + reconnect unit あり。Windows/NAS 実測が残る。 |
-| DFS referral metadata | partial | `SMBee.dfsReferral` / `smbcli dfs` と one-hop `connectFollowingDFS`。unit fixture + Samba msdfs E2E あり。multi-hop auto-follow は未実装。 |
+| DFS referral metadata | implemented-but-underverified | `SMBee.dfsReferral` / `smbcli dfs`、multi-hop `resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS`。loop detection、TTL cache、suffix rewrite は unit + Samba msdfs E2E 済み。Windows DFS 実測が残る。 |
 | reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。実サーバ smoke が残る。 |
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
 | sparse file operations | partial | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse`、allocation size stat 表示、Samba FSCTL E2E は実装済み。通常 transfer の hole preservation policy が残る。 |
@@ -98,7 +98,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P0-2. API stability / packaging
 
-状態: `partial`
+状態: `implemented-but-underverified`
 
 現状:
 
@@ -182,19 +182,12 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 - `SMBee.dfsReferral` / `smbcli dfs` はある。
 - Samba msdfs link の実 wire E2E を push CI と Apple Container ローカル E2E で確認した。
-- `connectFollowingDFS` は最初の target へ同 credential で再接続する。Samba link target の list/read E2E 済み。
-
-やること:
-
-- auto-follow policy を設計する:
-  - multi-hop / loop detection
-  - referral TTL cache
-- path suffix rewrite を含む transparent referral を追加するか決める。
+- `resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS` は target 再接続、multi-hop、loop detection、TTL cache、path suffix rewrite を行う。Samba chain link の list/read E2E 済み。
 
 完了条件:
 
-- msdfs Samba / Windows DFS で referral metadata が実 wire で decode できる。
-- auto-follow を入れる場合、DFS link 配下の `ls/stat/read` が通る。
+- Samba msdfs で referral metadata と chain link の read が実 wire で通る。
+- Windows DFS は compatibility matrix の pending として実測する。
 
 ### P1-4. Kerberos / GSS / SPNEGO(Kerberos mech)
 
@@ -449,7 +442,7 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - Kerberos / GSS は未対応。現状は NTLMv2 / NT hash / anonymous。
 - Windows SMB Server / NAS は smoke 未完了。
 - durable / persistent handle は未対応。lease / oplock は要求しない。byte-range lock は library API 先行。
-- DFS referral は metadata 取得のみ。auto-follow と実 msdfs E2E は未完了。
+- DFS referral は multi-hop auto-follow、loop detection、TTL cache、path suffix rewrite と Samba msdfs E2E まで実装済み。Windows DFS は matrix pending。
 - symlink / mount point / LX symlink は `readlink` で target 解決可。DFS/NFS reparse data は opaque。
 - byte-level resume と `--verify size|hash` は対応済み。
 - sparse FSCTL は対応済みだが、転送時の sparse preservation と allocation size 表示は未整理。

@@ -33,6 +33,9 @@ docker run -d --name "${SAMBA_CONTAINER}" -p "${SMBEE_E2E_PORT}:445" \
     printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
     # Samba msdfs links are symlinks whose target uses the msdfs: prefix.
     ln -s "msdfs:127.0.0.1\\public" /srv/smbee/dfsroot/public-link
+    ln -s "msdfs:127.0.0.1\\dfsroot\\public-link" /srv/smbee/dfsroot/chain-link
+    ln -s "msdfs:127.0.0.1\\dfsroot\\loop-b" /srv/smbee/dfsroot/loop-a
+    ln -s "msdfs:127.0.0.1\\dfsroot\\loop-a" /srv/smbee/dfsroot/loop-b
     # Keep the boundary-range smoke fixture sparse; SMBee never uploads 4GiB.
     truncate -s 4295032833 /srv/smbee/public/large-4gib-plus.bin
     chown -R smbee:smbee /srv/smbee

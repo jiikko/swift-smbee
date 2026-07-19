@@ -558,6 +558,40 @@ private final class SMBTransferProgressEmitter: @unchecked Sendable {
     }
 }
 
+actor SMBDfsReferralCache {
+    struct Key: Hashable {
+        let host: String
+        let port: UInt16
+        let path: String
+
+        init(host: String, port: UInt16, path: String) {
+            self.host = host.lowercased()
+            self.port = port
+            self.path = path.lowercased()
+        }
+    }
+
+    private struct Entry {
+        let referral: SMBDfsReferralResult
+        let expiresAt: Date
+    }
+
+    private var entries: [Key: Entry] = [:]
+
+    func get(_ key: Key) -> SMBDfsReferralResult? {
+        guard let entry = entries[key] else { return nil }
+        guard entry.expiresAt > Date() else {
+            entries.removeValue(forKey: key)
+            return nil
+        }
+        return entry.referral
+    }
+
+    func put(_ referral: SMBDfsReferralResult, for key: Key, ttl: UInt32) {
+        entries[key] = Entry(referral: referral, expiresAt: Date().addingTimeInterval(TimeInterval(ttl)))
+    }
+}
+
 private final class SMBDirectoryEntryCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [SMBDirectoryEntry] = []
@@ -1403,6 +1437,8 @@ public actor SMBClientTreeSession {
 }
 
 public enum SMBClient {
+    private static let dfsReferralCache = SMBDfsReferralCache()
+
     private static func dfsShare(from path: String) throws -> String {
         let components = path.split(separator: "\\", omittingEmptySubsequences: true)
         guard components.count >= 2 else {
@@ -1416,6 +1452,91 @@ public enum SMBClient {
             throw SMBCodecError.invalidValue("DFS referral target must be in \\\\server\\share form")
         }
         return target
+    }
+
+    private static func dfsRelativePath(from path: String) throws -> String {
+        let components = path.split(separator: "\\", omittingEmptySubsequences: true)
+        guard components.count >= 2 else {
+            throw SMBCodecError.invalidValue("DFS path must be in \\\\server\\share[\\path] form")
+        }
+        return components.dropFirst(2).joined(separator: "\\")
+    }
+
+    static func dfsPathSuffix(_ path: String, consumedUTF16Bytes: Int) throws -> String {
+        guard consumedUTF16Bytes >= 0, consumedUTF16Bytes.isMultiple(of: 2) else {
+            throw SMBCodecError.invalidValue("DFS PathConsumed must be an even UTF-16 byte count")
+        }
+        let units = Array(path.utf16)
+        // Samba reports PathConsumed from the first server-name character and
+        // excludes one of the two UNC leading separators. Restore that UTF-16
+        // code unit before slicing the caller's canonical UNC string.
+        let uncAdjustment = path.hasPrefix("\\\\") ? 1 : 0
+        let consumedUnits = consumedUTF16Bytes / 2 + uncAdjustment
+        guard consumedUnits <= units.count else {
+            throw SMBCodecError.invalidValue("DFS PathConsumed exceeds referral path length")
+        }
+        return String(decoding: units.dropFirst(consumedUnits), as: UTF16.self)
+    }
+
+    private static func resolveDFSPath(
+        host: String,
+        port: UInt16,
+        credential: SMBCredential,
+        path: String,
+        timeout: Duration?,
+        makeTransport: (@Sendable () -> SMBTransport)?,
+        maxHops: Int
+    ) async throws -> SMBDfsResolvedPath {
+        guard maxHops > 0 else {
+            throw SMBCodecError.invalidValue("DFS maxHops must be greater than zero")
+        }
+        var currentPath = path
+        var visited = Set<String>()
+
+        for hop in 0..<maxHops {
+            let endpoint = try dfsTarget(from: currentPath)
+            let visitKey = "\(endpoint.host.lowercased())/\(endpoint.share.lowercased())/\(currentPath.lowercased())"
+            guard visited.insert(visitKey).inserted else {
+                throw SMBCodecError.invalidValue("DFS referral loop detected")
+            }
+
+            do {
+                let referral = try await cachedDFSReferral(
+                    host: endpoint.host, port: port, credential: credential, path: currentPath,
+                    timeout: timeout, makeTransport: makeTransport
+                )
+                guard let target = referral.targets.first,
+                      let networkAddress = referral.referrals.first(where: { $0.target == target })?.networkAddress else {
+                    throw SMBCodecError.invalidValue("DFS referral did not include a share target")
+                }
+                currentPath = networkAddress + (try dfsPathSuffix(currentPath, consumedUTF16Bytes: referral.pathConsumed))
+            } catch let error as SMBError {
+                if case .unsupported = error {
+                    return SMBDfsResolvedPath(
+                        host: endpoint.host, share: endpoint.share,
+                        path: try dfsRelativePath(from: currentPath), hops: hop
+                    )
+                }
+                throw error
+            }
+        }
+        throw SMBCodecError.invalidValue("DFS referral exceeded maxHops (\(maxHops))")
+    }
+
+    private static func cachedDFSReferral(
+        host: String, port: UInt16, credential: SMBCredential, path: String,
+        timeout: Duration?, makeTransport: (@Sendable () -> SMBTransport)?
+    ) async throws -> SMBDfsReferralResult {
+        let key = SMBDfsReferralCache.Key(host: host, port: port, path: path)
+        if let cached = await dfsReferralCache.get(key) { return cached }
+        let referral = try await dfsReferral(
+            host: host, port: port, credential: credential, path: path,
+            timeout: timeout, makeTransport: makeTransport
+        )
+        if let ttl = referral.referrals.map(\.timeToLive).min(), ttl > 0 {
+            await dfsReferralCache.put(referral, for: key, ttl: ttl)
+        }
+        return referral
     }
 
     static func resolvedTransportFactory(
@@ -1665,17 +1786,41 @@ public enum SMBClient {
         timeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
-        let referral = try await dfsReferral(
+        let target = try await resolveDFSPath(
             host: host, port: port, credential: credential, path: path,
-            timeout: timeout, makeTransport: makeTransport
+            timeout: timeout, makeTransport: makeTransport, maxHops: 8
         )
-        guard let target = referral.targets.first else {
-            throw SMBCodecError.invalidValue("DFS referral did not include a share target")
-        }
         return try await connect(
             host: target.host, port: port, share: target.share, credential: credential,
             timeout: timeout, makeTransport: makeTransport
         )
+    }
+
+    public static func resolveDFS(
+        host: String, port: UInt16 = 445, credential: SMBCredential, path: String,
+        timeout: Duration? = nil, maxHops: Int = 8,
+        makeTransport: (@Sendable () -> SMBTransport)? = nil
+    ) async throws -> SMBDfsResolvedPath {
+        try await resolveDFSPath(
+            host: host, port: port, credential: credential, path: path,
+            timeout: timeout, makeTransport: makeTransport, maxHops: maxHops
+        )
+    }
+
+    public static func listFollowingDFS(
+        host: String, port: UInt16 = 445, credential: SMBCredential, path: String,
+        timeout: Duration? = nil, maxHops: Int = 8
+    ) async throws -> [SMBDirectoryEntry] {
+        let resolved = try await resolveDFS(host: host, port: port, credential: credential, path: path, timeout: timeout, maxHops: maxHops)
+        return try await list(host: resolved.host, port: port, share: resolved.share, path: resolved.path, credential: credential, timeout: timeout)
+    }
+
+    public static func readFollowingDFS(
+        host: String, port: UInt16 = 445, credential: SMBCredential, path: String,
+        range: SMBReadRange? = nil, timeout: Duration? = nil, maxHops: Int = 8
+    ) async throws -> [UInt8] {
+        let resolved = try await resolveDFS(host: host, port: port, credential: credential, path: path, timeout: timeout, maxHops: maxHops)
+        return try await read(host: resolved.host, port: port, share: resolved.share, path: resolved.path, range: range, credential: credential, timeout: timeout)
     }
 
     public static func dfsReferral(

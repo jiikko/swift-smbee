@@ -98,7 +98,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P0-2. API stability / packaging
 
-状態: `implemented-but-underverified`（scoped tree API で実装済み）
+状態: `partial`
 
 現状:
 
@@ -124,7 +124,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P1-1. SMB2 credit accounting / multi-credit large IO E2E
 
-状態: `partial`
+状態: `implemented-but-underverified`
 
 更新: SMB 3.1.1 encrypted の 2MiB+ READ/WRITE と multi-credit WRITE は push CI E2E で検証済み。残りは copychunk 実測と性能回帰監視。
 
@@ -155,8 +155,6 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 状態: `implemented-but-underverified`（scoped tree API で実装済み）
 
 更新: `SMBClientSession.listShares()` と `SMBClientTreeSession.listShares()` を追加し、IPC$ share discovery を同一認証 session の scoped tree として実行できるようにした。`withTree(share:)` で public / 別 share も同一 session 上で扱え、child tree tracking と session close 時の全 tree 切断にも対応した。DFS referral は scoped DFS-root tree 上で実行する。
-
-状態: `partial`
 
 現状:
 

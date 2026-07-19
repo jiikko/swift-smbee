@@ -44,7 +44,7 @@
 | recursive get / put / cp / rm | implemented | `continueOnError` / `skipExisting` / `dryRun` / resume / verify / include-exclude / per-file-timeout あり。 |
 | share discovery | implemented-but-underverified | IPC$ + SRVSVC `NetrShareEnum`。Samba では実測済み。macOS SMBX / Windows / NAS smoke が残る。 |
 | volume / filesystem info | implemented-but-underverified | `SMBee.volumeInfo` / `smbcli df`。Samba E2E 済み。macOS SMBX / Windows / NAS smoke が残る。 |
-| path validation | implemented-but-underverified | `SMBPath` / `SMBShareName` で validation 済み。Unicode normalization の実測が残る。 |
+| path validation | implemented-but-underverified | `SMBPath` / `SMBShareName` で validation 済み。Samba の decomposed Unicode path E2E 済み。macOS SMBX / Windows / NAS の実測が残る。 |
 | metadata read/write | implemented | file attributes、creation/access/modified/change time、`SMBFileMetadataUpdate`、`updateMetadata`。 |
 | security descriptor read / DACL / owner / group write | implemented-but-underverified | `securityInfo` / `setSecurityInfo` / `smbcli acl` / `smbcli setacl`。SACL は scope 外。AD / Samba AD 実測が残る。 |
 | SID name resolution | implemented-but-underverified | well-known SID table + LSARPC `LsarLookupSids`。AD / Samba AD 実測と issue 整理が残る。 |

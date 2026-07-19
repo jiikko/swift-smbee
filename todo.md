@@ -56,7 +56,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 | SMB 3.1.1 GMAC/GCM | implemented-but-underverified | Samba では green。Windows / NAS smoke が残る。 |
 | share discovery | implemented-but-underverified | Samba 実測済み。macOS SMBX / Windows / NAS smoke が残る。 |
 | volume info | implemented-but-underverified | Samba E2E 済み。macOS SMBX / Windows / NAS smoke が残る。 |
-| path handling | implemented-but-underverified | validation は実装済み。Unicode normalization の実測が残る。 |
+| path handling | implemented-but-underverified | validation と Samba の decomposed Unicode path E2E は実装済み。macOS SMBX / Windows / NAS の normalization 実測が残る。 |
 | ACL / owner / group / SID lookup | implemented-but-underverified | Samba では実測済み。AD / Samba AD / Windows での実測が残る。 |
 | CHANGE_NOTIFY reconnect | implemented-but-underverified | unit + Samba E2E あり。Windows / NAS での挙動確認が残る。 |
 | shared-session READ cancellation | implemented-but-underverified | blocking-send unit、Samba E2E、実 NAS の cancel-storm 確認あり。Windows / 他 NAS での matrix は残る。 |
@@ -117,7 +117,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 
 ### P2: 実用性・管理系 follow-up
 
-- path Unicode normalization smoke
+- path Unicode normalization smoke（Samba は実施済み。macOS SMBX / Windows / NAS が残る）
 - share discovery / volume / ACL / SID lookup の実サーバ smoke
 - reparse / readlink の実サーバ smoke
 - sparse file preservation / allocation size 表示

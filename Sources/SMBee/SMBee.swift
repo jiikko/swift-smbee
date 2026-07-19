@@ -424,9 +424,10 @@ public enum SMBee {
         path: String,
         range: SMBReadRange? = nil,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws -> [UInt8] {
-        try await SMBClient.read(host: host, port: port, share: share, path: path, range: range, credential: credential, timeout: timeout, onProgress: onProgress)
+        try await SMBClient.read(host: host, port: port, share: share, path: path, range: range, credential: credential, timeout: timeout, operationTimeout: operationTimeout, onProgress: onProgress)
     }
 
     public static func read(

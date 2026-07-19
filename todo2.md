@@ -338,7 +338,7 @@ Linux/macOS smbclient として必要な理由:
 
 残:
 
-- `operationTimeout` / `deadline` を public API に広げるか決める。
+- `SMBee.read(..., operationTimeout:)` を追加済み。主要な write/recursive API へ広げるか決める。
 - timeout error taxonomy を固定する。
 
 ### P2-6. keepalive と reconnect policy の統合

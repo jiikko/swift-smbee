@@ -2021,10 +2021,12 @@ public enum SMBClient {
         range: SMBReadRange? = nil,
         credential: SMBCredential,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws -> [UInt8] {
-        try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: false)
             do {
                 let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
@@ -2043,6 +2045,7 @@ public enum SMBClient {
             } catch {
                 await session.bestEffortClose(treeId: treeId, fileId: fileId)
                 throw error
+            }
             }
         }
     }

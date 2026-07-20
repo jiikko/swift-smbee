@@ -61,6 +61,11 @@ final class SMBeeOperationDeadlineE2ETests: XCTestCase {
                 host: host, port: port, credential: credential, share: share,
                 path: uploaded, directory: true, recursive: true, operationTimeout: .seconds(10)
             )
+            let rootEntries = try await SMBee.list(
+                host: host, port: port, credential: credential, share: share
+            )
+            XCTAssertFalse(rootEntries.contains { $0.name == copied })
+            XCTAssertFalse(rootEntries.contains { $0.name == uploaded })
         } catch {
             try? await SMBee.delete(
                 host: host, port: port, credential: credential, share: share,

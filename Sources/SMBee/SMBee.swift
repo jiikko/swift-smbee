@@ -717,19 +717,15 @@ public enum SMBee {
         data: [UInt8],
         overwrite: Bool = true,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
-        try await SMBClient.upload(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            data: data,
-            overwrite: overwrite,
-            credential: credential,
-            timeout: timeout,
-            onProgress: onProgress
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.upload(
+                host: host, port: port, share: share, path: path, data: data,
+                overwrite: overwrite, credential: credential, timeout: timeout, onProgress: onProgress
+            )
+        }
     }
 
     public static func upload(
@@ -763,20 +759,15 @@ public enum SMBee {
         overwrite: Bool = true,
         resume: Bool = false,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
-        try await SMBClient.upload(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            fileURL: fileURL,
-            overwrite: overwrite,
-            resume: resume,
-            credential: credential,
-            timeout: timeout,
-            onProgress: onProgress
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.upload(
+                host: host, port: port, share: share, path: path, fileURL: fileURL,
+                overwrite: overwrite, resume: resume, credential: credential, timeout: timeout, onProgress: onProgress
+            )
+        }
     }
 
     public static func upload(
@@ -823,13 +814,15 @@ public enum SMBee {
         resume: Bool = false,
         dryRun: Bool = false,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
-        try await SMBClient.uploadDirectory(
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.uploadDirectory(
             host: host,
             port: port,
             share: share,
@@ -847,7 +840,8 @@ public enum SMBee {
             timeout: timeout,
             onAction: onAction,
             onProgress: onProgress
-        )
+            )
+        }
     }
 
     /// - Parameter resume: When true, skips files whose remote destination size already matches the local source

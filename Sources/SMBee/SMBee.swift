@@ -587,6 +587,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter operationTimeout: Deadline for the complete recursive download, including connection and traversal.
     /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
     ///   final destination after the full tree succeeds. This is best-effort local atomicity only: the final
     ///   move/replace is not transactional across filesystems or crashes. `dryRun` creates no staging directory,
@@ -609,32 +610,35 @@ public enum SMBee {
         dryRun: Bool = false,
         atomic: Bool = false,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
-        try await SMBClient.downloadDirectory(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            localDirectory: localDirectory,
-            overwrite: overwrite,
-            continueOnError: continueOnError,
-            skipExisting: skipExisting,
-            resume: resume,
-            dryRun: dryRun,
-            atomic: atomic,
-            include: include,
-            exclude: exclude,
-            perFileTimeout: perFileTimeout,
-            credential: credential,
-            timeout: timeout,
-            onAction: onAction,
-            onProgress: onProgress
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.downloadDirectory(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localDirectory: localDirectory,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                resume: resume,
+                dryRun: dryRun,
+                atomic: atomic,
+                include: include,
+                exclude: exclude,
+                perFileTimeout: perFileTimeout,
+                credential: credential,
+                timeout: timeout,
+                onAction: onAction,
+                onProgress: onProgress
+            )
+        }
     }
 
     /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the
@@ -648,7 +652,7 @@ public enum SMBee {
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
         localDirectory: URL,
@@ -658,31 +662,34 @@ public enum SMBee {
         resume: Bool = false,
         dryRun: Bool = false,
         atomic: Bool = false,
+        operationTimeout: Duration? = nil,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
-        try await SMBClient.downloadDirectory(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            localDirectory: localDirectory,
-            overwrite: overwrite,
-            continueOnError: continueOnError,
-            skipExisting: skipExisting,
-            resume: resume,
-            dryRun: dryRun,
-            atomic: atomic,
-            include: include,
-            exclude: exclude,
-            perFileTimeout: perFileTimeout,
-            credentialProvider: credentialProvider,
-            onAction: onAction,
-            onProgress: onProgress
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.downloadDirectory(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localDirectory: localDirectory,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                resume: resume,
+                dryRun: dryRun,
+                atomic: atomic,
+                include: include,
+                exclude: exclude,
+                perFileTimeout: perFileTimeout,
+                credentialProvider: credentialProvider,
+                onAction: onAction,
+                onProgress: onProgress
+            )
+        }
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.

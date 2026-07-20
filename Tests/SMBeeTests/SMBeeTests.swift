@@ -799,6 +799,28 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testSMBeeDownloadDirectoryOperationTimeout() async throws {
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("smbee-deadline-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        do {
+            try await SMBee.downloadDirectory(
+                host: "server",
+                credentialProvider: {
+                    try await Task.sleep(for: .seconds(5))
+                    return .anonymous
+                },
+                share: "share",
+                path: "remote",
+                localDirectory: destination,
+                operationTimeout: .milliseconds(10)
+            )
+            XCTFail("recursive download unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        }
+    }
+
     func testReadURLParserKeepsUserInfoPassword() throws {
         let endpoint = try SMBURLParser.parseReadURL("smb://user:pass@server:1445/share/path/to/file.txt")
 

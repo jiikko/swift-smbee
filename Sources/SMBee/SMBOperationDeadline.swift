@@ -2,8 +2,10 @@ import Foundation
 
 /// Runs an operation with a cooperative client-side deadline.
 ///
-/// A timeout cancels the operation task and reports `SMBTransportError.timedOut`,
-/// but it does not roll back local or remote side effects that already completed.
+/// A timeout requests cancellation of the operation task and reports
+/// `SMBTransportError.timedOut` after that task finishes. Because cancellation is
+/// cooperative, this call may return after the configured duration. It does not roll
+/// back local or remote side effects that already completed.
 /// Callers should inspect or reconcile destination state before retrying mutating operations.
 public enum SMBOperationDeadline {
     public static func run<T: Sendable>(

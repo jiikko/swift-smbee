@@ -66,6 +66,8 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 
 ## 現在の未解決タスク
 
+2026-07-21 時点で、repo とローカル Apple Container の Samba だけで完結できる 0.1 必須実装・回帰テストはない。以下の未解決項目は、実 Windows / NAS / macOS SMBX または offload-capable server を必要とする互換 smoke と、明示的に 0.1 対象外とした roadmap である。Windows 対応は pending とする。
+
 ### P0: release blocker
 
 1. **compatibility matrix を実サーバで埋める**
@@ -120,7 +122,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 
 - path Unicode normalization smoke（Samba は実施済み。macOS SMBX / Windows / NAS が残る）
 - share discovery / volume / ACL / SID lookup の実サーバ smoke
-- reparse / readlink の実サーバ smoke
+- reparse / readlink の reparse-capable 実サーバ smoke
 - sparse file preservation（通常 get/put/copy は logical-content policy。allocation size 表示と Samba sparse FSCTL E2E は実装済み。hole topology の保存は明示的に未対応）
 - operation-level deadline の Windows / NAS 実測
 - keepalive invalidation / watch reconnect policy の実サーバ smoke

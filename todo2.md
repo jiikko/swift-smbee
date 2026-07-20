@@ -59,6 +59,8 @@
 
 ## P0: 0.1.0 前の release blocker
 
+2026-07-21 時点で、repo とローカル Apple Container の Samba だけで完結できる 0.1 必須実装・回帰テストは完了している。以下で残っているのは実 Windows / NAS / macOS SMBX または offload-capable server を必要とする互換検証であり、Windows 対応は pending とする。`explicitly-unsupported` の項目は 0.1 の実装残件には数えない。
+
 ### P0-1. 互換 matrix を実サーバで埋める
 
 状態: `partial` / `implemented-but-underverified`
@@ -289,7 +291,7 @@ Linux/macOS smbclient として必要な理由:
 
 残:
 
-- Samba / Windows / macOS SMBX で `smbcli readlink` smoke を取る。
+- reparse point target を公開する Samba 構成、Windows、macOS SMBX で `smbcli readlink` smoke を取る。通常の POSIX symlink を透過 follow する Samba 構成はこの検証の代替にならない。
 - recursive operationはtargetをfollowしない。download/copyはreparse entryをskipし、deleteは`FILE_OPEN_REPARSE_POINT`でlink自体を削除する。unitとREADME/coverageに固定済み。
 
 ### P2-4. sparse file preservation / allocation size

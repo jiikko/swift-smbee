@@ -652,6 +652,46 @@ public enum SMBee {
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        localDirectory: URL,
+        overwrite: Bool = true,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        resume: Bool = false,
+        dryRun: Bool = false,
+        atomic: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try await SMBClient.downloadDirectory(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localDirectory: localDirectory,
+            overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            resume: resume,
+            dryRun: dryRun,
+            atomic: atomic,
+            include: include,
+            exclude: exclude,
+            perFileTimeout: perFileTimeout,
+            credentialProvider: credentialProvider,
+            onAction: onAction,
+            onProgress: onProgress
+        )
+    }
+
+    public static func downloadDirectory(
+        host: String,
+        port: UInt16 = 445,
         credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
@@ -662,7 +702,7 @@ public enum SMBee {
         resume: Bool = false,
         dryRun: Bool = false,
         atomic: Bool = false,
-        operationTimeout: Duration? = nil,
+        operationTimeout: Duration?,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
@@ -738,12 +778,32 @@ public enum SMBee {
     public static func upload(
         host: String,
         port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        data: [UInt8],
+        overwrite: Bool = true
+    ) async throws {
+        try await SMBClient.upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            data: data,
+            overwrite: overwrite,
+            credentialProvider: credentialProvider
+        )
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
         credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
         data: [UInt8],
         overwrite: Bool = true,
-        operationTimeout: Duration? = nil
+        operationTimeout: Duration?
     ) async throws {
         try await SMBOperationDeadline.run(timeout: operationTimeout) {
             try await SMBClient.upload(
@@ -783,6 +843,32 @@ public enum SMBee {
     public static func upload(
         host: String,
         port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        fileURL: URL,
+        overwrite: Bool = true,
+        resume: Bool = false,
+        timeout: Duration? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try await SMBClient.upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            fileURL: fileURL,
+            overwrite: overwrite,
+            resume: resume,
+            credential: try await credentialProvider(),
+            timeout: timeout,
+            onProgress: onProgress
+        )
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
         credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
@@ -790,7 +876,7 @@ public enum SMBee {
         overwrite: Bool = true,
         resume: Bool = false,
         timeout: Duration? = nil,
-        operationTimeout: Duration? = nil,
+        operationTimeout: Duration?,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await SMBOperationDeadline.run(timeout: operationTimeout) {
@@ -864,6 +950,44 @@ public enum SMBee {
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        localDirectory: URL,
+        overwrite: Bool = true,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        resume: Bool = false,
+        dryRun: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try await SMBClient.uploadDirectory(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localDirectory: localDirectory,
+            overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            resume: resume,
+            dryRun: dryRun,
+            include: include,
+            exclude: exclude,
+            perFileTimeout: perFileTimeout,
+            credentialProvider: credentialProvider,
+            onAction: onAction,
+            onProgress: onProgress
+        )
+    }
+
+    public static func uploadDirectory(
+        host: String,
+        port: UInt16 = 445,
         credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
@@ -873,7 +997,7 @@ public enum SMBee {
         skipExisting: Bool = false,
         resume: Bool = false,
         dryRun: Bool = false,
-        operationTimeout: Duration? = nil,
+        operationTimeout: Duration?,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
@@ -933,13 +1057,35 @@ public enum SMBee {
     public static func upload(
         host: String,
         port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true,
+        resume: Bool = false
+    ) async throws {
+        try await SMBClient.upload(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localFile: localFile,
+            overwrite: overwrite,
+            resume: resume,
+            credentialProvider: credentialProvider
+        )
+    }
+
+    public static func upload(
+        host: String,
+        port: UInt16 = 445,
         credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
         localFile: URL,
         overwrite: Bool = true,
         resume: Bool = false,
-        operationTimeout: Duration? = nil
+        operationTimeout: Duration?
     ) async throws {
         try await SMBOperationDeadline.run(timeout: operationTimeout) {
             try await SMBClient.upload(
@@ -1042,6 +1188,40 @@ public enum SMBee {
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        fromPath: String,
+        toPath: String,
+        overwrite: Bool = false,
+        continueOnError: Bool = false,
+        skipExisting: Bool = false,
+        dryRun: Bool = false,
+        include: [String] = [],
+        exclude: [String] = [],
+        perFileTimeout: Duration? = nil,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+    ) async throws {
+        try await SMBClient.copyDirectory(
+            host: host,
+            port: port,
+            share: share,
+            fromPath: fromPath,
+            toPath: toPath,
+            overwrite: overwrite,
+            continueOnError: continueOnError,
+            skipExisting: skipExisting,
+            dryRun: dryRun,
+            include: include,
+            exclude: exclude,
+            perFileTimeout: perFileTimeout,
+            credentialProvider: credentialProvider,
+            onAction: onAction
+        )
+    }
+
+    public static func copyDirectory(
+        host: String,
+        port: UInt16 = 445,
         credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         fromPath: String,
@@ -1050,7 +1230,7 @@ public enum SMBee {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
-        operationTimeout: Duration? = nil,
+        operationTimeout: Duration?,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
@@ -1155,6 +1335,32 @@ public enum SMBee {
     public static func delete(
         host: String,
         port: UInt16 = 445,
+        credentialProvider: SMBCredentialProvider,
+        share: String,
+        path: String,
+        directory: Bool = false,
+        recursive: Bool = false,
+        continueOnError: Bool = false,
+        dryRun: Bool = false,
+        onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
+    ) async throws {
+        try await SMBClient.delete(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            directory: directory,
+            recursive: recursive,
+            continueOnError: continueOnError,
+            dryRun: dryRun,
+            credentialProvider: credentialProvider,
+            onAction: onAction
+        )
+    }
+
+    public static func delete(
+        host: String,
+        port: UInt16 = 445,
         credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
@@ -1162,7 +1368,7 @@ public enum SMBee {
         recursive: Bool = false,
         continueOnError: Bool = false,
         dryRun: Bool = false,
-        operationTimeout: Duration? = nil,
+        operationTimeout: Duration?,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
         try await SMBOperationDeadline.run(timeout: operationTimeout) {

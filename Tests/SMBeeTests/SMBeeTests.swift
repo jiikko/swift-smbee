@@ -866,7 +866,7 @@ final class SMBeeTests: XCTestCase {
                 share: "share",
                 path: "remote",
                 localDirectory: destination,
-                operationTimeout: .milliseconds(10)
+                operationTimeout: .milliseconds(250)
             )
             XCTFail("recursive download unexpectedly completed")
         } catch SMBTransportError.timedOut {
@@ -886,7 +886,7 @@ final class SMBeeTests: XCTestCase {
                 share: "share",
                 fromPath: "source",
                 toPath: "destination",
-                operationTimeout: .milliseconds(10)
+                operationTimeout: .milliseconds(250)
             )
             XCTFail("recursive copy unexpectedly completed")
         } catch SMBTransportError.timedOut {
@@ -907,7 +907,7 @@ final class SMBeeTests: XCTestCase {
                 path: "directory",
                 directory: true,
                 recursive: true,
-                operationTimeout: .milliseconds(10)
+                operationTimeout: .milliseconds(250)
             )
             XCTFail("recursive delete unexpectedly completed")
         } catch SMBTransportError.timedOut {

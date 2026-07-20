@@ -103,7 +103,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 現状:
 
 - SwiftPM library と CLI は動く。
-- SemVer、public API の source compatibility、deprecated credential surface、DocC/API examples、binary/release artifact の方針は未整理。
+- pre-1.0 は SwiftPM source build、通常のsource compatibilityはbest-effort、ABI / function-value signature / binary artifactは非保証とする方針を `docs/api-stability.md` に固定済み。1.0向けSemVer保証、deprecated credential surface、DocC/API examples、release artifact配布方針は未整理。
 - consumer が依存し始める前に public 型の命名、Sendable、error taxonomy、cancellation / timeout semantics を凍結する必要がある。
 
 やること:

@@ -76,11 +76,10 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
    - `docs/compatibility-matrix.md` と `bin/e2e/smoke-real-server.sh` を使って、代表コマンドの smoke を埋める。
 
 2. **API stability / packaging**
-   - SemVer 方針。
-   - public API source compatibility。
+   - pre-1.0 は SwiftPM source build、source compatibility は best-effort、ABI / function-value signature / binary artifact は非保証とする方針を `docs/api-stability.md` に固定済み。1.0向けSemVer保証は未整理。
    - `SMBCredential.password` 露出の deprecation plan。
    - DocC / examples。
-   - binary / release artifact 方針。
+   - 1.0向けrelease artifact配布方針。
    - Sendable / error taxonomy / cancellation / timeout semantics の凍結。
 
 ### P1: smbclient 中核残件

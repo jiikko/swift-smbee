@@ -1,6 +1,7 @@
 import Foundation
 
-public enum SMBTransportError: Error, Equatable {
+/// A connection-level failure reported by an `SMBTransport` or an operation deadline.
+public enum SMBTransportError: Error, Equatable, Sendable {
     case connectionClosed
     case invalidAddress
     case socketFailure(String)

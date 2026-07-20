@@ -33,7 +33,7 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 - [docs/architecture.md](docs/architecture.md) — 内部構成と transport 抽象（macOS=NWConnection / Linux=POSIX|NIO）
 - [docs/testing.md](docs/testing.md) — テスト戦略（unit vector / コンテナ Samba で E2E: ローカル=Apple container・CI=Docker / 実サーバ smoke）
 - [docs/coverage.md](docs/coverage.md) — SMBee が実装済み・未検証・未対応の SMB surface とテスト状況
-- [docs/api-stability.md](docs/api-stability.md) — pre-1.0 の source / ABI compatibility 方針
+- [docs/api-stability.md](docs/api-stability.md) — 0.1 public API freeze、error / concurrency / credential migration 方針
 - [docs/compatibility-matrix.md](docs/compatibility-matrix.md) — Samba / macOS SMBX / Windows / NAS の実サーバ smoke 記録
 - [todo.md](todo.md) — 実装 TODO（Phase 0〜5 のチェックリスト）
 

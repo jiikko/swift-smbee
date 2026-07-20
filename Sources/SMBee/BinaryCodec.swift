@@ -1,6 +1,10 @@
 import Foundation
 
-enum SMBCodecError: Error, Equatable {
+/// A validation or wire-format error detected before an SMB operation can complete.
+///
+/// Public APIs use `invalidValue` for invalid arguments and inconsistent local or
+/// remote data, and `truncated` when a received protocol message ends unexpectedly.
+public enum SMBCodecError: Error, Equatable, Sendable {
     case truncated
     case invalidValue(String)
 }

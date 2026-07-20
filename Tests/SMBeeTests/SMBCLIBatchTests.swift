@@ -90,6 +90,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--exclude",
             "*.bak",
             "--dry-run",
+            "--json",
             "--no-overwrite",
             "--recursive",
             "--progress",
@@ -100,6 +101,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(command.localDirectory, "/tmp/out")
         XCTAssertEqual(command.exclude, ["debug-*", "*.bak"])
         XCTAssertTrue(command.dryRun)
+        XCTAssertTrue(command.json)
         XCTAssertTrue(command.noOverwrite)
         XCTAssertTrue(command.recursive)
         XCTAssertTrue(command.progress)
@@ -113,6 +115,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--exclude",
             "file9.*",
             "--dry-run",
+            "--json",
             "--no-overwrite",
             "--recursive",
             "--progress",
@@ -123,6 +126,7 @@ final class SMBCLIBatchTests: XCTestCase {
         XCTAssertEqual(command.remoteDirectory, "smb://user@host/share/dir")
         XCTAssertEqual(command.exclude, ["file9.*"])
         XCTAssertTrue(command.dryRun)
+        XCTAssertTrue(command.json)
         XCTAssertTrue(command.noOverwrite)
         XCTAssertTrue(command.recursive)
         XCTAssertTrue(command.progress)
@@ -214,6 +218,28 @@ final class SMBCLIBatchTests: XCTestCase {
             recursiveActionLine(action, json: true),
             "{\"action\":\"download\",\"path\":\"dir\\\\file.txt\"}"
         )
+    }
+
+    func testBatchJSONLinesAreMachineReadableAndIncludeDryRunSummary() throws {
+        let action = batchActionLine(
+            kind: .download,
+            source: "dir\\file.txt",
+            destination: "/tmp/file.txt",
+            json: true
+        )
+        let actionObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(action.utf8)) as? [String: Any])
+        XCTAssertEqual(actionObject["action"] as? String, "download")
+        XCTAssertEqual(actionObject["source"] as? String, "dir\\file.txt")
+        XCTAssertEqual(actionObject["destination"] as? String, "/tmp/file.txt")
+
+        let summary = batchSummaryLine(command: "mget", action: "planned", count: 2, skipped: 1, dryRun: true, json: true)
+        let summaryObject = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(summary.utf8)) as? [String: Any])
+        XCTAssertEqual(summaryObject["command"] as? String, "mget")
+        XCTAssertEqual(summaryObject["action"] as? String, "planned")
+        XCTAssertEqual(summaryObject["count"] as? Int, 2)
+        XCTAssertEqual(summaryObject["skipped"] as? Int, 1)
+        XCTAssertEqual(summaryObject["dryRun"] as? Bool, true)
+        XCTAssertEqual(summaryObject["ok"] as? Bool, true)
     }
 
     func testVerifyHashModeParsesAndLocalHashMatchesKnownVector() throws {

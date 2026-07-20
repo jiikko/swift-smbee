@@ -350,13 +350,12 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-7. CLI surface follow-up
 
-状態: `partial`（byte-range lock surface は実装済み）
+状態: `partial`（byte-range lock / batch dry-run / JSON surface は実装済み）
 
 残:
 
 - byte-range lock CLI (`smbcli lock`) は実装済み。実サーバ matrix での CLI smoke は残る。
-- mget/mput の確認 prompt を実装するか、`--dry-run` で代替すると明記する。
-- JSON schema が増えたら `docs/smbcli-json.md` を更新する。
+- `mget` / `mput` は非対話で使えるよう確認 prompt を設けず、`--dry-run` を明示的な確認手段とする。`--json` は item action と summary の NDJSON を出力する。unit + Samba CLI smoke で回帰をカバー済み。
 
 ## P3: optional / advanced / 明示的に後回し
 

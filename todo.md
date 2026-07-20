@@ -41,6 +41,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - graceful TREE_DISCONNECT / LOGOFF
 - `smbcli lock`（byte-range lock の acquire/release surface）
 - `SMBFileStat.allocationSize` / `stat --json` allocation size
+- `mget` / `mput` の `--dry-run` による非対話確認と `--json` NDJSON action / summary
 - `SMBee.read(..., operationTimeout:)` の単一 read deadline
 - 1 MiB local read/write chunk、credit-aware multi-flight I/O、週次 4GiB+ read-stream E2E
 - shared session 上の in-flight READ cancel 後の response drain（実 NAS で再利用確認済み）

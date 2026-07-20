@@ -31,8 +31,11 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "${local_dir}/dir/child"
+mkdir -p "${local_dir}/batch-source" "${local_dir}/batch-plan" "${local_dir}/batch-download"
 printf "hello smbee command smoke\n" > "${local_dir}/file.txt"
 printf "nested payload\n" > "${local_dir}/dir/child/nested.txt"
+printf "batch one\n" > "${local_dir}/batch-source/one.txt"
+printf "batch two\n" > "${local_dir}/batch-source/two.txt"
 
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" ls "${SMB_URL}"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" ls --json "${SMB_URL}" | grep -F '"name":"known.txt"'
@@ -40,6 +43,14 @@ SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" shares "${SMB_SERVER_URL}" | gr
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" shares --json "${SMB_SERVER_URL}" | grep -F "\"name\":\"${SMBEE_E2E_SHARE}\""
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" ping "${SMB_URL}"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mkdir "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}"
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mput --dry-run --json "${local_dir}/batch-source" "*.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/batch" | grep -F '"command":"mput"' | grep -F '"dryRun":true'
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mput --json "${local_dir}/batch-source" "*.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/batch" | grep -F '"command":"mput"' | grep -F '"action":"uploaded"'
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mput --no-overwrite --json "${local_dir}/batch-source" "*.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/batch" | grep -F '"command":"mput"' | grep -F '"skipped":2'
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mget --dry-run --json "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/batch" "*.txt" "${local_dir}/batch-plan" | grep -F '"command":"mget"' | grep -F '"dryRun":true'
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mget --json "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/batch" "*.txt" "${local_dir}/batch-download" | grep -F '"command":"mget"' | grep -F '"action":"downloaded"'
+SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" mget --no-overwrite --json "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/batch" "*.txt" "${local_dir}/batch-download" | grep -F '"command":"mget"' | grep -F '"skipped":2'
+cmp "${local_dir}/batch-source/one.txt" "${local_dir}/batch-download/one.txt"
+cmp "${local_dir}/batch-source/two.txt" "${local_dir}/batch-download/two.txt"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" put "${local_dir}/file.txt" "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" stat "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt" | grep -Fx "size: 26"
 SMB_PASSWORD="${SMBEE_E2E_PASSWORD}" "${SMBCLI}" stat --json "${SMB_URL}/${SMBEE_E2E_SMOKE_ROOT}/file.txt" | grep -F '"size":26'

@@ -43,6 +43,9 @@ struct MGet: AsyncParsableCommand {
     @Flag(help: "Print planned transfers without downloading")
     var dryRun = false
 
+    @Flag(help: "Output newline-delimited JSON actions and a final summary")
+    var json = false
+
     @Flag(help: "Skip files whose local destination already exists")
     var noOverwrite = false
 
@@ -100,11 +103,21 @@ struct MGet: AsyncParsableCommand {
             let localFile = URL(fileURLWithPath: localDirectory).appendingPathComponent(file.relativePath)
             if noOverwrite, FileManager.default.fileExists(atPath: localFile.path) {
                 skipped += 1
-                print("skip \(file.relativePath) (exists)")
+                writeBatchAction(
+                    kind: .skip,
+                    source: remotePath,
+                    destination: localFile.path,
+                    json: json
+                )
                 continue
             }
             if dryRun {
-                print("download \(remotePath) -> \(localFile.path)")
+                writeBatchAction(
+                    kind: .download,
+                    source: remotePath,
+                    destination: localFile.path,
+                    json: json
+                )
                 continue
             }
             try FileManager.default.createDirectory(at: localFile.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -119,9 +132,10 @@ struct MGet: AsyncParsableCommand {
             try await session.download(path: remotePath, localFile: localFile, overwrite: !noOverwrite, onProgress: onProgress)
             progressWriter?.finish()
             transferred += 1
+            writeBatchAction(kind: .download, source: remotePath, destination: localFile.path, json: json)
         }
         let count = dryRun ? files.count - skipped : transferred
-        printBatchSummary(action: dryRun ? "planned" : "downloaded", count: count, skipped: skipped)
+        writeBatchSummary(command: "mget", action: dryRun ? "planned" : "downloaded", count: count, skipped: skipped, dryRun: dryRun, json: json)
     }
 }
 
@@ -146,6 +160,9 @@ struct MPut: AsyncParsableCommand {
 
     @Flag(help: "Print planned transfers without uploading")
     var dryRun = false
+
+    @Flag(help: "Output newline-delimited JSON actions and a final summary")
+    var json = false
 
     @Flag(help: "Skip files whose remote destination already exists")
     var noOverwrite = false
@@ -215,11 +232,21 @@ struct MPut: AsyncParsableCommand {
             }
             if noOverwrite, exists {
                 skipped += 1
-                print("skip \(file.name) (exists)")
+                writeBatchAction(
+                    kind: .skip,
+                    source: file.url.path,
+                    destination: remotePath,
+                    json: json
+                )
                 continue
             }
             if dryRun {
-                print("upload \(file.url.path) -> \(remotePath)")
+                writeBatchAction(
+                    kind: .upload,
+                    source: file.url.path,
+                    destination: remotePath,
+                    json: json
+                )
                 continue
             }
             try await makeRemoteParentDirectories(session: session, remotePath: remotePath)
@@ -234,9 +261,10 @@ struct MPut: AsyncParsableCommand {
             try await session.upload(path: remotePath, fileURL: file.url, overwrite: !noOverwrite, onProgress: onProgress)
             progressWriter?.finish()
             transferred += 1
+            writeBatchAction(kind: .upload, source: file.url.path, destination: remotePath, json: json)
         }
         let count = dryRun ? files.count - skipped : transferred
-        printBatchSummary(action: dryRun ? "planned" : "uploaded", count: count, skipped: skipped)
+        writeBatchSummary(command: "mput", action: dryRun ? "planned" : "uploaded", count: count, skipped: skipped, dryRun: dryRun, json: json)
     }
 
     private func makeRemoteParentDirectories(session: SMBClientSession, remotePath: String) async throws {
@@ -467,10 +495,50 @@ private func remoteDirectoryEntries(session: SMBClientSession, path: String) asy
     return collector.entries
 }
 
-private func printBatchSummary(action: String, count: Int, skipped: Int) {
-    if skipped == 0 {
-        print("\(action): \(count)")
-    } else {
-        print("\(action): \(count), skipped: \(skipped)")
+enum BatchActionKind: String, Encodable {
+    case download
+    case upload
+    case skip
+}
+
+private struct BatchActionOutput: Encodable {
+    let action: BatchActionKind
+    let source: String
+    let destination: String
+}
+
+private struct BatchSummaryOutput: Encodable {
+    let command: String
+    let action: String
+    let count: Int
+    let skipped: Int
+    let dryRun: Bool
+    let ok = true
+}
+
+func batchActionLine(kind: BatchActionKind, source: String, destination: String, json: Bool) -> String {
+    guard json else {
+        return "\(kind.rawValue) \(source) -> \(destination)"
     }
+    return (try? String(decoding: JSONEncoder().encode(BatchActionOutput(action: kind, source: source, destination: destination)), as: UTF8.self))
+        ?? "{\"ok\":false,\"error\":\"failed to encode batch action\"}"
+}
+
+func batchSummaryLine(command: String, action: String, count: Int, skipped: Int, dryRun: Bool, json: Bool) -> String {
+    guard json else {
+        if skipped == 0 {
+            return "\(action): \(count)"
+        }
+        return "\(action): \(count), skipped: \(skipped)"
+    }
+    return (try? String(decoding: JSONEncoder().encode(BatchSummaryOutput(command: command, action: action, count: count, skipped: skipped, dryRun: dryRun)), as: UTF8.self))
+        ?? "{\"ok\":false,\"error\":\"failed to encode batch summary\"}"
+}
+
+private func writeBatchAction(kind: BatchActionKind, source: String, destination: String, json: Bool) {
+    print(batchActionLine(kind: kind, source: source, destination: destination, json: json))
+}
+
+private func writeBatchSummary(command: String, action: String, count: Int, skipped: Int, dryRun: Bool, json: Bool) {
+    print(batchSummaryLine(command: command, action: action, count: count, skipped: skipped, dryRun: dryRun, json: json))
 }

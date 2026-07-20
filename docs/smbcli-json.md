@@ -17,6 +17,8 @@ Commands with stable JSON output:
 - `dfs --json`
 - `watch --json`
 - `sparse --query --json`
+- `mget --json`
+- `mput --json`
 
 `stat --json` includes the server-reported `allocationSize` when available.
 
@@ -44,6 +46,22 @@ object (suppressed for `--dry-run`, where the NDJSON lines are the plan):
 ```json
 {"action":"download","path":"dir\\file.txt"}
 ```
+
+Batch runs (`mget` / `mput`) with `--json` also print newline-delimited JSON:
+one `{action,source,destination}` object for each downloaded, uploaded, planned,
+or skipped item, followed by one summary object. The summary has
+`command`, `action` (`planned`, `downloaded`, or `uploaded`), `count`,
+`skipped`, `dryRun`, and `ok`. For example:
+
+```json
+{"action":"upload","source":"/tmp/in/a.txt","destination":"dir\\a.txt"}
+{"command":"mput","action":"uploaded","count":1,"skipped":0,"dryRun":false,"ok":true}
+```
+
+`mget` and `mput` deliberately have no interactive confirmation prompt: this
+keeps stdin usable in scripts. Use `--dry-run` to review the exact transfer
+plan before running a mutating batch command; it emits the same action records
+with a `planned` summary and makes no file changes.
 
 Success output shape:
 

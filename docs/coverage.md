@@ -65,7 +65,7 @@ Status labels:
 | JSON output | CLI | `SMBCLIOutput.swift`, `smbcli`, `docs/smbcli-json.md` | yes | yes | no | no | partial | Core inspection commands and `watch` have JSON smoke coverage. Mutating commands expose success JSON when `--json` is set. `--json` errors use a structured stderr object. |
 | exit codes | CLI | `SMBCLI.swift`, `docs/smbcli-exit-codes.md` | yes | yes | no | no | covered | Keep exhaustive mapping as `SMBError` evolves. |
 | debug redaction | operational | `SMBDebug.swift`, `smbcli --debug/--trace-wire` | yes | yes | no | no | covered | Raw wire trace remains explicitly opt-in. |
-| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift`, `SMB2Cancel` | yes | yes | no | no | partial | Socket-level timeout is broadly wired. `smbcli --operation-timeout` wraps all commands, `SMBee.read(..., operationTimeout:)` covers single reads, recursive transfers have per-file timeout, and recursive get/put expose per-file progress. Public deadline parameters for write/recursive APIs remain. CHANGE_NOTIFY cancellation sends SMB2 CANCEL. |
+| timeout/progress/cancellation | operational | `SMBTransport.swift`, `SMBOperationDeadline.swift`, `SMBTransferProgress.swift`, `SMB2Cancel` | yes | yes | no | no | implemented-but-underverified | Socket-level timeout is broadly wired. `smbcli --operation-timeout` wraps all commands; read, upload, and recursive download/upload/copy/delete expose operation deadlines; recursive transfers retain per-file timeout. Deadline errors are `SMBTransportError.timedOut`. CHANGE_NOTIFY cancellation sends SMB2 CANCEL. Windows/NAS cancellation smoke remains. |
 
 ## Release Blockers
 

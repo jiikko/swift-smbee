@@ -322,17 +322,17 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-5. operation-level deadline の public API 方針
 
-状態: `partial`
+状態: `implemented-but-underverified`
 
 現状:
 
 - socket-level `timeout` は配線済み。
 - CLI は `--operation-timeout` と recursive transfer の `--per-file-timeout` を持つ。
 
-残:
-
-- `SMBee.read(..., operationTimeout:)` を追加済み。write/recursive API への展開は、ブロック中の transport receive を deadline cancellation で確実に中断できるようにしてから行う。
-- timeout error taxonomy を固定する。
+- `SMBee.read(...)`、単一/再帰 upload、recursive download/copy/delete に `operationTimeout` を公開済み。
+- `operationTimeout` は credential provider・接続・再帰 traversal を含む操作全体、`perFileTimeout` は再帰転送の各ファイル、`timeout` は socket send/receive に適用する。
+- deadline 超過の error taxonomy は `SMBTransportError.timedOut` に固定。unit で cancellation と各 facade の deadline をカバーする。
+- Windows / NAS の blocking receive cancellation 実測は pending。
 
 ### P2-6. keepalive と reconnect policy の統合
 
@@ -430,7 +430,7 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - SID lookup: LSARPC lookup 実装済み。残件は AD / Samba AD 実測と issue 更新。
 - owner/group write: 実装済み。SACL は scope 外。
 - byte-level resume / verify: 実装済み。sparse transfer は logical-content policy を採用し、allocation topology は保持しない。
-- operation timeout: CLI と `SMBee.read(..., operationTimeout:)` に実装済み。残件は write/recursive API への展開判断。
+- operation timeout: CLI と `SMBee.read(...)`、upload、recursive download/upload/copy/delete に実装済み。残件は Windows / NAS の cancellation 実測。
 - durable handle: 現時点では unsupported として明記する。
 - shared-session READ cancel: 送信中 task を cancel せず response を drain する修正済み。blocking-send unit / Samba E2E / 実 NAS 確認あり。Windows / 他 NAS の互換確認は残る。
 

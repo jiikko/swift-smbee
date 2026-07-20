@@ -42,7 +42,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - `smbcli lock`（byte-range lock の acquire/release surface）
 - `SMBFileStat.allocationSize` / `stat --json` allocation size
 - `mget` / `mput` の `--dry-run` による非対話確認と `--json` NDJSON action / summary
-- `SMBee.read(..., operationTimeout:)` の単一 read deadline
+- `SMBee.read(...)` / upload / recursive download・upload・copy・delete の operation deadline
 - 1 MiB local read/write chunk、credit-aware multi-flight I/O、週次 4GiB+ read-stream E2E
 - shared session 上の in-flight READ cancel 後の response drain（実 NAS で再利用確認済み）
 - socket timeout / operation timeout / per-file timeout
@@ -124,7 +124,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - share discovery / volume / ACL / SID lookup の実サーバ smoke
 - reparse / readlink の実サーバ smoke
 - sparse file preservation（通常 get/put/copy は logical-content policy。allocation size 表示と Samba sparse FSCTL E2E は実装済み。hole topology の保存は明示的に未対応）
-- operation-level deadline の public API 化判断
+- operation-level deadline の Windows / NAS 実測
 - keepalive と reconnect policy の統合
 - byte-range lock CLI surface
 - JSON schema 更新運用
@@ -155,7 +155,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - byte-level resume / `--verify size|hash` は実装済み。
 - sparse FSCTL と allocation size 表示は実装済み。通常 transfer は logical-content policy とし、hole topology preservation は未対応として明示する。
 - operation timeout は CLI 実装済み。残りは public API 化判断。
-- `SMBee.read(..., operationTimeout:)` は実装済み。残りは write/recursive API への展開判断。
+- `SMBee.read(...)`、upload、recursive download/upload/copy/delete の `operationTimeout` は実装済み。残りは Windows / NAS の cancellation 実測。
 - shared session の READ cancel は、送信中 task を cancel せず response を drain するよう修正済み。残りは Windows / 他 NAS の互換確認。
 - durable handle は未実装ではなく、現時点では unsupported として扱う。
 

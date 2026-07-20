@@ -821,6 +821,24 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testSMBeeCopyDirectoryOperationTimeout() async throws {
+        do {
+            try await SMBee.copyDirectory(
+                host: "server",
+                credentialProvider: {
+                    try await Task.sleep(for: .seconds(5))
+                    return .anonymous
+                },
+                share: "share",
+                fromPath: "source",
+                toPath: "destination",
+                operationTimeout: .milliseconds(10)
+            )
+            XCTFail("recursive copy unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        }
+    }
+
     func testReadURLParserKeepsUserInfoPassword() throws {
         let endpoint = try SMBURLParser.parseReadURL("smb://user:pass@server:1445/share/path/to/file.txt")
 

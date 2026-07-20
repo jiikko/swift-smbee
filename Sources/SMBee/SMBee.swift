@@ -984,6 +984,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter operationTimeout: Deadline for the complete recursive server-side copy.
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
@@ -996,34 +997,37 @@ public enum SMBee {
         skipExisting: Bool = false,
         dryRun: Bool = false,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
-        try await SMBClient.copyDirectory(
-            host: host,
-            port: port,
-            share: share,
-            fromPath: fromPath,
-            toPath: toPath,
-            overwrite: overwrite,
-            continueOnError: continueOnError,
-            skipExisting: skipExisting,
-            dryRun: dryRun,
-            include: include,
-            exclude: exclude,
-            perFileTimeout: perFileTimeout,
-            credential: credential,
-            timeout: timeout,
-            onAction: onAction
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.copyDirectory(
+                host: host,
+                port: port,
+                share: share,
+                fromPath: fromPath,
+                toPath: toPath,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                dryRun: dryRun,
+                include: include,
+                exclude: exclude,
+                perFileTimeout: perFileTimeout,
+                credential: credential,
+                timeout: timeout,
+                onAction: onAction
+            )
+        }
     }
 
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         fromPath: String,
         toPath: String,
@@ -1031,27 +1035,30 @@ public enum SMBee {
         continueOnError: Bool = false,
         skipExisting: Bool = false,
         dryRun: Bool = false,
+        operationTimeout: Duration? = nil,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
-        try await SMBClient.copyDirectory(
-            host: host,
-            port: port,
-            share: share,
-            fromPath: fromPath,
-            toPath: toPath,
-            overwrite: overwrite,
-            continueOnError: continueOnError,
-            skipExisting: skipExisting,
-            dryRun: dryRun,
-            include: include,
-            exclude: exclude,
-            perFileTimeout: perFileTimeout,
-            credentialProvider: credentialProvider,
-            onAction: onAction
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.copyDirectory(
+                host: host,
+                port: port,
+                share: share,
+                fromPath: fromPath,
+                toPath: toPath,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                dryRun: dryRun,
+                include: include,
+                exclude: exclude,
+                perFileTimeout: perFileTimeout,
+                credentialProvider: credentialProvider,
+                onAction: onAction
+            )
+        }
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.

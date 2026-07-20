@@ -82,25 +82,25 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
    - 1.0向けrelease artifact配布方針。
    - Sendable / error taxonomy / cancellation / timeout semantics の凍結。
 
-### P1: smbclient 中核残件
+### P1: smbclient 中核の状態
 
-1. **SMB2 credit / multi-credit large IO E2E**
-   - 状態: `implemented-but-underverified`（暗号化 large READ/WRITE は CI E2E 済み）
+1. **SMB2 credit / multi-credit large IO**
+   - 状態: `implemented`（暗号化 large READ/WRITE は CI E2E 済み）
    - credit accounting / `SMB2CreditWindow` / messageId demux と 1 MiB local chunk は実装済み。
    - 4GiB+ read-stream E2E は weekly workflow で実行する。PR/push には 4GiB 境界 range-read E2E がある。
    - SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
-   - 残りは offload-capable server の copychunk 実測と throughput regression の継続監視。
+   - offload-capable server の copychunk 実測は compatibility matrix、throughput regression は継続的な CI 運用として扱う。
 
-2. **multi-share / multi-tree session model**
+2. **multi-share / multi-tree session model** — `implemented`
    - `SMBClientSession.listShares()` が同一認証セッション上で IPC$ を一時接続し、既存 tree を維持する。
    - `withTree(share:)` で public / 別 share を同じ session から扱え、child tree を tracking して session close 時に全 tree を切断する。
    - DFS referral も同一 session の scoped DFS-root tree 経由に統合済み。
    - `withTree(share:)` は実装済み。
    - scoped tree API で必要な multi-share 利用・helper 統合・child tree tracking は完了。full server/tree 型分離は任意の API 整理として扱う。
 
-3. **DFS referral real E2E + optional auto-follow**
+3. **DFS referral real E2E + auto-follow** — `implemented-but-underverified`
    - `SMBee.dfsReferral` / `smbcli dfs` は実装済み。
-   - Samba msdfs link の実 wire referral decode は push CI E2E で検証する。
+   - Samba msdfs link の実 wire referral decode は push CI E2E で検証済み。
    - `SMBee.resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS` は multi-hop、loop detection、credential-scoped / bounded TTL cache、path suffix rewrite を実装済み。
    - `connectFollowingDFS` は `SMBDfsConnection` として session・最終 relative path・hop 数を返す。
    - Samba E2E で chain link の list/read、suffix rewrite、loop rejection を検証済み。custom target selection は `SMBDfsReferralResult.targets` で可能。
@@ -124,8 +124,8 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - reparse / readlink の実サーバ smoke
 - sparse file preservation（通常 get/put/copy は logical-content policy。allocation size 表示と Samba sparse FSCTL E2E は実装済み。hole topology の保存は明示的に未対応）
 - operation-level deadline の Windows / NAS 実測
-- keepalive と reconnect policy の統合
-- byte-range lock CLI surface
+- keepalive invalidation / watch reconnect policy の実サーバ smoke
+- byte-range lock CLI の実サーバ smoke
 - JSON schema 更新運用
 
 ### P3: optional / advanced / 後回し
@@ -167,10 +167,8 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 
 ## 推奨順
 
-1. compatibility matrix の実サーバ結果埋め。
-2. multi-credit WRITE / SMB 3.1.1 encrypted large IO E2E。
-3. multi-tree session model 整理。
-4. DFS real E2E + optional auto-follow。
-5. API stability / packaging。
-6. macOS metadata / named stream policy（data fork only。resource fork / xattr / ADS は未対応）。
-7. Kerberos / GSS。実要件が出たら着手。
+1. API stability / packaging（0.1 freeze note、deprecation、DocC、1.0 artifact policy）。
+2. compatibility matrix の実サーバ結果埋め（Windows は pending）。
+3. offload-capable server の copychunk と各実サーバ固有機能の smoke。
+4. Kerberos / GSS。0.1 では unsupported を明示し、実要件と検証環境が揃った段階で着手。
+5. compression / multichannel / QUIC / POSIX extensions / named streams は optional roadmap とし、対応までは unsupported を維持。

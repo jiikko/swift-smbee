@@ -6,7 +6,7 @@
 
 ## 監査時点
 
-- 最終更新: 2026-07-19
+- 最終更新: 2026-07-20
 - 対象 branch: `master`
 - 正本仕様:
   - MS-SMB2: SMB2/3 command、dialect、signing/encryption、credit、durable handle、CHANGE_NOTIFY
@@ -124,9 +124,9 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P1-1. SMB2 credit accounting / multi-credit large IO E2E
 
-状態: `implemented-but-underverified`
+状態: `implemented`（実サーバ固有の offload 経路は compatibility matrix で継続検証）
 
-更新: SMB 3.1.1 encrypted の 2MiB+ READ/WRITE と multi-credit WRITE は push CI E2E で検証済み。残りは copychunk 実測と性能回帰監視。
+更新: SMB 3.1.1 encrypted の 2MiB+ READ/WRITE と multi-credit WRITE は push CI E2E で検証済み。copychunk 実測と性能回帰監視は継続検証へ移した。
 
 現状:
 
@@ -135,15 +135,12 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグは修正済み。
 - local read/write chunk cap は 1 MiB へ引き上げ済み。
 - PR/push には 4GiB 境界 range-read E2E があり、週次 `Large-file E2E` workflow は sparse 4GiB+ fixture で read-stream と EOF を検証する。
-   - SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
-   - 残件は offload-capable server の copychunk 実測と性能回帰監視。
+- SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
 
-やること:
+継続検証:
 
-- copychunk と encryption overhead を含む chunk planner の E2E 検証を広げる。
-- SMB 3.1.1 encrypted session で 1 MiB chunk の large file read/write を実行する。
-- multi-credit WRITE と offload-capable server の copychunk を実測する。
-- throughput regression を command count / byte count / chunk count で監視する。
+- offload-capable server では copychunk 実経路を compatibility matrix に記録する。非対応サーバでの read/write fallback は unit と Samba E2E でカバー済み。
+- throughput regression は command count / byte count / chunk count で監視する。
 
 完了条件:
 
@@ -152,7 +149,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P1-2. multi-share / multi-tree session model
 
-状態: `implemented-but-underverified`（scoped tree API で実装済み）
+状態: `implemented`（scoped tree API を採用）
 
 更新: `SMBClientSession.listShares()` と `SMBClientTreeSession.listShares()` を追加し、IPC$ share discovery を同一認証 session の scoped tree として実行できるようにした。`withTree(share:)` で public / 別 share も同一 session 上で扱え、child tree tracking と session close 時の全 tree 切断にも対応した。DFS referral は scoped DFS-root tree 上で実行する。
 
@@ -163,11 +160,10 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - share discovery は scoped IPC$ tree、DFS referral は scoped DFS-root tree を使用する。
 - full `SMBServerSession` / `SMBTreeSession` 型分離は未実装（現 API の scoped tree で要件を満たす）。
 
-やること:
+判断:
 
-- `SMBServerSession` と `SMBTreeSession` に分けるか、既存 API のまま scoped tree を強化するか決める。
-- IPC$ / data share / DFS / LSA helper を `withTree` ベースで統合する。
-- graceful teardown を tree 単位 / session 単位に分ける。
+- 0.1 API は既存の `SMBClientSession` / `SMBClientTreeSession` と scoped `withTree` を採用する。full server/tree 型分離は必須残件にしない。
+- IPC$ / data share / DFS helper の `withTree` 統合と、tree/session 単位の graceful teardown は実装・unit coverage 済み。
 
 完了条件:
 
@@ -239,7 +235,7 @@ Linux/macOS smbclient として必要な理由:
 
 ### P1-6. macOS metadata / resource fork / alternate data stream policy
 
-状態: `implemented-but-underverified`（data fork only policy を固定）
+状態: `implemented`（data fork only policy を固定）
 
 現状:
 
@@ -331,7 +327,7 @@ Linux/macOS smbclient として必要な理由:
 
 - `SMBee.read(...)`、単一/再帰 upload、recursive download/copy/delete の credential / credential-provider overload に `operationTimeout` を公開済み。provider 版は `operationTimeout` 明示overloadと旧非escaping overloadを分け、ソース互換性を維持する。
 - `operationTimeout` は credential provider・接続・再帰 traversal を含む操作全体、`perFileTimeout` は再帰転送の各ファイル、`timeout` は socket send/receive に適用する。
-- deadline 超過の error taxonomy は `SMBTransportError.timedOut` に固定。deadline は cooperative な client-side cancellation であり、完了済みの local / remote side effect は rollback しない。
+- deadline 超過の error taxonomy は `SMBTransportError.timedOut` に固定。deadline は cooperative な client-side cancellation で、operation task の終了を待つため指定時間を超えて返る場合がある。完了済みの local / remote side effect は rollback しない。
 - unit で provider 解決中と認証後 blocking receive の deadline（単一 / 再帰 upload を含む）、Samba E2E で再帰操作の成功経路と delete 後の不存在をカバーする。
 - Windows / NAS の blocking receive cancellation 実測は pending。
 
@@ -352,7 +348,7 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-7. CLI surface follow-up
 
-状態: `partial`（byte-range lock / batch dry-run / JSON surface は実装済み）
+状態: `implemented-but-underverified`（byte-range lock / batch dry-run / JSON surface は実装済み）
 
 残:
 
@@ -442,23 +438,21 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - SMB 3.x only。SMB 2.1 authenticated fallback は非対応。SMB 2.1 は probe-only。
 - Kerberos / GSS は未対応。現状は NTLMv2 / NT hash / anonymous。
 - Windows SMB Server / NAS は smoke 未完了。
-- durable / persistent handle は未対応。lease / oplock は要求しない。byte-range lock は library API 先行。
+- durable / persistent handle は未対応。lease / oplock は要求しない。byte-range lock は library API / CLI ともに実装済み。
 - DFS referral は multi-hop auto-follow、loop detection、TTL cache、path suffix rewrite と Samba msdfs E2E まで実装済み。Windows DFS は matrix pending。
 - symlink / mount point / LX symlink は `readlink` で target 解決可。DFS/NFS reparse data は opaque。
 - byte-level resume と `--verify size|hash` は対応済み。
 - sparse FSCTL と allocation size 表示は対応済み。通常 transfer は logical-content policy、hole topology preservation は未対応。
-- macOS resource fork / xattr / named stream preservation は未対応または方針未決。
+- macOS resource fork / xattr / named stream preservation は data fork only policy により対象外。
 - SMB1 / NetBIOS / port 139 / printer / RDMA / QUIC / multichannel / compression は未対応。
 
 ## 推奨実装順
 
-1. P0-1 compatibility matrix の実サーバ結果埋め。Windows / NAS / macOS SMBX re-run。
-2. P1-1 multi-credit WRITE / SMB 3.1.1 encrypted large IO E2E。
-3. P1-2 multi-tree session model。
-4. P1-3 DFS real E2E + optional auto-follow。
-5. P0-2 API stability / packaging。
-6. P1-6 macOS metadata / named stream policy。
-7. P1-4 Kerberos / GSS。実ユーザーや実サーバ要件が出たら着手。
+1. P0-2 API stability / packaging（0.1 freeze note、deprecation、DocC、1.0 artifact policy）。
+2. P0-1 compatibility matrix の実サーバ結果埋め。Windows は環境待ち pending、NAS / macOS SMBX は継続実測。
+3. offload-capable server の copychunk と各実サーバ固有機能の smoke。
+4. P1-4 Kerberos / GSS。0.1 では unsupported を明示し、実ユーザー要件と AD / GSS 検証環境が揃った段階で着手。
+5. P3 optional features は roadmap として維持し、実装までは unsupported を明記する。
 
 ## 完了の定義
 

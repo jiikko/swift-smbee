@@ -176,7 +176,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P1-3. DFS referral の実サーバ E2E と auto-follow
 
-状態: `partial`
+状態: `implemented-but-underverified`（invalidation policy を固定）
 
 現状:
 
@@ -337,7 +337,7 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-6. keepalive と reconnect policy の統合
 
-状態: `partial`
+状態: `implemented-but-underverified`（invalidation policy を固定）
 
 現状:
 
@@ -346,8 +346,9 @@ Linux/macOS smbclient として必要な理由:
 
 残:
 
-- keepalive 失敗時に reconnect まで行うか、session invalidation のみにするか決める。
-- watch reconnect との責務分離を docs に書く。
+- keepalive は ECHO 失敗時に transport を閉じて session を invalid にする。透過的な reconnect / handle replay は行わない。
+- watch の再接続は `withChangeNotifications(autoReconnect:)` / `smbcli watch --reconnect` に限定する。keepalive は watch の resubscribe を行わない。
+- Windows / NAS での ECHO failure と invalidation の matrix は残る。
 
 ### P2-7. CLI surface follow-up
 

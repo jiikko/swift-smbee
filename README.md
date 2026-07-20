@@ -46,6 +46,7 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 - DFS referral は metadata 取得のみ。target への auto-follow は未対応。
 - reparse point / symlink / mount point / LX symlink の target は `readlink` API で扱える。DFS/NFS の reparse data は MS-FSCC 上 opaque (client 解釈対象外) で、DFS link の解決は `smbcli dfs` (FSCTL_DFS_GET_REFERRALS)。実サーバ readlink smoke は未完了。
 - single-file download/upload の byte-level resume と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file は `smbcli sparse` (SET_SPARSE / hole punch / allocated-range query) と `stat`/JSON の `allocationSize` に対応 (FS 依存)。通常の get/put/copy は file size と byte content を保証する logical-content policy であり、転送時の hole topology preservation は未対応。
+- keepalive は authenticated ECHO の失敗時に session を invalid にして transport を閉じるだけで、自動 reconnect はしない。通知監視の再接続は `withChangeNotifications(autoReconnect:)` / `smbcli watch --reconnect` の責務とする。
 - `SMBee.read(..., operationTimeout:)` で単一 read の operation deadline を指定できる。write/recursive API への展開は未整理。
 - macOS resource fork / xattr / named stream preservation は未対応。通常の data fork 転送を対象にする。
 - SMB1 / NetBIOS port 139 / printer share / SMB Direct(RDMA) / SMB over QUIC / multichannel / compression は未対応。

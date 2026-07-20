@@ -1105,6 +1105,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter operationTimeout: Deadline for the complete delete, including recursive traversal when requested.
     public static func delete(
         host: String,
         port: UInt16 = 445,
@@ -1116,46 +1117,52 @@ public enum SMBee {
         continueOnError: Bool = false,
         dryRun: Bool = false,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
-        try await SMBClient.delete(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            directory: directory,
-            recursive: recursive,
-            continueOnError: continueOnError,
-            dryRun: dryRun,
-            credential: credential,
-            timeout: timeout,
-            onAction: onAction
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.delete(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                directory: directory,
+                recursive: recursive,
+                continueOnError: continueOnError,
+                dryRun: dryRun,
+                credential: credential,
+                timeout: timeout,
+                onAction: onAction
+            )
+        }
     }
 
     public static func delete(
         host: String,
         port: UInt16 = 445,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
         directory: Bool = false,
         recursive: Bool = false,
         continueOnError: Bool = false,
         dryRun: Bool = false,
+        operationTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil
     ) async throws {
-        try await SMBClient.delete(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            directory: directory,
-            recursive: recursive,
-            continueOnError: continueOnError,
-            dryRun: dryRun,
-            credentialProvider: credentialProvider,
-            onAction: onAction
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.delete(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                directory: directory,
+                recursive: recursive,
+                continueOnError: continueOnError,
+                dryRun: dryRun,
+                credentialProvider: credentialProvider,
+                onAction: onAction
+            )
+        }
     }
 }

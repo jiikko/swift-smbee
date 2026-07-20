@@ -839,6 +839,25 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testSMBeeRecursiveDeleteOperationTimeout() async throws {
+        do {
+            try await SMBee.delete(
+                host: "server",
+                credentialProvider: {
+                    try await Task.sleep(for: .seconds(5))
+                    return .anonymous
+                },
+                share: "share",
+                path: "directory",
+                directory: true,
+                recursive: true,
+                operationTimeout: .milliseconds(10)
+            )
+            XCTFail("recursive delete unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        }
+    }
+
     func testReadURLParserKeepsUserInfoPassword() throws {
         let endpoint = try SMBURLParser.parseReadURL("smb://user:pass@server:1445/share/path/to/file.txt")
 

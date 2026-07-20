@@ -204,6 +204,7 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
     private let lock = NSLock()
     private let receiveState = ReceiveState()
     private var inbound: [UInt8]
+    private var outboundStorage: [UInt8] = []
     private var blocked = false
 
     init(inbound: [UInt8]) {
@@ -214,6 +215,10 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
         lock.withLock { blocked }
     }
 
+    var outbound: [UInt8] {
+        lock.withLock { outboundStorage }
+    }
+
     func connect(host: String, port: UInt16) async throws {
         try Task.checkCancellation()
         _ = host
@@ -222,7 +227,9 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
 
     func send(_ bytes: [UInt8]) async throws {
         try Task.checkCancellation()
-        _ = bytes
+        lock.withLock {
+            outboundStorage.append(contentsOf: bytes)
+        }
     }
 
     func receive(maxLength: Int) async throws -> [UInt8] {
@@ -862,7 +869,7 @@ final class SMBeeTests: XCTestCase {
         do {
             try await SMBee.downloadDirectory(
                 host: "server",
-                credential: SMBCredential(username: "user", password: "pass"),
+                credential: .anonymous,
                 share: "share",
                 path: "remote",
                 localDirectory: destination,
@@ -872,6 +879,7 @@ final class SMBeeTests: XCTestCase {
         } catch SMBTransportError.timedOut {
         }
         XCTAssertTrue(transport.didBlockAfterScript)
+        try assertOutboundContainsCreateRequest(transport)
     }
 
     func testSMBeeCopyDirectoryOperationTimeout() async throws {
@@ -882,7 +890,7 @@ final class SMBeeTests: XCTestCase {
         do {
             try await SMBee.copyDirectory(
                 host: "server",
-                credential: SMBCredential(username: "user", password: "pass"),
+                credential: .anonymous,
                 share: "share",
                 fromPath: "source",
                 toPath: "destination",
@@ -892,6 +900,7 @@ final class SMBeeTests: XCTestCase {
         } catch SMBTransportError.timedOut {
         }
         XCTAssertTrue(transport.didBlockAfterScript)
+        try assertOutboundContainsCreateRequest(transport)
     }
 
     func testSMBeeRecursiveDeleteOperationTimeout() async throws {
@@ -902,7 +911,7 @@ final class SMBeeTests: XCTestCase {
         do {
             try await SMBee.delete(
                 host: "server",
-                credential: SMBCredential(username: "user", password: "pass"),
+                credential: .anonymous,
                 share: "share",
                 path: "directory",
                 directory: true,
@@ -913,6 +922,7 @@ final class SMBeeTests: XCTestCase {
         } catch SMBTransportError.timedOut {
         }
         XCTAssertTrue(transport.didBlockAfterScript)
+        try assertOutboundContainsCreateRequest(transport)
     }
 
     func testSMBeeCredentialProviderUploadOperationTimeout() async throws {
@@ -941,7 +951,7 @@ final class SMBeeTests: XCTestCase {
         do {
             try await SMBee.upload(
                 host: "server",
-                credential: SMBCredential(username: "user", password: "pass"),
+                credential: .anonymous,
                 share: "share",
                 path: "file.txt",
                 data: [1, 2, 3],
@@ -951,6 +961,7 @@ final class SMBeeTests: XCTestCase {
         } catch SMBTransportError.timedOut {
         }
         XCTAssertTrue(transport.didBlockAfterScript)
+        try assertOutboundContainsCreateRequest(transport)
     }
 
     func testSMBeeUploadDirectoryOperationTimeoutDuringFileIO() async throws {
@@ -967,7 +978,7 @@ final class SMBeeTests: XCTestCase {
         do {
             try await SMBee.uploadDirectory(
                 host: "server",
-                credential: SMBCredential(username: "user", password: "pass"),
+                credential: .anonymous,
                 share: "share",
                 path: "",
                 localDirectory: localDirectory,
@@ -977,6 +988,7 @@ final class SMBeeTests: XCTestCase {
         } catch SMBTransportError.timedOut {
         }
         XCTAssertTrue(transport.didBlockAfterScript)
+        try assertOutboundContainsCreateRequest(transport)
     }
 
     func testSMBeeCredentialProviderReadOperationTimeout() async throws {
@@ -7274,12 +7286,39 @@ final class SMBeeTests: XCTestCase {
     }
 
     private func outboundFrames(_ transport: InMemoryTransport, containCommand command: UInt16) throws -> Bool {
-        try unframed(transport.outbound).contains { frame in
+        try outboundFrames(transport.outbound, containCommand: command)
+    }
+
+    private func outboundFrames(_ bytes: [UInt8], containCommand command: UInt16) throws -> Bool {
+        try unframed(bytes).contains { frame in
             guard frame.count >= 4, Array(frame.prefix(4)) == [0xfe, 0x53, 0x4d, 0x42] else {
                 return false
             }
             return try SMB2Header.decode(frame).command == command
         }
+    }
+
+    private func assertOutboundContainsCreateRequest(
+        _ transport: ScriptedBlockingReceiveTransport,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let containsCreate = try outboundFrames(transport.outbound, containCommand: SMB2Commands.create)
+        let summary = try outboundFrameSummary(transport.outbound)
+        XCTAssertTrue(
+            containsCreate,
+            summary,
+            file: file,
+            line: line
+        )
+    }
+
+    private func outboundFrameSummary(_ bytes: [UInt8]) throws -> String {
+        try unframed(bytes).map { frame in
+            let prefix = frame.prefix(4).map { String(format: "%02x", $0) }.joined()
+            let command = (try? SMB2Header.decode(frame).command).map(String.init) ?? "n/a"
+            return "\(prefix):\(frame.count):\(command)"
+        }.joined(separator: ",")
     }
 
     private func writePayload(from request: [UInt8]) throws -> [UInt8] {

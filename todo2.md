@@ -292,10 +292,7 @@ Linux/macOS smbclient として必要な理由:
 残:
 
 - Samba / Windows / macOS SMBX で `smbcli readlink` smoke を取る。
-- recursive operation の policy を docs に明記する:
-  - follow しない
-  - same-share だけ follow
-  - explicit `--follow-reparse` のみ
+- recursive operationはtargetをfollowしない。download/copyはreparse entryをskipし、deleteは`FILE_OPEN_REPARSE_POINT`でlink自体を削除する。unitとREADME/coverageに固定済み。
 
 ### P2-4. sparse file preservation / allocation size
 

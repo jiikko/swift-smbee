@@ -45,7 +45,7 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 - durable handle / lease / oplock は未対応。byte-range lock はライブラリ API (`SMBClientSession.withFileLock`) と `smbcli lock` に対応するが、resilient/durable reconnect は未対応。
 - CHANGE_NOTIFY は `--reconnect` で接続断時の再購読に対応 (取りこぼし分は overflow で通知)。
 - DFS referral は metadata取得に加え、multi-hop auto-follow、loop detection、bounded TTL cache、path suffix rewriteに対応する。Samba msdfs E2Eは実施済みで、Windows DFSはpending。
-- reparse point / symlink / mount point / LX symlink の target は `readlink` API で扱える。DFS/NFS の reparse data は MS-FSCC 上 opaque (client 解釈対象外) で、DFS link の解決は `smbcli dfs` (FSCTL_DFS_GET_REFERRALS)。実サーバ readlink smoke は未完了。
+- reparse point / symlink / mount point / LX symlink の target は `readlink` API で扱える。recursive download/copyはreparse entryをskipし、recursive deleteはtargetをfollowせずlink自体を削除する。DFS/NFS の reparse data は MS-FSCC 上 opaque (client 解釈対象外) で、DFS link の解決は `smbcli dfs` (FSCTL_DFS_GET_REFERRALS)。実サーバ readlink smoke は未完了。
 - single-file download/upload の byte-level resume と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file は `smbcli sparse` (SET_SPARSE / hole punch / allocated-range query) と `stat`/JSON の `allocationSize` に対応 (FS 依存)。通常の get/put/copy は file size と byte content を保証する logical-content policy であり、転送時の hole topology preservation は未対応。
 - keepalive は authenticated ECHO の失敗時に session を invalid にして transport を閉じるだけで、自動 reconnect はしない。通知監視の再接続は `withChangeNotifications(autoReconnect:)` / `smbcli watch --reconnect` の責務とする。
 - macOS の転送は data fork only。resource fork、Finder metadata、extended attribute、SMB alternate data stream は保存・列挙せず、Finder 相当コピーを保証しない。

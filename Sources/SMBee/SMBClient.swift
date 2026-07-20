@@ -2688,12 +2688,15 @@ public enum SMBClient {
         )
         for entry in entries {
             try Task.checkCancellation()
-            guard !entry.isReparsePoint else { continue }
             try SMBPath.validateDirectoryEntryName(entry.name)
             let remoteChild = joinSMBPath(path, entry.name)
             let relativeChild = joinSMBPath(relativePath, entry.name)
             let localChild = localDirectory.appendingPathComponent(entry.name)
             let actionChild = reportedDirectory.appendingPathComponent(entry.name)
+            if entry.isReparsePoint {
+                onAction?(SMBRecursiveAction(kind: .skip, path: actionChild.path))
+                continue
+            }
             if recursiveEntryIsExcluded(name: entry.name, relativePath: relativeChild, exclude: exclude) {
                 continue
             }
@@ -4405,13 +4408,18 @@ actor SMBSession {
         do {
             try await queryDirectory(treeId: treeId, fileId: sourceFileId) { entry in
                 try Task.checkCancellation()
+                try SMBPath.validateDirectoryEntryName(entry.name)
                 let sourceChild = self.joinSMBPath(fromPath, entry.name)
                 let destinationChild = self.joinSMBPath(toPath, entry.name)
                 let relativeChild = self.joinSMBPath(relativePath, entry.name)
                 if recursiveEntryIsExcluded(name: entry.name, relativePath: relativeChild, exclude: exclude) {
                     return
                 }
-                if entry.isDirectory && !entry.isReparsePoint {
+                if entry.isReparsePoint {
+                    onAction?(SMBRecursiveAction(kind: .skip, path: destinationChild))
+                    return
+                }
+                if entry.isDirectory {
                     do {
                         try await self.copyDirectory(
                             treeId: treeId,
@@ -4562,11 +4570,30 @@ actor SMBSession {
             do {
                 try await queryDirectory(treeId: treeId, fileId: fileId) { entry in
                     try Task.checkCancellation()
-                    guard !entry.isReparsePoint else { return }
+                    try SMBPath.validateDirectoryEntryName(entry.name)
+                    let childPath = self.joinSMBPath(path, entry.name)
+                    if entry.isReparsePoint {
+                        do {
+                            if dryRun {
+                                onAction?(SMBRecursiveAction(kind: .delete, path: childPath))
+                            } else {
+                                let childFileId = try await self.create(
+                                    treeId: treeId,
+                                    request: .deleteReparsePoint(path: childPath, directory: entry.isDirectory)
+                                )
+                                try await self.close(treeId: treeId, fileId: childFileId)
+                                onAction?(SMBRecursiveAction(kind: .delete, path: childPath))
+                            }
+                        } catch {
+                            guard continueOnError else { throw error }
+                            collector.record(path: childPath, error: error)
+                        }
+                        return
+                    }
                     do {
                         try await self.deleteRecursively(
                             treeId: treeId,
-                            path: self.joinSMBPath(path, entry.name),
+                            path: childPath,
                             directory: entry.isDirectory,
                             continueOnError: continueOnError,
                             dryRun: dryRun,
@@ -4576,7 +4603,7 @@ actor SMBSession {
                         )
                     } catch {
                         guard continueOnError else { throw error }
-                        collector.record(path: self.joinSMBPath(path, entry.name), error: error)
+                        collector.record(path: childPath, error: error)
                     }
                 }
                 await bestEffortClose(treeId: treeId, fileId: fileId)

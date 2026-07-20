@@ -3640,6 +3640,19 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt32LE(request, at: 104), 0x0000_1040)
     }
 
+    func testCreateDeleteReparsePointRequestDoesNotFollowDirectoryTarget() throws {
+        let request = try SMB2Create.encodeRequest(
+            messageId: 10,
+            sessionId: 0x1122,
+            treeId: 0x3344,
+            request: .deleteReparsePoint(path: "link", directory: true)
+        )
+
+        XCTAssertEqual(readUInt32LE(request, at: 88), 0x0001_0000)
+        XCTAssertEqual(readUInt32LE(request, at: 100), 0x0000_0001)
+        XCTAssertEqual(readUInt32LE(request, at: 104), 0x0020_1001)
+    }
+
     func testCreateSetSecurityRequestUsesWriteDACAccess() throws {
         let request = try SMB2Create.encodeRequest(
             messageId: 10,
@@ -5900,6 +5913,164 @@ final class SMBeeTests: XCTestCase {
         ])
     }
 
+    func testSessionCopyDirectorySkipsReparsePointWithoutFollowingTarget() async throws {
+        let sourceRootId = hexBytes("00000000000000000000000000000042")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceRootId, messageId: 0, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(
+                        name: "linked-directory",
+                        isDirectory: true,
+                        nextOffset: 0,
+                        attributes: SMBFileAttributes.directory | SMBFileAttributes.reparsePoint
+                    ),
+                ],
+                messageId: 1,
+                treeId: 0x3344
+            ),
+            try smb2StatusResponse(
+                status: SMB2Status.noMoreFiles,
+                command: SMB2Commands.queryDirectory,
+                messageId: 2,
+                treeId: 0x3344
+            ),
+            try smb2StatusResponse(
+                status: SMB2Status.success,
+                command: SMB2Commands.close,
+                messageId: 3,
+                treeId: 0x3344
+            ),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let recorder = RecursiveActionRecorder()
+
+        try await session.copyDirectory(
+            treeId: 0x3344,
+            fromPath: "src",
+            toPath: "dst",
+            overwrite: false,
+            dryRun: true
+        ) { action in
+            recorder.append(action)
+        }
+
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .mkdir, path: "dst"),
+            SMBRecursiveAction(kind: .skip, path: "dst\\linked-directory"),
+        ])
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.close,
+        ])
+    }
+
+    func testSessionCopyDirectoryRejectsUnsafeServerEntryBeforeChildOperation() async throws {
+        let sourceRootId = hexBytes("00000000000000000000000000000047")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: sourceRootId, messageId: 0, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [makeDirectoryEntry(name: "bad\\name", isDirectory: true, nextOffset: 0)],
+                messageId: 1,
+                treeId: 0x3344
+            ),
+            try smb2StatusResponse(
+                status: SMB2Status.success,
+                command: SMB2Commands.close,
+                messageId: 2,
+                treeId: 0x3344
+            ),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        do {
+            try await session.copyDirectory(
+                treeId: 0x3344,
+                fromPath: "src",
+                toPath: "dst",
+                overwrite: false,
+                dryRun: true
+            )
+            XCTFail("expected unsafe directory entry rejection")
+        } catch SMBCodecError.invalidValue("invalid directory entry name") {
+        }
+
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.queryDirectory,
+            SMB2Commands.close,
+        ])
+    }
+
+    func testSessionRecursiveDeleteRemovesReparsePointWithoutFollowingTarget() async throws {
+        let rootFileId = hexBytes("00000000000000000000000000000043")
+        let linkFileId = hexBytes("00000000000000000000000000000044")
+        let deleteRootFileId = hexBytes("00000000000000000000000000000045")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: rootFileId, messageId: 0, treeId: 0x3344),
+            try smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(
+                        name: "linked-directory",
+                        isDirectory: true,
+                        nextOffset: 0,
+                        attributes: SMBFileAttributes.directory | SMBFileAttributes.reparsePoint
+                    ),
+                ],
+                messageId: 1,
+                treeId: 0x3344
+            ),
+            try smb2CreateResponse(fileId: linkFileId, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 4, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 5, treeId: 0x3344),
+            try smb2CreateResponse(fileId: deleteRootFileId, messageId: 6, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let recorder = RecursiveActionRecorder()
+
+        try await session.deleteRecursively(
+            treeId: 0x3344,
+            path: "root",
+            directory: true
+        ) { action in
+            recorder.append(action)
+        }
+
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .delete, path: "root\\linked-directory"),
+            SMBRecursiveAction(kind: .delete, path: "root"),
+        ])
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(try SMB2Header.decode(requests[2]).command, SMB2Commands.create)
+        XCTAssertEqual(readUInt32LE(requests[2], at: 104), 0x0020_1001)
+        XCTAssertEqual(Array(requests[3][72..<88]), linkFileId)
+    }
+
     func testSessionCopyDirectoryDryRunFiltersRecursiveFiles() async throws {
         let sourceRootId = hexBytes("00000000000000000000000000000051")
         let sourceChildId = hexBytes("00000000000000000000000000000052")
@@ -6199,6 +6370,50 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("a.txt"), encoding: .utf8), "alpha")
         XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("b.txt"), encoding: .utf8), "beta")
         XCTAssertEqual(try atomicStagingDirectories(in: root, destinationName: "downloaded"), [])
+    }
+
+    func testDownloadDirectorySkipsReparsePointWithoutFollowingTarget() async throws {
+        let destination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("smbee-reparse-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: destination) }
+        let directoryId = hexBytes("00000000000000000000000000000046")
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
+            smb2QueryDirectoryResponse(
+                entries: [
+                    makeDirectoryEntry(
+                        name: "linked-directory",
+                        isDirectory: true,
+                        nextOffset: 0,
+                        attributes: SMBFileAttributes.directory | SMBFileAttributes.reparsePoint
+                    ),
+                ],
+                messageId: 5,
+                treeId: 0x3344
+            ),
+            smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
+            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0),
+        ]))
+        let recorder = RecursiveActionRecorder()
+
+        try await SMBClient.downloadDirectory(
+            host: "server",
+            share: "share",
+            path: "remote",
+            localDirectory: destination,
+            dryRun: true,
+            credential: .anonymous,
+            makeTransport: { transport },
+            onAction: { action in recorder.append(action) }
+        )
+
+        XCTAssertEqual(recorder.actions, [
+            SMBRecursiveAction(kind: .mkdir, path: destination.path),
+            SMBRecursiveAction(kind: .skip, path: destination.appendingPathComponent("linked-directory").path),
+        ])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
     }
 
     func testDownloadDirectoryAtomicFailurePreservesExistingDestinationAndRemovesStaging() async throws {

@@ -6,7 +6,7 @@
 
 ## 監査時点
 
-- 最終更新: 2026-07-20
+- 最終更新: 2026-07-21
 - 対象 branch: `master`
 - 正本仕様:
   - MS-SMB2: SMB2/3 command、dialect、signing/encryption、credit、durable handle、CHANGE_NOTIFY
@@ -54,7 +54,7 @@
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
 | sparse file operations | implemented-but-underverified | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse`、allocation size stat 表示、Samba FSCTL E2E は実装済み。通常 transfer は logical-content policy で、hole topology preservation は未対応。 |
 | ECHO / keepalive | implemented-but-underverified | `echo` / `smbcli ping` / opt-in keepalive と session invalidation policy は実装・unit test 済み。Windows / NAS smoke が残る。 |
-| SMB CANCEL / shared-session READ cancellation | implemented-but-underverified | watch / READ / IOCTL 等の通常 transaction cancellation で SMB2 CANCEL を送る。送信中 task を cancel せず response を drain する修正は blocking-send unit、Samba E2E、実 NAS の cancel-storm で確認済み。Windows / 他 NAS matrix は残る。 |
+| SMB CANCEL / shared-session READ cancellation | implemented-but-underverified | watch / READ / IOCTL 等の通常 transaction cancellation で SMB2 CANCEL を送る。送信中 task を cancel せず response を drain する修正は blocking-send unit、PR/push必須のSamba cancel-storm E2E、実 NAS の確認で固定済み。Windows / 他 NAS matrix は残る。 |
 | byte-range lock | implemented-but-underverified | library API `SMBClientSession.withFileLock` と `smbcli lock`。Windows 実測は matrix 側。 |
 
 ## P0: 0.1.0 前の release blocker
@@ -441,11 +441,10 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 
 ## 推奨実装順
 
-1. P0-2 API stability / packaging（0.1 freeze note、deprecation、DocC、1.0 artifact policy）。
-2. P0-1 compatibility matrix の実サーバ結果埋め。Windows は環境待ち pending、NAS / macOS SMBX は継続実測。
-3. offload-capable server の copychunk と各実サーバ固有機能の smoke。
-4. P1-4 Kerberos / GSS。0.1 では unsupported を明示し、実ユーザー要件と AD / GSS 検証環境が揃った段階で着手。
-5. P3 optional features は roadmap として維持し、実装までは unsupported を明記する。
+1. P0-1 compatibility matrix の実サーバ結果埋め。Windows は環境待ち pending、NAS / macOS SMBX は継続実測。
+2. offload-capable server の copychunk と各実サーバ固有機能の smoke。
+3. P1-4 Kerberos / GSS。0.1 では unsupported を明示し、実ユーザー要件と AD / GSS 検証環境が揃った段階で着手。
+4. P3 optional features は roadmap として維持し、実装までは unsupported を明記する。
 
 ## 完了の定義
 

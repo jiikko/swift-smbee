@@ -2,7 +2,7 @@
 
 This document is the compact source for what SMBee implements, how it is tested,
 and what remains unsupported or underverified. It complements `todo.md`, which is
-a chronological implementation log.
+the compact current-state backlog.
 
 Status labels:
 
@@ -23,7 +23,7 @@ Status labels:
 | NTLMv2 + SPNEGO | MS-NLMP, MS-SPNG | `NTLM.swift`, `SMBClient.swift` | yes | yes | smoke | no | covered | Kerberos/GSS is unsupported. |
 | Anonymous/guest NTLM | MS-NLMP | `NTLM.swift`, `SMBClient.swift`, `smbcli` | yes | yes | no | no | underverified | Samba guest path covered only. |
 | SESSION_SETUP / TREE_CONNECT | MS-SMB2 3.2.4.3, 3.2.4.4 | `SMBClient.swift`, `SMBClientSession.withTree` | yes | yes | smoke | no | covered | Primary `SMBClientSession` remains one-tree oriented, with scoped additional tree access via `withTree`. Full server/tree session split is future work. |
-| ECHO | MS-SMB2 3.2.4.25 | `SMB2ReadCodecs.swift`, `SMBClient.echo`, `SMBClientSession.startKeepAlive`, `smbcli ping` | yes | yes | no | no | partial | Manual authenticated ECHO has Samba smoke coverage. Persistent-session keepalive is opt-in and closes the transport on ECHO failure; reconnect policy is future work. |
+| ECHO | MS-SMB2 3.2.4.25 | `SMB2ReadCodecs.swift`, `SMBClient.echo`, `SMBClientSession.startKeepAlive`, `smbcli ping` | yes | yes | no | no | underverified | Manual authenticated ECHO and session-close-during-keepalive have Samba coverage. Persistent-session keepalive is opt-in and invalidates the session by closing the transport on ECHO failure; transparent reconnect and handle replay are explicitly unsupported. |
 | TREE_DISCONNECT / LOGOFF | MS-SMB2 3.2.4.23, 3.2.4.24 | `SMBClient.swift` | yes | yes | no | no | covered | Best-effort on clean close. |
 
 ## File Operations
@@ -42,7 +42,7 @@ Status labels:
 | recursive get/put/cp/rm | MS-SMB2 composed operations | `SMBRecursiveOperation.swift`, `SMBClient.swift` | yes | yes | no | no | covered | `get -r` / `put -r` / `cp -r` support include/exclude globs and per-file timeout. Remote reparse entries are never followed: download/copy skip them and delete opens the reparse point itself. Single-file `get` / `put` support `--create-dirs`. No true transactional directory atomicity; directory resume is size-based skip; `--verify hash` performs SHA-256 read-back per transferred file. |
 | server-side copychunk | MS-FSCC FSCTL_SRV_COPYCHUNK | `SMBClient.swift` | yes | fallback observed | no | no | underverified | Samba test FS returns unsupported and exercises fallback; offload-capable server smoke is missing. |
 | change notify | MS-SMB2 CHANGE_NOTIFY | `SMBClient.swift`, `SMBee.withChangeNotifications`, `SMBClientSession.withChangeNotifications(autoReconnect:)`, `smbcli watch --json --reconnect` | yes | yes | no | no | covered | Opt-in reconnect resubscribes and emits an overflow for the gap. Real-server reconnect smoke is missing. |
-| cancel | MS-SMB2 CANCEL | `SMB2Cancel`, `SMBSession.sendCancel`, signed transaction cancellation | yes | no | no | no | partial | CHANGE_NOTIFY and regular signed transactions (including READ/IOCTL paths) send SMB2 CANCEL without closing the transport. `STATUS_CANCELLED` maps to cancellation. General outstanding request tracking is future work. |
+| cancel | MS-SMB2 CANCEL | `SMB2Cancel`, `SMBSession.sendCancel`, signed transaction cancellation | yes | yes | no | real NAS smoke | underverified | CHANGE_NOTIFY and regular signed transactions (including READ/IOCTL paths) send SMB2 CANCEL without closing the transport. `STATUS_CANCELLED` maps to cancellation. CI exercises cancel then follow-up READ on the same session; Windows and additional NAS verification remain. |
 
 ## Metadata And Admin Operations
 
@@ -71,5 +71,5 @@ Status labels:
 
 - Add and run real-server smoke for Windows SMB Server and at least one NAS class target.
 - Keep PR/push E2E gating on SMB 3.0.2 encrypted plus SMB 3.1.1 authenticated signing/encrypted smoke.
-- Decide and document whether SMB 2.1 authenticated fallback remains unsupported or becomes opt-in.
+- Keep SMB 2.1 authenticated fallback explicitly unsupported unless a separately tested opt-in design is approved.
 - Keep the 0.1 public API/error/concurrency contract and credential migration plan in `docs/api-stability.md`; the replacement non-readable credential representation remains tracked for a later 0.x release.

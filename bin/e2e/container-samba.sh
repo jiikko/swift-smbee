@@ -16,6 +16,7 @@ SMBEE_E2E_PASSWORD="${SMBEE_E2E_PASSWORD:-smbee}"
 SMBEE_E2E_SHARE="${SMBEE_E2E_SHARE:-public}"
 SMBEE_E2E_KEEP_CONTAINER="${SMBEE_E2E_KEEP_CONTAINER:-0}"
 SMBEE_E2E_TEST_FILTER="${SMBEE_E2E_TEST_FILTER:-SMBeeE2ETests}"
+SMBEE_E2E_SKIP_EXTRA_API_TESTS="${SMBEE_E2E_SKIP_EXTRA_API_TESTS:-0}"
 SMBEE_E2E_SKIP_CLI_SMOKE="${SMBEE_E2E_SKIP_CLI_SMOKE:-0}"
 
 cd "${REPO_ROOT}"
@@ -114,6 +115,21 @@ SMBEE_DEBUG=1 swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
 
 printf '\n== Samba-backed API E2E tests ==\n'
 SMBEE_DEBUG=1 swift test --filter "${SMBEE_E2E_TEST_FILTER}"
+
+if [ "${SMBEE_E2E_SKIP_EXTRA_API_TESTS}" = "1" ]; then
+  printf '\n== Supplemental API E2E tests skipped ==\n'
+else
+  printf '\n== Operational coverage E2E tests ==\n'
+  SMBEE_DEBUG=1 swift test --filter SMBOperationalCoverageE2ETests
+
+  printf '\n== Unicode path E2E tests ==\n'
+  SMBEE_DEBUG=1 swift test --filter SMBUnicodePathE2ETests
+
+  if [ "${SMBEE_E2E_PROFILE}" = "smb302-encrypted-required" ]; then
+    printf '\n== Shared-session ranged-read cancellation E2E tests ==\n'
+    SMBEE_DEBUG=1 swift test --filter SMBeeSharedSessionRangedReadE2ETests
+  fi
+fi
 
 if [ "${SMBEE_E2E_SKIP_CLI_SMOKE}" = "1" ]; then
   printf '\n== smbcli command smoke skipped ==\n'

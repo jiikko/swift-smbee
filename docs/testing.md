@@ -67,7 +67,7 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 
 ### CI 実行 — Docker / Linux runner
 
-- CI は **`ubuntu-latest` + Docker で Samba を起動**して E2E（`.github/workflows/e2e.yml`、Swift 6.0 / 6.2 matrix）。
+- CI は **`ubuntu-latest` + Docker で Samba を起動**して E2E（`.github/workflows/e2e.yml`、Swift 6.2）。
   ローカルは Apple container、CI は Docker、と起動手段を分ける。
 - **前提（再掲）**: Linux で動かす以上、SMBee が Linux ビルド可能であること（上の transport 制約）。
 - E2E テストは env gate（`SMBEE_E2E=1` + 接続情報 env）。未満足ならローカルの通常 `swift test` では skip。
@@ -79,9 +79,11 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   ECHO/list を含む 2MiB 超の encrypted large-I/O smoke で回す。これにより PR / push でも
   3.1.1 の GMAC signing-only path と GCM encrypted path を最低 1 本ずつ通す。
 - API E2E と compatibility matrix は `SMBOperationalCoverageE2ETests` も実行し、実サーバの
-  allocation size、単一 read deadline、lock CLI（CLI smoke）を検証する。
+  allocation size と単一 read deadline を検証する。PR / push の primary profile はさらに
+  `SMBUnicodePathE2ETests` と `SMBeeSharedSessionRangedReadE2ETests` を実行し、Unicode path と
+  cancel 後の同一 session 再利用を回帰検証する。lock CLI は CLI smoke で検証する。
 - `.github/workflows/samba-compat.yml` は重い互換性 matrix。`workflow_dispatch` と週次 schedule で、
-  distro-provided Samba、Swift 6.0 / 6.2、`test/e2e/smb/*.conf` profile の代表組み合わせを回す。
+  distro-provided Samba、Swift 6.2、`test/e2e/smb/*.conf` profile の代表組み合わせを回す。
 
 ### ローカル実行 — Apple container / macOS
 
@@ -91,7 +93,8 @@ macOS で CI の E2E に近い条件を再現する場合は Apple の `containe
 1. `ubuntu:24.04` コンテナを起動し、`apt-get install samba` で CI と同じ distro Samba を入れる。
 2. `test/e2e/smb/smb302-encrypted-required.conf` を `/etc/samba/smb.conf` に配置する。
 3. `127.0.0.1:1445 -> container:445` で Samba を公開する。
-4. CI と同じ順序で `smbcli probe`、`swift test --filter SMBeeE2ETests`、`smbcli` smoke を実行する。
+4. CI と同じ順序で `smbcli probe`、primary API suite、operational / Unicode / shared-session
+   cancellation suite、`smbcli` smoke を実行する。
 5. 成功/失敗にかかわらずコンテナを削除する。
 
 初回だけ `container system start` が kernel download / setup の確認を出すことがある。
@@ -115,6 +118,7 @@ SMB 3.1.1 の NEGOTIATE だけをローカルで確認する場合:
 SAMBA_CONFIG=test/e2e/smb/smb311-encrypted-required.conf \
 SMBEE_E2E_PROFILE=smb311-encrypted-required \
 SMBEE_E2E_TEST_FILTER=SMBeeE2ETests.testProbeNegotiatesExpectedProfile \
+SMBEE_E2E_SKIP_EXTRA_API_TESTS=1 \
 SMBEE_E2E_SKIP_CLI_SMOKE=1 \
 bin/e2e/container-samba.sh
 ```

@@ -76,11 +76,10 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
    - `docs/compatibility-matrix.md` と `bin/e2e/smoke-real-server.sh` を使って、代表コマンドの smoke を埋める。
 
 2. **API stability / packaging**
-   - pre-1.0 は SwiftPM source build、source compatibility は best-effort、ABI / function-value signature / binary artifact は非保証とする方針を `docs/api-stability.md` に固定済み。1.0向けSemVer保証は未整理。
-   - `SMBCredential.password` 露出の deprecation plan。
-   - DocC / examples。
-   - 1.0向けrelease artifact配布方針。
-   - Sendable / error taxonomy / cancellation / timeout semantics の凍結。
+   - 0.1 public API freeze、source compatibility、Sendable / actor isolation、error / cancellation / timeout contractは`docs/api-stability.md`に固定済み。
+   - `SMBCodecError` / `SMBTransportError`はpublic `Sendable`としてcompile regressionで固定済み。
+   - `SMBCredential.password`の段階的deprecation planはissue 063、DocC / compile-tested examplesは追加済み。
+   - 1.0向けrelease artifact配布方針はproduct decisionとしてdeferred。
 
 ### P1: smbclient 中核の状態
 
@@ -106,16 +105,16 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
    - Samba E2E で chain link の list/read、suffix rewrite、loop rejection を検証済み。custom target selection は `SMBDfsReferralResult.targets` で可能。
 
 4. **Kerberos / GSS / SPNEGO(Kerberos mech)**
-   - 現状は NTLMv2 / NT hash / anonymous。
-   - Kerberos / GSS backend と auth abstraction は未実装。
+   - 状態: 0.1では`explicitly-unsupported`。現状はNTLMv2 / NT hash / anonymous。
+   - CLIにKerberos modeはなく、README limitationを正本とする。将来実装はAD/GSS検証環境が揃ってから扱う。
 
 5. **durable / persistent handle**
    - 現時点では explicitly unsupported。
    - 対応するなら切断シミュレーション E2E と file handle reconnect state machine が必要。
 
 6. **macOS metadata / resource fork / named stream policy**
-   - data fork only にするか、named stream API を実装するか未決。
-   - Finder 相当コピーを名乗るなら必須。
+   - 状態: `implemented`（data fork only policy）。
+   - resource fork / xattr / ADSは保存・列挙せず、Finder相当コピーを保証しない。
 
 ### P2: 実用性・管理系 follow-up
 
@@ -128,7 +127,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - byte-range lock CLI の実サーバ smoke
 - JSON schema 更新運用
 
-### P3: optional / advanced / 後回し
+### P3: optional roadmap（0.1では明示的unsupported）
 
 - SMB compression
 - SMB multichannel

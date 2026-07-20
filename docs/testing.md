@@ -30,7 +30,7 @@ test code は共通（Samba を起動 → golden path）で、**起動手段だ�
 
 > ⚠️ **CI(Docker/Linux) の前提**: Docker は Linux で動かす（macOS hosted runner では Docker 不可）。
 > よって **SMBee が Linux でビルド/実行できる**必要がある。→ **決定: transport を抽象化**し
-> macOS=NWConnection / Linux=POSIX|NIO を差し替える（[architecture.md](architecture.md)）。
+> macOS=NWConnection / Linux=POSIXSocketTransport を差し替える（[architecture.md](architecture.md)）。
 > `Network.framework` 依存は `NWConnectionTransport` 内に `#if canImport(Network)` で閉じ込める。
 
 ゴールデンパス（probe → 認証 → 操作）:

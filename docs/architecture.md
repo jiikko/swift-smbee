@@ -16,7 +16,7 @@ protocol SMBTransport            // TCP 445 上の双方向バイトストリー
   - close()
         ▲                         ▲
         │                         │
- NWConnectionTransport      NIOTransport (or POSIXSocketTransport)
+ NWConnectionTransport      POSIXSocketTransport
  (macOS 本番)               (Linux CI / E2E / cross-platform)
 ```
 
@@ -25,20 +25,16 @@ protocol SMBTransport            // TCP 445 上の双方向バイトストリー
 - **本番 (macOS app)** は `Network.framework` の `NWConnection` を使いたい（省電力・接続管理・
   Apple 統合）。
 - **CI の E2E** は **Linux runner + Docker の Samba** で回す（無料・再現可能）。Linux では
-  `Network.framework` が無いので、**POSIX socket / SwiftNIO** 実装が要る。
+  `Network.framework` が無いため、実装済みの **POSIX socket transport** を使う。
 - 両者を `SMBTransport` protocol の差し替えで吸収する＝ **best of both**。SMB の本体ロジックは
   一切プラットフォーム分岐を持たない。
 
 ### 実装方針
 
 - `SMBTransport` は SMB に固有の概念を持たない（純粋に「接続して send/receive」だけ）。
-  direct-TCP の **4 byte length framing** は transport の外（SMB 層）で行うか、transport の
-  「メッセージ境界付き」版にするかは実装時に決める ⓥ（まずは生バイトストリーム + SMB 層で
-  framing が素直）。
+  direct-TCP の **4 byte length framing** は `DirectTCPFraming` としてtransportの外側に実装済み。
 - `NWConnectionTransport`: macOS。`#if canImport(Network)` でガード。
-- `NIOTransport` / `POSIXSocketTransport`: Linux + macOS 両対応（テスト・E2E・CI 用）。
-  SwiftNIO を入れるか POSIX 直書きかは実装時に判断 ⓥ（依存を増やしたくなければ POSIX、
-  async/backpressure を楽にしたければ NIO）。
+- `POSIXSocketTransport`: Linux + macOS 両対応（テスト・E2E・CI用）。SwiftNIO依存は採用していない。
 - テスト（unit）は transport を **in-memory fake / loopback** に差し替えて framing を検証できる。
 
 ### プラットフォーム条件

@@ -103,22 +103,18 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 現状:
 
 - SwiftPM library と CLI は動く。
-- pre-1.0 は SwiftPM source build、通常のsource compatibilityはbest-effort、ABI / function-value signature / binary artifactは非保証とする方針を `docs/api-stability.md` に固定済み。1.0向けSemVer保証、deprecated credential surface、DocC/API examples、release artifact配布方針は未整理。
-- consumer が依存し始める前に public 型の命名、Sendable、error taxonomy、cancellation / timeout semantics を凍結する必要がある。
+- 0.1 public API freeze、通常のsource compatibility、Sendable / actor isolation、public error taxonomy、cooperative cancellation / timeout semanticsを`docs/api-stability.md`に固定済み。
+- `SMBCredential.password`の段階的deprecation planはissue 063、DocC catalogとpublic-import compile examplesは追加済み。
+- 1.0向けrelease artifact配布方針はproduct decisionとしてdeferred。
 
-やること:
+残:
 
-- `SMBCredential.password` 露出の deprecation plan を決める。
-- public 型と error taxonomy をレビューする。
-- `Sendable` / actor isolation / cancellation semantics を doc に固定する。
-- DocC/API examples を追加する。
-- 1.0向け release artifact 配布方針を決める。
+- 1.0向け release artifact 配布方針（deferred）。
 
 完了条件:
 
-- `0.1.0` 用の public API freeze note が README / docs にある。
-- breaking change 予定が issue 化されている。
-- consumer が依存しても migration path を説明できる。
+- `0.1.0` 用の public API freeze noteがREADME / docsにあり、public-import regressionで主要contractをcompileできる。
+- credential breaking change予定がissue化され、consumer向けmigration順序を説明できる。
 
 ## P1: smbclient として実装すべき中核残件
 
@@ -172,7 +168,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P1-3. DFS referral の実サーバ E2E と auto-follow
 
-状態: `implemented-but-underverified`（invalidation policy を固定）
+状態: `implemented-but-underverified`（Windows DFSのみpending）
 
 現状:
 
@@ -187,13 +183,14 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P1-4. Kerberos / GSS / SPNEGO(Kerberos mech)
 
-状態: `partial`
+状態: `explicitly-unsupported`（0.1。将来roadmap）
 
 現状:
 
 - 現在は NTLMv2 / NT hash / anonymous が中心。
 - SPNEGO は NTLM OID 前提。
 - `SMBAuthenticator` のような auth backend 抽象化は未実装。
+- CLIにKerberos auth modeはなく、未対応modeが暗黙にNTLMへfallbackする経路はない。README limitationを0.1の契約とする。
 
 Linux/macOS smbclient として必要な理由:
 
@@ -359,7 +356,7 @@ Linux/macOS smbclient として必要な理由:
 
 ### P3-1. SMB compression
 
-状態: `missing`
+状態: `explicitly-unsupported`（0.1）
 
 SMB 3.1.1 compression は未実装。WAN 越しや大ファイル転送では有効な場合があるが、ローカル NAS / obaket MVP では後回し。
 
@@ -369,7 +366,7 @@ SMB 3.1.1 compression は未実装。WAN 越しや大ファイル転送では有
 
 ### P3-2. SMB multichannel
 
-状態: `missing`
+状態: `explicitly-unsupported`（0.1）
 
 複数 NIC / Wi-Fi + Ethernet / 高速 NAS で効くが、実装規模が大きい。Linux/macOS userspace client としては optional。
 
@@ -380,7 +377,7 @@ SMB 3.1.1 compression は未実装。WAN 越しや大ファイル転送では有
 
 ### P3-3. SMB over QUIC
 
-状態: `missing`
+状態: `explicitly-unsupported`（0.1）
 
 Windows 系の新しい構成向け。Linux/macOS の汎用 smbclient MVP では scope 外。
 
@@ -408,13 +405,13 @@ SMB1 / CIFS は scope 外。transport は direct TCP 445 のみ。
 
 ### P3-7. POSIX / UNIX extensions
 
-状態: `missing`
+状態: `explicitly-unsupported`（0.1）
 
 Linux client としては mode/uid/gid/symlink/xattr の期待が出るが、SMB2/3 標準互換との境界が難しい。まず metadata/resource fork/ADS policy を決めた後に扱う。
 
 ### P3-8. quotas / named streams / extended attributes
 
-状態: `missing`
+状態: `explicitly-unsupported`（0.1）
 
 file browser / backup / macOS metadata preservation を本格的にやるなら必要。MVP では data fork only として明示する方が安全。
 

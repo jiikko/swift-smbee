@@ -200,6 +200,58 @@ private final class BlockingReceiveTransport: SMBTransport, @unchecked Sendable 
     }
 }
 
+private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private let receiveState = ReceiveState()
+    private var inbound: [UInt8]
+    private var blocked = false
+
+    init(inbound: [UInt8]) {
+        self.inbound = inbound
+    }
+
+    var didBlockAfterScript: Bool {
+        lock.withLock { blocked }
+    }
+
+    func connect(host: String, port: UInt16) async throws {
+        try Task.checkCancellation()
+        _ = host
+        _ = port
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
+        _ = bytes
+    }
+
+    func receive(maxLength: Int) async throws -> [UInt8] {
+        try Task.checkCancellation()
+        let chunk = lock.withLock { () -> [UInt8]? in
+            guard !inbound.isEmpty else {
+                blocked = true
+                return nil
+            }
+            let count = min(maxLength, inbound.count)
+            let chunk = Array(inbound.prefix(count))
+            inbound.removeFirst(count)
+            return chunk
+        }
+        if let chunk {
+            return chunk
+        }
+        return try await withTaskCancellationHandler {
+            try await receiveState.waitForCancellation()
+        } onCancel: {
+            receiveState.cancel()
+        }
+    }
+
+    func close() {
+        receiveState.cancel()
+    }
+}
+
 private final class BlockingSendTransport: SMBTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var inbound: [UInt8]
@@ -803,14 +855,14 @@ final class SMBeeTests: XCTestCase {
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("smbee-deadline-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: destination) }
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
 
         do {
             try await SMBee.downloadDirectory(
                 host: "server",
-                credentialProvider: {
-                    try await Task.sleep(for: .seconds(5))
-                    return .anonymous
-                },
+                credential: SMBCredential(username: "user", password: "pass"),
                 share: "share",
                 path: "remote",
                 localDirectory: destination,
@@ -819,16 +871,18 @@ final class SMBeeTests: XCTestCase {
             XCTFail("recursive download unexpectedly completed")
         } catch SMBTransportError.timedOut {
         }
+        XCTAssertTrue(transport.didBlockAfterScript)
     }
 
     func testSMBeeCopyDirectoryOperationTimeout() async throws {
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
         do {
             try await SMBee.copyDirectory(
                 host: "server",
-                credentialProvider: {
-                    try await Task.sleep(for: .seconds(5))
-                    return .anonymous
-                },
+                credential: SMBCredential(username: "user", password: "pass"),
                 share: "share",
                 fromPath: "source",
                 toPath: "destination",
@@ -837,16 +891,18 @@ final class SMBeeTests: XCTestCase {
             XCTFail("recursive copy unexpectedly completed")
         } catch SMBTransportError.timedOut {
         }
+        XCTAssertTrue(transport.didBlockAfterScript)
     }
 
     func testSMBeeRecursiveDeleteOperationTimeout() async throws {
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
         do {
             try await SMBee.delete(
                 host: "server",
-                credentialProvider: {
-                    try await Task.sleep(for: .seconds(5))
-                    return .anonymous
-                },
+                credential: SMBCredential(username: "user", password: "pass"),
                 share: "share",
                 path: "directory",
                 directory: true,
@@ -856,6 +912,7 @@ final class SMBeeTests: XCTestCase {
             XCTFail("recursive delete unexpectedly completed")
         } catch SMBTransportError.timedOut {
         }
+        XCTAssertTrue(transport.didBlockAfterScript)
     }
 
     func testSMBeeCredentialProviderUploadOperationTimeout() async throws {

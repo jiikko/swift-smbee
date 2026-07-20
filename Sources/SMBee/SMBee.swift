@@ -738,21 +738,24 @@ public enum SMBee {
     public static func upload(
         host: String,
         port: UInt16 = 445,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
         data: [UInt8],
-        overwrite: Bool = true
+        overwrite: Bool = true,
+        operationTimeout: Duration? = nil
     ) async throws {
-        try await SMBClient.upload(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            data: data,
-            overwrite: overwrite,
-            credentialProvider: credentialProvider
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.upload(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                data: data,
+                overwrite: overwrite,
+                credentialProvider: credentialProvider
+            )
+        }
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
@@ -780,27 +783,30 @@ public enum SMBee {
     public static func upload(
         host: String,
         port: UInt16 = 445,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
         fileURL: URL,
         overwrite: Bool = true,
         resume: Bool = false,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
-        try await SMBClient.upload(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            fileURL: fileURL,
-            overwrite: overwrite,
-            resume: resume,
-            credential: try await credentialProvider(),
-            timeout: timeout,
-            onProgress: onProgress
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.upload(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                fileURL: fileURL,
+                overwrite: overwrite,
+                resume: resume,
+                credential: try await credentialProvider(),
+                timeout: timeout,
+                onProgress: onProgress
+            )
+        }
     }
 
     /// - Parameter resume: When true, skips files whose remote destination size already matches the local source
@@ -830,23 +836,23 @@ public enum SMBee {
     ) async throws {
         try await SMBOperationDeadline.run(timeout: operationTimeout) {
             try await SMBClient.uploadDirectory(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            localDirectory: localDirectory,
-            overwrite: overwrite,
-            continueOnError: continueOnError,
-            skipExisting: skipExisting,
-            resume: resume,
-            dryRun: dryRun,
-            include: include,
-            exclude: exclude,
-            perFileTimeout: perFileTimeout,
-            credential: credential,
-            timeout: timeout,
-            onAction: onAction,
-            onProgress: onProgress
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localDirectory: localDirectory,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                resume: resume,
+                dryRun: dryRun,
+                include: include,
+                exclude: exclude,
+                perFileTimeout: perFileTimeout,
+                credential: credential,
+                timeout: timeout,
+                onAction: onAction,
+                onProgress: onProgress
             )
         }
     }
@@ -858,7 +864,7 @@ public enum SMBee {
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
         localDirectory: URL,
@@ -867,30 +873,33 @@ public enum SMBee {
         skipExisting: Bool = false,
         resume: Bool = false,
         dryRun: Bool = false,
+        operationTimeout: Duration? = nil,
         include: [String] = [],
         exclude: [String] = [],
         perFileTimeout: Duration? = nil,
         onAction: (@Sendable (SMBRecursiveAction) -> Void)? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
-        try await SMBClient.uploadDirectory(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            localDirectory: localDirectory,
-            overwrite: overwrite,
-            continueOnError: continueOnError,
-            skipExisting: skipExisting,
-            resume: resume,
-            dryRun: dryRun,
-            include: include,
-            exclude: exclude,
-            perFileTimeout: perFileTimeout,
-            credentialProvider: credentialProvider,
-            onAction: onAction,
-            onProgress: onProgress
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.uploadDirectory(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localDirectory: localDirectory,
+                overwrite: overwrite,
+                continueOnError: continueOnError,
+                skipExisting: skipExisting,
+                resume: resume,
+                dryRun: dryRun,
+                include: include,
+                exclude: exclude,
+                perFileTimeout: perFileTimeout,
+                credentialProvider: credentialProvider,
+                onAction: onAction,
+                onProgress: onProgress
+            )
+        }
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
@@ -903,41 +912,47 @@ public enum SMBee {
         localFile: URL,
         overwrite: Bool = true,
         resume: Bool = false,
-        timeout: Duration? = nil
+        timeout: Duration? = nil,
+        operationTimeout: Duration? = nil
     ) async throws {
-        try await SMBClient.upload(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            localFile: localFile,
-            overwrite: overwrite,
-            resume: resume,
-            credential: credential,
-            timeout: timeout
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.upload(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localFile: localFile,
+                overwrite: overwrite,
+                resume: resume,
+                credential: credential,
+                timeout: timeout
+            )
+        }
     }
 
     public static func upload(
         host: String,
         port: UInt16 = 445,
-        credentialProvider: SMBCredentialProvider,
+        credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         path: String,
         localFile: URL,
         overwrite: Bool = true,
-        resume: Bool = false
+        resume: Bool = false,
+        operationTimeout: Duration? = nil
     ) async throws {
-        try await SMBClient.upload(
-            host: host,
-            port: port,
-            share: share,
-            path: path,
-            localFile: localFile,
-            overwrite: overwrite,
-            resume: resume,
-            credentialProvider: credentialProvider
-        )
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.upload(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localFile: localFile,
+                overwrite: overwrite,
+                resume: resume,
+                credentialProvider: credentialProvider
+            )
+        }
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.

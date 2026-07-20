@@ -933,6 +933,52 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testSMBeeUploadOperationTimeoutDuringIO() async throws {
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        do {
+            try await SMBee.upload(
+                host: "server",
+                credential: SMBCredential(username: "user", password: "pass"),
+                share: "share",
+                path: "file.txt",
+                data: [1, 2, 3],
+                operationTimeout: .milliseconds(250)
+            )
+            XCTFail("upload unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        }
+        XCTAssertTrue(transport.didBlockAfterScript)
+    }
+
+    func testSMBeeUploadDirectoryOperationTimeoutDuringFileIO() async throws {
+        let localDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("smbee-deadline-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+        try Data([1, 2, 3]).write(to: localDirectory.appendingPathComponent("file.txt"))
+        defer { try? FileManager.default.removeItem(at: localDirectory) }
+
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        SMBTransportTestOverride.factory = { transport }
+        defer { SMBTransportTestOverride.factory = nil }
+
+        do {
+            try await SMBee.uploadDirectory(
+                host: "server",
+                credential: SMBCredential(username: "user", password: "pass"),
+                share: "share",
+                path: "",
+                localDirectory: localDirectory,
+                operationTimeout: .milliseconds(250)
+            )
+            XCTFail("recursive upload unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        }
+        XCTAssertTrue(transport.didBlockAfterScript)
+    }
+
     func testSMBeeCredentialProviderReadOperationTimeout() async throws {
         do {
             _ = try await SMBee.read(

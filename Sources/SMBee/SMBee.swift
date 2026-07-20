@@ -493,6 +493,33 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter operationTimeout: Deadline for credential resolution, connection, and the complete read.
+    public static func read(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: @escaping SMBCredentialProvider,
+        share: String,
+        path: String,
+        range: SMBReadRange? = nil,
+        timeout: Duration? = nil,
+        operationTimeout: Duration?,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws -> [UInt8] {
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await SMBClient.read(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                range: range,
+                credential: try await credentialProvider(),
+                timeout: timeout,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func withReadStream(
         host: String,
         port: UInt16 = 445,

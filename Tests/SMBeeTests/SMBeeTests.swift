@@ -933,6 +933,23 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testSMBeeCredentialProviderReadOperationTimeout() async throws {
+        do {
+            _ = try await SMBee.read(
+                host: "server",
+                credentialProvider: {
+                    try await Task.sleep(for: .seconds(5))
+                    return .anonymous
+                },
+                share: "share",
+                path: "file.txt",
+                operationTimeout: .milliseconds(10)
+            )
+            XCTFail("read unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        }
+    }
+
     func testReadURLParserKeepsUserInfoPassword() throws {
         let endpoint = try SMBURLParser.parseReadURL("smb://user:pass@server:1445/share/path/to/file.txt")
 

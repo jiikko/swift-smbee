@@ -5,6 +5,7 @@ import XCTest
 final class SMBeeSourceCompatibilityTests: XCTestCase {
     func testLegacyCredentialProviderOverloadsAcceptNonescapingForwarding() {
         _ = forwardLegacyDownloadDirectory
+        _ = forwardLegacyRead
         _ = forwardLegacyDataUpload
         _ = forwardLegacyFileURLUpload
         _ = forwardLegacyUploadDirectory
@@ -12,6 +13,15 @@ final class SMBeeSourceCompatibilityTests: XCTestCase {
         _ = forwardLegacyCopyDirectory
         _ = forwardLegacyDelete
     }
+}
+
+private func forwardLegacyRead(_ provider: SMBCredentialProvider) async throws {
+    _ = try await SMBee.read(
+        host: "server",
+        credentialProvider: provider,
+        share: "share",
+        path: "remote.txt"
+    )
 }
 
 private func forwardLegacyDownloadDirectory(_ provider: SMBCredentialProvider) async throws {

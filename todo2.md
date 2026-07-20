@@ -112,7 +112,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - public 型と error taxonomy をレビューする。
 - `Sendable` / actor isolation / cancellation semantics を doc に固定する。
 - DocC/API examples を追加する。
-- release artifact 方針を決める。
+- 1.0向け release artifact 配布方針を決める。
 
 完了条件:
 

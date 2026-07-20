@@ -329,9 +329,9 @@ Linux/macOS smbclient として必要な理由:
 - socket-level `timeout` は配線済み。
 - CLI は `--operation-timeout` と recursive transfer の `--per-file-timeout` を持つ。
 
-- `SMBee.read(...)`、単一/再帰 upload、recursive download/copy/delete に `operationTimeout` を公開済み。
+- `SMBee.read(...)`、単一/再帰 upload、recursive download/copy/delete の credential / credential-provider overload に `operationTimeout` を公開済み。provider 版は `operationTimeout` 明示overloadと旧非escaping overloadを分け、ソース互換性を維持する。
 - `operationTimeout` は credential provider・接続・再帰 traversal を含む操作全体、`perFileTimeout` は再帰転送の各ファイル、`timeout` は socket send/receive に適用する。
-- deadline 超過の error taxonomy は `SMBTransportError.timedOut` に固定。unit で cancellation と各 facade の deadline をカバーする。
+- deadline 超過の error taxonomy は `SMBTransportError.timedOut` に固定。unit で provider 解決中と認証後 blocking receive の deadline、Samba E2E で再帰操作の成功経路と delete 後の不存在をカバーする。
 - Windows / NAS の blocking receive cancellation 実測は pending。
 
 ### P2-6. keepalive と reconnect policy の統合

@@ -154,8 +154,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - owner/group write は実装済み。SACL は scope 外。
 - byte-level resume / `--verify size|hash` は実装済み。
 - sparse FSCTL と allocation size 表示は実装済み。通常 transfer は logical-content policy とし、hole topology preservation は未対応として明示する。
-- operation timeout は CLI 実装済み。残りは public API 化判断。
-- `SMBee.read(...)`、upload、recursive download/upload/copy/delete の `operationTimeout` は実装済み。残りは Windows / NAS の cancellation 実測。
+- operation timeout は CLI と、`SMBee.read(...)`、upload、recursive download/upload/copy/delete の public API に実装済み。provider の旧非escaping overloadも維持済み。残りは Windows / NAS の cancellation 実測。
 - shared session の READ cancel は、送信中 task を cancel せず response を drain するよう修正済み。残りは Windows / 他 NAS の互換確認。
 - durable handle は未実装ではなく、現時点では unsupported として扱う。
 

@@ -53,7 +53,7 @@
 | reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。実サーバ smoke が残る。 |
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
 | sparse file operations | implemented-but-underverified | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse`、allocation size stat 表示、Samba FSCTL E2E は実装済み。通常 transfer は logical-content policy で、hole topology preservation は未対応。 |
-| ECHO / keepalive | implemented | `echo` / `smbcli ping` / opt-in keepalive 実装済み。reconnect policy との統合は未決。 |
+| ECHO / keepalive | implemented-but-underverified | `echo` / `smbcli ping` / opt-in keepalive と session invalidation policy は実装・unit test 済み。Windows / NAS smoke が残る。 |
 | SMB CANCEL / shared-session READ cancellation | implemented-but-underverified | watch / READ / IOCTL 等の通常 transaction cancellation で SMB2 CANCEL を送る。送信中 task を cancel せず response を drain する修正は blocking-send unit、Samba E2E、実 NAS の cancel-storm で確認済み。Windows / 他 NAS matrix は残る。 |
 | byte-range lock | implemented-but-underverified | library API `SMBClientSession.withFileLock` と `smbcli lock`。Windows 実測は matrix 側。 |
 
@@ -98,18 +98,16 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 
 ### P0-2. API stability / packaging
 
-状態: `implemented-but-underverified`
+状態: `implemented`
 
 現状:
 
 - SwiftPM library と CLI は動く。
 - 0.1 public API freeze、通常のsource compatibility、Sendable / actor isolation、public error taxonomy、cooperative cancellation / timeout semanticsを`docs/api-stability.md`に固定済み。
 - `SMBCredential.password`の段階的deprecation planはissue 063、DocC catalogとpublic-import compile examplesは追加済み。
-- 1.0向けrelease artifact配布方針はproduct decisionとしてdeferred。
+- pre-1.0 / 1.0 の source・binary artifact 配布方針は本 backlog の対象外。
 
-残:
-
-- 1.0向け release artifact 配布方針（deferred）。
+残: なし。
 
 完了条件:
 

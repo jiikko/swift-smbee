@@ -79,7 +79,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
    - 0.1 public API freeze、source compatibility、Sendable / actor isolation、error / cancellation / timeout contractは`docs/api-stability.md`に固定済み。
    - `SMBCodecError` / `SMBTransportError`はpublic `Sendable`としてcompile regressionで固定済み。
    - `SMBCredential.password`の段階的deprecation planはissue 063、DocC / compile-tested examplesは追加済み。
-   - 1.0向けrelease artifact配布方針はproduct decisionとしてdeferred。
+   - pre-1.0 / 1.0 の source・binary artifact 配布方針は本 backlog の対象外とし、残タスクには数えない。
 
 ### P1: smbclient 中核の状態
 

@@ -59,8 +59,8 @@ an `SMBCredentialProvider`, and do not retain credentials after connecting.
 
 - ABI or module stability for previously compiled clients.
 - Compatibility of function-value references when overload signatures change.
-- A stable binary framework or other binary release artifact.
+- A stable binary framework or other binary release artifact. Artifact distribution is
+  outside the scope of the current release backlog.
 
 Consumers should rebuild after updating the package and use an exact version or revision
-when they need a frozen pre-1.0 API. The 1.0 SemVer and artifact policy is defined
-separately before a 1.0 release.
+when they need a frozen pre-1.0 API.

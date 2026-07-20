@@ -125,7 +125,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - operation-level deadline の Windows / NAS 実測
 - keepalive invalidation / watch reconnect policy の実サーバ smoke
 - byte-range lock CLI の実サーバ smoke
-- JSON schema 更新運用
+- JSON schema更新運用は`docs/smbcli-json.md`の互換ルールとunit/E2E更新checklistに固定済み
 
 ### P3: optional roadmap（0.1では明示的unsupported）
 
@@ -166,8 +166,6 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 
 ## 推奨順
 
-1. API stability / packaging（0.1 freeze note、deprecation、DocC、1.0 artifact policy）。
-2. compatibility matrix の実サーバ結果埋め（Windows は pending）。
-3. offload-capable server の copychunk と各実サーバ固有機能の smoke。
-4. Kerberos / GSS。0.1 では unsupported を明示し、実要件と検証環境が揃った段階で着手。
-5. compression / multichannel / QUIC / POSIX extensions / named streams は optional roadmap とし、対応までは unsupported を維持。
+1. compatibility matrix の実サーバ結果埋め（Windows は pending）。
+2. offload-capable server の copychunk と各実サーバ固有機能の smoke。
+3. 0.1でunsupportedとしたKerberos / GSSやP3機能は、実要件と検証環境が揃った段階でroadmapから着手。

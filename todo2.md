@@ -348,6 +348,7 @@ Linux/macOS smbclient として必要な理由:
 
 - byte-range lock CLI (`smbcli lock`) は実装済み。実サーバ matrix での CLI smoke は残る。
 - `mget` / `mput` は非対話で使えるよう確認 prompt を設けず、`--dry-run` を明示的な確認手段とする。`--json` は item action と summary の NDJSON を出力する。unit + Samba CLI smoke で回帰をカバー済み。
+- JSON / NDJSONの0.x互換ルールとschema変更checklistは`docs/smbcli-json.md`に固定済み。既存key/type/orderは維持し、additiveなoptional keyを許可する。
 
 ## P3: optional / advanced / 明示的に後回し
 

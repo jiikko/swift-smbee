@@ -77,3 +77,28 @@ Error output shape:
 
 `category` is `smb`, `usage`, or `other`. `exitCode` matches the process exit
 status.
+
+## Compatibility and update policy
+
+JSON and NDJSON described in this document are a source-level CLI contract for the
+0.x series. There is no numeric `schemaVersion` field: record kinds already have stable
+discriminators (`event`, `action`, or `command`), and adding a version field to every
+existing object would itself change consumers' exact-shape expectations.
+
+Within 0.x:
+
+- existing keys, value types, and NDJSON record order are not removed or renamed;
+- new optional keys or new discriminator values may be added;
+- consumers should ignore unknown keys and handle unknown discriminator values;
+- a required-key or type change needs a documented migration and a release note;
+- human-readable text in `error` is diagnostic and must not be parsed as a stable enum.
+
+Every JSON output change updates these items in the same commit:
+
+1. the encoder or CLI emission site;
+2. an exact-shape unit regression in `SMBCLIOutputTests`, `SMBCLIHelperTests`, or
+   `SMBCLIBatchTests`;
+3. this document, including NDJSON ordering when applicable;
+4. the relevant Samba CLI smoke assertion for externally visible command output.
+
+This checklist is the schema-change gate until a separately versioned schema is needed.

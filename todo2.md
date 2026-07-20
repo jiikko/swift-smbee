@@ -52,7 +52,7 @@
 | DFS referral metadata | implemented-but-underverified | `SMBee.dfsReferral` / `smbcli dfs`、multi-hop `resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS`。loop detection、credential-scoped / bounded TTL cache、suffix rewrite は unit + Samba msdfs E2E 済み。Windows DFS 実測が残る。 |
 | reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。実サーバ smoke が残る。 |
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
-| sparse file operations | partial | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse`、allocation size stat 表示、Samba FSCTL E2E は実装済み。通常 transfer の hole preservation policy が残る。 |
+| sparse file operations | implemented-but-underverified | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse`、allocation size stat 表示、Samba FSCTL E2E は実装済み。通常 transfer は logical-content policy で、hole topology preservation は未対応。 |
 | ECHO / keepalive | implemented | `echo` / `smbcli ping` / opt-in keepalive 実装済み。reconnect policy との統合は未決。 |
 | SMB CANCEL / shared-session READ cancellation | implemented-but-underverified | watch / READ / IOCTL 等の通常 transaction cancellation で SMB2 CANCEL を送る。送信中 task を cancel せず response を drain する修正は blocking-send unit、Samba E2E、実 NAS の cancel-storm で確認済み。Windows / 他 NAS matrix は残る。 |
 | byte-range lock | implemented-but-underverified | library API `SMBClientSession.withFileLock` と `smbcli lock`。Windows 実測は matrix 側。 |
@@ -307,7 +307,7 @@ Linux/macOS smbclient として必要な理由:
 
 ### P2-4. sparse file preservation / allocation size
 
-状態: `partial`（allocation size の stat/JSON 表示は実装済み）
+状態: `implemented-but-underverified`（logical-content policy を固定）
 
 現状:
 
@@ -317,8 +317,9 @@ Linux/macOS smbclient として必要な理由:
 残:
 
 - `SMBFileStat.allocationSize` と `stat --json` の `allocationSize` は実装済み。実サーバごとの差異確認は残る。
-- copy/get/put で sparse hole を保存する policy を決める。
-- ローカル FS 側の sparse write と SMB 側 allocated ranges の対応を検証する。
+- 通常の get/put/copy は file size と byte content を保証する **logical-content policy** とする。ローカル APFS 等の hole topology と SMB server の allocation topology は API 契約に含めない。これにより、sparse 非対応 filesystem / SMB server でも転送結果の内容が一貫する。
+- hole topology を意図して操作する利用者は `setSparse` / `zeroRange` / `allocatedRanges`（CLI は `smbcli sparse`）を明示的に使う。自動 preservation は未対応として README limitation に残す。
+- 実サーバごとの allocation size / allocated ranges の差異確認は継続する。
 
 ### P2-5. operation-level deadline の public API 方針
 
@@ -428,7 +429,7 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - CHANGE_NOTIFY reconnect: 実装済み。残件は実サーバ互換 matrix。
 - SID lookup: LSARPC lookup 実装済み。残件は AD / Samba AD 実測と issue 更新。
 - owner/group write: 実装済み。SACL は scope 外。
-- byte-level resume / verify: 実装済み。残件は sparse preservation / allocation size。
+- byte-level resume / verify: 実装済み。sparse transfer は logical-content policy を採用し、allocation topology は保持しない。
 - operation timeout: CLI と `SMBee.read(..., operationTimeout:)` に実装済み。残件は write/recursive API への展開判断。
 - durable handle: 現時点では unsupported として明記する。
 - shared-session READ cancel: 送信中 task を cancel せず response を drain する修正済み。blocking-send unit / Samba E2E / 実 NAS 確認あり。Windows / 他 NAS の互換確認は残る。
@@ -444,7 +445,7 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - DFS referral は multi-hop auto-follow、loop detection、TTL cache、path suffix rewrite と Samba msdfs E2E まで実装済み。Windows DFS は matrix pending。
 - symlink / mount point / LX symlink は `readlink` で target 解決可。DFS/NFS reparse data は opaque。
 - byte-level resume と `--verify size|hash` は対応済み。
-- sparse FSCTL は対応済みだが、転送時の sparse preservation と allocation size 表示は未整理。
+- sparse FSCTL と allocation size 表示は対応済み。通常 transfer は logical-content policy、hole topology preservation は未対応。
 - macOS resource fork / xattr / named stream preservation は未対応または方針未決。
 - SMB1 / NetBIOS / port 139 / printer / RDMA / QUIC / multichannel / compression は未対応。
 

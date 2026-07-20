@@ -35,7 +35,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - DFS referral metadata API
 - byte-level resume for single-file get/put
 - transfer verification `--verify size|hash`
-- sparse FSCTL operations
+- sparse FSCTL operations（通常 transfer は logical-content policy。hole topology の保存は未対応）
 - persistent session API
 - scoped multi-tree API `withTree(share:)`
 - graceful TREE_DISCONNECT / LOGOFF
@@ -123,7 +123,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - path Unicode normalization smoke（Samba は実施済み。macOS SMBX / Windows / NAS が残る）
 - share discovery / volume / ACL / SID lookup の実サーバ smoke
 - reparse / readlink の実サーバ smoke
-- sparse file preservation（allocation size 表示と Samba sparse FSCTL E2E は実装済み。通常 transfer の hole preservation policy が残る）
+- sparse file preservation（通常 get/put/copy は logical-content policy。allocation size 表示と Samba sparse FSCTL E2E は実装済み。hole topology の保存は明示的に未対応）
 - operation-level deadline の public API 化判断
 - keepalive と reconnect policy の統合
 - byte-range lock CLI surface
@@ -153,7 +153,7 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 - SID lookup は LSARPC lookup 実装済み。残りは AD / Samba AD 実測。
 - owner/group write は実装済み。SACL は scope 外。
 - byte-level resume / `--verify size|hash` は実装済み。
-- sparse FSCTL と allocation size 表示は実装済み。残りは転送時の hole preservation。
+- sparse FSCTL と allocation size 表示は実装済み。通常 transfer は logical-content policy とし、hole topology preservation は未対応として明示する。
 - operation timeout は CLI 実装済み。残りは public API 化判断。
 - `SMBee.read(..., operationTimeout:)` は実装済み。残りは write/recursive API への展開判断。
 - shared session の READ cancel は、送信中 task を cancel せず response を drain するよう修正済み。残りは Windows / 他 NAS の互換確認。

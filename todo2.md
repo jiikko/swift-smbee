@@ -2,7 +2,7 @@
 
 この文書は、SMBee を **Linux / macOS で使う smbclient 相当の SMB2/3 クライアント**として育てるための、現在の未解決 backlog である。
 
-`todo.md` は実装進捗の時系列ログではなく、現在の状態が分かる要約に整理する。詳細な調査ログや履歴は issue / commit / docs に寄せる。
+この文書を現在の実装・互換性 backlog の正本とする。完了済みの旧要約は [`issues/done/todo.md`](issues/done/todo.md) に保存し、詳細な調査ログや履歴は issue / commit / docs に寄せる。
 
 ## 監査時点
 

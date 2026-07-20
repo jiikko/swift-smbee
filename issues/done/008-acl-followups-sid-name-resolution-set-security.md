@@ -2,7 +2,7 @@
 
 状態: **done** (2026-07-03 に A の LSARPC lookup も実装。issues/done へ移動)
 起票: 2026-07-01
-関連: [todo.md](../todo.md) 「ACL / owner / SID metadata」/ `Sources/SMBee/SMB2ReadCodecs.swift`
+関連: [完了済み旧 TODO](todo.md) 「ACL / owner / SID metadata」/ `Sources/SMBee/SMB2ReadCodecs.swift`
 (`decodeSecurityDescriptor` / `decodeSID`) / `Sources/smbcli/SMBCLI.swift` (`acl` サブコマンド)
 
 ## 背景

@@ -1,7 +1,7 @@
 # SMBee Coverage Matrix
 
 This document is the compact source for what SMBee implements, how it is tested,
-and what remains unsupported or underverified. It complements `todo.md`, which is
+and what remains unsupported or underverified. It complements `todo2.md`, which is
 the compact current-state backlog.
 
 Status labels:

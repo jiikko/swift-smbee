@@ -2,7 +2,7 @@
 
 pure-Swift SMB2/3 client。プロトコル正本は [docs/smb-protocol.md](docs/smb-protocol.md) /
 [docs/architecture.md](docs/architecture.md)、テスト戦略正本は [docs/testing.md](docs/testing.md)、
-実装 TODO は [todo.md](todo.md)。ここには「触ったときに必ず踏む手順」だけを置く。
+実装 TODO は [todo2.md](todo2.md)。ここには「触ったときに必ず踏む手順」だけを置く。
 
 ## 実装を変更したら smoke E2E を回す（最重要）
 

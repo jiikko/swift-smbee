@@ -7,7 +7,7 @@
 ## 進捗 (2026-07-01)
 
 SMBee 側で本 issue に関連する auth 基盤を実装した（commit c8172c3 / 17b897d、
-[todo.md](../todo.md) の authentication options 参照）。
+[todo2.md](../todo2.md) の authentication options 参照）。
 
 - **guest / anonymous NTLM** を実装（`SMBCredential.anonymous`、CLI `--anonymous`/`--guest`、
   NTLM anonymous Type3、signing 不可時の unsigned フォールバック）。実 Samba guest で ls/cat/stat 成功。
@@ -103,7 +103,7 @@ Finder 相当認証の正体は複数あり得る。
 
 成果物:
 
-- [x] 現行 NTLM 認証経路の短いメモ（本節 + `todo.md` authentication options）。
+- [x] 現行 NTLM 認証経路の短いメモ（本節 + `todo2.md` authentication options）。
 - [x] provider 入口は実装済み。Keychain など consumer 依存 credential source は provider に閉じ込める。
 - [ ] `SMBAuthenticator` のような抽象化が必要な差し替え点リスト（GSS を実装する場合のみ必要）。
 

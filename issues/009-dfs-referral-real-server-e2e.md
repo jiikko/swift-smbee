@@ -3,7 +3,7 @@
 状態: **open** (backlog)
 起票: 2026-07-01
 関連: `Sources/SMBee/SMB2DfsReferral.swift` / `Sources/SMBee/SMBClient.swift` (`dfsReferral`) /
-`bin/e2e/container-samba.sh` / `test/e2e/smb/` / [todo.md](../todo.md) 「symlink / reparse point / DFS referral」
+`bin/e2e/container-samba.sh` / `test/e2e/smb/` / [todo2.md](../todo2.md) 「symlink / reparse point / DFS referral」
 
 ## 背景
 

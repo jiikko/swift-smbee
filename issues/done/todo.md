@@ -1,8 +1,8 @@
-# SMBee implementation TODO
+# SMBee implementation TODO (completed snapshot)
 
-この文書は、SMBee の現在の実装状態と残タスクを短く確認するための入口である。
+この文書は、SMBee の実装状態と残タスクを確認するために使っていた旧入口である。
 
-詳細な smbclient backlog は [`todo2.md`](todo2.md) を正本とする。実装方針は [`docs/architecture.md`](docs/architecture.md) / [`docs/smb-protocol.md`](docs/smb-protocol.md) / [`docs/testing.md`](docs/testing.md) を正本とする。
+この文書は 2026-07-21 に完了済みスナップショットとして移動した。現在の smbclient backlog は [`todo2.md`](../../todo2.md) を正本とする。実装方針は [`docs/architecture.md`](../../docs/architecture.md) / [`docs/smb-protocol.md`](../../docs/smb-protocol.md) / [`docs/testing.md`](../../docs/testing.md) を正本とする。
 
 ## 現在の到達点
 

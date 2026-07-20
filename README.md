@@ -35,7 +35,8 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 - [docs/coverage.md](docs/coverage.md) — SMBee が実装済み・未検証・未対応の SMB surface とテスト状況
 - [docs/api-stability.md](docs/api-stability.md) — 0.1 public API freeze、error / concurrency / credential migration 方針
 - [docs/compatibility-matrix.md](docs/compatibility-matrix.md) — Samba / macOS SMBX / Windows / NAS の実サーバ smoke 記録
-- [todo.md](todo.md) — 実装 TODO（Phase 0〜5 のチェックリスト）
+- [todo2.md](todo2.md) — 現在の実装・互換性 backlog
+- [issues/done/todo.md](issues/done/todo.md) — 完了済みの旧実装 TODO
 
 ## 現時点の制限
 

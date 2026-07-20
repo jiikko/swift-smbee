@@ -2,7 +2,7 @@
 
 状態: **実装済み。macOS SMBX 手動 smoke 待ち**
 起票: 2026-06-30
-関連: `todo.md` / `Sources/SMBee/SMBClient.swift` / `Sources/smbcli/SMBCLI.swift`
+関連: `todo2.md` / `Sources/SMBee/SMBClient.swift` / `Sources/smbcli/SMBCLI.swift`
 
 ## 背景
 

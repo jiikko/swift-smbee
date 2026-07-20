@@ -174,5 +174,5 @@ SMBee は、Linux / macOS で動く Swift 製 SMB2/3 client library + `smbcli` �
 3. multi-tree session model 整理。
 4. DFS real E2E + optional auto-follow。
 5. API stability / packaging。
-6. macOS metadata / named stream policy。
+6. macOS metadata / named stream policy（data fork only。resource fork / xattr / ADS は未対応）。
 7. Kerberos / GSS。実要件が出たら着手。

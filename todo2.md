@@ -239,7 +239,7 @@ Linux/macOS smbclient として必要な理由:
 
 ### P1-6. macOS metadata / resource fork / alternate data stream policy
 
-状態: `missing`
+状態: `implemented-but-underverified`（data fork only policy を固定）
 
 現状:
 
@@ -251,13 +251,12 @@ Linux/macOS smbclient として必要な理由:
 - macOS の Finder 相当コピーでは、拡張属性・resource fork・Finder info が問題になる。
 - CLI copy として「data fork だけコピー」なのか「macOS metadata も保つ」のかを明示しないと事故る。
 
-やること:
+方針:
 
-- まず policy を決める:
-  - SMBee core は data fork のみ。
-  - macOS metadata は consumer 側。
-  - あるいは named stream API を実装する。
-- 実装する場合:
+- SMBee core と CLI の get/put/mget/mput は **data fork only**。resource fork、Finder metadata、extended attributes、SMB alternate data streams は保存・列挙しない。
+- Finder 相当コピーは保証しない。named stream API / xattr mapping は将来の明示的な opt-in 機能として扱う。
+- 通常 transfer の byte content 回帰は unit と Samba CLI smoke でカバー済み。resource fork / ADS の実サーバ matrix は API を追加するまで対象外。
+- 将来実装する場合:
   - named stream enumeration / read / write を調査する。
   - macOS resource fork / AFP_AfpInfo 相当の互換性を実測する。
 

@@ -5013,31 +5013,32 @@ actor SMBSession {
             try await sendUnsigned(packet, messageId: messageId)
             return
         }
-        var signed = packet
-        signed[16] |= UInt8(SMB2Flags.signed & 0xff)
-        for index in 48..<64 { signed[index] = 0 }
+        // Sign it in place: mutation gives this local buffer unique ownership, avoiding
+        // a second payload-sized copy before the transport framing copy.
+        packet[16] |= UInt8(SMB2Flags.signed & 0xff)
+        for index in 48..<64 { packet[index] = 0 }
         let signature: [UInt8]
 #if canImport(CryptoExtras) && !canImport(CommonCrypto)
         if signingAlgorithm == .aesCMAC, let signingCMACContext {
-            signature = signingCMACContext.authenticationCode(message: signed)
+            signature = signingCMACContext.authenticationCode(message: packet)
         } else {
             signature = try SMBSessionSigning.signatureForNormalizedPacket(
-                algorithm: signingAlgorithm, key: signingKey, packet: signed, sender: .client
+                algorithm: signingAlgorithm, key: signingKey, packet: packet, sender: .client
             )
         }
 #else
         signature = try SMBSessionSigning.signatureForNormalizedPacket(
-            algorithm: signingAlgorithm, key: signingKey, packet: signed, sender: .client
+            algorithm: signingAlgorithm, key: signingKey, packet: packet, sender: .client
         )
 #endif
-        for index in 0..<16 { signed[48 + index] = signature[index] }
-        let reservedCharge = try await reserveCredit(signed)
+        for index in 0..<16 { packet[48 + index] = signature[index] }
+        let reservedCharge = try await reserveCredit(packet)
         if let messageId, !markSendStarted(messageId: messageId) {
             await refundCredit(charge: reservedCharge)
             throw CancellationError()
         }
         do {
-            try await transport.send(DirectTCPFraming.frame(signed))
+            try await transport.send(DirectTCPFraming.frame(packet))
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error

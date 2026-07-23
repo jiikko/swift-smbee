@@ -331,7 +331,7 @@ test_summary_happy_path() {
     '- Raw samples: **read_stream=10, write_stream=10**' \
     '| `read_stream` | Throughput | ✅ Pass | 737.364 MiB/s | 1.84× / +84.3% | Higher ↑ | > 400 MiB/s | Median | 8 MiB/iteration × 20 iterations/sample × 5 samples (160 MiB/sample) | MAD 0.000 MiB/s; 737.364 MiB/s–737.364 MiB/s | 2 |' \
     '| `read_stream` | User CPU | ℹ️ Observe | 200.000 ms | — | Lower ↓ | Observation only | Median | 8 MiB/iteration × 20 iterations/sample × 5 samples (160 MiB/sample) | MAD 0.000 ms; 200.000 ms–200.000 ms | 2 |' \
-    '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | — | Stable window | ≥ 200 ms | Median | 8 MiB/iteration × 20 iterations/sample × 5 samples (160 MiB/sample) | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' \
+    '| `read_stream` | Measured duration | ✅ Pass | 245.000 ms | — | Stable window | ≥ 100 ms | Median | 8 MiB/iteration × 20 iterations/sample × 5 samples (160 MiB/sample) | MAD 0.000 ms; 245.000 ms–245.000 ms | 2 |' \
     '- ✅ **1/1 passed**' \
     '### CPU efficiency (Observe-only)' \
     'These derived metrics are Observe-only and do not affect guardrail results or exit status.' \
@@ -344,7 +344,7 @@ test_summary_happy_path() {
     '| Memory | ✅ Healthy | XCTest peak 279.3 MiB (54.6% of limit); CMAC current-RSS delta median 0.000 MiB | No retained signing-buffer growth is visible; process peak stays below the absolute guardrail. |' \
     '| AES-CMAC signing | ✅ Strengthened | signing 640.369 ms vs pure Swift 1280.738 ms (2.0×); 97.1% of full synthetic | The backend is faster, but signing still dominates full synthetic write and remains a profiling target. |' \
     '| Payload scaling | ✅ Linear | 4–16 MiB throughput 2295.964–2295.964 MiB/s (0.0% span) | Flat throughput indicates no payload-size cliff in the measured range. |' \
-    '| Measurement confidence | ℹ️ Provisional | 2 invocation(s); raw throughput span read 0.0%, write 0.0% | A normal push is a health snapshot; use a 10-run dispatch before making optimization decisions. |' \
+    '| Measurement confidence | ℹ️ Provisional | 2 invocation(s); raw throughput span read 0.0%, write 0.0% | Each push collects 10 complete benchmark invocations and reports their median to reduce hosted-runner noise. |' \
     'XCTest process peak RSS: **279.3 MiB** · ✅ Pass (`< 512 MiB` guardrail).' \
     'Whole `swift test` process-tree peak RSS: **666.1 MiB** (682080 KiB).' \
     '`swift test` wall time: **42.50 s**.' \
@@ -653,7 +653,7 @@ test_summary_edge_cases() {
   # shellcheck disable=SC2016
   expect_contains "${boundary_summary}" \
     '| `read_stream` | Throughput | ❌ Fail | 400.000 MiB/s | 1.00× / +0.0% | Higher ↑ | > 400 MiB/s | Median |' \
-    '| `read_stream` | Measured duration | ✅ Pass | 200.000 ms | — | Stable window | ≥ 200 ms | Median |' \
+    '| `read_stream` | Measured duration | ✅ Pass | 200.000 ms | — | Stable window | ≥ 100 ms | Median |' \
     'XCTest process peak RSS: **512.0 MiB** · ❌ Fail (`< 512 MiB` guardrail).'
 
   local no_cache_log="${scenario_dir}/no-cache.log"

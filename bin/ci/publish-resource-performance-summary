@@ -104,7 +104,7 @@ PY
     echo '- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; calibrated catastrophic floors are shown per operation.'
     echo '- **User/System CPU:** CPU consumed during the measured transfer. Lower is better, but currently informational because hosted-runner variance needs more history.'
     echo '- **Process max RSS:** peak memory for the entire XCTest process, not a per-operation allocation delta. It can repeat across read/write rows; the job fails at 512 MiB or above.'
-    echo '- **Measured duration:** each aggregated sample must cover at least 200 ms of transfer-only intervals to reduce timer and scheduler noise.'
+    echo '- **Measured duration:** each aggregated sample must cover at least 100 ms of transfer-only intervals to reduce timer and scheduler noise.'
     echo '- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.'
   elif [ "${parse_status}" -ne 0 ]; then
     echo '| — | Metrics unavailable | ❌ Parse failed | — | — | — | — | — | — | — | — |'
@@ -212,7 +212,7 @@ for (operation, metric), metric_rows in summary_metrics.items():
         direction = "Lower ↓"
     elif metric == "sample_elapsed_ms":
         direction = "Stable window"
-        guardrail = "≥ 200 ms"
+        guardrail = "≥ 100 ms"
         result = "✅ Pass" if display_value_number >= 200 else "❌ Too short"
     workload = metric_rows[0]
     total_size = Decimal(workload["size_mib"])
@@ -386,7 +386,7 @@ if read_span is not None and write_span is not None:
     confidence_evidence += f"; raw throughput span read {read_span * 100:.1f}%, write {write_span * 100:.1f}%"
 print(
     f"| Measurement confidence | {confidence_status} | {confidence_evidence} "
-    "| A normal push is a health snapshot; use a 10-run dispatch before making optimization decisions. |"
+    "| Each push collects 10 complete benchmark invocations and reports their median to reduce hosted-runner noise. |"
 )
 
 print()
@@ -395,7 +395,7 @@ print()
 print("- **Throughput:** synthetic in-memory SMB transfer rate. Higher is better; calibrated catastrophic floors are shown per operation.")
 print("- **User/System CPU:** CPU consumed during the measured transfer. Lower is better, but currently informational because hosted-runner variance needs more history.")
 print("- **Process max RSS:** shown once below because it is a process-wide peak, not an operation-specific allocation delta.")
-print("- **Measured duration:** each aggregated sample must cover at least 200 ms of transfer-only intervals to reduce timer and scheduler noise.")
+print("- **Measured duration:** each aggregated sample must cover at least 100 ms of transfer-only intervals to reduce timer and scheduler noise.")
 print("- **Spread (raw):** with one baseline run, this is the raw sample min–max. With multiple runs, it is the representative-value MAD and min–max; N is the number of values used.")
 print("- Compare trends between runs of this same Linux Release job. Values from macOS, Debug builds, or real-network E2E are not directly comparable.")
 

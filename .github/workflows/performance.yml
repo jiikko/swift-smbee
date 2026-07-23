@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       baseline_runs:
-        description: Number of benchmark invocations to collect after one Release build
+        description: Number of complete benchmark invocations to collect after one Release build
         required: false
-        default: "1"
+        default: "10"
   push:
     branches: [master]
   pull_request:
@@ -31,7 +31,7 @@ jobs:
     needs: ci-script-tests
     runs-on: ubuntu-latest
     env:
-      RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '1' }}
+      RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '10' }}
     steps:
       - uses: actions/checkout@v5
       - name: Restore SwiftPM performance build
@@ -43,7 +43,7 @@ jobs:
           restore-keys: |
             performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', '.swift-image-digest', 'Package.resolved') }}-
       - name: Deterministic contracts and Release resource metrics
-        timeout-minutes: 15
+        timeout-minutes: 30
         env:
           RESOURCE_SKIP_BUILD: ${{ steps.swiftpm-cache.outputs.cache-hit == 'true' }}
         run: bin/ci/run-resource-performance

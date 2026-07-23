@@ -10,7 +10,12 @@ public enum SMBCodecError: Error, Equatable, Sendable {
 }
 
 struct SMBByteWriter {
-    private(set) var bytes: [UInt8] = []
+    private(set) var bytes: [UInt8]
+
+    init(capacity: Int = 0) {
+        bytes = []
+        bytes.reserveCapacity(capacity)
+    }
 
     mutating func writeUInt8(_ value: UInt8) {
         bytes.append(value)

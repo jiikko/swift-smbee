@@ -718,7 +718,9 @@ enum SMB2Write {
             treeId: treeId,
             sessionId: sessionId
         ).encode()
-        var writer = SMBByteWriter()
+        // A WRITE packet carries the caller's payload. Reserve its exact wire size so
+        // appending each 64 KiB chunk does not grow and copy the backing buffer.
+        var writer = SMBByteWriter(capacity: dataOffset + max(1, data.count))
         writer.writeBytes(header)
         writer.writeUInt16LE(49)
         writer.writeUInt16LE(UInt16(dataOffset))

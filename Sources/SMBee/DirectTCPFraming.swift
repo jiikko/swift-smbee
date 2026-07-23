@@ -4,15 +4,27 @@ enum DirectTCPFraming {
     // Keep direct-TCP framing in the SMB layer so transports remain plain byte streams.
     // This preserves the architecture rule that SMB logic depends only on SMBTransport.
     static func frame(_ message: [UInt8]) throws -> [UInt8] {
-        guard message.count <= 0x00ff_ffff else {
+        let framed = try segments([message])
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(message.count + 4)
+        for segment in framed { bytes.append(contentsOf: segment) }
+        return bytes
+    }
+
+    /// Produces a framing header and payload buffers without joining the payload into
+    /// another allocation. Vectored transports can send these buffers directly.
+    static func segments(_ payload: [[UInt8]]) throws -> [[UInt8]] {
+        let length = payload.reduce(0) { $0 + $1.count }
+        guard length <= 0x00ff_ffff else {
             throw SMBCodecError.invalidValue("SMB direct-TCP frame too large")
         }
-        return [
+        let header: [UInt8] = [
             0,
-            UInt8((message.count >> 16) & 0xff),
-            UInt8((message.count >> 8) & 0xff),
-            UInt8(message.count & 0xff)
-        ] + message
+            UInt8((length >> 16) & 0xff),
+            UInt8((length >> 8) & 0xff),
+            UInt8(length & 0xff)
+        ]
+        return [header] + payload
     }
 
     static func length(from header: [UInt8]) throws -> Int {

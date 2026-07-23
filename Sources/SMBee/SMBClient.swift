@@ -4986,7 +4986,7 @@ actor SMBSession {
             throw CancellationError()
         }
         do {
-            try await transport.send(DirectTCPFraming.frame(packet))
+            try await transport.send(DirectTCPFraming.segments([packet]))
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
@@ -5038,7 +5038,7 @@ actor SMBSession {
             throw CancellationError()
         }
         do {
-            try await transport.send(DirectTCPFraming.frame(packet))
+            try await transport.send(DirectTCPFraming.segments([packet]))
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
@@ -5084,7 +5084,7 @@ actor SMBSession {
             throw CancellationError()
         }
         do {
-            try await transport.send(DirectTCPFraming.frame(try header.encode() + sealed.ciphertext))
+            try await transport.send(DirectTCPFraming.segments([try header.encode(), sealed.ciphertext]))
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error

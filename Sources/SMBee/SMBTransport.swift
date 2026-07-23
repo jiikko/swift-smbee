@@ -11,8 +11,22 @@ public enum SMBTransportError: Error, Equatable, Sendable {
 public protocol SMBTransport: Sendable {
     func connect(host: String, port: UInt16) async throws
     func send(_ bytes: [UInt8]) async throws
+    func send(_ segments: [[UInt8]]) async throws
     func receive(maxLength: Int) async throws -> [UInt8]
     func close()
+}
+
+public extension SMBTransport {
+    /// Sends one logical byte stream assembled from multiple buffers. Transports can
+    /// override this to use vectored I/O; the default preserves source compatibility.
+    func send(_ segments: [[UInt8]]) async throws {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(segments.reduce(0) { $0 + $1.count })
+        for segment in segments {
+            bytes.append(contentsOf: segment)
+        }
+        try await send(bytes)
+    }
 }
 
 public final class InMemoryTransport: SMBTransport, @unchecked Sendable {

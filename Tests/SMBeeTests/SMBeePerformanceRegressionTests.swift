@@ -657,6 +657,18 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
         }
     }
 
+    func send(_ segments: [[UInt8]]) async throws {
+        try Task.checkCancellation()
+        lock.withLock {
+            sentBytes += segments.reduce(0) { $0 + $1.count }
+            if retainOutbound {
+                for segment in segments {
+                    outboundStorage.append(contentsOf: segment)
+                }
+            }
+        }
+    }
+
     func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
         return try lock.withLock {

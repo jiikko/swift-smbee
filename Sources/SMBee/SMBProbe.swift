@@ -40,7 +40,7 @@ public enum SMBProbe {
                 Data("NEGOTIATE request (\(request.count) bytes): \(SMBDebug.packetSummary(request, traceWire: traceWire))\n".utf8)
             )
         }
-        try await transport.send(DirectTCPFraming.frame(request))
+        try await transport.send(DirectTCPFraming.segments([request]))
         let response = try await receiveFramedMessage(from: transport)
         if ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" {
             let traceWire = ProcessInfo.processInfo.environment["SMBEE_TRACE_WIRE"] == "1"

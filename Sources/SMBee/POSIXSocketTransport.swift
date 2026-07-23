@@ -51,6 +51,25 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         try Task.checkCancellation()
     }
 
+    public func send(_ segments: [[UInt8]]) async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            do {
+                try await Task.detached {
+                    for segment in segments {
+                        try self.sendBlocking(segment)
+                    }
+                }.value
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                throw error
+            }
+        } onCancel: {
+            self.interruptBlockingIO()
+        }
+        try Task.checkCancellation()
+    }
+
     public func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
         let bytes = try await withTaskCancellationHandler {

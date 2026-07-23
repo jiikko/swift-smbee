@@ -9,6 +9,28 @@ enum SMBSessionEncryptionAlgorithm {
 }
 
 enum SMBSessionSigning {
+    /// Signs a packet whose SMB2 signature field (bytes 48..<64) is already zeroed.
+    /// Outbound packets are normalized before this call, so avoiding a second full
+    /// packet copy keeps signing on the hot path focused on the CMAC/GMAC operation.
+    static func signatureForNormalizedPacket(
+        algorithm: SMBSessionSigningAlgorithm,
+        key: [UInt8],
+        packet: [UInt8],
+        sender: SMBSessionSigningSender
+    ) throws -> [UInt8] {
+        switch algorithm {
+        case .aesCMAC:
+            return try AESCMAC.authenticationCode(key: key, message: packet)
+        case .aesGMAC:
+            let header = try SMB2Header.decode(packet)
+            return try SMBCrypto.aesGMAC(
+                key: key,
+                nonce: gmacNonce(messageId: header.messageId, command: header.command, sender: sender),
+                authenticatedData: packet
+            )
+        }
+    }
+
     static func signature(
         algorithm: SMBSessionSigningAlgorithm,
         key: [UInt8],
@@ -17,17 +39,9 @@ enum SMBSessionSigning {
     ) throws -> [UInt8] {
         var normalized = packet
         normalized.replaceSubrange(48..<64, with: Array(repeating: 0, count: 16))
-        switch algorithm {
-        case .aesCMAC:
-            return try AESCMAC.authenticationCode(key: key, message: normalized)
-        case .aesGMAC:
-            let header = try SMB2Header.decode(packet)
-            return try SMBCrypto.aesGMAC(
-                key: key,
-                nonce: gmacNonce(messageId: header.messageId, command: header.command, sender: sender),
-                authenticatedData: normalized
-            )
-        }
+        return try signatureForNormalizedPacket(
+            algorithm: algorithm, key: key, packet: normalized, sender: sender
+        )
     }
 
     static func gmacNonce(messageId: UInt64, command: UInt16, sender: SMBSessionSigningSender) -> [UInt8] {

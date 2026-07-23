@@ -131,6 +131,28 @@ enum AES128 {
 }
 
 public enum AESCMAC {
+#if canImport(CryptoExtras) && !canImport(CommonCrypto)
+    /// Reuses the BoringSSL CMAC key schedule while keeping each message one-shot.
+    /// Copying the template clones the native context, so a finalized message never
+    /// contaminates the next packet.
+    struct Context {
+        private let template: AES.CMAC
+
+        init(key: [UInt8]) throws {
+            guard key.count == 16 else {
+                throw SMBCodecError.invalidValue("AES-CMAC requires a 16-byte key")
+            }
+            template = try AES.CMAC(key: SymmetricKey(data: key))
+        }
+
+        func authenticationCode(message: [UInt8]) -> [UInt8] {
+            var authenticator = template
+            message.withUnsafeBytes { authenticator.update(bufferPointer: $0) }
+            return Array(authenticator.finalize())
+        }
+    }
+#endif
+
     public static func authenticationCode(key: [UInt8], message: [UInt8]) throws -> [UInt8] {
         guard key.count == 16 else { throw SMBCodecError.invalidValue("AES-CMAC requires a 16-byte key") }
         // Keep the context one-shot: session close/reconnect must not leave expanded key state behind.

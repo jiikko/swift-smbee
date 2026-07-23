@@ -353,13 +353,15 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         for packet in packets {
             if usingPureSwiftBackend {
                 var normalized = packet
-                normalized.replaceSubrange(48..<64, with: repeatElement(0, count: 16))
+                for index in 48..<64 { normalized[index] = 0 }
                 signatureBytes += try AESCMAC.pureSwiftAuthenticationCode(
                     key: signingKey, message: normalized
                 ).count
             } else {
-                signatureBytes += try SMBSessionSigning.signature(
-                    algorithm: .aesCMAC, key: signingKey, packet: packet, sender: .client
+                var normalized = packet
+                for index in 48..<64 { normalized[index] = 0 }
+                signatureBytes += try SMBSessionSigning.signatureForNormalizedPacket(
+                    algorithm: .aesCMAC, key: signingKey, packet: normalized, sender: .client
                 ).count
             }
         }

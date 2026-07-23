@@ -3671,6 +3671,9 @@ actor SMBSession {
     private var messageId: UInt64 = 0
     private var sessionId: UInt64 = 0
     private var signingKey: [UInt8]?
+#if canImport(CryptoExtras) && !canImport(CommonCrypto)
+    private var signingCMACContext: AESCMAC.Context?
+#endif
     private var signingRequired = false
     private var encryptionKey: [UInt8]?
     private var decryptionKey: [UInt8]?
@@ -3814,6 +3817,11 @@ actor SMBSession {
             encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
             decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
         }
+#if canImport(CryptoExtras) && !canImport(CommonCrypto)
+        if let signingKey {
+            signingCMACContext = try AESCMAC.Context(key: signingKey)
+        }
+#endif
         // Swift cannot guarantee zeroization of copied String/Array backing storage. Releasing the
         // session's owning reference here still bounds the plaintext credential lifetime instead of
         // retaining it for every subsequent operation.
@@ -5003,13 +5011,21 @@ actor SMBSession {
         var signed = packet
         signed[16] |= UInt8(SMB2Flags.signed & 0xff)
         for index in 48..<64 { signed[index] = 0 }
-        let signature = try SMBSessionSigning.signature(
-            algorithm: signingAlgorithm,
-            key: signingKey,
-            packet: signed,
-            sender: .client
+        let signature: [UInt8]
+#if canImport(CryptoExtras) && !canImport(CommonCrypto)
+        if signingAlgorithm == .aesCMAC, let signingCMACContext {
+            signature = signingCMACContext.authenticationCode(message: signed)
+        } else {
+            signature = try SMBSessionSigning.signatureForNormalizedPacket(
+                algorithm: signingAlgorithm, key: signingKey, packet: signed, sender: .client
+            )
+        }
+#else
+        signature = try SMBSessionSigning.signatureForNormalizedPacket(
+            algorithm: signingAlgorithm, key: signingKey, packet: signed, sender: .client
         )
-        signed.replaceSubrange(48..<64, with: signature)
+#endif
+        for index in 0..<16 { signed[48 + index] = signature[index] }
         let reservedCharge = try await reserveCredit(signed)
         if let messageId, !markSendStarted(messageId: messageId) {
             await refundCredit(charge: reservedCharge)

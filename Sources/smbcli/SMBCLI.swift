@@ -66,9 +66,7 @@ enum SMBCLIMain {
             return
         }
         let stderr = FileHandle.standardError
-        if let data = "Error: \(error)\n".data(using: .utf8) {
-            stderr.write(data)
-        }
+        stderr.write(Data("Error: \(error)\n".utf8))
     }
 }
 
@@ -1842,7 +1840,10 @@ func errorJSONString(_ error: Error) throws -> String {
 func sparseRangesJSONString(_ ranges: [SMBAllocatedRange]) throws -> String {
     let objects = ranges.map { ["offset": $0.offset, "length": $0.length] }
     let data = try JSONSerialization.data(withJSONObject: objects, options: [.sortedKeys])
-    return String(decoding: data, as: UTF8.self)
+    guard let result = String(bytes: data, encoding: .utf8) else {
+        throw ValidationError("failed to encode JSON as UTF-8")
+    }
+    return result
 }
 
 final class TransferProgressWriter: @unchecked Sendable {

@@ -21,8 +21,6 @@ final class SMBDfsReferralE2ETests: XCTestCase {
             password: environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
         )
         let session = try await SMBee.connect(host: host, port: port, credential: credential, share: "public")
-        defer { Task { await session.close() } }
-
         let result = try await session.dfsReferral(
             share: "dfsroot", path: "\\\\\(host)\\dfsroot\\public-link"
         )
@@ -31,18 +29,19 @@ final class SMBDfsReferralE2ETests: XCTestCase {
             referral.networkAddress?.lowercased().contains("public") == true
         }, "unexpected DFS referrals: \(result.referrals.map { $0.networkAddress })")
         XCTAssertGreaterThan(result.pathConsumed, 0)
+        await session.close()
 
         let connection = try await SMBee.connectFollowingDFS(
             host: host, port: port, credential: credential,
             path: "\\\\\(host)\\dfsroot\\public-link"
         )
         let targetSession = connection.session
-        defer { Task { await targetSession.close() } }
         XCTAssertEqual(connection.path, "")
         let entries = try await targetSession.list()
         XCTAssertTrue(entries.contains { $0.name == "known.txt" })
         let data = try await targetSession.read(path: "known.txt")
         XCTAssertEqual(data, Array("hello from SMBee E2E\n".utf8))
+        await targetSession.close()
 
         let chainedPath = "\\\\\(host)\\dfsroot\\chain-link\\known.txt"
         let resolved = try await SMBee.resolveDFS(host: host, port: port, credential: credential, path: chainedPath)
@@ -53,10 +52,10 @@ final class SMBDfsReferralE2ETests: XCTestCase {
         let chainedConnection = try await SMBee.connectFollowingDFS(
             host: host, port: port, credential: credential, path: chainedPath
         )
-        defer { Task { await chainedConnection.session.close() } }
         XCTAssertEqual(chainedConnection.path, "known.txt")
         let connectionData = try await chainedConnection.session.read(path: chainedConnection.path)
         XCTAssertEqual(connectionData, Array("hello from SMBee E2E\n".utf8))
+        await chainedConnection.session.close()
         let chainedData = try await SMBee.readFollowingDFS(
             host: host, port: port, credential: credential, path: chainedPath
         )

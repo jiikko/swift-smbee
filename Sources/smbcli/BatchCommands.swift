@@ -520,8 +520,11 @@ func batchActionLine(kind: BatchActionKind, source: String, destination: String,
     guard json else {
         return "\(kind.rawValue) \(source) -> \(destination)"
     }
-    return (try? String(decoding: JSONEncoder().encode(BatchActionOutput(action: kind, source: source, destination: destination)), as: UTF8.self))
-        ?? "{\"ok\":false,\"error\":\"failed to encode batch action\"}"
+    guard let data = try? JSONEncoder().encode(BatchActionOutput(action: kind, source: source, destination: destination)),
+          let result = String(bytes: data, encoding: .utf8) else {
+        return "{\"ok\":false,\"error\":\"failed to encode batch action\"}"
+    }
+    return result
 }
 
 func batchSummaryLine(command: String, action: String, count: Int, skipped: Int, dryRun: Bool, json: Bool) -> String {
@@ -531,8 +534,11 @@ func batchSummaryLine(command: String, action: String, count: Int, skipped: Int,
         }
         return "\(action): \(count), skipped: \(skipped)"
     }
-    return (try? String(decoding: JSONEncoder().encode(BatchSummaryOutput(command: command, action: action, count: count, skipped: skipped, dryRun: dryRun)), as: UTF8.self))
-        ?? "{\"ok\":false,\"error\":\"failed to encode batch summary\"}"
+    guard let data = try? JSONEncoder().encode(BatchSummaryOutput(command: command, action: action, count: count, skipped: skipped, dryRun: dryRun)),
+          let result = String(bytes: data, encoding: .utf8) else {
+        return "{\"ok\":false,\"error\":\"failed to encode batch summary\"}"
+    }
+    return result
 }
 
 private func writeBatchAction(kind: BatchActionKind, source: String, destination: String, json: Bool) {

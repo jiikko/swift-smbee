@@ -1790,8 +1790,9 @@ public enum SMBClient {
             host: host, port: port, share: share, credential: credential,
             timeout: timeout, makeTransport: makeTransport
         )
-        defer { Task { await session.close() } }
-        return try await session.dfsReferral(share: share, path: path)
+        let result = try await session.dfsReferral(share: share, path: path)
+        await session.close()
+        return result
     }
 
     /// Resolve `path` through DFS referrals and connect using the same credential.
@@ -5397,13 +5398,13 @@ actor SMBSession {
         return bytes + Array(repeating: 0, count: length - bytes.count)
     }
 
-    /// READ 1 リクエストの local 上限。READ は「投げて応答を待つ」直列往復なので、
-    /// チャンクが小さいとスループット上限が RTT × チャンクで決まる (64 KiB × ~19ms
-    /// RTT = 実測 3.3 MB/s、obaket issue 389)。1 MiB に上げると往復回数が 1/16 に
-    /// なる。実際のリクエスト長は negotiate の maxRead と credit 残高
-    /// (1 MiB = 16 credits) で常に clamp されるため、サーバ制約は破らない。
-    /// write 側 (`localWriteChunkLimit` / `creditAwareWriteChunkSize`) は別途計測して
-    /// から判断する (読みだけが preview 律速のため先行)。
+    // READ 1 リクエストの local 上限。READ は「投げて応答を待つ」直列往復なので、
+    // チャンクが小さいとスループット上限が RTT × チャンクで決まる (64 KiB × ~19ms
+    // RTT = 実測 3.3 MB/s、obaket issue 389)。1 MiB に上げると往復回数が 1/16 に
+    // なる。実際のリクエスト長は negotiate の maxRead と credit 残高
+    // (1 MiB = 16 credits) で常に clamp されるため、サーバ制約は破らない。
+    // write 側 (`localWriteChunkLimit` / `creditAwareWriteChunkSize`) は別途計測して
+    // から判断する (読みだけが preview 律速のため先行)。
     // internal: SMBeePerformanceRegressionTests が期待チャンク数の導出に参照する。
     static let localReadChunkLimit = 1024 * 1024
 

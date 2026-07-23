@@ -915,7 +915,7 @@ enum SMB2ReparsePoint {
         guard readUInt32LE(data, at: 0) == 2 else {
             throw SMBCodecError.invalidValue("unsupported LX symlink reparse data version")
         }
-        let target = String(decoding: data.dropFirst(4), as: UTF8.self)
+        let target = String(bytes: data.dropFirst(4), encoding: .utf8) ?? ""
         return SMBReparsePoint(tag: tag, substituteName: target, rawData: data)
     }
 

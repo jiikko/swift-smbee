@@ -1440,7 +1440,7 @@ final class SMBeeTests: XCTestCase {
         let requests = try unframed(transport.outbound)
         XCTAssertGreaterThanOrEqual(requests.count, 3)
         let type1 = try SPNEGO.unwrapNTLMToken(Array(requests[1][88..<requests[1].count]))
-        XCTAssertEqual(String(decoding: readSecurityBuffer(type1, at: 16), as: UTF8.self), "PROVIDER-DOMAIN")
+        XCTAssertEqual(String(bytes: readSecurityBuffer(type1, at: 16), encoding: .utf8), "PROVIDER-DOMAIN")
     }
 
     func testCredentialProviderIsResolvedOnceForOneShotStat() async throws {
@@ -1475,7 +1475,7 @@ final class SMBeeTests: XCTestCase {
         let requests = try unframed(transport.outbound)
         XCTAssertGreaterThanOrEqual(requests.count, 3)
         let type1 = try SPNEGO.unwrapNTLMToken(Array(requests[1][88..<requests[1].count]))
-        XCTAssertEqual(String(decoding: readSecurityBuffer(type1, at: 16), as: UTF8.self), "ONE-SHOT-DOMAIN")
+        XCTAssertEqual(String(bytes: readSecurityBuffer(type1, at: 16), encoding: .utf8), "ONE-SHOT-DOMAIN")
     }
 
     func testSMBeeFacadeStatUsesTransportOverride() async throws {
@@ -3394,8 +3394,8 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readUInt16LE(type1, at: 24), 4)
         XCTAssertEqual(readUInt16LE(type1, at: 26), 4)
         XCTAssertEqual(readUInt32LE(type1, at: 28), 43)
-        XCTAssertEqual(String(decoding: type1[40..<43], as: UTF8.self), "DOM")
-        XCTAssertEqual(String(decoding: type1[43..<47], as: UTF8.self), "WKST")
+        XCTAssertEqual(String(bytes: type1[40..<43], encoding: .utf8), "DOM")
+        XCTAssertEqual(String(bytes: type1[43..<47], encoding: .utf8), "WKST")
     }
 
     func testSPNEGONegTokenInitDERStructure() throws {
@@ -6506,10 +6506,11 @@ final class SMBeeTests: XCTestCase {
             dryRun: true,
             atomic: true,
             credential: SMBCredential(username: "user", password: "pass"),
-            makeTransport: { transport }
-        ) { action in
-            recorder.append(action)
-        }
+            makeTransport: { transport },
+            onAction: { action in
+                recorder.append(action)
+            }
+        )
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
         XCTAssertEqual(try atomicStagingDirectories(in: root, destinationName: "downloaded"), [])
@@ -6660,8 +6661,9 @@ final class SMBeeTests: XCTestCase {
             resume: true,
             dryRun: true,
             credential: SMBCredential(username: "user", password: "pass"),
-            makeTransport: { transport }
-        ) { recorder.append($0) }
+            makeTransport: { transport },
+            onAction: { recorder.append($0) }
+        )
 
         XCTAssertEqual(try String(contentsOf: destination.appendingPathComponent("partial.txt"), encoding: .utf8), "old")
         XCTAssertEqual(recorder.actions, [

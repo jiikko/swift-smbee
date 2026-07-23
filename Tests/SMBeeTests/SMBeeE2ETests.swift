@@ -77,7 +77,7 @@ final class SMBeeE2ETests: XCTestCase {
             let entries = try await session.list()
             XCTAssertTrue(entries.contains { $0.name == "known.txt" && !$0.isDirectory })
             let known = try await session.read(path: "known.txt")
-            XCTAssertEqual(String(decoding: known, as: UTF8.self), "hello from SMBee E2E\n")
+            XCTAssertEqual(String(bytes: known, encoding: .utf8), "hello from SMBee E2E\n")
             try await session.upload(path: path, data: payload)
             let roundTrip = try await session.read(path: path)
             XCTAssertEqual(roundTrip, payload)
@@ -263,7 +263,7 @@ final class SMBeeE2ETests: XCTestCase {
             share: share,
             path: "known.txt"
         )
-        XCTAssertEqual(String(decoding: data, as: UTF8.self), "hello from SMBee E2E\n")
+        XCTAssertEqual(String(bytes: data, encoding: .utf8), "hello from SMBee E2E\n")
 
         let rangeData = try await SMBee.read(
             host: host,
@@ -273,7 +273,7 @@ final class SMBeeE2ETests: XCTestCase {
             path: "known.txt",
             range: SMBReadRange(offset: 6, length: 4)
         )
-        XCTAssertEqual(String(decoding: rangeData, as: UTF8.self), "from")
+        XCTAssertEqual(String(bytes: rangeData, encoding: .utf8), "from")
     }
 
     func testShareDiscoveryListsPublicShare() async throws {
@@ -797,7 +797,6 @@ final class SMBeeE2ETests: XCTestCase {
         let session = try await awaitWithTimeout {
             try await SMBee.connect(host: host, port: port, credential: credential, share: share)
         }
-        defer { Task { await session.close() } }
 
         let watcher = Task {
             try await session.withChangeNotifications(path: "") { _ in }
@@ -829,7 +828,6 @@ final class SMBeeE2ETests: XCTestCase {
         let session = try await awaitWithTimeout {
             try await SMBee.connect(host: host, port: port, credential: credential, share: share)
         }
-        defer { Task { await session.close() } }
         let suffix = UUID().uuidString
         let largePath = "smbee-e2e-cancel-upload-\(suffix).bin"
         let smallPath = "smbee-e2e-cancel-upload-\(suffix)-small.txt"

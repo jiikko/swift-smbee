@@ -85,12 +85,13 @@ jobs:
       - name: Publish resource metrics to job summary
         if: always()
         run: bin/ci/publish-resource-performance-summary
-      - name: Compare resource metrics with previous master run
+      - name: Enforce performance regression gate against previous master
         if: always()
         run: |
           bin/ci/compare-resource-performance \
             .build/resource-performance.jsonl \
-            "${RUNNER_TEMP}/resource-performance-reference.jsonl" >> "${GITHUB_STEP_SUMMARY}"
+            "${RUNNER_TEMP}/resource-performance-reference.jsonl" \
+            --fail-on-regression >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload resource metrics artifact
         if: always()
         uses: actions/upload-artifact@v6

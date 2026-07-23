@@ -2,9 +2,10 @@
 set -u
 unset CDPATH
 
-# This command is deliberately advisory-only.  Artifact selection belongs to the
-# workflow; keeping this command file-to-file makes it deterministic and easy to test.
-python3 - "$@" <<'PY' || true
+# Artifact selection belongs to the workflow; keeping this command file-to-file
+# makes it deterministic and easy to test. Pass --fail-on-regression to enable
+# the push-time gate after the Markdown comparison has been written.
+python3 - "$@" <<'PY'
 from __future__ import annotations
 
 import json
@@ -15,7 +16,12 @@ from pathlib import Path
 
 OPERATIONS = ("read_stream", "write_stream")
 METRICS = ("throughput_mib_s", "user_cpu_ms", "system_cpu_ms", "max_rss_kb")
-METADATA_KEYS = ("swift_image", "runner_os", "runner_arch")
+METADATA_KEYS = ("swift_image", "runner_os", "runner_arch", "cpu_model", "cpu_count")
+REGRESSION_LIMITS = {
+    "throughput_mib_s": Decimal("15"),
+    "user_cpu_ms": Decimal("25"),
+    "max_rss_kb": Decimal("20"),
+}
 
 
 class ComparableError(Exception):
@@ -139,7 +145,14 @@ def percent_change(current: Decimal, reference: Decimal, metric: str) -> tuple[s
     return f"{sign}{change:.1f}%", direction
 
 
-def compare(current_path: Path, reference_path: Path) -> None:
+def regression_percent(current: Decimal, reference: Decimal, metric: str) -> Decimal | None:
+    if reference == 0 or metric not in REGRESSION_LIMITS:
+        return None
+    change = (current - reference) / reference * Decimal(100)
+    return -change if metric == "throughput_mib_s" else change
+
+
+def compare(current_path: Path, reference_path: Path, fail_on_regression: bool) -> bool:
     try:
         current_metadata, current_summaries, current_workloads = load(current_path, "current")
         reference_metadata, reference_summaries, reference_workloads = load(reference_path, "reference")
@@ -165,12 +178,17 @@ def compare(current_path: Path, reference_path: Path) -> None:
                 change, direction = percent_change(current_median, reference_median, metric)
                 results.append((operation, metric, current_median, reference_median, direction, change))
     except ComparableError as error:
-        print(f"## Resource performance history comparison\n\nNo comparable baseline ({error}).\n\nAdvisory only; this comparison does not affect guardrails or job status.")
-        return
+        suffix = "Regression gate skipped." if fail_on_regression else "Advisory only; this comparison does not affect guardrails or job status."
+        print(f"## Resource performance history comparison\n\nNo comparable baseline ({error}).\n\n{suffix}")
+        return False
 
     print("## Resource performance history comparison")
     print()
-    print("Advisory only: compared with the previous successful master push run; this does not affect guardrails or job status.")
+    if fail_on_regression:
+        print("Regression gate: compared with the previous successful master push run using 10-invocation medians.")
+        print("Limits: throughput -15%, user CPU +25%, process RSS +20%. System CPU remains observe-only.")
+    else:
+        print("Advisory only: compared with the previous successful master push run; this does not affect guardrails or job status.")
     print("Changes below 10% are labelled `within noise`; use the calibrated multi-run baseline for optimization decisions.")
     print()
     print("| Operation | Metric | Current median | Reference median | Change |")
@@ -181,16 +199,36 @@ def compare(current_path: Path, reference_path: Path) -> None:
             f"{display_number(reference, metric)} | {direction} ({change}) |"
         )
 
+    regressions = []
+    for operation, metric, current, reference, _, _ in results:
+        regression = regression_percent(current, reference, metric)
+        limit = REGRESSION_LIMITS.get(metric)
+        if regression is not None and limit is not None and regression > limit:
+            regressions.append(f"{operation}.{metric} regressed {regression:.1f}% (limit {limit:.0f}%)")
+    if fail_on_regression:
+        print()
+        if regressions:
+            print("**Performance regression gate: FAIL**")
+            for regression in regressions:
+                print(f"- {regression}")
+        else:
+            print("**Performance regression gate: PASS**")
+    return bool(regressions)
 
-def main() -> None:
-    if len(sys.argv) != 3:
+
+def main() -> int:
+    fail_on_regression = len(sys.argv) == 4 and sys.argv[3] == "--fail-on-regression"
+    if len(sys.argv) not in {3, 4} or (len(sys.argv) == 4 and not fail_on_regression):
         print("## Resource performance history comparison\n\nNo comparable baseline (current or reference JSONL argument is missing).\n\nAdvisory only; this comparison does not affect guardrails or job status.")
-        return
+        return 0
     try:
-        compare(Path(sys.argv[1]), Path(sys.argv[2]))
-    except Exception as error:  # The comparison is advisory and must never fail the job.
-        print(f"## Resource performance history comparison\n\nNo comparable baseline (comparison failed: {error}).\n\nAdvisory only; this comparison does not affect guardrails or job status.")
+        regressed = compare(Path(sys.argv[1]), Path(sys.argv[2]), fail_on_regression)
+        return 1 if fail_on_regression and regressed else 0
+    except Exception as error:
+        suffix = "Regression gate skipped." if fail_on_regression else "Advisory only; this comparison does not affect guardrails or job status."
+        print(f"## Resource performance history comparison\n\nNo comparable baseline (comparison failed: {error}).\n\n{suffix}")
+        return 0
 
 
-main()
+raise SystemExit(main())
 PY

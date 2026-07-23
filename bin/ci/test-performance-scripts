@@ -514,10 +514,30 @@ PY
     return 1
   fi
 
+  local gate_output="${scenario_dir}/gate-output.md"
+  if "${SCRIPT_DIR}/compare-resource-performance" \
+    "${compare_reference}" "${jsonl_file}" --fail-on-regression >"${gate_output}"; then
+    echo 'performance gate unexpectedly accepted a severe regression' >&2
+    return 1
+  fi
+  expect_contains "${gate_output}" \
+    'Regression gate: compared with the previous successful master push run using 10-invocation medians.' \
+    '**Performance regression gate: FAIL**' \
+    'read_stream.throughput_mib_s regressed 50.0% (limit 15%)' \
+    'write_stream.user_cpu_ms regressed 100.0% (limit 25%)'
+
+  local passing_gate_output="${scenario_dir}/passing-gate-output.md"
+  "${SCRIPT_DIR}/compare-resource-performance" \
+    "${jsonl_file}" "${compare_reference}" --fail-on-regression >"${passing_gate_output}"
+  expect_contains "${passing_gate_output}" '**Performance regression gate: PASS**'
+
   local no_baseline_output="${scenario_dir}/no-baseline.md"
   "${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${scenario_dir}/missing-reference.jsonl" \
     >"${no_baseline_output}"
   expect_contains "${no_baseline_output}" 'No comparable baseline (reference JSONL is missing).'
+  "${SCRIPT_DIR}/compare-resource-performance" \
+    "${jsonl_file}" "${scenario_dir}/missing-reference.jsonl" --fail-on-regression >"${no_baseline_output}"
+  expect_contains "${no_baseline_output}" 'Regression gate skipped.'
   "${SCRIPT_DIR}/compare-resource-performance" "${jsonl_file}" "${compare_metadata_mismatch}" \
     >"${no_baseline_output}"
   expect_contains "${no_baseline_output}" 'No comparable baseline (metadata mismatch: runner_os).'

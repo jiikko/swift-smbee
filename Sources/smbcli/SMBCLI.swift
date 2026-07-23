@@ -7,8 +7,6 @@ import Glibc
 #else
 import Darwin
 #endif
-// swiftlint:disable file_length
-
 struct SMBCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "smbcli",

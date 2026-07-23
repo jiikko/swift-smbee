@@ -11,7 +11,7 @@ enum DirectTCPFraming {
             0,
             UInt8((message.count >> 16) & 0xff),
             UInt8((message.count >> 8) & 0xff),
-            UInt8(message.count & 0xff),
+            UInt8(message.count & 0xff)
         ] + message
     }
 

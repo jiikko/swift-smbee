@@ -1,6 +1,4 @@
 import Foundation
-// swiftlint:disable file_length
-
 enum SMB2Commands {
     static let sessionSetup: UInt16 = 1
     static let logoff: UInt16 = 2

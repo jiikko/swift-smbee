@@ -4,8 +4,6 @@ import Glibc
 #else
 import Darwin
 #endif
-// swiftlint:disable file_length type_body_length
-
 /// Extracts the `.size` file attribute as `UInt64`. On Darwin the value bridges to `NSNumber`, but on
 /// Linux swift-corelibs-foundation it is a plain `Int`, so `as? NSNumber` alone fails there. Handle both.
 private func smbFileSizeValue(from attributes: [FileAttributeKey: Any]) -> UInt64? {
@@ -319,7 +317,7 @@ public enum SMBWellKnownSID {
         "S-1-5-32-550": "BUILTIN\\Print Operators",
         "S-1-5-32-551": "BUILTIN\\Backup Operators",
         "S-1-5-32-552": "BUILTIN\\Replicators",
-        "S-1-5-32-555": "BUILTIN\\Remote Desktop Users",
+        "S-1-5-32-555": "BUILTIN\\Remote Desktop Users"
     ]
 
     public static func name(for sid: String) -> String? {
@@ -2643,7 +2641,6 @@ public enum SMBClient {
         }
     }
 
-    // swiftlint:disable:next function_parameter_count
     private static func downloadDirectoryRecursive(
         host: String,
         port: UInt16,
@@ -3082,7 +3079,6 @@ public enum SMBClient {
         try failures.throwIfNeeded()
     }
 
-    // swiftlint:disable:next function_body_length function_parameter_count
     private static func uploadDirectoryRecursive(
         host: String,
         port: UInt16,
@@ -5396,7 +5392,7 @@ actor SMBSession {
             UInt8((value >> 24) & 0xff),
             UInt8((value >> 16) & 0xff),
             UInt8((value >> 8) & 0xff),
-            UInt8(value & 0xff),
+            UInt8(value & 0xff)
         ]
         return bytes + Array(repeating: 0, count: length - bytes.count)
     }
@@ -5492,7 +5488,7 @@ enum SMB2Status {
 private struct SMBServerSideCopyFallback: Error {
     static let allowedStatuses: Set<UInt32> = [
         SMB2Status.notSupported,
-        SMB2Status.invalidDeviceRequest,
+        SMB2Status.invalidDeviceRequest
     ]
 }
 

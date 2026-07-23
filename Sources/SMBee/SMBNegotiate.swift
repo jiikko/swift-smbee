@@ -39,12 +39,12 @@ public enum SMBNegotiateCodec {
         SMBNegotiateConstants.dialect210,
         SMBNegotiateConstants.dialect300,
         SMBNegotiateConstants.dialect302,
-        SMBNegotiateConstants.dialect311,
+        SMBNegotiateConstants.dialect311
     ]
     public static let authenticatedDialects: [UInt16] = [
         SMBNegotiateConstants.dialect300,
         SMBNegotiateConstants.dialect302,
-        SMBNegotiateConstants.dialect311,
+        SMBNegotiateConstants.dialect311
     ]
     public static let authenticatedUnsupportedMessage =
         "Authenticated SMB connections require SMB 3.x (3.0, 3.0.2, or 3.1.1). SMB 2.0.2/2.1 are probe-only and not supported for authenticated operations."
@@ -247,7 +247,7 @@ extension UUID {
             tuple.0, tuple.1, tuple.2, tuple.3,
             tuple.4, tuple.5, tuple.6, tuple.7,
             tuple.8, tuple.9, tuple.10, tuple.11,
-            tuple.12, tuple.13, tuple.14, tuple.15,
+            tuple.12, tuple.13, tuple.14, tuple.15
         ]
     }
 

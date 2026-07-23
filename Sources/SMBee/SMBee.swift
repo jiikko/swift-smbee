@@ -1,6 +1,5 @@
 import Foundation
 
-// swiftlint:disable file_length type_body_length
 /// SMBee 🐝 — a pure-Swift SMB2/3 client.
 ///
 /// SMB protocol / framing / NTLMv2 flow / SMB3 crypto framing は本ライブラリで

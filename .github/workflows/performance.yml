@@ -52,7 +52,6 @@ jobs:
         run: bin/ci/write-resource-performance-artifact
       - name: Download previous master resource artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -63,7 +62,7 @@ jobs:
           previous_run_id="$(gh api \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/performance.yml/runs?branch=master&event=push&status=success&per_page=100" \
             --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | .id" \
-            | head -n 1)"
+            | sed -n '1p')"
           if [ -z "${previous_run_id}" ]; then
             echo 'No previous successful master push run found.'
             exit 0
@@ -71,7 +70,7 @@ jobs:
           artifact_name="$(gh api \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${previous_run_id}/artifacts?per_page=100" \
             --jq '.artifacts[] | select(.name | startswith("resource-performance-")) | .name' \
-            | head -n 1)"
+            | sed -n '1p')"
           if [ -z "${artifact_name}" ]; then
             echo "No resource performance artifact found for run ${previous_run_id}."
             exit 0

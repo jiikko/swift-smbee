@@ -24,8 +24,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
       - name: Test performance CI scripts
         run: bin/ci/test-performance-scripts
 
@@ -36,6 +34,8 @@ jobs:
       RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '10' }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Restore SwiftPM performance build
         id: swiftpm-cache
         uses: actions/cache@v6

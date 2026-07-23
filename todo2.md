@@ -75,6 +75,8 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - `docs/compatibility-matrix.md` と `bin/e2e/smoke-real-server.sh` は追加済み。
 - real-server smoke は representative file operation に加えて ECHO、byte-range lock、
   CHANGE_NOTIFY の実イベントを一括検証する。
+- `SMBEE_SMOKE_REPORT` を指定すると、pass/fail、失敗step、client/server metadata、
+  NEGOTIATE JSONをpasswordなしのMarkdown証跡として保存できる。
 - SMBee を `smbclient` 相当と名乗る前に、Samba green だけでは不足。
 
 やること:

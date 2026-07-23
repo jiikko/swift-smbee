@@ -11,10 +11,24 @@ swift build --product smbcli
 SMB_PASSWORD='...' bin/e2e/smoke-real-server.sh smb://user@host/share
 ```
 
+To save a reviewable record, set the report path and server metadata:
+
+```sh
+SMB_PASSWORD='...' \
+SMBEE_SMOKE_REPORT=smoke-report.md \
+SMBEE_SMOKE_SERVER='Windows Server' \
+SMBEE_SMOKE_VERSION='Windows Server 2025, build ...' \
+SMBEE_SMOKE_AUTH='NTLMv2 password' \
+bin/e2e/smoke-real-server.sh smb://user@host/share
+```
+
 The script exercises `probe`, `shares`, `ls`, `stat`, `cat`, `get`, `put`,
 `mkdir`, `cp`, `mv`, `rm`, `df`, `acl`, `ping`, byte-range `lock`, and
 `watch` against a temporary directory. The watch check creates a file after
-subscribing and requires the matching change event within 10 seconds.
+subscribing and requires the matching change event within 10 seconds. The
+optional Markdown report records pass/fail, the failing step and exit code,
+client/server metadata, and the machine-readable NEGOTIATE result. It never
+records `SMB_PASSWORD`.
 
 ## Results
 

@@ -13,6 +13,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  swiftlint:
+    name: SwiftLint (strict)
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify SwiftLint has no warnings
+        # The command plugin uses the repository-pinned SwiftLint binary from
+        # SwiftLintPlugins. --strict promotes every warning to an error.
+        run: swift package plugin --allow-writing-to-package-directory swiftlint -- lint --strict --no-cache
+
   build-test:
     # public repo なので macOS runner は無料 (.claude/rules gha-runner)。
     # Network.framework / CryptoKit-backed swift-crypto に依存するため macOS で回す。

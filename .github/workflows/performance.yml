@@ -72,7 +72,8 @@ jobs:
             bin/ci/run-resource-performance
             exit 0
           fi
-          for pair in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
+          pair_total="${RESOURCE_BASELINE_RUNS}"
+          for pair in $(seq 1 "${pair_total}"); do
             offset=$((pair - 1))
             append=false
             current_skip_build="${RESOURCE_SKIP_BUILD}"
@@ -85,7 +86,7 @@ jobs:
             run_current() {
               RESOURCE_BASELINE_RUNS=1 \
                 RESOURCE_BASELINE_RUN_OFFSET="${offset}" \
-                RESOURCE_BASELINE_RUN_TOTAL="${RESOURCE_BASELINE_RUNS}" \
+                RESOURCE_BASELINE_RUN_TOTAL="${pair_total}" \
                 RESOURCE_APPEND_LOG="${append}" \
                 RESOURCE_SKIP_BUILD="${current_skip_build}" \
                 bin/ci/run-resource-performance
@@ -94,17 +95,17 @@ jobs:
               RESOURCE_REPO_ROOT="${PERFORMANCE_REFERENCE_DIR}" \
                 RESOURCE_BASELINE_RUNS=1 \
                 RESOURCE_BASELINE_RUN_OFFSET="${offset}" \
-                RESOURCE_BASELINE_RUN_TOTAL="${RESOURCE_BASELINE_RUNS}" \
+                RESOURCE_BASELINE_RUN_TOTAL="${pair_total}" \
                 RESOURCE_APPEND_LOG="${append}" \
                 RESOURCE_SKIP_BUILD="${reference_skip_build}" \
                 bin/ci/run-resource-performance
             }
             if [ $((pair % 2)) -eq 1 ]; then
-              echo "Measuring pair ${pair}/${RESOURCE_BASELINE_RUNS}: current then reference"
+              echo "Measuring pair ${pair}/${pair_total}: current then reference"
               run_current
               run_reference
             else
-              echo "Measuring pair ${pair}/${RESOURCE_BASELINE_RUNS}: reference then current"
+              echo "Measuring pair ${pair}/${pair_total}: reference then current"
               run_reference
               run_current
             fi

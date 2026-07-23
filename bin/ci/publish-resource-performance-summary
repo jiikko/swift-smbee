@@ -386,7 +386,7 @@ if read_span is not None and write_span is not None:
     confidence_evidence += f"; raw throughput span read {read_span * 100:.1f}%, write {write_span * 100:.1f}%"
 print(
     f"| Measurement confidence | {confidence_status} | {confidence_evidence} "
-    "| Each push collects 10 complete benchmark invocations and reports their median to reduce hosted-runner noise. |"
+    "| Each push collects 20 alternating current/reference pairs; this table reports the current median and spread. |"
 )
 
 print()

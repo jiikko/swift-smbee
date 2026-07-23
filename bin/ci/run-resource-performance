@@ -3,11 +3,14 @@ set -euo pipefail
 unset CDPATH
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="${RESOURCE_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SWIFT_IMAGE="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"
 LOG_FILE="${RESOURCE_PERFORMANCE_LOG:-${REPO_ROOT}/.build/resource-performance.log}"
 RESOURCE_BASELINE_RUNS="${RESOURCE_BASELINE_RUNS:-1}"
 RESOURCE_SKIP_BUILD="${RESOURCE_SKIP_BUILD:-false}"
+RESOURCE_APPEND_LOG="${RESOURCE_APPEND_LOG:-false}"
+RESOURCE_BASELINE_RUN_OFFSET="${RESOURCE_BASELINE_RUN_OFFSET:-0}"
+RESOURCE_BASELINE_RUN_TOTAL="${RESOURCE_BASELINE_RUN_TOTAL:-${RESOURCE_BASELINE_RUNS}}"
 DEFAULT_LOG_FILE="${REPO_ROOT}/.build/resource-performance.log"
 
 if [ "${LOG_FILE}" != "${DEFAULT_LOG_FILE}" ]; then
@@ -17,12 +20,23 @@ if [ "${LOG_FILE}" != "${DEFAULT_LOG_FILE}" ]; then
 fi
 
 if ! [[ "${RESOURCE_BASELINE_RUNS}" =~ ^[0-9]+$ ]] ||
-    [ "${RESOURCE_BASELINE_RUNS}" -lt 1 ] || [ "${RESOURCE_BASELINE_RUNS}" -gt 20 ]; then
-  echo "RESOURCE_BASELINE_RUNS must be an integer from 1 through 20" >&2
+    [ "${RESOURCE_BASELINE_RUNS}" -lt 1 ] || [ "${RESOURCE_BASELINE_RUNS}" -gt 50 ]; then
+  echo "RESOURCE_BASELINE_RUNS must be an integer from 1 through 50" >&2
   exit 2
 fi
 if [ "${RESOURCE_SKIP_BUILD}" != true ] && [ "${RESOURCE_SKIP_BUILD}" != false ]; then
   echo "RESOURCE_SKIP_BUILD must be true or false" >&2
+  exit 2
+fi
+if [ "${RESOURCE_APPEND_LOG}" != true ] && [ "${RESOURCE_APPEND_LOG}" != false ]; then
+  echo "RESOURCE_APPEND_LOG must be true or false" >&2
+  exit 2
+fi
+if ! [[ "${RESOURCE_BASELINE_RUN_OFFSET}" =~ ^[0-9]+$ ]] ||
+    ! [[ "${RESOURCE_BASELINE_RUN_TOTAL}" =~ ^[0-9]+$ ]] ||
+    [ "${RESOURCE_BASELINE_RUN_TOTAL}" -lt 1 ] ||
+    [ $((RESOURCE_BASELINE_RUN_OFFSET + RESOURCE_BASELINE_RUNS)) -gt "${RESOURCE_BASELINE_RUN_TOTAL}" ]; then
+  echo "baseline run offset/count must fit within RESOURCE_BASELINE_RUN_TOTAL" >&2
   exit 2
 fi
 
@@ -32,6 +46,9 @@ mkdir -p "$(dirname "${LOG_FILE}")"
 docker run --rm \
   -e RESOURCE_BASELINE_RUNS \
   -e RESOURCE_SKIP_BUILD \
+  -e RESOURCE_APPEND_LOG \
+  -e RESOURCE_BASELINE_RUN_OFFSET \
+  -e RESOURCE_BASELINE_RUN_TOTAL \
   -v "${REPO_ROOT}:/workspace" \
   -w /workspace \
   "${SWIFT_IMAGE}" \
@@ -45,7 +62,9 @@ docker run --rm \
       apt-get install -y -qq time >/dev/null
     fi
     mkdir -p .build
-    : > .build/resource-performance.log
+    if [ "${RESOURCE_APPEND_LOG}" != true ]; then
+      : > .build/resource-performance.log
+    fi
     test_arguments=(-c release)
     if [ "${RESOURCE_SKIP_BUILD}" = true ]; then
       test_arguments+=(--skip-build)
@@ -64,13 +83,16 @@ docker run --rm \
     cpu_model="$(grep -m1 -E "^(model name|Hardware|Processor)[[:space:]]*:" /proc/cpuinfo 2>/dev/null | sed -E "s/^[^:]*:[[:space:]]*//" || true)"
     cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
     {
-      emit_env swift_version "${swift_version}"
-      emit_env kernel "${kernel}"
-      emit_env cpu_model "${cpu_model}"
-      emit_env cpu_count "${cpu_count}"
-      echo "PERF_BUILD_CACHE exact_hit=${RESOURCE_SKIP_BUILD}"
+      if [ "${RESOURCE_APPEND_LOG}" != true ]; then
+        emit_env swift_version "${swift_version}"
+        emit_env kernel "${kernel}"
+        emit_env cpu_model "${cpu_model}"
+        emit_env cpu_count "${cpu_count}"
+        echo "PERF_BUILD_CACHE exact_hit=${RESOURCE_SKIP_BUILD}"
+      fi
       for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
-        echo "PERF_BASELINE_RUN run=${baseline_run} total=${RESOURCE_BASELINE_RUNS}"
+        run_number=$((RESOURCE_BASELINE_RUN_OFFSET + baseline_run))
+        echo "PERF_BASELINE_RUN run=${run_number} total=${RESOURCE_BASELINE_RUN_TOTAL}"
         /usr/bin/time -v swift test "${test_arguments[@]}" --filter "SMBee(PerformanceRegression|ResourcePerformance)Tests"
       done
     } 2>&1 | tee -a .build/resource-performance.log

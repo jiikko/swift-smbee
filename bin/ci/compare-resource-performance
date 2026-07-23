@@ -9,6 +9,8 @@ python3 - "$@" <<'PY'
 from __future__ import annotations
 
 import json
+import math
+import random
 import sys
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -58,6 +60,60 @@ def median(values: list[Decimal]) -> Decimal:
     if len(ordered) % 2:
         return ordered[middle]
     return (ordered[middle - 1] + ordered[middle]) / Decimal(2)
+
+
+def paired_inference(
+    current: list[Decimal], reference: list[Decimal], seed: str
+) -> tuple[float, float, float, float] | None:
+    if len(current) != len(reference) or len(current) < 2:
+        return None
+    if any(value <= 0 for value in current + reference):
+        return None
+    differences = [
+        math.log(float(current_value / reference_value))
+        for current_value, reference_value in zip(current, reference, strict=True)
+    ]
+    observed = abs(sum(differences) / len(differences))
+    rng = random.Random(seed)
+    bootstrap_means = []
+    for _ in range(50_000):
+        bootstrap_means.append(
+            sum(differences[rng.randrange(len(differences))] for _ in differences) / len(differences)
+        )
+    bootstrap_means.sort()
+    lower_log = bootstrap_means[int(len(bootstrap_means) * 0.025)]
+    upper_log = bootstrap_means[int(len(bootstrap_means) * 0.975)]
+
+    extreme = 0
+    permutations = 1 << len(differences) if len(differences) <= 20 else 200_000
+    for permutation in range(permutations):
+        if len(differences) <= 20:
+            signed_mean = sum(
+                difference if permutation & (1 << index) else -difference
+                for index, difference in enumerate(differences)
+            ) / len(differences)
+        else:
+            signed_mean = sum(
+                difference if rng.getrandbits(1) else -difference
+                for difference in differences
+            ) / len(differences)
+        if abs(signed_mean) >= observed - 1e-15:
+            extreme += 1
+    p_value = extreme / permutations
+    effect = math.expm1(sum(differences) / len(differences)) * 100
+    lower = math.expm1(lower_log) * 100
+    upper = math.expm1(upper_log) * 100
+    return effect, lower, upper, p_value
+
+
+def holm_adjust(p_values: list[float]) -> list[float]:
+    adjusted = [1.0] * len(p_values)
+    running_max = 0.0
+    for rank, index in enumerate(sorted(range(len(p_values)), key=p_values.__getitem__)):
+        candidate = min(1.0, p_values[index] * (len(p_values) - rank))
+        running_max = max(running_max, candidate)
+        adjusted[index] = running_max
+    return adjusted
 
 
 def load(path: Path, label: str) -> tuple[dict[str, object], dict[str, list[dict[str, object]]], dict[str, tuple[Decimal, int, int]]]:
@@ -167,7 +223,7 @@ def compare(current_path: Path, reference_path: Path, fail_on_regression: bool) 
         if workload_mismatches:
             raise ComparableError("workload mismatch: " + ", ".join(workload_mismatches))
 
-        results: list[tuple[str, str, Decimal, Decimal, str, str]] = []
+        results: list[dict[str, object]] = []
         for operation in OPERATIONS:
             for metric in METRICS:
                 key = f"{operation}.{metric}"
@@ -176,7 +232,15 @@ def compare(current_path: Path, reference_path: Path, fail_on_regression: bool) 
                 current_median = median(current_values)
                 reference_median = median(reference_values)
                 change, direction = percent_change(current_median, reference_median, metric)
-                results.append((operation, metric, current_median, reference_median, direction, change))
+                results.append({
+                    "operation": operation,
+                    "metric": metric,
+                    "current": current_median,
+                    "reference": reference_median,
+                    "direction": direction,
+                    "change": change,
+                    "inference": paired_inference(current_values, reference_values, key),
+                })
     except ComparableError as error:
         suffix = "Regression gate skipped." if fail_on_regression else "Advisory only; this comparison does not affect guardrails or job status."
         print(f"## Resource performance history comparison\n\nNo comparable baseline ({error}).\n\n{suffix}")
@@ -185,26 +249,76 @@ def compare(current_path: Path, reference_path: Path, fail_on_regression: bool) 
     print("## Resource performance history comparison")
     print()
     if fail_on_regression:
-        print("Regression gate: compared with the previous successful master push run using 10-invocation medians.")
+        pair_count = len(current_summaries["read_stream.throughput_mib_s"])
+        print(
+            f"Regression gate: {pair_count} alternating current/reference pairs on the same runner. "
+            "Paired effects use geometric mean ratios, deterministic 95% bootstrap confidence intervals, "
+            "and two-sided sign-flip permutation tests."
+        )
         print("Limits: throughput -15%, user CPU +25%, process RSS +20%. System CPU remains observe-only.")
     else:
         print("Advisory only: compared with the previous successful master push run; this does not affect guardrails or job status.")
-    print("Changes below 10% are labelled `within noise`; use the calibrated multi-run baseline for optimization decisions.")
+    print(
+        "Holm-adjusted p-values control the family-wise error rate across the reported metrics. "
+        "Statistical significance does not imply a practically important change."
+    )
     print()
-    print("| Operation | Metric | Current median | Reference median | Change |")
-    print("|---|---|---:|---:|---|")
-    for operation, metric, current, reference, direction, change in results:
+    inferential_indexes = [index for index, result in enumerate(results) if result["inference"] is not None]
+    adjusted_values = holm_adjust([
+        results[index]["inference"][3]  # type: ignore[index]
+        for index in inferential_indexes
+    ])
+    adjusted_by_index = dict(zip(inferential_indexes, adjusted_values, strict=True))
+    print("| Operation | Metric | Current median | Reference median | Change | Paired effect (95% CI; Holm p) |")
+    print("|---|---|---:|---:|---|---|")
+    for index, result in enumerate(results):
+        operation = result["operation"]
+        metric = result["metric"]
+        current = result["current"]
+        reference = result["reference"]
+        inference = result["inference"]
+        if inference is None:
+            inference_text = "unavailable (zero or insufficient pairs)"
+        else:
+            effect, lower, upper, _ = inference
+            inference_text = (
+                f"{effect:+.2f}% ({lower:+.2f}% to {upper:+.2f}%; "
+                f"p={adjusted_by_index[index]:.4f})"
+            )
         print(
             f"| `{operation}` | `{metric}` | {display_number(current, metric)} | "
-            f"{display_number(reference, metric)} | {direction} ({change}) |"
+            f"{display_number(reference, metric)} | {result['direction']} ({result['change']}) | "
+            f"{inference_text} |"
         )
 
     regressions = []
-    for operation, metric, current, reference, _, _ in results:
+    for index, result in enumerate(results):
+        operation = result["operation"]
+        metric = result["metric"]
+        current = result["current"]
+        reference = result["reference"]
         regression = regression_percent(current, reference, metric)
         limit = REGRESSION_LIMITS.get(metric)
-        if regression is not None and limit is not None and regression > limit:
-            regressions.append(f"{operation}.{metric} regressed {regression:.1f}% (limit {limit:.0f}%)")
+        adjusted_p = adjusted_by_index.get(index, 1.0)
+        inference = result["inference"]
+        pair_count = len(current_summaries[f"{operation}.{metric}"])
+        statistically_confirmed = inference is not None and pair_count >= 10 and adjusted_p < 0.05
+        insufficient_for_inference = pair_count < 10
+        if (
+            regression is not None
+            and limit is not None
+            and regression > limit
+            and (statistically_confirmed or insufficient_for_inference)
+        ):
+            evidence = (
+                f"Holm p={adjusted_p:.4f}"
+                if statistically_confirmed
+                else f"only {pair_count} pairs; practical-limit safeguard"
+            )
+            regressions.append(
+                f"{operation}.{metric} regressed {regression:.1f}% "
+                f"(limit {limit:.0f}%, {evidence})"
+            )
     if fail_on_regression:
         print()
         if regressions:

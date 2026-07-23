@@ -189,20 +189,25 @@ GitHub Actions の `windows-latest` は将来 Windows SMB Server host として�
 
 ## Push 後の performance regression 確認
 
-`Performance` workflow は同一 Release build から完全な benchmark invocation を10回収集し、中央値と
-MAD / min-maxをjob summaryへ出す。masterへのpushでは、直前のsuccessful masterも同じjob・同じrunner上で
-10回測定し、次の大幅な退行をjob failureにする。current/referenceを同一CPU上で測るため、hosted runner間の
-CPU世代差をperformance差として誤検出しない。
+`Performance` workflow はcurrentと直前のsuccessful masterを同じjob・同じrunner上で交互に20ペア
+（current 20回 + reference 20回）測定する。ペア内の実行順もAB/BAと交互にする。時間経過によるrunner負荷のdriftを片側だけに寄せず、中央値、
+MAD / min-maxに加えて、ペアごとの比率の幾何平均、deterministic bootstrap 95%信頼区間、両側sign-flip
+permutation testのHolm補正p値をjob summaryへ出す。これによりhosted runner間のCPU世代差と、連続した
+片側測定による時間順序のbiasをperformance差として誤検出しにくくする。
 
 - read/write throughput: 15%超の低下
 - user CPU: 25%超の増加
 - process max RSS: 20%超の増加
 - system CPU: hosted-runnerでの揺れが大きいためobserve-only
 
+gateは実用上の閾値を超え、かつ10ペア以上でHolm補正後 `p < 0.05` の退行をfailureにする。10ペア未満の
+manual runでは統計的検出力が不足するため、従来の実用閾値だけを使うsafeguardへfallbackする。有意差だけで
+改善と判断せず、effect sizeと95% CIを必ず併記する。
+
 Swift image、runner OS/arch、CPU model/count、workloadが一致しない場合は誤判定を避けるためgateをskipし、
 summaryに理由を表示する。この場合、performance-sensitiveな修正は比較可能なrunを取り直すまで改善確認済みと
 扱わない。まとまった修正やtransport / codec / crypto / read-write pathの変更では、push後にworkflowの完了、
-job summary、10回中央値、spreadを確認し、run URLとbefore/afterを作業結果へ記録する。
+job summary、20ペアの中央値、effect size、95% CI、spreadを確認し、run URLとbefore/afterを作業結果へ記録する。
 
 ## まとめ
 

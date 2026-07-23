@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       baseline_runs:
-        description: Number of complete benchmark invocations to collect after one Release build
+        description: Number of paired current/reference benchmark invocations
         required: false
-        default: "10"
+        default: "20"
   push:
     branches: [master]
   pull_request:
@@ -31,7 +31,7 @@ jobs:
     needs: ci-script-tests
     runs-on: ubuntu-latest
     env:
-      RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '10' }}
+      RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '20' }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -44,17 +44,8 @@ jobs:
           key: performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', '.swift-image-digest', 'Package.resolved') }}-${{ github.sha }}
           restore-keys: |
             performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', '.swift-image-digest', 'Package.resolved') }}-
-      - name: Deterministic contracts and Release resource metrics
-        timeout-minutes: 30
-        env:
-          RESOURCE_SKIP_BUILD: ${{ steps.swiftpm-cache.outputs.cache-hit == 'true' }}
-        run: bin/ci/run-resource-performance
-      - name: Build resource metrics artifact
-        if: always()
-        run: bin/ci/write-resource-performance-artifact
-      - name: Measure previous master on the same runner
+      - name: Prepare previous successful master
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        timeout-minutes: 30
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -68,15 +59,67 @@ jobs:
             echo 'No previous successful master push run found.'
             exit 0
           fi
-          echo "Measuring previous successful master ${previous_sha} on the current runner."
+          echo "Preparing previous successful master ${previous_sha}."
           git worktree add --detach "${reference_dir}" "${previous_sha}"
-          (
-            cd "${reference_dir}"
-            RESOURCE_SKIP_BUILD=false bin/ci/run-resource-performance
-            bin/ci/write-resource-performance-artifact
-          )
-          cp "${reference_dir}/.build/resource-performance.jsonl" \
-            "${RUNNER_TEMP}/resource-performance-reference.jsonl"
+          echo "PERFORMANCE_REFERENCE_DIR=${reference_dir}" >> "${GITHUB_ENV}"
+      - name: Alternating paired Release resource metrics
+        timeout-minutes: 60
+        env:
+          RESOURCE_SKIP_BUILD: ${{ steps.swiftpm-cache.outputs.cache-hit == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PERFORMANCE_REFERENCE_DIR:-}" ]; then
+            bin/ci/run-resource-performance
+            exit 0
+          fi
+          for pair in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
+            offset=$((pair - 1))
+            append=false
+            current_skip_build="${RESOURCE_SKIP_BUILD}"
+            reference_skip_build=false
+            if [ "${pair}" -gt 1 ]; then
+              append=true
+              current_skip_build=true
+              reference_skip_build=true
+            fi
+            run_current() {
+              RESOURCE_BASELINE_RUNS=1 \
+                RESOURCE_BASELINE_RUN_OFFSET="${offset}" \
+                RESOURCE_BASELINE_RUN_TOTAL="${RESOURCE_BASELINE_RUNS}" \
+                RESOURCE_APPEND_LOG="${append}" \
+                RESOURCE_SKIP_BUILD="${current_skip_build}" \
+                bin/ci/run-resource-performance
+            }
+            run_reference() {
+              RESOURCE_REPO_ROOT="${PERFORMANCE_REFERENCE_DIR}" \
+                RESOURCE_BASELINE_RUNS=1 \
+                RESOURCE_BASELINE_RUN_OFFSET="${offset}" \
+                RESOURCE_BASELINE_RUN_TOTAL="${RESOURCE_BASELINE_RUNS}" \
+                RESOURCE_APPEND_LOG="${append}" \
+                RESOURCE_SKIP_BUILD="${reference_skip_build}" \
+                bin/ci/run-resource-performance
+            }
+            if [ $((pair % 2)) -eq 1 ]; then
+              echo "Measuring pair ${pair}/${RESOURCE_BASELINE_RUNS}: current then reference"
+              run_current
+              run_reference
+            else
+              echo "Measuring pair ${pair}/${RESOURCE_BASELINE_RUNS}: reference then current"
+              run_reference
+              run_current
+            fi
+          done
+      - name: Build resource metrics artifact
+        if: always()
+        run: |
+          set -euo pipefail
+          bin/ci/write-resource-performance-artifact
+          if [ -n "${PERFORMANCE_REFERENCE_DIR:-}" ]; then
+            RESOURCE_REPO_ROOT="${PERFORMANCE_REFERENCE_DIR}" \
+              bin/ci/write-resource-performance-artifact
+            cp "${PERFORMANCE_REFERENCE_DIR}/.build/resource-performance.jsonl" \
+              "${RUNNER_TEMP}/resource-performance-reference.jsonl"
+          fi
       - name: Publish resource metrics to job summary
         if: always()
         run: bin/ci/publish-resource-performance-summary

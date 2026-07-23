@@ -3,7 +3,7 @@ set -euo pipefail
 unset CDPATH
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="${RESOURCE_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 LOG_FILE="${RESOURCE_PERFORMANCE_LOG:-${REPO_ROOT}/.build/resource-performance.log}"
 OUTPUT_FILE="${RESOURCE_PERFORMANCE_JSONL:-${REPO_ROOT}/.build/resource-performance.jsonl}"
 SWIFT_IMAGE="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"

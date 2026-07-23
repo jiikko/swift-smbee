@@ -344,7 +344,7 @@ test_summary_happy_path() {
     '| Memory | ✅ Healthy | XCTest peak 279.3 MiB (54.6% of limit); CMAC current-RSS delta median 0.000 MiB | No retained signing-buffer growth is visible; process peak stays below the absolute guardrail. |' \
     '| AES-CMAC signing | ✅ Strengthened | signing 640.369 ms vs pure Swift 1280.738 ms (2.0×); 97.1% of full synthetic | The backend is faster, but signing still dominates full synthetic write and remains a profiling target. |' \
     '| Payload scaling | ✅ Linear | 4–16 MiB throughput 2295.964–2295.964 MiB/s (0.0% span) | Flat throughput indicates no payload-size cliff in the measured range. |' \
-    '| Measurement confidence | ℹ️ Provisional | 2 invocation(s); raw throughput span read 0.0%, write 0.0% | Each push collects 10 complete benchmark invocations and reports their median to reduce hosted-runner noise. |' \
+    '| Measurement confidence | ℹ️ Provisional | 2 invocation(s); raw throughput span read 0.0%, write 0.0% | Each push collects 20 alternating current/reference pairs; this table reports the current median and spread. |' \
     'XCTest process peak RSS: **279.3 MiB** · ✅ Pass (`< 512 MiB` guardrail).' \
     'Whole `swift test` process-tree peak RSS: **666.1 MiB** (682080 KiB).' \
     '`swift test` wall time: **42.50 s**.' \
@@ -503,11 +503,10 @@ PY
   # Literal Markdown backticks are intentional.
   # shellcheck disable=SC2016
   expect_contains "${compare_output}" \
-    '| `read_stream` | `throughput_mib_s` | 737.364 MiB/s | 368.682 MiB/s | improved (+100.0%) |' \
-    '| `read_stream` | `user_cpu_ms` | 200.000 ms | 400.000 ms | improved (-50.0%) |' \
-    '| `read_stream` | `system_cpu_ms` | 4.000 ms | 8.000 ms | improved (-50.0%) |' \
-    '| `read_stream` | `max_rss_kb` | 286048.0 KiB | 572096.0 KiB | improved (-50.0%) |' \
-    '| `write_stream` | `system_cpu_ms` | 0.000 ms | 0.000 ms | unchanged (±0.0%) |' \
+    '| `read_stream` | `throughput_mib_s` | 737.364 MiB/s | 368.682 MiB/s | improved (+100.0%) | +100.00%' \
+    '| `read_stream` | `user_cpu_ms` | 200.000 ms | 400.000 ms | improved (-50.0%) | -50.00%' \
+    '| `write_stream` | `system_cpu_ms` | 0.000 ms | 0.000 ms | unchanged (±0.0%) | unavailable' \
+    'Holm-adjusted p-values' \
     'Advisory only'
   if grep -Eq '✅|❌|Pass|Fail' "${compare_output}"; then
     echo 'comparison unexpectedly included guardrail status' >&2
@@ -521,10 +520,10 @@ PY
     return 1
   fi
   expect_contains "${gate_output}" \
-    'Regression gate: compared with the previous successful master push run using 10-invocation medians.' \
+    'Regression gate: 2 alternating current/reference pairs on the same runner.' \
     '**Performance regression gate: FAIL**' \
-    'read_stream.throughput_mib_s regressed 50.0% (limit 15%)' \
-    'write_stream.user_cpu_ms regressed 100.0% (limit 25%)'
+    'read_stream.throughput_mib_s regressed 50.0% (limit 15%, only 2 pairs; practical-limit safeguard)' \
+    'write_stream.user_cpu_ms regressed 100.0% (limit 25%, only 2 pairs; practical-limit safeguard)'
 
   local passing_gate_output="${scenario_dir}/passing-gate-output.md"
   "${SCRIPT_DIR}/compare-resource-performance" \

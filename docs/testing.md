@@ -183,6 +183,22 @@ GitHub Actions の `windows-latest` は将来 Windows SMB Server host として�
 現状の SMBee client は POSIX/Darwin/Linux transport 前提なので、Windows runner 上で直接 client E2E を
 回すには Windows transport 対応を先に入れる。
 
+## Push 後の performance regression 確認
+
+`Performance` workflow は同一 Release build から完全な benchmark invocation を10回収集し、中央値と
+MAD / min-maxをjob summaryへ出す。masterへのpushでは、直前の比較可能なsuccessful master artifactと
+自動比較し、次の大幅な退行をjob failureにする。
+
+- read/write throughput: 15%超の低下
+- user CPU: 25%超の増加
+- process max RSS: 20%超の増加
+- system CPU: hosted-runnerでの揺れが大きいためobserve-only
+
+Swift image、runner OS/arch、CPU model/count、workloadが一致しない場合は誤判定を避けるためgateをskipし、
+summaryに理由を表示する。この場合、performance-sensitiveな修正は比較可能なrunを取り直すまで改善確認済みと
+扱わない。まとまった修正やtransport / codec / crypto / read-write pathの変更では、push後にworkflowの完了、
+job summary、10回中央値、spreadを確認し、run URLとbefore/afterを作業結果へ記録する。
+
 ## まとめ
 
 | Tier | 対象 | CI | 役割 |

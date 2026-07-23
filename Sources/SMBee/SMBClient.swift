@@ -5162,8 +5162,8 @@ actor SMBSession {
         // before the authenticated context is established; once populated, both are
         // part of the correlation key.
         guard header.command == pending.expectedCommand,
-              (pending.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == pending.expectedSessionId),
-              (pending.expectedTreeId == 0 || header.treeId == 0 || header.treeId == pending.expectedTreeId) else {
+              pending.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == pending.expectedSessionId,
+              pending.expectedTreeId == 0 || header.treeId == 0 || header.treeId == pending.expectedTreeId else {
             throw SMBCodecError.invalidValue("SMB response correlation mismatch command=\(header.command)/\(pending.expectedCommand) session=\(header.sessionId)/\(pending.expectedSessionId) tree=\(header.treeId)/\(pending.expectedTreeId)")
         }
         if try SMB2AsyncInterim.shouldDiscard(packet) {

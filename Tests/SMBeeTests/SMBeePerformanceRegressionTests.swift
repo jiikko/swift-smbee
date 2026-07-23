@@ -58,12 +58,12 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
                 try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
                 try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
                 try smb2TreeConnectResponse(treeId: treeId),
-                try smb2CreateResponse(fileId: fileId, messageId: 4, treeId: treeId),
+                try smb2CreateResponse(fileId: fileId, messageId: 4, treeId: treeId)
             ]
                 + writeResponses(fileSize: fileSize, chunkSize: effectiveWriteChunkSize, firstMessageId: 5)
                 + [
                     try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: UInt64(5 + expectedChunks), treeId: treeId),
-                    try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: UInt64(6 + expectedChunks), treeId: treeId),
+                    try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: UInt64(6 + expectedChunks), treeId: treeId)
                 ]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound)
@@ -107,7 +107,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
                 treeId: treeId
             ),
             try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 13, treeId: treeId),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 14, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 14, treeId: treeId)
         ])
         let transport = PerformanceInMemoryTransport(inbound: inbound)
         let session = try await SMBClient.connect(
@@ -135,7 +135,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
             try smb2TreeConnectResponse(treeId: treeId),
             try smb2CreateResponse(fileId: fileId, messageId: 4, treeId: treeId),
             try smb2QueryInfoResponse(size: 3, messageId: 5, treeId: treeId),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId)
         ])
         let transport = PerformanceInMemoryTransport(inbound: inbound)
         let session = try await SMBClient.connect(
@@ -372,7 +372,7 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         let inbound = try framed(
             [
                 try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId),
-                try smb2QueryInfoResponse(size: UInt64(size), messageId: 1, treeId: treeId),
+                try smb2QueryInfoResponse(size: UInt64(size), messageId: 1, treeId: treeId)
             ] + lengths.enumerated().map { index, length in
                 try smb2ReadResponse(
                     Array(repeating: UInt8(index & 0xff), count: length),
@@ -385,7 +385,7 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
                     command: SMB2Commands.close,
                     messageId: UInt64(lengths.count + 2),
                     treeId: treeId
-                ),
+                )
             ]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound)
@@ -433,7 +433,7 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
                         command: SMB2Commands.close,
                         messageId: UInt64(lengths.count + 2),
                         treeId: treeId
-                    ),
+                    )
                 ]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound, retainOutbound: retainOutbound)

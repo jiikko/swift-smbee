@@ -595,7 +595,7 @@ enum SMB2QueryInfo {
             let aceEnd = cursor + aceSize
             let accessMask = aceSize >= 8 ? readUInt32LE(data, at: cursor + 4) : 0
             let trusteeSID: String?
-            if (type == 0 || type == 1), cursor + 8 < aceEnd {
+            if type == 0 || type == 1, cursor + 8 < aceEnd {
                 trusteeSID = try decodeSID(data, at: cursor + 8, limit: aceEnd)
             } else {
                 // ⓥ Object/callback ACE layouts can carry object GUID fields before a SID; keep

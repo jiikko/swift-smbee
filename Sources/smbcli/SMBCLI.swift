@@ -694,7 +694,7 @@ struct ByteRangeLock: AsyncParsableCommand {
 
     static func validateOptions(length: UInt64, holdSeconds: Double?) throws {
         guard length > 0 else { throw ValidationError("--length must be greater than zero") }
-        if let holdSeconds, (!holdSeconds.isFinite || holdSeconds < 0 || holdSeconds > 7 * 24 * 60 * 60) {
+        if let holdSeconds, !holdSeconds.isFinite || holdSeconds < 0 || holdSeconds > 7 * 24 * 60 * 60 {
             throw ValidationError("--hold-seconds must be finite, non-negative, and at most 7 days")
         }
     }
@@ -1805,7 +1805,7 @@ private func makeRemoteParentDirectories(
 func successJSONString(command: String, path: String? = nil) throws -> String {
     var object: [String: Any] = [
         "ok": true,
-        "command": command,
+        "command": command
     ]
     if let path {
         object["path"] = path
@@ -1820,7 +1820,7 @@ func successJSONString(command: String, path: String? = nil) throws -> String {
 func errorJSONString(_ error: Error) throws -> String {
     var object: [String: Any] = [
         "ok": false,
-        "error": String(describing: error),
+        "error": String(describing: error)
     ]
     if let smbError = error as? SMBError {
         object["category"] = "smb"
@@ -1931,7 +1931,7 @@ func makeEndpointAndCredential(url: String, auth: AuthOptions) throws -> (SMBURL
 
 func makeCredential(username: String?, password urlPassword: String?, auth: AuthOptions) throws -> SMBCredential {
     if auth.usesAnonymousAuthentication || username?.isEmpty != false {
-        guard (!auth.usesAnonymousAuthentication || username?.isEmpty != false),
+        guard !auth.usesAnonymousAuthentication || username?.isEmpty != false,
               urlPassword == nil,
               auth.ntHash == nil,
               !auth.passwordStdin,

@@ -32,7 +32,7 @@ final class SMBCLIOutputTests: XCTestCase {
     func testDirectoryEntriesJSONShape() throws {
         let entries = [
             SMBDirectoryEntry(name: "docs", fileSize: 0, isDirectory: true, attributes: 0x0000_0010),
-            SMBDirectoryEntry(name: "readme.txt", fileSize: 42, isDirectory: false, attributes: 0x0000_0020),
+            SMBDirectoryEntry(name: "readme.txt", fileSize: 42, isDirectory: false, attributes: 0x0000_0020)
         ]
 
         let array = try jsonArray(SMBCLIOutput.jsonData(for: entries))
@@ -123,7 +123,7 @@ final class SMBCLIOutputTests: XCTestCase {
     func testSharesJSONShape() throws {
         let shares = [
             SMBShareInfo(name: "public", type: 0x0000_0000, comment: "Public files"),
-            SMBShareInfo(name: "ipc$", type: nil, comment: nil),
+            SMBShareInfo(name: "ipc$", type: nil, comment: nil)
         ]
 
         let array = try jsonArray(SMBCLIOutput.jsonData(for: shares))
@@ -213,7 +213,7 @@ final class SMBCLIOutputTests: XCTestCase {
         let resolved = [
             "S-1-5-21-1-2-3-1000": "WORKGROUP\\alice",
             // Resolved map wins over the well-known table when both could match.
-            "S-1-1-0": "EVERYONE\\override",
+            "S-1-1-0": "EVERYONE\\override"
         ]
 
         let object = try jsonObject(SMBCLIOutput.jsonData(for: info, resolveSIDs: true, resolvedNames: resolved))
@@ -227,7 +227,7 @@ final class SMBCLIOutputTests: XCTestCase {
     func testChangeNotifyJSONShapes() throws {
         let event = SMBChangeNotifyEvent.changes([
             SMBFileChange(action: .added, name: "new.txt"),
-            SMBFileChange(action: .renamedNewName, name: "renamed.txt"),
+            SMBFileChange(action: .renamedNewName, name: "renamed.txt")
         ])
 
         let object = try jsonObject(SMBCLIOutput.jsonData(for: event))

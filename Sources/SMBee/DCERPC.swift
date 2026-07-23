@@ -110,7 +110,7 @@ enum DCERPC {
             let header = try decodeHeader(Array(bytes[cursor...]))
             let length = Int(header.fragLength)
             guard header.type == pduTypeResponse, length >= 24,
-                  (expectedCallId == nil || header.callId == expectedCallId),
+                  expectedCallId == nil || header.callId == expectedCallId,
                   bytes[cursor + 4..<cursor + 8] == dataRepresentation[0..<4]
             else { throw SMBCodecError.invalidValue("invalid DCE/RPC response fragment correlation") }
             guard first ? (header.flags & pfcFirstFrag) != 0 : (header.flags & pfcFirstFrag) == 0 else {

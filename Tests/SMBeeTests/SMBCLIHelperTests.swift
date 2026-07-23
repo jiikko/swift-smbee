@@ -162,7 +162,7 @@ final class SMBCLIHelperTests: XCTestCase {
     func testSparseRangesJSONStringUsesStableNumericShape() throws {
         let json = try sparseRangesJSONString([
             SMBAllocatedRange(offset: 4096, length: 8192),
-            SMBAllocatedRange(offset: 16384, length: 256),
+            SMBAllocatedRange(offset: 16384, length: 256)
         ])
         let value = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]])
         XCTAssertEqual(value.count, 2)

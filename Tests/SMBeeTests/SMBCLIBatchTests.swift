@@ -27,7 +27,7 @@ final class SMBCLIBatchTests: XCTestCase {
             SMBDirectoryEntry(name: "a.log", fileSize: 1, isDirectory: false),
             SMBDirectoryEntry(name: "b.log", fileSize: 1, isDirectory: false),
             SMBDirectoryEntry(name: "c.txt", fileSize: 1, isDirectory: false),
-            SMBDirectoryEntry(name: "logs.log", fileSize: 0, isDirectory: true),
+            SMBDirectoryEntry(name: "logs.log", fileSize: 0, isDirectory: true)
         ]
 
         let files = batchGlobEntries(entries, include: "*.log", exclude: ["b.*"])
@@ -93,7 +93,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--json",
             "--no-overwrite",
             "--recursive",
-            "--progress",
+            "--progress"
         ])
 
         XCTAssertEqual(command.remoteDirectory, "smb://user@host/share/dir")
@@ -118,7 +118,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--json",
             "--no-overwrite",
             "--recursive",
-            "--progress",
+            "--progress"
         ])
 
         XCTAssertEqual(command.localDirectory, "/tmp/in")
@@ -196,7 +196,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--zero-offset", "65536",
             "--length", "65536",
             "--query",
-            "--json",
+            "--json"
         ])
         XCTAssertEqual(cmd.url, "smb://user@host/share/vm.img")
         XCTAssertTrue(cmd.setSparse)
@@ -280,7 +280,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--include",
             "*.log",
             "--exclude",
-            "debug*",
+            "debug*"
         ])
         XCTAssertEqual(get.source, "smb://user@host/share/dir")
         XCTAssertEqual(get.destination, "/tmp/out")
@@ -308,7 +308,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--include",
             "*.txt",
             "--exclude",
-            "nested/skip*",
+            "nested/skip*"
         ])
         XCTAssertEqual(put.source, "/tmp/in")
         XCTAssertEqual(put.destination, "smb://user@host/share/file.txt")
@@ -342,7 +342,7 @@ final class SMBCLIBatchTests: XCTestCase {
             "--include",
             "*.dat",
             "--exclude",
-            "tmp*",
+            "tmp*"
         ])
         XCTAssertEqual(copy.source, "smb://user@host/share/source")
         XCTAssertEqual(copy.destination, "smb://user@host/share/destination")

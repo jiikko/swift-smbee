@@ -178,7 +178,9 @@ swift build --product smbcli
 SMB_PASSWORD='...' bin/e2e/smoke-real-server.sh smb://user@host/share
 ```
 
-結果は [compatibility-matrix.md](compatibility-matrix.md) に記録する。
+結果は [compatibility-matrix.md](compatibility-matrix.md) に記録する。smoke は基本的な
+file operation に加えて、authenticated ECHO、byte-range lock、CHANGE_NOTIFY で作成した
+ファイル名が10秒以内に通知されることも確認する。
 GitHub Actions の `windows-latest` は将来 Windows SMB Server host として使える候補だが、
 現状の SMBee client は POSIX/Darwin/Linux transport 前提なので、Windows runner 上で直接 client E2E を
 回すには Windows transport 対応を先に入れる。

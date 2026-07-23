@@ -73,6 +73,8 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - macOS SMBX は 3.0.2 の基本 smoke 記録あり。
 - Windows SMB Server / Windows Pro / Synology / QNAP / 古い Samba 系 NAS は未実測。
 - `docs/compatibility-matrix.md` と `bin/e2e/smoke-real-server.sh` は追加済み。
+- real-server smoke は representative file operation に加えて ECHO、byte-range lock、
+  CHANGE_NOTIFY の実イベントを一括検証する。
 - SMBee を `smbclient` 相当と名乗る前に、Samba green だけでは不足。
 
 やること:

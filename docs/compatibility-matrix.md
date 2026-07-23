@@ -12,7 +12,9 @@ SMB_PASSWORD='...' bin/e2e/smoke-real-server.sh smb://user@host/share
 ```
 
 The script exercises `probe`, `shares`, `ls`, `stat`, `cat`, `get`, `put`,
-`mkdir`, `cp`, `mv`, `rm`, `df`, and `acl` against a temporary directory.
+`mkdir`, `cp`, `mv`, `rm`, `df`, `acl`, `ping`, byte-range `lock`, and
+`watch` against a temporary directory. The watch check creates a file after
+subscribing and requires the matching change event within 10 seconds.
 
 ## Results
 

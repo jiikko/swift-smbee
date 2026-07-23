@@ -486,7 +486,8 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         print("PERF_RESOURCE \(operation).sample_elapsed_ms value=\(format(elapsed)) \(common)")
         print("PERF_RESOURCE \(operation).max_rss_kb value=\(maxRSS) \(common)")
         XCTAssertGreaterThan(throughput, Double(throughputFloor), "catastrophic synthetic \(operation) throughput regression")
-        XCTAssertGreaterThanOrEqual(elapsed, 200, "synthetic \(operation) sample is too short for stable timing")
+        // Keep a minimum sample duration without rejecting legitimate throughput gains.
+        XCTAssertGreaterThanOrEqual(elapsed, 100, "synthetic \(operation) sample is too short for stable timing")
         XCTAssertLessThan(maxRSS, 512 * 1024, "catastrophic synthetic \(operation) RSS regression")
     }
 

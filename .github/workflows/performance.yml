@@ -24,6 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Test performance CI scripts
         run: bin/ci/test-performance-scripts
 
@@ -50,38 +52,31 @@ jobs:
       - name: Build resource metrics artifact
         if: always()
         run: bin/ci/write-resource-performance-artifact
-      - name: Download previous master resource artifact
+      - name: Measure previous master on the same runner
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        timeout-minutes: 30
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          reference_dir="${RUNNER_TEMP}/resource-performance-reference"
-          rm -rf "${reference_dir}"
-          mkdir -p "${reference_dir}"
-          previous_run_id="$(gh api \
+          reference_dir="${RUNNER_TEMP}/resource-performance-reference-${GITHUB_RUN_ID}"
+          previous_sha="$(gh api \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/performance.yml/runs?branch=master&event=push&status=success&per_page=100" \
-            --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | .id" \
+            --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | .head_sha" \
             | sed -n '1p')"
-          if [ -z "${previous_run_id}" ]; then
+          if [ -z "${previous_sha}" ]; then
             echo 'No previous successful master push run found.'
             exit 0
           fi
-          artifact_name="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${previous_run_id}/artifacts?per_page=100" \
-            --jq '.artifacts[] | select(.name | startswith("resource-performance-")) | .name' \
-            | sed -n '1p')"
-          if [ -z "${artifact_name}" ]; then
-            echo "No resource performance artifact found for run ${previous_run_id}."
-            exit 0
-          fi
-          gh run download "${previous_run_id}" --name "${artifact_name}" --dir "${reference_dir}"
-          reference_jsonl="$(find "${reference_dir}" -type f -name resource-performance.jsonl -print -quit)"
-          if [ -z "${reference_jsonl}" ]; then
-            echo 'Downloaded artifact did not contain resource-performance.jsonl.'
-            exit 0
-          fi
-          cp "${reference_jsonl}" "${RUNNER_TEMP}/resource-performance-reference.jsonl"
+          echo "Measuring previous successful master ${previous_sha} on the current runner."
+          git worktree add --detach "${reference_dir}" "${previous_sha}"
+          (
+            cd "${reference_dir}"
+            RESOURCE_SKIP_BUILD=false bin/ci/run-resource-performance
+            bin/ci/write-resource-performance-artifact
+          )
+          cp "${reference_dir}/.build/resource-performance.jsonl" \
+            "${RUNNER_TEMP}/resource-performance-reference.jsonl"
       - name: Publish resource metrics to job summary
         if: always()
         run: bin/ci/publish-resource-performance-summary

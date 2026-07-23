@@ -136,9 +136,10 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 継続検証:
 
 - offload-capable server では copychunk 実経路を compatibility matrix に記録する。非対応サーバでの read/write fallback は unit と Samba E2E でカバー済み。
-- throughput regression は command count / byte count / chunk countに加え、pushごとに10回測定した中央値を
-  直前の比較可能なmaster runと照合する。read/write throughput -15%、user CPU +25%、process RSS +20%を
-  超える退行はPerformance jobを失敗させる。runner CPUなどが一致しない比較はskip理由をsummaryへ出す。
+- throughput regression は command count / byte count / chunk countに加え、pushごとにcurrentと直前の
+  successful masterを同一runner上で各10回測定し、中央値を照合する。read/write throughput -15%、
+  user CPU +25%、process RSS +20%を超える退行はPerformance jobを失敗させる。比較不能時はskip理由を
+  summaryへ出す。
 
 完了条件:
 

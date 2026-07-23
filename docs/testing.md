@@ -186,8 +186,9 @@ GitHub Actions の `windows-latest` は将来 Windows SMB Server host として�
 ## Push 後の performance regression 確認
 
 `Performance` workflow は同一 Release build から完全な benchmark invocation を10回収集し、中央値と
-MAD / min-maxをjob summaryへ出す。masterへのpushでは、直前の比較可能なsuccessful master artifactと
-自動比較し、次の大幅な退行をjob failureにする。
+MAD / min-maxをjob summaryへ出す。masterへのpushでは、直前のsuccessful masterも同じjob・同じrunner上で
+10回測定し、次の大幅な退行をjob failureにする。current/referenceを同一CPU上で測るため、hosted runner間の
+CPU世代差をperformance差として誤検出しない。
 
 - read/write throughput: 15%超の低下
 - user CPU: 25%超の増加

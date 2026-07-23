@@ -3706,6 +3706,11 @@ actor SMBSession {
         self.authenticationCredential = credential
         self.transport = transport
         self.signingKey = signingKey
+#if canImport(CryptoExtras) && !canImport(CommonCrypto)
+        if let signingKey {
+            self.signingCMACContext = try? AESCMAC.Context(key: signingKey)
+        }
+#endif
         self.signingAlgorithm = signingAlgorithm
         self.signingRequired = signingRequired
         self.initialCredits = initialCredits

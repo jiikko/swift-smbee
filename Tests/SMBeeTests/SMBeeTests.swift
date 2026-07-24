@@ -3723,6 +3723,8 @@ final class SMBeeTests: XCTestCase {
         // directory bit (FILE_DIRECTORY_FILE 0x1) を CreateOptions (offset 104) に持つ。
         XCTAssertEqual(readUInt32LE(requests[0], at: 104) & 0x40, 0x40)
         XCTAssertEqual(readUInt32LE(requests[1], at: 104) & 0x1, 0x1)
+        XCTAssertEqual(readUInt32LE(requests[0], at: 104) & 0x0020_0000, 0x0020_0000)
+        XCTAssertEqual(readUInt32LE(requests[1], at: 104) & 0x0020_0000, 0x0020_0000)
     }
 
     func testCreateResponseDecodesFileIdAtResponseStructureOffset64() throws {

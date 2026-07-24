@@ -288,6 +288,16 @@ struct SMB2CreateRequest {
         )
     }
 
+    static func readMetadata(path: String, directory: Bool) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: directory ? 0x0000_0089 : 0x0000_0081,
+            createDisposition: 0x0000_0001,
+            // Query the directory entry itself rather than following a reparse target.
+            createOptions: (directory ? 0x0000_0001 : 0x0000_0040) | 0x0020_0000
+        )
+    }
+
     static func changeNotify(path: String) -> SMB2CreateRequest {
         SMB2CreateRequest(
             path: path,

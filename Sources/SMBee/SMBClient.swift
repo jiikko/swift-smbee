@@ -3911,9 +3911,9 @@ actor SMBSession {
     /// 開かないのは、そうすると file の open が壊れるサーバがあり得るため。
     func createForMetadata(treeId: UInt32, path: String) async throws -> [UInt8] {
         do {
-            return try await create(treeId: treeId, path: path, directory: false)
+            return try await create(treeId: treeId, request: .readMetadata(path: path, directory: false))
         } catch SMBError.fileIsADirectory {
-            return try await create(treeId: treeId, path: path, directory: true)
+            return try await create(treeId: treeId, request: .readMetadata(path: path, directory: true))
         }
     }
 

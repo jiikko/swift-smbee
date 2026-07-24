@@ -308,6 +308,7 @@ Linux/macOS smbclient として必要な理由:
 済:
 
 - Samba 4.22 専用profileで、SMB経由の`FSCTL_SET_REPARSE_POINT`によりrelative symlink reparse fixtureを作成し、`stat` / `FSCTL_GET_REPARSE_POINT` (`readlink`) をPR/push必須E2Eで検証した。
+- 同じSamba 4.22 profileをローカル`make smoke`のpre-push gateにも組み込み、CIへpushする前に実reparse回帰を検出する。
 - recursive operationはtargetをfollowしない。copyはreparse entryをskipし、deleteは`FILE_OPEN_REPARSE_POINT`でlink自体を削除する。外部targetが残ることも同じ実サーバE2Eで固定済み。
 
 ### P2-4. sparse file preservation / allocation size

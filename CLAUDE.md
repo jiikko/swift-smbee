@@ -30,7 +30,8 @@ swift build && swift test          # 1. まず unit（サーバ不要・必須�
 bin/e2e/container-samba.sh          # 2. production を触ったら container Samba E2E smoke
 ```
 
-2プロファイルをまとめて検証し、push 前ゲート用マーカーを作るには `bin/e2e/smoke-all`（または
+SMB 3.0.2 encrypted、SMB 3.1.1 signing、Samba 4.22 reparseの3プロファイルをまとめて検証し、
+push 前ゲート用マーカーを作るには `bin/e2e/smoke-all`（または
 `make smoke`）を実行する。初回だけ `make setup-hooks` でリポジトリ管理の pre-push フックを有効化する。
 `make smoke`は進捗と結果だけを表示し、完全ログを`tmp/e2e-smoke-latest.log`へ保存する。
 wire logを端末へ全量表示したい場合だけ`make smoke-verbose`を使う。

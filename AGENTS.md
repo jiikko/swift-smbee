@@ -9,7 +9,9 @@
   The canonical cross-agent policy is [`docs/agent-performance-verification.md`](docs/agent-performance-verification.md).
 - `bin/ci/verify-agent-performance` remains the lower-level Performance-only
   verifier; normally use the integrated push verifier.
-- Use `make smoke` for concise progress plus `tmp/e2e-smoke-latest.log`; use
+- `make smoke` covers SMB 3.0.2 encrypted, SMB 3.1.1 signing, and the focused
+  Samba 4.22 reparse profile. It prints concise progress and saves the full log
+  to `tmp/e2e-smoke-latest.log`; use
   `make smoke-verbose` only when the complete wire log must be streamed live.
 - If a required job fails, inspect the failing step and job log, fix the failure when it is in scope, push the fix, and verify the replacement run.
 - For a substantial change, or any change touching SMB transport, framing, codecs, signing, encryption, read/write paths, performance tests, or performance CI, inspect the `Performance` workflow job summary and logs after push.

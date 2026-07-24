@@ -9,7 +9,7 @@ log_file="${SMBEE_SMOKE_LOG:-${REPO_ROOT}/tmp/e2e-smoke-latest.log}"
 cd "${REPO_ROOT}"
 mkdir -p "$(dirname "${log_file}")"
 
-echo "Running two-profile Samba smoke (full log: ${log_file})"
+echo "Running required Samba smoke profiles (full log: ${log_file})"
 if "${SCRIPT_DIR}/smoke-all" 2>&1 \
   | tee "${log_file}" \
   | awk '

@@ -17,6 +17,15 @@ SMBEE_E2E_PROFILE=smb311-signing-required \
 SAMBA_CONFIG=test/e2e/smb/smb311-signing-required.conf \
   bin/e2e/container-samba.sh
 
+printf '\n== E2E smoke: smb422-reparse ==\n'
+SAMBA_BASE_IMAGE=debian:13-slim \
+SMBEE_E2E_PROFILE=smb422-reparse \
+SMBEE_E2E_TEST_FILTER=SMBReparsePointE2ETests \
+SMBEE_E2E_SKIP_EXTRA_API_TESTS=1 \
+SMBEE_E2E_SKIP_CLI_SMOKE=1 \
+SAMBA_CONFIG=test/e2e/smb/smb422-reparse.conf \
+  bin/e2e/container-samba.sh
+
 if ! git diff --quiet HEAD -- Sources/SMBee; then
   printf 'ERROR: Sources/SMBee has uncommitted changes; commit them before running smoke-all\n' >&2
   printf '(the marker certifies the committed Sources/SMBee subtree, not the dirty worktree).\n' >&2

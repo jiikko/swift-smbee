@@ -147,3 +147,45 @@ jobs:
             .build/resource-performance-reference.log
             .build/resource-performance-reference.jsonl
           if-no-files-found: warn
+
+  samba-network-performance:
+    needs: ci-script-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SAMBA_CONTAINER: smbee-samba-network-performance
+      SAMBA_BASE_IMAGE: ubuntu:24.04
+      SAMBA_CONFIG: test/e2e/smb/smb302-encrypted-required.conf
+      SMBEE_E2E_PROFILE: smb302-encrypted-required
+      SMBEE_E2E_HOST: 127.0.0.1
+      SMBEE_E2E_PORT: "445"
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start encrypted Samba
+        run: bash test/e2e/start-samba-ci.sh
+      - name: Measure real Samba latency and throughput
+        env:
+          SWIFT_VERSION: "6.2"
+          SMBEE_NETWORK_PERFORMANCE: "1"
+          DOCKER_RUN_ENV: SMBEE_NETWORK_PERFORMANCE
+        run: |
+          mkdir -p .build
+          bash test/e2e/run-swift-in-container.sh \
+            'swift test -c release --filter SMBeeNetworkPerformanceE2ETests' \
+            2>&1 | tee .build/network-performance.log
+      - name: Publish Samba network metrics to job summary
+        if: always()
+        run: bin/ci/publish-network-performance-summary .build/network-performance.log >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload Samba network metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: network-performance-${{ github.sha }}
+          retention-days: 30
+          path: .build/network-performance.log
+          if-no-files-found: error
+      - name: Samba logs and teardown
+        if: always()
+        uses: ./.github/actions/samba-teardown
+        with:
+          container: ${{ env.SAMBA_CONTAINER }}

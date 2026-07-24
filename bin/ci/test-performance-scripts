@@ -152,13 +152,14 @@ test_syntax_checks() {
     "${SCRIPT_DIR}/run-resource-performance" \
     "${SCRIPT_DIR}/resource-performance-metadata" \
     "${SCRIPT_DIR}/parse-resource-performance" \
+    "${SCRIPT_DIR}/publish-network-performance-summary" \
     "${SCRIPT_DIR}/publish-resource-performance-summary" \
     "${SCRIPT_DIR}/write-resource-performance-artifact" \
     "${SCRIPT_DIR}/verify-agent-performance" \
     "${SCRIPT_DIR}/update-swift-image-digest" \
     "${SCRIPT_DIR}/compare-resource-performance"; do
     case "${script}" in
-      *parse-resource-performance) ;;
+      *parse-resource-performance|*publish-network-performance-summary) ;;
       *) bash -n "${script}" ;;
     esac
   done
@@ -169,6 +170,38 @@ import sys
 
 ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 PY
+  PYTHONDONTWRITEBYTECODE=1 python3 - "${SCRIPT_DIR}/publish-network-performance-summary" <<'PY'
+import ast
+import pathlib
+import sys
+
+ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+PY
+}
+
+test_network_performance_summary() {
+  local scenario_dir log_file summary_file
+  scenario_dir="$(new_scenario_dir)"
+  log_file="${scenario_dir}/network.log"
+  summary_file="${scenario_dir}/summary.md"
+  cat >"${log_file}" <<'EOF'
+PERF_NETWORK operation=read iterations=100 size_bytes=1048576 throughput_mib_s=100.000 latency_p50_ms=10.000 latency_p95_ms=12.000 latency_p99_ms=15.000
+PERF_NETWORK operation=write iterations=100 size_bytes=1048576 throughput_mib_s=80.000 latency_p50_ms=12.000 latency_p95_ms=15.000 latency_p99_ms=20.000
+EOF
+  "${SCRIPT_DIR}/publish-network-performance-summary" "${log_file}" >"${summary_file}"
+  expect_contains "${summary_file}" \
+    'SMB 3.0.2 signing/encryption required; one persistent session; 5 warm-ups.' \
+    '| read | 100 | 1 MiB | 100.000 MiB/s | 10.000 ms | 12.000 ms | 15.000 ms |' \
+    '| write | 100 | 1 MiB | 80.000 MiB/s | 12.000 ms | 15.000 ms | 20.000 ms |'
+
+  sed '/operation=write/d' "${log_file}" >"${scenario_dir}/incomplete.log"
+  if "${SCRIPT_DIR}/publish-network-performance-summary" \
+    "${scenario_dir}/incomplete.log" >"${scenario_dir}/bad.out" 2>"${scenario_dir}/bad.err"; then
+    echo "network summary unexpectedly accepted an incomplete log" >&2
+    return 1
+  fi
+  expect_contains "${scenario_dir}/bad.err" \
+    'expected read/write PERF_NETWORK summaries, found 1'
 }
 
 test_swift_image() {
@@ -747,6 +780,7 @@ test_missing_log_metadata() {
 }
 
 run_scenario test_syntax_checks
+run_scenario test_network_performance_summary
 run_scenario test_swift_image
 run_scenario test_run_resource_performance_log_path
 run_scenario test_run_performance_regression

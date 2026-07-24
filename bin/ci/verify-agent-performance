@@ -152,6 +152,47 @@ if ! grep -Fq '**Performance regression gate: PASS**' <<<"${comparison}"; then
   exit 1
 fi
 
+network_job_json="$(gh run view "${run_id}" --json jobs \
+  --jq '.jobs[] | select(.name == "samba-network-performance")')"
+python3 -c '
+import json
+import sys
+
+job = json.load(sys.stdin)
+required = {
+    "Start encrypted Samba",
+    "Measure real Samba latency and throughput",
+    "Publish Samba network metrics to job summary",
+    "Upload Samba network metrics artifact",
+    "Samba logs and teardown",
+}
+steps = {step["name"]: step["conclusion"] for step in job["steps"]}
+missing = sorted(required - steps.keys())
+failed = sorted(name for name in required if steps.get(name) != "success")
+if missing or failed:
+    raise SystemExit(f"required Samba performance steps invalid; missing={missing}, failed={failed}")
+' <<<"${network_job_json}"
+
+network_artifact_dir="${artifact_dir}/network"
+mkdir -p "${network_artifact_dir}"
+gh run download "${run_id}" \
+  --name "network-performance-${commit_sha}" \
+  --dir "${network_artifact_dir}"
+network_log="${network_artifact_dir}/network-performance.log"
+if [ ! -s "${network_log}" ]; then
+  echo "Samba network performance artifact is missing its log" >&2
+  exit 1
+fi
+network_summary="$("${SCRIPT_DIR}/publish-network-performance-summary" "${network_log}")"
+printf '\n%s\n' "${network_summary}"
+for operation in read write; do
+  sample_count="$(grep -c "PERF_NETWORK_SAMPLE operation=${operation} " "${network_log}")"
+  if [ "${sample_count}" -ne 100 ]; then
+    echo "Expected 100 ${operation} network samples, got ${sample_count}" >&2
+    exit 1
+  fi
+done
+
 echo
 echo "Verified Performance workflow: ${run_url}"
 echo "Verified commit: ${commit_sha}"

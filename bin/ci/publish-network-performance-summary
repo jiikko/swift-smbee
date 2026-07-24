@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+import re
+import sys
+from pathlib import Path
+
+if len(sys.argv) != 2:
+    raise SystemExit("usage: publish-network-performance-summary LOG")
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+pattern = re.compile(
+    r"PERF_NETWORK operation=(read|write) iterations=(\d+) size_bytes=(\d+) "
+    r"throughput_mib_s=([\d.]+) latency_p50_ms=([\d.]+) "
+    r"latency_p95_ms=([\d.]+) latency_p99_ms=([\d.]+)"
+)
+rows = pattern.findall(text)
+if len(rows) != 2:
+    raise SystemExit(f"expected read/write PERF_NETWORK summaries, found {len(rows)}")
+
+print("## Samba network performance")
+print()
+print("SMB 3.0.2 signing/encryption required; one persistent session; 5 warm-ups.")
+print()
+print("| Operation | Samples | Payload | Throughput | p50 | p95 | p99 |")
+print("|---|---:|---:|---:|---:|---:|---:|")
+for operation, iterations, size_bytes, throughput, p50, p95, p99 in rows:
+    size_mib = int(size_bytes) / 1_048_576
+    print(
+        f"| {operation} | {iterations} | {size_mib:g} MiB | "
+        f"{throughput} MiB/s | {p50} ms | {p95} ms | {p99} ms |"
+    )

@@ -164,6 +164,7 @@ test_syntax_checks() {
       *) bash -n "${script}" ;;
     esac
   done
+  bash -n "${REPO_ROOT}/bin/e2e/smoke-agent"
   PYTHONDONTWRITEBYTECODE=1 python3 - "${SCRIPT_DIR}/parse-resource-performance" <<'PY'
 import ast
 import pathlib

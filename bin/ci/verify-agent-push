@@ -47,6 +47,9 @@ cleanup() {
   rm -f "${state_file}" "${failed_log}" "${runs_file}"
 }
 trap cleanup EXIT
+started_at="${SECONDS}"
+next_heartbeat="${SECONDS}"
+previous_state=''
 
 summarize_runs() {
   python3 - "${commit_sha}" "${runs_file}" "${state_file}" <<'PY'
@@ -76,6 +79,18 @@ with open(output, "w", encoding="utf-8") as stream:
 PY
 }
 
+report_progress() {
+  printf 'CI status (%ss):' "$((SECONDS - started_at))"
+  while IFS=$'\t' read -r name status conclusion _run_id _run_url; do
+    if [ -n "${conclusion}" ]; then
+      printf ' %s=%s/%s' "${name}" "${status}" "${conclusion}"
+    else
+      printf ' %s=%s' "${name}" "${status}"
+    fi
+  done <"${state_file}"
+  printf '\n'
+}
+
 echo "Waiting for Test, E2E, and Performance workflows for ${commit_sha}..."
 while [ "${SECONDS}" -lt "${deadline}" ]; do
   runs_json="$(gh run list \
@@ -84,6 +99,13 @@ while [ "${SECONDS}" -lt "${deadline}" ]; do
     --json databaseId,name,status,conclusion,url,headSha)"
   printf '%s\n' "${runs_json}" >"${runs_file}"
   summarize_runs
+
+  current_state="$(cut -f1-3 "${state_file}" | tr '\n' ';')"
+  if [ "${current_state}" != "${previous_state}" ] || [ "${SECONDS}" -ge "${next_heartbeat}" ]; then
+    report_progress
+    previous_state="${current_state}"
+    next_heartbeat=$((SECONDS + 60))
+  fi
 
   if ! grep -Eq $'\t(missing|queued|pending|in_progress|requested|waiting)\t' "${state_file}"; then
     break

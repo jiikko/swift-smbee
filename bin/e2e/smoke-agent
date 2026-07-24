@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+log_file="${SMBEE_SMOKE_LOG:-${REPO_ROOT}/tmp/e2e-smoke-latest.log}"
+
+cd "${REPO_ROOT}"
+mkdir -p "$(dirname "${log_file}")"
+
+echo "Running two-profile Samba smoke (full log: ${log_file})"
+if "${SCRIPT_DIR}/smoke-all" 2>&1 \
+  | tee "${log_file}" \
+  | awk '
+      /^== E2E smoke:/ ||
+      /^Starting Samba container/ ||
+      /^Samba is ready/ ||
+      /^Test Suite '\''Selected tests'\'' (passed|failed)/ ||
+      /^Local container E2E completed successfully/ ||
+      /^E2E smoke verified Sources\/SMBee tree:/ ||
+      /^ERROR:/ {
+        print
+        fflush()
+      }
+    '; then
+  echo "Samba smoke passed. Full log: ${log_file}"
+else
+  status=$?
+  echo >&2
+  echo "Samba smoke failed (exit ${status}). Highlights:" >&2
+  if ! grep -Ei \
+    '(^|[^[:alpha:]])(error|failed|failure|fatal|exception|assert|timed out|timeout)([^[:alpha:]]|$)' \
+    "${log_file}" | tail -120 >&2; then
+    tail -120 "${log_file}" >&2
+  fi
+  echo "Full log: ${log_file}" >&2
+  exit "${status}"
+fi

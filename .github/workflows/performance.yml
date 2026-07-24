@@ -120,6 +120,10 @@ jobs:
               bin/ci/write-resource-performance-artifact
             cp "${PERFORMANCE_REFERENCE_DIR}/.build/resource-performance.jsonl" \
               "${RUNNER_TEMP}/resource-performance-reference.jsonl"
+            cp "${PERFORMANCE_REFERENCE_DIR}/.build/resource-performance.jsonl" \
+              .build/resource-performance-reference.jsonl
+            cp "${PERFORMANCE_REFERENCE_DIR}/.build/resource-performance.log" \
+              .build/resource-performance-reference.log
           fi
       - name: Publish resource metrics to job summary
         if: always()
@@ -140,4 +144,6 @@ jobs:
           path: |
             .build/resource-performance.log
             .build/resource-performance.jsonl
+            .build/resource-performance-reference.log
+            .build/resource-performance-reference.jsonl
           if-no-files-found: warn

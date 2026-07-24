@@ -202,7 +202,8 @@ permutation testのHolm補正p値をjob summaryへ出す。これによりhosted
 
 gateは実用上の閾値を超え、かつ10ペア以上でHolm補正後 `p < 0.05` の退行をfailureにする。10ペア未満の
 manual runでは統計的検出力が不足するため、従来の実用閾値だけを使うsafeguardへfallbackする。有意差だけで
-改善と判断せず、effect sizeと95% CIを必ず併記する。
+改善と判断せず、effect sizeと95% CIを必ず併記する。artifactにはcurrent/reference双方のraw logとJSONLを
+保存し、同じpaired analysisを後から再現可能にする。
 
 Swift image、runner OS/arch、CPU model/count、workloadが一致しない場合は誤判定を避けるためgateをskipし、
 summaryに理由を表示する。この場合、performance-sensitiveな修正は比較可能なrunを取り直すまで改善確認済みと

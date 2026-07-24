@@ -70,10 +70,11 @@ with open(output, "w", encoding="utf-8") as stream:
     for name in required:
         run = by_name.get(name)
         if run is None:
-            stream.write(f"{name}\tmissing\t\t\t\n")
+            stream.write(f"{name}\tmissing\t-\t-\t-\n")
         else:
+            conclusion = run.get("conclusion") or "-"
             stream.write(
-                f'{name}\t{run["status"]}\t{run.get("conclusion", "")}'
+                f'{name}\t{run["status"]}\t{conclusion}'
                 f'\t{run["databaseId"]}\t{run["url"]}\n'
             )
 PY
@@ -82,7 +83,7 @@ PY
 report_progress() {
   printf 'CI status (%ss):' "$((SECONDS - started_at))"
   while IFS=$'\t' read -r name status conclusion _run_id _run_url; do
-    if [ -n "${conclusion}" ]; then
+    if [ "${conclusion}" != "-" ]; then
       printf ' %s=%s/%s' "${name}" "${status}" "${conclusion}"
     else
       printf ' %s=%s' "${name}" "${status}"

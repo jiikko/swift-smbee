@@ -393,6 +393,15 @@ struct SMB2CreateRequest {
         )
     }
 
+    static func setReparsePoint(path: String) -> SMB2CreateRequest {
+        SMB2CreateRequest(
+            path: path,
+            desiredAccess: 0x0000_0100,
+            createDisposition: 0x0000_0001,
+            createOptions: 0x0000_0040 | 0x0020_0000
+        )
+    }
+
     static func querySecurity(path: String) -> SMB2CreateRequest {
         SMB2CreateRequest(
             path: path,
@@ -752,6 +761,7 @@ enum SMB2Ioctl {
     static let fsctlPipeTransceive: UInt32 = 0x0011_c017
     static let fsctlDfsGetReferrals: UInt32 = 0x0006_0194
     static let fsctlGetReparsePoint: UInt32 = 0x0009_00a8
+    static let fsctlSetReparsePoint: UInt32 = 0x0009_00a4
     static let fsctlSrvRequestResumeKey: UInt32 = 0x0014_0078
     static let fsctlSrvCopychunkWrite: UInt32 = 0x0014_40f4
     static let fsctlSetSparse: UInt32 = 0x0009_00c4
@@ -889,6 +899,34 @@ enum SMB2SparseFile {
 }
 
 enum SMB2ReparsePoint {
+    static func encodeSymbolicLink(
+        substituteName: String,
+        printName: String,
+        relative: Bool
+    ) throws -> [UInt8] {
+        let substitute = Array(substituteName.utf16).flatMap(littleEndianBytes)
+        let printable = Array(printName.utf16).flatMap(littleEndianBytes)
+        var data = SMBByteWriter()
+        data.writeUInt16LE(0)
+        try data.writeUInt16LE(count: substitute.count, of: "reparse substitute name")
+        try data.writeUInt16LE(count: substitute.count, of: "reparse print-name offset")
+        try data.writeUInt16LE(count: printable.count, of: "reparse print name")
+        data.writeUInt32LE(relative ? 1 : 0)
+        data.writeBytes(substitute)
+        data.writeBytes(printable)
+
+        var buffer = SMBByteWriter()
+        buffer.writeUInt32LE(SMBReparseTags.symlink)
+        try buffer.writeUInt16LE(count: data.bytes.count, of: "reparse data")
+        buffer.writeUInt16LE(0)
+        buffer.writeBytes(data.bytes)
+        return buffer.bytes
+    }
+
+    private static func littleEndianBytes(_ codeUnit: UInt16) -> [UInt8] {
+        [UInt8(truncatingIfNeeded: codeUnit), UInt8(truncatingIfNeeded: codeUnit >> 8)]
+    }
+
     static func decode(_ bytes: [UInt8]) throws -> SMBReparsePoint {
         guard bytes.count >= 8 else { throw SMBCodecError.truncated }
         let tag = readUInt32LE(bytes, at: 0)

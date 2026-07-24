@@ -686,6 +686,22 @@ public actor SMBClientSession {
         await session.retainsAuthenticationCredentialForTesting()
     }
 
+    func installSymbolicLinkReparsePointForTesting(path: String, target: String) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .setReparsePoint(path: path))
+        do {
+            try await session.setSymbolicLinkReparsePoint(
+                treeId: treeId,
+                fileId: fileId,
+                target: target
+            )
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+        } catch {
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     /// Tear down the current connection and establish a fresh session + tree from the
     /// stored reconnect info. Throws `SMBError.connectionLost` if this session was not
     /// created with reconnect support.
@@ -4786,6 +4802,21 @@ actor SMBSession {
             allowedStatuses: []
         )
         return try SMB2ReparsePoint.decode(response.output)
+    }
+
+    func setSymbolicLinkReparsePoint(treeId: UInt32, fileId: [UInt8], target: String) async throws {
+        _ = try await ioctl(
+            treeId: treeId,
+            fileId: fileId,
+            ctlCode: SMB2Ioctl.fsctlSetReparsePoint,
+            input: try SMB2ReparsePoint.encodeSymbolicLink(
+                substituteName: target,
+                printName: target,
+                relative: true
+            ),
+            maxOutputResponse: 0,
+            allowedStatuses: []
+        )
     }
 
     func close(treeId: UInt32, fileId: [UInt8]) async throws {

@@ -22,13 +22,17 @@ SMBEE_SMOKE_AUTH='NTLMv2 password' \
 bin/e2e/smoke-real-server.sh smb://user@host/share
 ```
 
-The script exercises `probe`, `shares`, `ls`, `stat`, `cat`, `get`, `put`,
-`mkdir`, `cp`, `mv`, `rm`, `df`, `acl`, `ping`, byte-range `lock`, and
-`watch` against a temporary directory. The watch check creates a file after
-subscribing and requires the matching change event within 10 seconds. The
-optional Markdown report records pass/fail, the failing step and exit code,
-client/server metadata, and the machine-readable NEGOTIATE result. It never
-records `SMB_PASSWORD`.
+The script exercises `probe`, `shares`, `ls`, `stat` (including allocation
+size), `cat`, `get`, `put`, recursive transfer, byte-level resume, SHA-256
+verification, decomposed-Unicode path round trip, `mkdir`, `cp`, `mv`, `rm`,
+`df`, SID-resolving `acl`, `ping`, byte-range `lock`, and `watch` against a
+temporary directory. It also probes sparse FSCTL support without failing the
+whole smoke when the server/filesystem legitimately does not support it. The
+watch check creates a file after subscribing and requires the matching change
+event within 10 seconds. The optional Markdown report records pass/fail, the
+failing step and exit code, client/server metadata, Unicode spelling behavior,
+allocation-size availability, sparse capability, and the machine-readable
+NEGOTIATE result. It never records `SMB_PASSWORD`.
 
 ## Results
 
@@ -54,6 +58,7 @@ For every manual run, capture:
 - auth mode: password, NT hash, anonymous/guest, or future Kerberos
 - command failures and exact `smbcli` exit code
 - path encoding or Unicode normalization differences
+- whether `allocationSize` is reported and sparse FSCTLs are supported
 - ACL/security descriptor behavior, especially mask normalization
 
 ## Known Gaps

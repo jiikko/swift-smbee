@@ -281,6 +281,8 @@ Linux/macOS smbclient として必要な理由:
 
 - macOS Finder / Samba / Windows / NAS で Unicode normalization 差を実測する。
 - matrix に path encoding / normalization の観測結果を残す。
+- `bin/e2e/smoke-real-server.sh` は decomposed Unicode 名の put/cat/list を実行し、
+  spelling が保存されたか normalized / escaped されたかを Markdown report に記録する。
 
 ### P2-2. share discovery / volume / metadata / ACL の実サーバ smoke
 
@@ -292,6 +294,8 @@ Linux/macOS smbclient として必要な理由:
 - volume info の macOS SMBX / Windows / NAS smoke。
 - ACL / owner / group / SID lookup の AD / Samba AD 実測。
 - Samba POSIX backend の正規化差分を docs に残す。
+- real-server smoke は `shares`、`df --json`、`stat --json`、`acl --resolve-sids --json`
+  を必須検証し、filesystem 名・allocation size・DACL/SID 解決経路を一括確認する。
 
 ### P2-3. reparse / readlink 実サーバ smoke
 
@@ -317,6 +321,9 @@ Linux/macOS smbclient として必要な理由:
 - 通常の get/put/copy は file size と byte content を保証する **logical-content policy** とする。ローカル APFS 等の hole topology と SMB server の allocation topology は API 契約に含めない。これにより、sparse 非対応 filesystem / SMB server でも転送結果の内容が一貫する。
 - hole topology を意図して操作する利用者は `setSparse` / `zeroRange` / `allocatedRanges`（CLI は `smbcli sparse`）を明示的に使う。自動 preservation は未対応として README limitation に残す。
 - 実サーバごとの allocation size / allocated ranges の差異確認は継続する。
+- real-server smoke は `allocationSize` の存在を必須確認し、SET_SPARSE /
+  QUERY_ALLOCATED_RANGES は filesystem 非対応を許容する capability probe として
+  Markdown report に supported / unsupported を記録する。
 
 ### P2-5. operation-level deadline の public API 方針
 

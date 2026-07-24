@@ -129,7 +129,23 @@ jobs:
           bash test/e2e/run-swift-in-container.sh '
             swift build --product smbcli
             bin/e2e/smbcli-smoke.sh
+            SMBEE_SMOKE_ROOT="smbee-real-smoke-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}" \
+              SMBEE_SMOKE_REPORT=".build/real-server-smoke-report.md" \
+              SMBEE_SMOKE_SERVER="Samba container" \
+              SMBEE_SMOKE_VERSION="Ubuntu 24.04 / smb302-encrypted-required" \
+              SMBEE_SMOKE_AUTH="NTLMv2 password" \
+              bin/e2e/smoke-real-server.sh \
+                "smb://smbee@${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public"
           '
+
+      - name: Upload real-server smoke report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: real-server-smoke-${{ github.sha }}
+          retention-days: 30
+          path: .build/real-server-smoke-report.md
+          if-no-files-found: error
 
       - name: Samba logs and teardown
         if: always()

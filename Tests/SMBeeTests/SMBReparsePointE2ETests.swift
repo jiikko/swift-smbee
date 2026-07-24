@@ -43,7 +43,7 @@ final class SMBReparsePointE2ETests: XCTestCase {
                 onAction: { copiedActions.record($0) }
             )
             XCTAssertTrue(copiedActions.snapshot().contains {
-                $0.kind == .skip && $0.path == "\(copiedRoot)/target-link"
+                $0.kind == .skip && $0.path == "\(copiedRoot)\\target-link"
             })
 
             try await session.delete(path: root, directory: true, recursive: true)

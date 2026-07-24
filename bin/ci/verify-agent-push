@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: bin/ci/verify-agent-push [commit]
+
+Waits concurrently for the Test, E2E, and Performance workflows for a commit
+(default: HEAD). On failure, prints the failed jobs and a filtered failed-log
+tail. On success, performs the full Performance artifact/statistics check.
+
+Environment:
+  AGENT_PUSH_VERIFY_TIMEOUT_SECONDS  Maximum wait time (default: 7200)
+  AGENT_PUSH_VERIFY_POLL_SECONDS     Poll interval (default: 15)
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -gt 1 ]]; then
+  usage
+  exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+commit="${1:-HEAD}"
+timeout_seconds="${AGENT_PUSH_VERIFY_TIMEOUT_SECONDS:-7200}"
+poll_seconds="${AGENT_PUSH_VERIFY_POLL_SECONDS:-15}"
+
+if ! [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || [ "${timeout_seconds}" -lt 1 ]; then
+  echo "AGENT_PUSH_VERIFY_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "${poll_seconds}" =~ ^[0-9]+$ ]] || [ "${poll_seconds}" -lt 1 ]; then
+  echo "AGENT_PUSH_VERIFY_POLL_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+
+cd "${REPO_ROOT}"
+commit_sha="$(git rev-parse "${commit}^{commit}")"
+deadline=$((SECONDS + timeout_seconds))
+runs_json='[]'
+state_file="$(mktemp)"
+failed_log="$(mktemp)"
+runs_file="$(mktemp)"
+cleanup() {
+  rm -f "${state_file}" "${failed_log}" "${runs_file}"
+}
+trap cleanup EXIT
+
+summarize_runs() {
+  python3 - "${commit_sha}" "${runs_file}" "${state_file}" <<'PY'
+import json
+import sys
+
+commit_sha, input_path, output = sys.argv[1:]
+with open(input_path, encoding="utf-8") as stream:
+    runs = json.load(stream)
+required = ("Test", "E2E", "Performance")
+by_name = {}
+for run in runs:
+    if run.get("headSha") != commit_sha or run.get("name") not in required:
+        continue
+    by_name.setdefault(run["name"], run)
+
+with open(output, "w", encoding="utf-8") as stream:
+    for name in required:
+        run = by_name.get(name)
+        if run is None:
+            stream.write(f"{name}\tmissing\t\t\t\n")
+        else:
+            stream.write(
+                f'{name}\t{run["status"]}\t{run.get("conclusion", "")}'
+                f'\t{run["databaseId"]}\t{run["url"]}\n'
+            )
+PY
+}
+
+echo "Waiting for Test, E2E, and Performance workflows for ${commit_sha}..."
+while [ "${SECONDS}" -lt "${deadline}" ]; do
+  runs_json="$(gh run list \
+    --commit "${commit_sha}" \
+    --limit 20 \
+    --json databaseId,name,status,conclusion,url,headSha)"
+  printf '%s\n' "${runs_json}" >"${runs_file}"
+  summarize_runs
+
+  if ! grep -Eq $'\t(missing|queued|pending|in_progress|requested|waiting)\t' "${state_file}"; then
+    break
+  fi
+  sleep "${poll_seconds}"
+done
+
+cat "${state_file}" | while IFS=$'\t' read -r name status conclusion run_id run_url; do
+  printf '%-11s %-12s %-10s %s\n' "${name}" "${status}" "${conclusion:--}" "${run_url:--}"
+done
+
+if grep -Eq $'\t(missing|queued|pending|in_progress|requested|waiting)\t' "${state_file}"; then
+  echo "Timed out waiting for all required workflows for ${commit_sha}" >&2
+  exit 1
+fi
+
+failed=0
+while IFS=$'\t' read -r name status conclusion run_id run_url; do
+  if [ "${status}" = "completed" ] && [ "${conclusion}" = "success" ]; then
+    continue
+  fi
+  failed=1
+  echo >&2
+  echo "${name} workflow failed: ${run_url} (${conclusion:-${status}})" >&2
+  gh run view "${run_id}" \
+    --json jobs \
+    --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "  \(.conclusion): \(.name) (\(.url))"' \
+    >&2 || true
+  if gh run view "${run_id}" --log-failed >"${failed_log}" 2>/dev/null; then
+    echo "  Failed log highlights:" >&2
+    if ! grep -Ei \
+      '##\[error\]|:[0-9]+: error:|Test (Case|Suite).*failed|XCTAssert|Assertion|fatal:|Exception|Process completed|timed out|timeout' \
+      "${failed_log}" | tail -120 >&2; then
+      tail -120 "${failed_log}" >&2
+    fi
+  fi
+done <"${state_file}"
+
+if [ "${failed}" -ne 0 ]; then
+  exit 1
+fi
+
+"${SCRIPT_DIR}/verify-agent-performance" "${commit_sha}"
+
+echo
+echo "Verified push CI for commit: ${commit_sha}"

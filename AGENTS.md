@@ -2,10 +2,13 @@
 
 ## Required post-push verification
 
-- **Mandatory command for performance-sensitive changes:** after pushing, run
-  `bin/ci/verify-agent-performance <full-commit-sha>`. Do not report completion until it exits 0.
+- **Mandatory command after pushing:** run
+  `bin/ci/verify-agent-push <full-commit-sha>`. It waits for Test, E2E, and
+  Performance concurrently, summarizes failed jobs/logs, and performs the strict
+  Performance artifact check. Do not report completion until it exits 0.
   The canonical cross-agent policy is [`docs/agent-performance-verification.md`](docs/agent-performance-verification.md).
-- After every push, wait for the GitHub Actions runs triggered by that push to reach a terminal state. Do not report the task as complete while required jobs are queued or running.
+- `bin/ci/verify-agent-performance` remains the lower-level Performance-only
+  verifier; normally use the integrated push verifier.
 - If a required job fails, inspect the failing step and job log, fix the failure when it is in scope, push the fix, and verify the replacement run.
 - For a substantial change, or any change touching SMB transport, framing, codecs, signing, encryption, read/write paths, performance tests, or performance CI, inspect the `Performance` workflow job summary and logs after push.
 - Performance-sensitive work is complete only after recording the run URL and comparing the alternating current/previous-master 20-pair medians measured on the same runner. Report effect size, 95% confidence interval, Holm-adjusted p-value, and observed spread; do not infer an improvement from a single raw sample or p-value alone.

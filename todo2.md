@@ -6,7 +6,7 @@
 
 ## 監査時点
 
-- 最終更新: 2026-07-23
+- 最終更新: 2026-07-24
 - 対象 branch: `master`
 - 正本仕様:
   - MS-SMB2: SMB2/3 command、dialect、signing/encryption、credit、durable handle、CHANGE_NOTIFY
@@ -50,7 +50,7 @@
 | SID name resolution | implemented-but-underverified | well-known SID table + LSARPC `LsarLookupSids`。AD / Samba AD 実測と issue 整理が残る。 |
 | change notification | implemented-but-underverified | `withChangeNotifications(autoReconnect:)` / `smbcli watch --json --reconnect`。Samba E2E + reconnect unit あり。Windows/NAS 実測が残る。 |
 | DFS referral metadata | implemented-but-underverified | `SMBee.dfsReferral` / `smbcli dfs`、multi-hop `resolveDFS` / `connectFollowingDFS` / `listFollowingDFS` / `readFollowingDFS`。loop detection、credential-scoped / bounded TTL cache、suffix rewrite は unit + Samba msdfs E2E 済み。Windows DFS 実測が残る。 |
-| reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。実サーバ smoke が残る。 |
+| reparse target resolution | implemented-but-underverified | `readlink` で symlink / mount point / LX symlink target decode。DFS/NFS reparse data は opaque。Samba 4.22 の実reparse E2E済み。Windows / macOS SMBX smokeが残る。 |
 | byte-level resume / transfer verification | implemented | single-file get/put resume、recursive verify size/hash、SHA-256 read-back 実装済み。 |
 | sparse file operations | implemented-but-underverified | FSCTL_SET_SPARSE / SET_ZERO_DATA / QUERY_ALLOCATED_RANGES と `smbcli sparse`、allocation size stat 表示、Samba FSCTL E2E は実装済み。通常 transfer は logical-content policy で、hole topology preservation は未対応。 |
 | ECHO / keepalive | implemented-but-underverified | `echo` / `smbcli ping` / opt-in keepalive と session invalidation policy は実装・unit test 済み。Windows / NAS smoke が残る。 |
@@ -303,8 +303,12 @@ Linux/macOS smbclient として必要な理由:
 
 残:
 
-- reparse point target を公開する Samba 構成、Windows、macOS SMBX で `smbcli readlink` smoke を取る。通常の POSIX symlink を透過 follow する Samba 構成はこの検証の代替にならない。
-- recursive operationはtargetをfollowしない。download/copyはreparse entryをskipし、deleteは`FILE_OPEN_REPARSE_POINT`でlink自体を削除する。unitとREADME/coverageに固定済み。
+- Windows、macOS SMBX で `smbcli readlink` smoke を取る。通常の POSIX symlink を透過 follow する構成はこの検証の代替にならない。
+
+済:
+
+- Samba 4.22 専用profileで、SMB経由の`FSCTL_SET_REPARSE_POINT`によりrelative symlink reparse fixtureを作成し、`stat` / `FSCTL_GET_REPARSE_POINT` (`readlink`) をPR/push必須E2Eで検証した。
+- recursive operationはtargetをfollowしない。copyはreparse entryをskipし、deleteは`FILE_OPEN_REPARSE_POINT`でlink自体を削除する。外部targetが残ることも同じ実サーバE2Eで固定済み。
 
 ### P2-4. sparse file preservation / allocation size
 

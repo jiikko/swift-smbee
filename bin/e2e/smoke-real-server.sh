@@ -124,6 +124,10 @@ printf 'hello from SMBee real-server smoke\n' > "${tmpdir}/upload.txt"
 mkdir -p "${tmpdir}/recursive/child"
 printf 'recursive SMBee smoke\n' > "${tmpdir}/recursive/child/nested.txt"
 unicode_name=$'normalization-e\u0301.txt'
+# Keep the command-line SMB URL ASCII and let SMBCLIEndpoint percent-decode the
+# decomposed UTF-8 component. Passing raw non-ASCII through Foundation URL parsing
+# can be interpreted as an invalid URL path on Linux.
+unicode_url_name='normalization-e%CC%81.txt'
 printf 'Unicode normalization smoke\n' > "${tmpdir}/unicode.txt"
 
 smoke_step="probe"
@@ -168,9 +172,9 @@ echo "== df / acl"
 smoke_step="Unicode normalization"
 echo "== Unicode normalization"
 "${SMBCLI}" put \
-  "${tmpdir}/unicode.txt" "${TARGET}/${SMBEE_SMOKE_ROOT}/${unicode_name}"
+  "${tmpdir}/unicode.txt" "${TARGET}/${SMBEE_SMOKE_ROOT}/${unicode_url_name}"
 "${SMBCLI}" cat \
-  "${TARGET}/${SMBEE_SMOKE_ROOT}/${unicode_name}" > "${tmpdir}/unicode-downloaded.txt"
+  "${TARGET}/${SMBEE_SMOKE_ROOT}/${unicode_url_name}" > "${tmpdir}/unicode-downloaded.txt"
 cmp "${tmpdir}/unicode.txt" "${tmpdir}/unicode-downloaded.txt"
 "${SMBCLI}" ls --json "${TARGET}/${SMBEE_SMOKE_ROOT}" > "${tmpdir}/unicode-list.json"
 if grep -Fq "\"name\":\"${unicode_name}\"" "${tmpdir}/unicode-list.json"; then
@@ -241,7 +245,7 @@ echo "== cp / mv / rm"
 "${SMBCLI}" rm "${TARGET}/${SMBEE_SMOKE_ROOT}/upload.txt"
 "${SMBCLI}" rm "${TARGET}/${SMBEE_SMOKE_ROOT}/watched.txt"
 "${SMBCLI}" rm "${TARGET}/${SMBEE_SMOKE_ROOT}/renamed.txt"
-"${SMBCLI}" rm "${TARGET}/${SMBEE_SMOKE_ROOT}/${unicode_name}"
+"${SMBCLI}" rm "${TARGET}/${SMBEE_SMOKE_ROOT}/${unicode_url_name}"
 "${SMBCLI}" rm -r "${TARGET}/${SMBEE_SMOKE_ROOT}"
 
 smoke_step="complete"

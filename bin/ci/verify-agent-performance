@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: bin/ci/verify-agent-performance [commit]
+
+Waits for the Performance workflow for a commit (default: HEAD), verifies the
+20-pair AB/BA measurement and regression-gate steps, downloads both raw
+artifacts, and reproduces the statistical comparison locally.
+
+Environment:
+  PERFORMANCE_VERIFY_TIMEOUT_SECONDS  Maximum wait time (default: 5400)
+  PERFORMANCE_VERIFY_POLL_SECONDS     Poll interval (default: 15)
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -gt 1 ]]; then
+  usage
+  exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+commit="${1:-HEAD}"
+timeout_seconds="${PERFORMANCE_VERIFY_TIMEOUT_SECONDS:-5400}"
+poll_seconds="${PERFORMANCE_VERIFY_POLL_SECONDS:-15}"
+
+if ! [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || [ "${timeout_seconds}" -lt 1 ]; then
+  echo "PERFORMANCE_VERIFY_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "${poll_seconds}" =~ ^[0-9]+$ ]] || [ "${poll_seconds}" -lt 1 ]; then
+  echo "PERFORMANCE_VERIFY_POLL_SECONDS must be a positive integer" >&2
+  exit 2
+fi
+
+cd "${REPO_ROOT}"
+commit_sha="$(git rev-parse "${commit}^{commit}")"
+deadline=$((SECONDS + timeout_seconds))
+run_json=""
+
+echo "Waiting for Performance workflow for ${commit_sha}..."
+while [ "${SECONDS}" -lt "${deadline}" ]; do
+  run_json="$(gh run list \
+    --workflow Performance \
+    --commit "${commit_sha}" \
+    --limit 1 \
+    --json databaseId,status,conclusion,url,headSha \
+    --jq '.[0] // empty')"
+  if [ -n "${run_json}" ]; then
+    status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<<"${run_json}")"
+    if [ "${status}" = "completed" ]; then
+      break
+    fi
+  fi
+  sleep "${poll_seconds}"
+done
+
+if [ -z "${run_json}" ]; then
+  echo "No Performance workflow found for ${commit_sha}" >&2
+  exit 1
+fi
+
+run_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["databaseId"])' <<<"${run_json}")"
+run_url="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["url"])' <<<"${run_json}")"
+run_head_sha="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["headSha"])' <<<"${run_json}")"
+status="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<<"${run_json}")"
+conclusion="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["conclusion"])' <<<"${run_json}")"
+
+if [ "${status}" != "completed" ]; then
+  echo "Timed out waiting for ${run_url}" >&2
+  exit 1
+fi
+if [ "${run_head_sha}" != "${commit_sha}" ]; then
+  echo "Performance run SHA mismatch: expected ${commit_sha}, got ${run_head_sha}" >&2
+  exit 1
+fi
+if [ "${conclusion}" != "success" ]; then
+  echo "Performance workflow did not succeed: ${run_url} (${conclusion})" >&2
+  exit 1
+fi
+
+job_json="$(gh run view "${run_id}" --json jobs --jq '.jobs[] | select(.name == "resource-performance")')"
+job_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["databaseId"])' <<<"${job_json}")"
+python3 -c '
+import json
+import sys
+
+job = json.load(sys.stdin)
+required = {
+    "Alternating paired Release resource metrics",
+    "Build resource metrics artifact",
+    "Publish resource metrics to job summary",
+    "Enforce performance regression gate against previous master",
+    "Upload resource metrics artifact",
+}
+steps = {step["name"]: step["conclusion"] for step in job["steps"]}
+missing = sorted(required - steps.keys())
+failed = sorted(name for name in required if steps.get(name) != "success")
+if missing or failed:
+    raise SystemExit(f"required Performance steps invalid; missing={missing}, failed={failed}")
+' <<<"${job_json}"
+
+log_file="$(mktemp)"
+artifact_dir="$(mktemp -d)"
+cleanup() {
+  rm -f "${log_file}"
+  rm -rf "${artifact_dir}"
+}
+trap cleanup EXIT
+
+gh run view "${run_id}" --job "${job_id}" --log >"${log_file}"
+python3 - "${log_file}" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+observed = re.findall(r"Z Measuring pair (\d+)/20: (current then reference|reference then current)", text)
+expected = [
+    (str(pair), "current then reference" if pair % 2 else "reference then current")
+    for pair in range(1, 21)
+]
+if observed != expected:
+    raise SystemExit(f"paired measurement sequence mismatch: observed {observed}")
+models = re.findall(r"Z PERF_ENV cpu_model (.+)", text)
+if len(models) != 2 or len(set(models)) != 1:
+    raise SystemExit(f"current/reference CPU metadata mismatch: {models}")
+PY
+
+artifact_name="resource-performance-${commit_sha}"
+gh run download "${run_id}" --name "${artifact_name}" --dir "${artifact_dir}"
+for required_file in \
+  resource-performance.log \
+  resource-performance.jsonl \
+  resource-performance-reference.log \
+  resource-performance-reference.jsonl; do
+  if [ ! -s "${artifact_dir}/${required_file}" ]; then
+    echo "Performance artifact is missing ${required_file}" >&2
+    exit 1
+  fi
+done
+
+comparison="$("${SCRIPT_DIR}/compare-resource-performance" \
+  "${artifact_dir}/resource-performance.jsonl" \
+  "${artifact_dir}/resource-performance-reference.jsonl" \
+  --fail-on-regression)"
+printf '%s\n' "${comparison}"
+if ! grep -Fq '**Performance regression gate: PASS**' <<<"${comparison}"; then
+  echo "Reproduced comparison did not pass" >&2
+  exit 1
+fi
+
+echo
+echo "Verified Performance workflow: ${run_url}"
+echo "Verified commit: ${commit_sha}"

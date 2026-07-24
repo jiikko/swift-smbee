@@ -4,6 +4,18 @@ pure-Swift SMB2/3 client。プロトコル正本は [docs/smb-protocol.md](docs/
 [docs/architecture.md](docs/architecture.md)、テスト戦略正本は [docs/testing.md](docs/testing.md)、
 実装 TODO は [todo2.md](todo2.md)。ここには「触ったときに必ず踏む手順」だけを置く。
 
+## push後のPerformance確認（Codex/Claude共通・必須）
+
+performance-sensitiveな実装をpushしたら、完了報告前に必ず次を実行し、終了コード0を確認する。
+
+```sh
+bin/ci/verify-agent-performance <full-commit-sha>
+```
+
+20ペア測定、AB/BA順序、regression gate、raw artifact、統計再計算のどれかが失敗・skipした場合は完了扱いに
+しない。canonical policyと対象範囲は
+[docs/agent-performance-verification.md](docs/agent-performance-verification.md)。
+
 ## 実装を変更したら smoke E2E を回す（最重要）
 
 **production の wire 挙動（`Sources/SMBee/` の codec / crypto / session / transport など）を変更したら、

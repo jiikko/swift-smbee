@@ -155,6 +155,8 @@ test_syntax_checks() {
     "${SCRIPT_DIR}/publish-network-performance-summary" \
     "${SCRIPT_DIR}/publish-resource-performance-summary" \
     "${SCRIPT_DIR}/write-resource-performance-artifact" \
+    "${SCRIPT_DIR}/gh-retry" \
+    "${SCRIPT_DIR}/test-agent-verifiers" \
     "${SCRIPT_DIR}/verify-agent-performance" \
     "${SCRIPT_DIR}/verify-agent-push" \
     "${SCRIPT_DIR}/update-swift-image-digest" \
@@ -204,6 +206,10 @@ EOF
   fi
   expect_contains "${scenario_dir}/bad.err" \
     'expected read/write PERF_NETWORK summaries, found 1'
+}
+
+test_agent_verifiers() {
+  "${SCRIPT_DIR}/test-agent-verifiers"
 }
 
 test_swift_image() {
@@ -782,6 +788,7 @@ test_missing_log_metadata() {
 }
 
 run_scenario test_syntax_checks
+run_scenario test_agent_verifiers
 run_scenario test_network_performance_summary
 run_scenario test_swift_image
 run_scenario test_run_resource_performance_log_path

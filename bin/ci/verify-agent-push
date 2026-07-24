@@ -23,6 +23,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+GH_RETRY="${SCRIPT_DIR}/gh-retry"
+performance_verifier="${AGENT_PUSH_VERIFY_PERFORMANCE_COMMAND:-${SCRIPT_DIR}/verify-agent-performance}"
 commit="${1:-HEAD}"
 timeout_seconds="${AGENT_PUSH_VERIFY_TIMEOUT_SECONDS:-7200}"
 poll_seconds="${AGENT_PUSH_VERIFY_POLL_SECONDS:-15}"
@@ -94,7 +96,7 @@ report_progress() {
 
 echo "Waiting for Test, E2E, and Performance workflows for ${commit_sha}..."
 while [ "${SECONDS}" -lt "${deadline}" ]; do
-  runs_json="$(gh run list \
+  runs_json="$("${GH_RETRY}" gh run list \
     --commit "${commit_sha}" \
     --limit 20 \
     --json databaseId,name,status,conclusion,url,headSha)"
@@ -131,11 +133,11 @@ while IFS=$'\t' read -r name status conclusion run_id run_url; do
   failed=1
   echo >&2
   echo "${name} workflow failed: ${run_url} (${conclusion:-${status}})" >&2
-  gh run view "${run_id}" \
+  "${GH_RETRY}" gh run view "${run_id}" \
     --json jobs \
     --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "  \(.conclusion): \(.name) (\(.url))"' \
     >&2 || true
-  if gh run view "${run_id}" --log-failed >"${failed_log}" 2>/dev/null; then
+  if "${GH_RETRY}" gh run view "${run_id}" --log-failed >"${failed_log}" 2>/dev/null; then
     echo "  Failed log highlights:" >&2
     if ! grep -Ei \
       '##\[error\]|:[0-9]+: error:|Test (Case|Suite).*failed|XCTAssert|Assertion|fatal:|Exception|Process completed|timed out|timeout' \
@@ -149,7 +151,7 @@ if [ "${failed}" -ne 0 ]; then
   exit 1
 fi
 
-"${SCRIPT_DIR}/verify-agent-performance" "${commit_sha}"
+"${performance_verifier}" "${commit_sha}"
 
 echo
 echo "Verified push CI for commit: ${commit_sha}"

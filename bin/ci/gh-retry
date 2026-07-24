@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -u
+unset CDPATH
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: bin/ci/gh-retry gh <arguments...>
+
+Retries a GitHub CLI command after transient failures.
+
+Environment:
+  GH_RETRY_ATTEMPTS       Total attempts (default: 5)
+  GH_RETRY_INITIAL_DELAY  Initial delay in seconds (default: 2)
+  GH_RETRY_MAX_DELAY      Maximum delay in seconds (default: 30)
+USAGE
+}
+
+if [ "$#" -lt 2 ] || [ "$1" != "gh" ]; then
+  usage
+  exit 2
+fi
+
+attempts="${GH_RETRY_ATTEMPTS:-5}"
+delay="${GH_RETRY_INITIAL_DELAY:-2}"
+max_delay="${GH_RETRY_MAX_DELAY:-30}"
+
+validate_integer() {
+  local name="$1"
+  local value="$2"
+  local minimum="$3"
+  if ! [[ "${value}" =~ ^[0-9]+$ ]] || [ "${value}" -lt "${minimum}" ]; then
+    echo "${name} must be an integer >= ${minimum}" >&2
+    exit 2
+  fi
+}
+
+validate_integer GH_RETRY_ATTEMPTS "${attempts}" 1
+validate_integer GH_RETRY_INITIAL_DELAY "${delay}" 0
+validate_integer GH_RETRY_MAX_DELAY "${max_delay}" 0
+
+attempt=1
+while true; do
+  if "$@"; then
+    exit 0
+  else
+    status=$?
+  fi
+  if [ "${attempt}" -ge "${attempts}" ]; then
+    echo "GitHub CLI failed after ${attempt} attempts: $*" >&2
+    exit "${status}"
+  fi
+  echo "GitHub CLI attempt ${attempt}/${attempts} failed; retrying in ${delay}s: $*" >&2
+  sleep "${delay}"
+  attempt=$((attempt + 1))
+  delay=$((delay * 2))
+  if [ "${delay}" -gt "${max_delay}" ]; then
+    delay="${max_delay}"
+  fi
+done

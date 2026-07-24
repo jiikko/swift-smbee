@@ -7,6 +7,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 cd "${REPO_ROOT}"
 
+if [ -n "$(git status --porcelain --untracked-files=all -- Sources/SMBee)" ]; then
+  printf 'ERROR: Sources/SMBee has uncommitted changes; commit them before running smoke-all\n' >&2
+  printf '(the marker certifies the committed Sources/SMBee subtree, not the dirty worktree).\n' >&2
+  exit 1
+fi
+
 printf '== E2E smoke: smb302-encrypted-required ==\n'
 SMBEE_E2E_PROFILE=smb302-encrypted-required \
 SAMBA_CONFIG=test/e2e/smb/smb302-encrypted-required.conf \
@@ -25,12 +31,6 @@ SMBEE_E2E_SKIP_EXTRA_API_TESTS=1 \
 SMBEE_E2E_SKIP_CLI_SMOKE=1 \
 SAMBA_CONFIG=test/e2e/smb/smb422-reparse.conf \
   bin/e2e/container-samba.sh
-
-if ! git diff --quiet HEAD -- Sources/SMBee; then
-  printf 'ERROR: Sources/SMBee has uncommitted changes; commit them before running smoke-all\n' >&2
-  printf '(the marker certifies the committed Sources/SMBee subtree, not the dirty worktree).\n' >&2
-  exit 1
-fi
 
 mkdir -p tmp
 # Key the marker to the Sources/SMBee subtree hash: docs-only commits keep it valid,

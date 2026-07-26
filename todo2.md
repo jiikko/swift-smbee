@@ -6,8 +6,9 @@
 
 ## 監査時点
 
-- 最終更新: 2026-07-24
+- 最終更新: 2026-07-26
 - 対象 branch: `master`
+- 対象 commit: `af4f939944d030f120de949119848d7d1701cb97`
 - 正本仕様:
   - MS-SMB2: SMB2/3 command、dialect、signing/encryption、credit、durable handle、CHANGE_NOTIFY
   - MS-FSCC: file info / filesystem info / FSCTL / reparse point / security descriptor
@@ -23,6 +24,20 @@
 - `partial`: 一部実装済み。smbclient として期待される挙動にはまだ足りない。
 - `missing`: 実装がない、または public API / CLI として露出していない。
 - `explicitly-unsupported`: 現時点では対応しない。README / docs に制限として明記する。
+
+## 現在の active backlog 要約
+
+| 優先度 | 項目 | 現在の残作業 |
+|---|---|---|
+| P0 | scheduled Large-file E2E | fixture path回帰を修正し、replacement runをgreenにする。 |
+| P0 | compatibility matrix | Windows SMB Server、NAS、macOS SMBXのrepresentative smokeを記録する。 |
+| P1 | offload copychunk | offload-capable serverで実経路を確認する。 |
+| P1 | Kerberos / GSS | 0.1では非対応。将来実装する場合はauth backend、SPNEGO、session key、実サーバ検証が必要。 |
+| P1 | durable / persistent handle | 現在は非対応。実装する場合は切断・復旧state machineと実サーバE2Eが必要。 |
+| P2 | 実サーバ固有機能 | Unicode、share/volume、ACL/SID、reparse、sparse、deadline、keepalive、lockをmatrixで確認する。 |
+| P3 | optional protocol surface | compression、multichannel、QUIC、RDMA、SMB1、POSIX extensions等は明示的非対応を維持する。 |
+
+上記以外のP1/P2項目は、原則として実装済みであり、残件はcompatibility matrixまたは継続的な性能回帰監視である。
 
 ## 既にカバーしている範囲
 
@@ -59,7 +74,27 @@
 
 ## P0: 0.1.0 前の release blocker
 
-2026-07-21 時点で、repo とローカル Apple Container の Samba だけで完結できる 0.1 必須実装・回帰テストは完了している。以下で残っているのは実 Windows / NAS / macOS SMBX または offload-capable server を必要とする互換検証であり、Windows 対応は pending とする。`explicitly-unsupported` の項目は 0.1 の実装残件には数えない。
+2026-07-26 時点で、repo とローカル Apple Container の Samba だけで完結する主要な 0.1 機能実装は完了している。ただし、scheduled Large-file E2E の fixture 作成回帰と、実 Windows / NAS / macOS SMBX または offload-capable server を必要とする互換検証が残る。Windows 対応は pending とする。`explicitly-unsupported` の項目は 0.1 の実装残件には数えない。
+
+### P0-0. scheduled Large-file E2E を green に戻す
+
+状態: `missing`（CI fixture regression）
+
+現状:
+
+- commit `af4f939944d030f120de949119848d7d1701cb97` の push `Test` / `E2E` / `Performance` は green。
+- 2026-07-26 の scheduled `Large-file E2E` run
+  [30189847461](https://github.com/jiikko/swift-smbee/actions/runs/30189847461) は red。
+- `Create sparse 4GiB+ fixture` が `/srv/smbee/public/large-4gib-plus.bin: No such file or directory` で失敗し、read-stream test 自体は実行されていない。
+
+やること:
+
+- `test/e2e/start-samba-ci.sh` が実際に作るshare pathとworkflowのfixture pathを一致させる。
+- workflow dispatchまたは次回scheduled runで、4GiB+ read-stream testがskipされずgreenになることを確認する。
+
+完了条件:
+
+- replacement `Large-file E2E` runがfixture作成と`testReadStreamCountsFileLargerThan4GiB`を完走してgreenになる。
 
 ### P0-1. 互換 matrix を実サーバで埋める
 
@@ -134,7 +169,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - `SMB2CreditWindow` actor と messageId keyed demux は実装済み。
 - multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグは修正済み。
 - local read/write chunk cap は 1 MiB へ引き上げ済み。
-- PR/push には 4GiB 境界 range-read E2E があり、週次 `Large-file E2E` workflow は sparse 4GiB+ fixture で read-stream と EOF を検証する。
+- PR/push には 4GiB 境界 range-read E2E がある。週次 `Large-file E2E` workflow は sparse 4GiB+ fixture でread-streamとEOFを検証する設計だが、2026-07-26 runはfixture path不整合でtest実行前に失敗しており、P0-0で追跡する。
 - SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
 
 継続検証:
@@ -463,10 +498,11 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 
 ## 推奨実装順
 
-1. P0-1 compatibility matrix の実サーバ結果埋め。Windows は環境待ち pending、NAS / macOS SMBX は継続実測。
-2. offload-capable server の copychunk と各実サーバ固有機能の smoke。
-3. P1-4 Kerberos / GSS。0.1 では unsupported を明示し、実ユーザー要件と AD / GSS 検証環境が揃った段階で着手。
-4. P3 optional features は roadmap として維持し、実装までは unsupported を明記する。
+1. P0-0 scheduled Large-file E2E のfixture regressionを直し、replacement runをgreenにする。
+2. P0-1 compatibility matrix の実サーバ結果埋め。Windows は環境待ち pending、NAS / macOS SMBX は継続実測。
+3. offload-capable server の copychunk と各実サーバ固有機能の smoke。
+4. P1-4 Kerberos / GSS。0.1 では unsupported を明示し、実ユーザー要件と AD / GSS 検証環境が揃った段階で着手。
+5. P3 optional features は roadmap として維持し、実装までは unsupported を明記する。
 
 ## 完了の定義
 
@@ -475,6 +511,7 @@ SMBee を Linux/macOS smbclient として `0.1.0` にする最低条件:
 - Samba / macOS SMBX / Windows SMB Server の smoke matrix がある。
 - README に unsupported features が明記されている。
 - 3.0.2 encrypted と 3.1.1 signing/encrypted の authenticated path が CI または scheduled compat で継続検証される。
+- scheduled 4GiB+ read-stream E2E がskipされずgreenである。
 - `docs/coverage.md` で spec feature と実装・テスト・未実装を辿れる。
 - 未対応項目は runtime error / CLI error / README limitation のどれかで明示され、暗黙に失敗しない。
 

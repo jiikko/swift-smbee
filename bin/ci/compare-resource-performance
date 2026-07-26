@@ -71,7 +71,7 @@ def paired_inference(
         return None
     differences = [
         math.log(float(current_value / reference_value))
-        for current_value, reference_value in zip(current, reference, strict=True)
+        for current_value, reference_value in zip(current, reference)
     ]
     observed = abs(sum(differences) / len(differences))
     rng = random.Random(seed)
@@ -268,7 +268,7 @@ def compare(current_path: Path, reference_path: Path, fail_on_regression: bool) 
         results[index]["inference"][3]  # type: ignore[index]
         for index in inferential_indexes
     ])
-    adjusted_by_index = dict(zip(inferential_indexes, adjusted_values, strict=True))
+    adjusted_by_index = dict(zip(inferential_indexes, adjusted_values))
     print("| Operation | Metric | Current median | Reference median | Change | Paired effect (95% CI; Holm p) |")
     print("|---|---|---:|---:|---|---|")
     for index, result in enumerate(results):

@@ -206,6 +206,7 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
     private var inbound: [UInt8]
     private var outboundStorage: [UInt8] = []
     private var blocked = false
+    private var closeCountStorage = 0
 
     init(inbound: [UInt8]) {
         self.inbound = inbound
@@ -217,6 +218,10 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
 
     var outbound: [UInt8] {
         lock.withLock { outboundStorage }
+    }
+
+    var closeCount: Int {
+        lock.withLock { closeCountStorage }
     }
 
     func connect(host: String, port: UInt16) async throws {
@@ -255,6 +260,7 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
     }
 
     func close() {
+        lock.withLock { closeCountStorage += 1 }
         receiveState.cancel()
     }
 }
@@ -856,6 +862,63 @@ final class SMBeeTests: XCTestCase {
         } catch {
             XCTFail("unexpected deadline error: \(error)")
         }
+    }
+
+    func testBestEffortCloseInvalidatesTransportWhenCloseResponseIsMissing() async {
+        let transport = ScriptedBlockingReceiveTransport(inbound: [])
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            cleanupTimeout: .milliseconds(25)
+        )
+
+        await session.bestEffortClose(treeId: 1, fileId: [UInt8](repeating: 1, count: 16))
+
+        XCTAssertTrue(transport.didBlockAfterScript)
+        XCTAssertEqual(transport.closeCount, 1)
+    }
+
+    func testDisconnectInvalidatesTransportWhenTreeDisconnectResponseIsMissing() async {
+        let transport = ScriptedBlockingReceiveTransport(inbound: [])
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            cleanupTimeout: .milliseconds(25)
+        )
+
+        await session.disconnect(treeId: 1)
+
+        XCTAssertTrue(transport.didBlockAfterScript)
+        XCTAssertEqual(transport.closeCount, 1)
+    }
+
+    func testCloseCreatedHandleInvalidatesTransportWhenCloseResponseIsMissing() async {
+        let transport = ScriptedBlockingReceiveTransport(inbound: [])
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            cleanupTimeout: .milliseconds(25)
+        )
+
+        do {
+            try await session.closeCreatedHandle(
+                treeId: 1,
+                fileId: [UInt8](repeating: 1, count: 16)
+            )
+            XCTFail("CLOSE unexpectedly completed without a response")
+        } catch SMBTransportError.timedOut {
+        } catch {
+            XCTFail("unexpected CLOSE error: \(error)")
+        }
+
+        XCTAssertTrue(transport.didBlockAfterScript)
+        XCTAssertEqual(transport.closeCount, 1)
     }
 
     func testSMBeeDownloadDirectoryOperationTimeout() async throws {

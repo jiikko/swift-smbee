@@ -33,6 +33,9 @@ compatibility for references to overloaded methods as function values.
 - `operationTimeout` is also cooperative. It reports `SMBTransportError.timedOut` only
   after the operation task finishes, so elapsed wall-clock time may exceed the duration.
 - Cancellation and timeout do not roll back completed local or remote side effects.
+- File/tree/session cleanup has a bounded internal deadline. A missing cleanup response
+  invalidates and closes the transport because the server-side resource state is unknown;
+  callers must establish a new session before continuing.
 
 ## Error contract
 

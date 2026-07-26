@@ -735,7 +735,7 @@ public actor SMBClientSession {
         await keepAliveTask?.value
         keepAliveTask = nil
         for childTreeId in childTreeIds {
-            try? await session.treeDisconnect(treeId: childTreeId)
+            await session.bestEffortTreeDisconnect(treeId: childTreeId)
         }
         childTreeIds.removeAll()
         await session.disconnect(treeId: treeId)
@@ -1151,7 +1151,7 @@ public actor SMBClientSession {
     public func makeDirectory(path: String) async throws {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, request: .makeDirectory(path: path))
-        try await session.close(treeId: treeId, fileId: fileId)
+        try await session.closeCreatedHandle(treeId: treeId, fileId: fileId)
     }
 
     public func upload(
@@ -1400,7 +1400,7 @@ public actor SMBClientTreeSession {
     public func close() async {
         guard !isClosed else { return }
         isClosed = true
-        try? await session.treeDisconnect(treeId: treeId)
+        await session.bestEffortTreeDisconnect(treeId: treeId)
     }
 
     public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
@@ -2929,7 +2929,7 @@ public enum SMBClient {
     ) async throws {
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: false, operationName: "MKDIR") { session, treeId in
             let fileId = try await session.create(treeId: treeId, request: .makeDirectory(path: path))
-            try await session.close(treeId: treeId, fileId: fileId)
+            try await session.closeCreatedHandle(treeId: treeId, fileId: fileId)
         }
     }
 
@@ -3678,6 +3678,8 @@ private struct SMBPendingResponse {
 /// 高レベル operation 全体はロックしない。複数 request からなる操作を並行実行した場合の意味論は
 /// SMB server と呼び出し元の ordering に依存するため、共有 session API を公開する際に別途整理する。
 actor SMBSession {
+    private static let defaultCleanupTimeout: Duration = .seconds(5)
+
     private let host: String
     private let port: UInt16
     // The source credential is needed only while SESSION_SETUP is being built. Derived session
@@ -3706,6 +3708,8 @@ actor SMBSession {
     private static let maxOrphanResponses = 64
     private var receiveLoopRunning = false
     private var wireFailure: Error?
+    private var transportClosed = false
+    private let cleanupTimeout: Duration
 
     init(
         host: String,
@@ -3715,7 +3719,8 @@ actor SMBSession {
         signingKey: [UInt8]? = nil,
         signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC,
         signingRequired: Bool = false,
-        initialCredits: UInt32 = 1
+        initialCredits: UInt32 = 1,
+        cleanupTimeout: Duration = SMBSession.defaultCleanupTimeout
     ) {
         self.host = host
         self.port = port
@@ -3731,6 +3736,7 @@ actor SMBSession {
         self.signingRequired = signingRequired
         self.initialCredits = initialCredits
         self.creditWindow = SMB2CreditWindow(initialCredits: initialCredits)
+        self.cleanupTimeout = cleanupTimeout
     }
 
     func connect() async throws {
@@ -3740,6 +3746,7 @@ actor SMBSession {
         try Task.checkCancellation()
         try await transport.connect(host: host, port: port)
         wireFailure = nil
+        transportClosed = false
         await creditWindow.reset(initialCredits: initialCredits)
         let negotiate = try SMBNegotiateCodec.encodeRequest(
             clientGuid: UUID(),
@@ -3920,10 +3927,10 @@ actor SMBSession {
     func deleteNonRecursive(treeId: UInt32, path: String, directory: Bool) async throws {
         do {
             let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: directory))
-            try await close(treeId: treeId, fileId: fileId)
+            try await closeCreatedHandle(treeId: treeId, fileId: fileId)
         } catch SMBError.fileIsADirectory where !directory {
             let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: true))
-            try await close(treeId: treeId, fileId: fileId)
+            try await closeCreatedHandle(treeId: treeId, fileId: fileId)
         }
     }
 
@@ -4414,7 +4421,7 @@ actor SMBSession {
                 onAction?(SMBRecursiveAction(kind: .mkdir, path: toPath))
             } else {
                 let destinationFileId = try await create(treeId: treeId, request: .makeDirectory(path: toPath))
-                try await close(treeId: treeId, fileId: destinationFileId)
+                try await closeCreatedHandle(treeId: treeId, fileId: destinationFileId)
                 onAction?(SMBRecursiveAction(kind: .mkdir, path: toPath))
             }
         } catch SMBError.nameCollision where overwrite {
@@ -4607,7 +4614,7 @@ actor SMBSession {
                                     treeId: treeId,
                                     request: .deleteReparsePoint(path: childPath, directory: entry.isDirectory)
                                 )
-                                try await self.close(treeId: treeId, fileId: childFileId)
+                                try await self.closeCreatedHandle(treeId: treeId, fileId: childFileId)
                                 onAction?(SMBRecursiveAction(kind: .delete, path: childPath))
                             }
                         } catch {
@@ -4643,7 +4650,7 @@ actor SMBSession {
                 onAction?(SMBRecursiveAction(kind: .delete, path: path))
             } else {
                 let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: directory))
-                try await close(treeId: treeId, fileId: fileId)
+                try await closeCreatedHandle(treeId: treeId, fileId: fileId)
                 onAction?(SMBRecursiveAction(kind: .delete, path: path))
             }
         } catch {
@@ -4825,10 +4832,30 @@ actor SMBSession {
         _ = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response")
     }
 
+    /// CLOSE is part of the operation result for create/delete-on-close paths. If it fails,
+    /// the FileId lifetime is unknown and the session must not remain reusable.
+    func closeCreatedHandle(treeId: UInt32, fileId: [UInt8]) async throws {
+        do {
+            try await SMBOperationDeadline.run(timeout: cleanupTimeout) {
+                try await self.close(treeId: treeId, fileId: fileId)
+            }
+        } catch {
+            closeTransport()
+            throw error
+        }
+    }
+
     /// Cleanup path: do not inherit caller cancellation while trying to release a handle.
     func bestEffortClose(treeId: UInt32, fileId: [UInt8]) async {
+        let timeout = cleanupTimeout
         let task = Task.detached { [self] in
-            try? await self.close(treeId: treeId, fileId: fileId)
+            do {
+                try await SMBOperationDeadline.run(timeout: timeout) {
+                    try await self.close(treeId: treeId, fileId: fileId)
+                }
+            } catch {
+                await self.closeTransport()
+            }
         }
         await task.value
     }
@@ -4839,6 +4866,22 @@ actor SMBSession {
         let response = try await signedWireTransaction(packet: packet, responseLabel: "TREE_DISCONNECT response")
         let header = try SMB2Header.decode(response)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_DISCONNECT")
+    }
+
+    /// Cleanup path for scoped trees. A missing response invalidates the shared transport,
+    /// because the server-side tree lifetime can no longer be determined safely.
+    func bestEffortTreeDisconnect(treeId: UInt32) async {
+        let timeout = cleanupTimeout
+        let task = Task.detached { [self] in
+            do {
+                try await SMBOperationDeadline.run(timeout: timeout) {
+                    try await self.treeDisconnect(treeId: treeId)
+                }
+            } catch {
+                await self.closeTransport()
+            }
+        }
+        await task.value
     }
 
     func logoff() async throws {
@@ -4873,15 +4916,27 @@ actor SMBSession {
     }
 
     func disconnect(treeId: UInt32) async {
+        let timeout = cleanupTimeout
         let task = Task.detached { [self] in
-            try? await self.treeDisconnect(treeId: treeId)
-            try? await self.logoff()
+            do {
+                try await SMBOperationDeadline.run(timeout: timeout) {
+                    try await self.treeDisconnect(treeId: treeId)
+                }
+                try await SMBOperationDeadline.run(timeout: timeout) {
+                    try await self.logoff()
+                }
+            } catch {
+                // A graceful cleanup response is missing or invalid. The connection is now
+                // suspect; closing it is the only bounded way to release server-side state.
+            }
             await self.closeTransport()
         }
         await task.value
     }
 
     func closeTransport() {
+        guard !transportClosed else { return }
+        transportClosed = true
         transport.close()
         failWire(error: SMBTransportError.connectionClosed)
     }

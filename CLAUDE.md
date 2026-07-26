@@ -4,6 +4,16 @@ pure-Swift SMB2/3 client。プロトコル正本は [docs/smb-protocol.md](docs/
 [docs/architecture.md](docs/architecture.md)、テスト戦略正本は [docs/testing.md](docs/testing.md)、
 実装 TODO は [todo2.md](todo2.md)。ここには「触ったときに必ず踏む手順」だけを置く。
 
+## 「issue」= `issues/` 配下の Markdown（GitHub Issues ではない）
+
+このリポジトリで **issue と言えば `issues/*.md`** を指す。番号（例: 「005」「issue 003」）も
+`issues/005-*.md` のファイル名先頭の連番のこと。GitHub Issues は運用していないので、
+`gh issue` / GitHub MCP の issue 系ツールで探さない（0 件しか返らない）。
+
+- 一覧・検索: `ls issues/`、`grep -ril "<keyword>" issues/`
+- 完了した issue は `issues/done/` へ移す。
+- 新規 issue も `issues/<連番>-<種別>-<slug>.md` として **リポジトリ内に** 作る。
+
 ## push後のCI確認（Codex/Claude共通・必須）
 
 pushしたら、完了報告前に必ず次を実行し、終了コード0を確認する。

@@ -4307,6 +4307,33 @@ final class SMBeeTests: XCTestCase {
         XCTAssertTrue(transport.outbound.isEmpty)
     }
 
+    /// A zero-length file is indistinguishable from a truncated one without QUERY_INFO, so the
+    /// first READ has to carry the whole answer: EOF on the initial request yields an empty
+    /// prefix instead of an error.
+    func testClientSessionReadPrefixOnEmptyFileReturnsNoBytes() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.endOfFile, command: SMB2Commands.read, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        let data = try await clientSession.readPrefix(path: "empty.bin", maxLength: 65_536)
+
+        XCTAssertEqual(data, [])
+        // One READ only: the EOF status must not be probed a second time.
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create, SMB2Commands.read, SMB2Commands.close
+        ])
+    }
+
     func testClientSessionReadPrefixRejectsInMemoryLimitBeforeCreate() async throws {
         let transport = InMemoryTransport()
         let session = SMBSession(

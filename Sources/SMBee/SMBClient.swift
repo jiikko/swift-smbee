@@ -1172,6 +1172,9 @@ public actor SMBClientSession {
     /// - Throws: If `maxLength` exceeds the in-memory accumulation limit.
     public func readPrefix(path: String, maxLength: UInt64) async throws -> [UInt8] {
         try ensureOpen()
+        // The zero-length early return below skips every wire call, so this is the only
+        // point where a pre-cancelled task gets rejected instead of "succeeding" with [].
+        try Task.checkCancellation()
         guard maxLength <= Self.maxPrefixReadLength else {
             throw SMBCodecError.invalidValue("prefix read exceeds the in-memory limit")
         }
@@ -1205,6 +1208,8 @@ public actor SMBClientSession {
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         try ensureOpen()
+        // Same as readPrefix: reject a pre-cancelled task before the zero-length early return.
+        try Task.checkCancellation()
         guard maxLength > 0 else { return }
 
         let progress = SMBReadStreamProgress()

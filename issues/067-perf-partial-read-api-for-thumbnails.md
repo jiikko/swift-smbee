@@ -1,7 +1,12 @@
 # 067 perf: 小さい部分 READ を安く回すための API が足りない（サムネイル生成用途）
 
-状態: **open**
+状態: **open（A は実装済み。B / C / D と実サーバ計測が未着手）**
 起票: 2026-07-27
+更新: 2026-07-27 — A: prefix read を実装（`9f20dbf` 実装 / `13acbdc` E2E / `4c36c12` 空ファイル unit）。
+`SMBClientSession.readPrefix` / `withPrefixReadStream` が使える。unit + perf regression
+（CREATE1/QUERY_INFO0/READ1/CLOSE1 = 3、既存 read は QUERY_INFO1 込みで 4）+ Samba E2E
+（smoke 3 プロファイル green）で固定済み。**測定はコマンド数の固定のみで、実サーバの
+往復レイテンシ削減は未計測**（「測定を先にやる」の実測部分は未達のまま）。
 関連: `Sources/SMBee/SMBClient.swift`（`read` / `withReadStream` / `streamRead` / `readBounds`） /
 `Sources/SMBee/SMB2Header.swift`（`nextCommand` / `SMB2CreditWindow`） /
 consumer 側: obaket `macOS/issues/437-feat-smb-thumbnail-display.md`
@@ -15,12 +20,13 @@ consumer（obaket）は SMB 上の画像に対して **client-side サムネイ�
 - 転送量は小さい（64 KiB）が **件数が多い**（可視 30〜60 件）。
 - したがって **往復回数がコストの支配項**であり、スループットではなくレイテンシが効く。
 
-現状の公開 API（`SMBClientTreeSession.read` / `withReadStream`）はこの用途に対して往復が多い。
+既存の公開 API（`SMBClientSession.read` / `withReadStream`）はこの用途に対して往復が多い。
 
 ## 現状の事実（実装確認済み）
 
-1. **1 ファイルあたり最低 4 往復**。`read` / `withReadStream` はどちらも
-   `create` → `queryInfo` → `readChunk`（1 回以上）→ `bestEffortClose` を個別のリクエストとして送る。
+1. **通常ファイルの読みで 4 往復**。`read` / `withReadStream` はどちらも
+   `create` → `queryInfo` → `readChunk`（1 回以上）→ `bestEffortClose` を個別のリクエストとして送る
+   （空ファイルなど READ が出ないケースは 3 往復。「最低 4」ではない）。
 2. **QUERY_INFO が常に発行される**。呼び出し側が range を明示していても、`readBounds` が
    `stat.size` でクランプするために必ず 1 往復増える。呼び出し側が listing で size を既に
    知っているケース（サムネイル生成はまさにこれ）でも省略できない。
@@ -36,7 +42,7 @@ consumer（obaket）は SMB 上の画像に対して **client-side サムネイ�
 
 ## 欲しいもの（候補・優先度順）
 
-### A. prefix read: QUERY_INFO を省略できる部分 READ
+### A. prefix read: QUERY_INFO を省略できる部分 READ — ✅ 実装済み（冒頭の更新履歴参照）
 
 「先頭 N バイトを読む。ファイルが N 未満なら取れた分だけ返す（EOF はエラーにしない）」という
 API を用意する。現状は EOF クランプのために QUERY_INFO を強制しているのが往復増の直接原因。

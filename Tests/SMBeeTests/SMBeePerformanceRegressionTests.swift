@@ -43,6 +43,37 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         sink.assertMetric("read_stream.bytes", actual: sink.byteCount, expected: fileSize)
     }
 
+    func testPrefixReadUsesThreeCommandsAndExistingReadUsesFour() async throws {
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId),
+            try smb2ReadResponse(Array("abc".utf8), messageId: 1, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: treeId),
+            try smb2CreateResponse(fileId: fileId, messageId: 3, treeId: treeId),
+            try smb2QueryInfoResponse(size: 3, messageId: 4, treeId: treeId),
+            try smb2ReadResponse(Array("abc".utf8), messageId: 5, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId)
+        ])
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = makeClientSession(transport: transport, initialCredits: negotiatedServerCredits)
+
+        let prefixData = try await session.readPrefix(path: "prefix.bin", maxLength: 3)
+        XCTAssertEqual(prefixData, Array("abc".utf8))
+        let prefixCounter = try SMBCommandCounter(outbound: transport.outbound)
+        prefixCounter.assertMetric("read_prefix.commands.CREATE", command: SMB2Commands.create, expected: 1)
+        prefixCounter.assertMetric("read_prefix.commands.QUERY_INFO", command: SMB2Commands.queryInfo, expected: 0)
+        prefixCounter.assertMetric("read_prefix.commands.READ", command: SMB2Commands.read, expected: 1)
+        prefixCounter.assertMetric("read_prefix.commands.CLOSE", command: SMB2Commands.close, expected: 1)
+
+        let readStart = transport.outbound.count
+        let readData = try await session.read(path: "existing.bin")
+        XCTAssertEqual(readData, Array("abc".utf8))
+        let readCounter = try SMBCommandCounter(outbound: Array(transport.outbound.dropFirst(readStart)))
+        readCounter.assertMetric("read.commands.QUERY_INFO", command: SMB2Commands.queryInfo, expected: 1)
+        readCounter.assertMetric("read.commands.CREATE", command: SMB2Commands.create, expected: 1)
+        readCounter.assertMetric("read.commands.READ", command: SMB2Commands.read, expected: 1)
+        readCounter.assertMetric("read.commands.CLOSE", command: SMB2Commands.close, expected: 1)
+    }
+
     func testWriteStreamingUsesExpectedWriteCommandAndByteCounts() async throws {
         XCTAssertEqual(SMBClientSession.localWriteChunkLimit, 1024 * 1024)
         let fileSize = 64 * 1024 * 2 + 321

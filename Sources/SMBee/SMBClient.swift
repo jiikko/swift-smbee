@@ -494,6 +494,14 @@ private final class SMBReadStreamProgress: @unchecked Sendable {
     }
 }
 
+private enum SMBPrefixReadSink: Sendable {
+    case accumulate
+    case stream(
+        progress: SMBReadStreamProgress,
+        onChunk: @Sendable ([UInt8]) async throws -> Void
+    )
+}
+
 /// Delivers callbacks away from protocol actors. At most one pending snapshot is retained; a slow
 /// consumer observes monotonic coalesced values and the transfer awaits the final delivery.
 private final class SMBTransferProgressEmitter: @unchecked Sendable {
@@ -658,6 +666,10 @@ private final class SMBDownloadSink: @unchecked Sendable {
 public actor SMBClientSession {
     // Keep writes comparable to reads; credit/negotiated limits still clamp this.
     static let localWriteChunkLimit = 1024 * 1024
+
+    // Prefix reads are intentionally bounded because readPrefix retains the complete result.
+    // The stream API has no equivalent limit because it does not accumulate data.
+    static let maxPrefixReadLength: UInt64 = 64 * 1024 * 1024
 
     /// Everything needed to rebuild a dropped connection for opt-in watch resubscribe.
     /// Only sessions created via `connect(...)` carry this; `withTree`-derived sessions do not.
@@ -1137,6 +1149,73 @@ public actor SMBClientSession {
                 progress: progress,
                 onProgress: onProgress,
                 onChunk: onChunk
+            )
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+        } catch {
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+            if progress.startedYielding, error.isSMBConnectionLoss {
+                throw SMBError.connectionLost(operation: "READ")
+            }
+            throw error
+        }
+    }
+
+    /// Read up to `maxLength` bytes from offset zero without issuing QUERY_INFO.
+    ///
+    /// A short success is treated as a best-effort EOF indication: it is not proof of the
+    /// file size, but it ends this operation immediately and returns the bytes received.
+    /// This API is intentionally session-only for now; the static facade and provider
+    /// overloads are omitted because consumers use a persistent `SMBClientSession`.
+    /// No `onProgress` is accepted because `maxLength` is not the actual file size and would
+    /// report misleading completion for a shorter file.
+    ///
+    /// - Throws: If `maxLength` exceeds the in-memory accumulation limit.
+    public func readPrefix(path: String, maxLength: UInt64) async throws -> [UInt8] {
+        try ensureOpen()
+        guard maxLength <= Self.maxPrefixReadLength else {
+            throw SMBCodecError.invalidValue("prefix read exceeds the in-memory limit")
+        }
+        guard maxLength > 0 else { return [] }
+
+        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+        do {
+            let data = try await SMBClient.prefixRead(
+                session: session,
+                treeId: treeId,
+                fileId: fileId,
+                maxLength: maxLength,
+                sink: .accumulate
+            )
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+            return data
+        } catch {
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
+    /// Stream a best-effort prefix from offset zero without issuing QUERY_INFO.
+    ///
+    /// A short success is not proof of the file size and ends the operation immediately.
+    /// Unlike `readPrefix`, this method does not impose an accumulation limit. A connection
+    /// loss after a chunk was yielded is normalized to `SMBError.connectionLost(operation: "READ")`.
+    public func withPrefixReadStream(
+        path: String,
+        maxLength: UInt64,
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        try ensureOpen()
+        guard maxLength > 0 else { return }
+
+        let progress = SMBReadStreamProgress()
+        let fileId = try await session.create(treeId: treeId, path: path, directory: false)
+        do {
+            _ = try await SMBClient.prefixRead(
+                session: session,
+                treeId: treeId,
+                fileId: fileId,
+                maxLength: maxLength,
+                sink: .stream(progress: progress, onChunk: onChunk)
             )
             await session.bestEffortClose(treeId: treeId, fileId: fileId)
         } catch {
@@ -2867,6 +2946,56 @@ public enum SMBClient {
         return result.bytes
     }
 
+    fileprivate static func prefixRead(
+        session: SMBSession,
+        treeId: UInt32,
+        fileId: [UInt8],
+        maxLength: UInt64,
+        sink: SMBPrefixReadSink
+    ) async throws -> [UInt8] {
+        var result: [UInt8] = []
+        if case .accumulate = sink {
+            // Prefix reads are capped at 64 MiB, but most prefixes are tiny. Reserve only
+            // one local maximum chunk up front to avoid allocating the whole cap for them.
+            result.reserveCapacity(Int(min(maxLength, UInt64(SMBSession.localReadChunkLimit))))
+        }
+        var cursor: UInt64 = 0
+        var remaining = maxLength
+        while remaining > 0 {
+            try Task.checkCancellation()
+            // The request length must come from the same calculation that encoded READ.
+            // Recomputing it here would race with other operations consuming/replenishing credits.
+            let read = try await session.readChunkReportingRequestedLength(
+                treeId: treeId,
+                fileId: fileId,
+                offset: cursor,
+                length: remaining
+            )
+            let chunk = read.data
+            if chunk.isEmpty { break }
+            let advanced = try SMBChunkedTransfer.advancedReadPosition(
+                cursor: cursor,
+                remaining: remaining,
+                receivedCount: chunk.count
+            )
+            try Task.checkCancellation()
+            switch sink {
+            case let .stream(progress, onChunk):
+                progress.markYielding()
+                try await onChunk(chunk)
+                try Task.checkCancellation()
+                progress.recordReceived(byteCount: chunk.count)
+            case .accumulate:
+                result.append(contentsOf: chunk)
+            }
+            cursor = advanced.cursor
+            remaining = advanced.remaining
+            // A short success is best-effort only; do not probe with another READ.
+            if UInt64(chunk.count) < UInt64(read.requestedLength) { break }
+        }
+        return result
+    }
+
     fileprivate static func streamRead(
         session: SMBSession,
         treeId: UInt32,
@@ -4128,7 +4257,18 @@ actor SMBSession {
     }
 
     func readChunk(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
-        guard length > 0 else { return [] }
+        (try await readChunkReportingRequestedLength(treeId: treeId, fileId: fileId, offset: offset, length: length)).data
+    }
+
+    // Prefix short-success detection must use the length encoded by this READ, not a
+    // separately predicted value: concurrent operations can change the credit window.
+    func readChunkReportingRequestedLength(
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset: UInt64,
+        length: UInt64
+    ) async throws -> (data: [UInt8], requestedLength: UInt32) {
+        guard length > 0 else { return ([], 0) }
         try Task.checkCancellation()
         let requestLength = UInt32(min(UInt64(await creditAwareReadChunkSize()), length))
         let packet = try SMB2Read.encodeRequest(
@@ -4145,7 +4285,7 @@ actor SMBSession {
         let response = try await signedWireTransaction(packet: packet, responseLabel: "READ response")
         let header = try SMB2Header.decode(response)
         if header.status == SMB2Status.endOfFile {
-            return []
+            return ([], requestLength)
         }
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "READ")
         let data = try SMB2Read.decodeResponse(response)
@@ -4156,7 +4296,7 @@ actor SMBSession {
             throw SMBCodecError.invalidValue("SMB read returned more data than requested")
         }
         try Task.checkCancellation()
-        return data
+        return (data, requestLength)
     }
 
     func write(

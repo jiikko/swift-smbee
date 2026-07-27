@@ -53,6 +53,23 @@ private final class TransferProgressCollector: @unchecked Sendable {
     }
 }
 
+private final class PrefixChunkCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [[UInt8]] = []
+
+    func append(_ chunk: [UInt8]) {
+        lock.lock()
+        storage.append(chunk)
+        lock.unlock()
+    }
+
+    var chunks: [[UInt8]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+}
+
 private var streamSocketType: Int32 {
     #if os(Linux)
     Int32(SOCK_STREAM.rawValue)
@@ -4293,6 +4310,29 @@ final class SMBeeTests: XCTestCase {
         ])
     }
 
+    func testClientSessionReadPrefixStopsAfterShortSuccessWhenMaxLengthExceedsFile() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2ReadResponse(Array("hello".utf8), messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        let data = try await clientSession.readPrefix(path: "short.bin", maxLength: 131_072)
+
+        XCTAssertEqual(data, Array("hello".utf8))
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create, SMB2Commands.read, SMB2Commands.close
+        ])
+    }
+
     func testClientSessionReadPrefixZeroDoesNotOpenAHandle() async throws {
         let transport = InMemoryTransport()
         let session = SMBSession(
@@ -4304,6 +4344,48 @@ final class SMBeeTests: XCTestCase {
 
         let data = try await clientSession.readPrefix(path: "file.txt", maxLength: 0)
         XCTAssertEqual(data, [])
+        XCTAssertTrue(transport.outbound.isEmpty)
+    }
+
+    func testClientSessionReadPrefixCancelledZeroLengthDoesNotOpenAHandle() async throws {
+        let transport = InMemoryTransport()
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let task = Task {
+            try await clientSession.readPrefix(path: "file.txt", maxLength: 0)
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("cancelled zero-length readPrefix unexpectedly completed")
+        } catch is CancellationError {
+        }
+        XCTAssertTrue(transport.outbound.isEmpty)
+    }
+
+    func testClientSessionPrefixStreamCancelledZeroLengthDoesNotOpenAHandle() async throws {
+        let transport = InMemoryTransport()
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let task = Task {
+            try await clientSession.withPrefixReadStream(path: "file.txt", maxLength: 0) { _ in }
+        }
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("cancelled zero-length prefix stream unexpectedly completed")
+        } catch is CancellationError {
+        }
         XCTAssertTrue(transport.outbound.isEmpty)
     }
 
@@ -4394,7 +4476,7 @@ final class SMBeeTests: XCTestCase {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let inbound = try framed([
             try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
-            try smb2ReadResponse(Array("toolong".utf8), messageId: 1, treeId: 0x3344),
+            try smb2ReadResponse(Array(repeating: UInt8(0x5a), count: 65_537), messageId: 1, treeId: 0x3344),
             try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
         ])
         let transport = InMemoryTransport(inbound: inbound)
@@ -4406,11 +4488,92 @@ final class SMBeeTests: XCTestCase {
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
 
         do {
-            _ = try await clientSession.readPrefix(path: "bad.bin", maxLength: 3)
+            // maxLength must exceed the 65,536-byte chunk request: with remaining == requestLength
+            // an oversized response also trips advancedReadPosition (received > remaining), which
+            // would mask a deleted oversize guard. remaining = 131,072 isolates the guard itself.
+            _ = try await clientSession.readPrefix(path: "bad.bin", maxLength: 131_072)
             XCTFail("expected oversized READ response to fail")
-        } catch {
-            // Expected.
+        } catch SMBCodecError.invalidValue(let message) {
+            // Pin the failure to the oversize guard, not some other invalidValue path.
+            XCTAssertTrue(message.contains("more data than requested"), "unexpected failure: \(message)")
         }
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create, SMB2Commands.read, SMB2Commands.close
+        ])
+    }
+
+    func testClientSessionReadPrefixRejectsDirectoryAtCreateWithoutRead() async throws {
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2StatusResponse(
+                status: SMB2Status.fileIsADirectory,
+                command: SMB2Commands.create,
+                messageId: 0,
+                treeId: 0x3344
+            )
+        ]))
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        do {
+            _ = try await clientSession.readPrefix(path: "directory", maxLength: 1)
+            XCTFail("readPrefix unexpectedly opened a directory")
+        } catch SMBError.fileIsADirectory {
+        }
+
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create
+        ])
+    }
+
+    func testClientSessionPrefixStreamStopsAfterShortSuccess() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2ReadResponse(Array("hello".utf8), messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+        ]))
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let chunks = PrefixChunkCollector()
+
+        try await clientSession.withPrefixReadStream(path: "stream.bin", maxLength: 131_072) { chunk in
+            chunks.append(chunk)
+        }
+
+        XCTAssertEqual(chunks.chunks, [Array("hello".utf8)])
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create, SMB2Commands.read, SMB2Commands.close
+        ])
+    }
+
+    func testClientSessionPrefixStreamReturnsNormallyOnEOF() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.endOfFile, command: SMB2Commands.read, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+        ]))
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let chunks = PrefixChunkCollector()
+
+        try await clientSession.withPrefixReadStream(path: "empty.bin", maxLength: 65_536) { chunk in
+            chunks.append(chunk)
+        }
+
+        XCTAssertTrue(chunks.chunks.isEmpty)
         XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
             SMB2Commands.create, SMB2Commands.read, SMB2Commands.close
         ])

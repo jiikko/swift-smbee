@@ -529,6 +529,77 @@ final class SMBeeE2ETests: XCTestCase {
         try await SMBee.delete(host: host, port: port, credential: credential, share: share, path: directory, directory: true)
     }
 
+    // swiftlint:disable:next function_body_length
+    func testAuthenticatedPrefixReadMatchesFullReadAndPreservesSession() async throws {
+        let details = try e2eConnectionDetails()
+        let session = try await SMBee.connect(
+            host: details.host,
+            port: details.port,
+            credential: details.credential,
+            share: details.share
+        )
+        let suffix = UUID().uuidString
+        let filePath = "smbee-prefix-\(suffix).bin"
+        let emptyPath = "smbee-prefix-\(suffix)-empty.bin"
+        let directoryPath = "smbee-prefix-\(suffix)-directory"
+        let payload = (0..<2_097_153).map { UInt8($0 & 0xff) }
+
+        do {
+            try await session.upload(path: filePath, data: payload)
+            try await session.upload(path: emptyPath, data: [])
+            try await session.makeDirectory(path: directoryPath)
+
+            let fullRead = try await session.read(path: filePath)
+            XCTAssertEqual(fullRead.count, payload.count)
+
+            let prefixLength = UInt64(1_500_000)
+            let prefix = try await session.readPrefix(path: filePath, maxLength: prefixLength)
+            XCTAssertEqual(prefix, Array(fullRead.prefix(Int(prefixLength))))
+
+            // The prefix operation must leave the same persistent session usable.
+            let followUpRead = try await session.read(path: filePath)
+            XCTAssertEqual(followUpRead, fullRead)
+            let fileStat = try await session.stat(path: filePath)
+            XCTAssertEqual(fileStat.size, UInt64(fullRead.count))
+            let entries = try await session.list()
+            XCTAssertTrue(entries.contains { $0.name == filePath && !$0.isDirectory })
+
+            let oversizedPrefix = try await session.readPrefix(
+                path: filePath,
+                maxLength: UInt64(fullRead.count + 1)
+            )
+            XCTAssertEqual(oversizedPrefix, fullRead)
+
+            let emptyPrefix = try await session.readPrefix(path: emptyPath, maxLength: 1)
+            XCTAssertEqual(emptyPrefix, [])
+
+            let streamedPrefix = PrefixReadAccumulator()
+            try await session.withPrefixReadStream(path: filePath, maxLength: prefixLength) { chunk in
+                await streamedPrefix.append(chunk)
+            }
+            let streamedBytes = await streamedPrefix.bytes
+            XCTAssertEqual(streamedBytes, prefix)
+
+            do {
+                _ = try await session.readPrefix(path: directoryPath, maxLength: 1)
+                XCTFail("readPrefix should fail when the path is a directory")
+            } catch {
+                // The directory:false CREATE must reject the directory before READ.
+            }
+
+            try await session.delete(path: filePath)
+            try await session.delete(path: emptyPath)
+            try await session.delete(path: directoryPath, directory: true)
+            await session.close()
+        } catch {
+            try? await session.delete(path: filePath)
+            try? await session.delete(path: emptyPath)
+            try? await session.delete(path: directoryPath, directory: true, recursive: true)
+            await session.close()
+            throw error
+        }
+    }
+
     func testReadStreamCountsFileLargerThan4GiB() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["SMBEE_E2E"] == "1" else {
@@ -949,5 +1020,17 @@ private actor DirectoryNameAccumulator {
 
     func contains(_ name: String) -> Bool {
         names.contains(name)
+    }
+}
+
+private actor PrefixReadAccumulator {
+    private var storage: [UInt8] = []
+
+    var bytes: [UInt8] {
+        storage
+    }
+
+    func append(_ chunk: [UInt8]) {
+        storage += chunk
     }
 }

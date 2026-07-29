@@ -4855,7 +4855,11 @@ final class SMBeeTests: XCTestCase {
         )
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
         let task = Task {
-            try await clientSession.readPrefix(path: "file.txt", maxLength: 0)
+            // Deterministic ordering: the API must only run once cancellation is already
+            // delivered. Cancelling a freshly created Task races with its body on other
+            // schedulers (observed on Linux CI: the body completed before cancel()).
+            while !Task.isCancelled { await Task.yield() }
+            return try await clientSession.readPrefix(path: "file.txt", maxLength: 0)
         }
         task.cancel()
 
@@ -4876,6 +4880,8 @@ final class SMBeeTests: XCTestCase {
         )
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
         let task = Task {
+            // Same deterministic ordering as the readPrefix variant above.
+            while !Task.isCancelled { await Task.yield() }
             try await clientSession.withPrefixReadStream(path: "file.txt", maxLength: 0) { _ in }
         }
         task.cancel()

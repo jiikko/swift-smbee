@@ -5,19 +5,22 @@ import Foundation
 /// 環境変数はプロセス起動時に 1 回だけ評価してキャッシュする。
 enum SMBPerfLog {
     static let isEnabled = ProcessInfo.processInfo.environment["SMBEE_PERF"] == "1"
+
+    /// Test-seam gate that stays race-free without an atomic (the package still targets
+    /// macOS 13, so `Synchronization.Atomic` is unavailable): the only mutable state
+    /// (`enabledOverrideStorage` / `testSinkStorage`) is read and written strictly under
+    /// `lock`. The lock-free fast path below reads nothing mutable — `isEnabled` and
+    /// `isTestProcess` are both immutable `let`s — so production (no XCTest loaded,
+    /// SMBEE_PERF unset) never takes the lock and never races. TSan flagged the previous
+    /// unguarded `overrideIsSet` flag read as a data race (macos-tsan, 2026-07-29).
+    private static let isTestProcess = NSClassFromString("XCTestCase") != nil
     private static let lock = NSLock()
     nonisolated(unsafe) private static var enabledOverrideStorage: Bool?
     nonisolated(unsafe) private static var testSinkStorage: (@Sendable (String) -> Void)?
-    nonisolated(unsafe) private static var overrideIsSet = false
 
     nonisolated(unsafe) static var enabledOverride: Bool? {
         get { lock.withLock { enabledOverrideStorage } }
-        set {
-            lock.withLock {
-                enabledOverrideStorage = newValue
-                overrideIsSet = newValue != nil
-            }
-        }
+        set { lock.withLock { enabledOverrideStorage = newValue } }
     }
 
     nonisolated(unsafe) static var testSink: (@Sendable (String) -> Void)? {
@@ -26,14 +29,12 @@ enum SMBPerfLog {
     }
 
     static var effectiveIsEnabled: Bool {
-        if !isEnabled, !overrideIsSet {
-            return false
-        }
+        guard isEnabled || isTestProcess else { return false }
         return lock.withLock { enabledOverrideStorage ?? isEnabled }
     }
 
     static func line(_ message: @autoclosure () -> String) {
-        guard isEnabled || overrideIsSet else { return }
+        guard isEnabled || isTestProcess else { return }
         lock.lock()
         defer { lock.unlock() }
         guard enabledOverrideStorage ?? isEnabled else { return }

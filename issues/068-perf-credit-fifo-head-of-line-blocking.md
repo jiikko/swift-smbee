@@ -1,6 +1,6 @@
 # 068 perf: prefix read 並行時の credit FIFO head-of-line blocking を実測する
 
-状態: **close (2026-07-29)。実測で credit FIFO の HoL blocking は発火せず (credit_wait 0 件)、issue 012 の判断を追認。WRITE 競合時の 5-6 倍遅延という別事実は下記に記録**
+状態: **open (2026-07-29 reopen)。既存計測では credit FIFO の HoL blocking の有無を判定できなかった。実 waiter ベースの診断で再計測が必要**
 起票: 2026-07-27（issue 067 A の敵対的レビューで検出、codex 反証レビューで訂正済み）
 関連: `Sources/SMBee/SMB2Header.swift`（`SMB2CreditWindow.resumeReadyWaiters` — 「FIFO on purpose」の
 rationale コメントあり） / `issues/done/012-credit-window-followups.md`（FIFO 採用の判断） /
@@ -38,13 +38,30 @@ consumer 側: obaket のサムネイル生成（prefix read 4 並列 + 転送の
 | competing（WRITE と重複、overlap=full 20/20） | 12.53 / 9.55 ms | 14.86 / 13.88 ms | 15.54 / 14.19 ms | **0** |
 | 比（competing / baseline） | **5.4〜5.8 倍** | 5.0〜5.6 倍 | 3.0〜3.6 倍 | — |
 
-**結論: この issue が仮説とした credit FIFO の head-of-line blocking は発火していない。**
-競合の重なりが全サンプルで成立している（`write_overlap=full` 20/20）にもかかわらず、
-`[wire] credit_wait` イベントは baseline / competing の**両方で 0 件**だった。
-つまり prefix read は credit 待ちに入っておらず、issue 012 の「FIFO は意図的」という判断は
-実測でも覆らなかった。**この issue は close してよい。**
+### この計測では判定できなかった
+
+競合の重なりは全サンプルで成立していた（`write_overlap=full` 20/20）が、当時の
+`[wire] credit_wait` は `SMB2CreditWindow` の実 waiter 入りを観測していなかった。
+`SMBSession.reserveCredit` が別 actor 呼び出しの前に balance を事前観測し、不足していた場合だけ
+出すログだったため、事前観測時には足りていても実際の `reserve` 時には不足して waiter に入る競合を
+取りこぼす。したがって baseline / competing ともに `credit_wait 0 件` だったことは、
+「credit 待ちが起きなかった」ことの証拠にならず、HoL blocking の有無も判定できない。
+この診断は本 reopen 時の変更で、waiter enqueue 時の `credit_wait` と解放時の
+`credit_granted` を `SMB2CreditWindow` 内から出すよう修正する。
+
+さらに、この計測条件は issue が想定した発火条件を作れていなかった。WRITE の charge は
+`localWriteChunkLimit` 1 MiB を 64 KiB 単位で数えるため最大 16 であり、credit window は 256 を
+目標に補充される。一方、competing 側は prefix read 1 本だけだった。この組み合わせでは
+「charge の大きい waiter が FIFO の先頭にいて、その後ろに多数の小 READ が並ぶ」条件を
+意図的にも決定論的にも作れていない。
+
+次の計測では、修正後の `credit_wait` / `credit_granted` で実待機を観測し、credit 残高を記録するか
+固定する。その上で charge の大きい request を意図的に先頭へ置き、その後ろへ charge 1 の request を
+複数投入する決定論的な条件を作り、後続 request の待ち時間を測る。
 
 ただし副産物として別の事実が判明した: **大きな WRITE と重なると prefix read の p50 が 5〜6 倍に伸びる**。
+これはこの環境における **2 run の点推定**として残す。各 p50 は 20 件の nearest-rank であり、
+表の比は対応するサンプルごとのペア比ではなく、baseline と competing の独立な p50 同士の比である。
 credit ではないので、原因の候補は (a) issue 072 で導入した送信直列化（大 WRITE の frame 送信中は
 小 READ の送信が待つ）、(b) socket / サーバ側の帯域競合、(c) その両方。**未切り分け**。
 `[wire] pending → sent → recv` の時刻差から「送信待ち」と「サーバ応答待ち」を分ければ切り分けられるが、

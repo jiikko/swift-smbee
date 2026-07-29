@@ -590,9 +590,11 @@ enum SMB2QueryInfo {
         guard try reader.readUInt16LE() == 9 else {
             throw SMBCodecError.invalidValue("invalid QUERY_INFO response structure size")
         }
-        let offset = Int(try reader.readUInt16LE())
-        let length = Int(try reader.readUInt32LE())
-        guard offset + length <= bytes.count else { throw SMBCodecError.truncated }
+        let rawOffset = UInt64(try reader.readUInt16LE())
+        let rawLength = UInt64(try reader.readUInt32LE())
+        guard rawOffset + rawLength <= UInt64(bytes.count) else { throw SMBCodecError.truncated }
+        let offset = Int(rawOffset)
+        let length = Int(rawLength)
         return Array(bytes[offset..<offset + length])
     }
 
@@ -840,10 +842,14 @@ enum SMB2Ioctl {
         try reader.skip(count: 16)
         _ = try reader.readUInt32LE()
         _ = try reader.readUInt32LE()
-        let outputOffset = Int(try reader.readUInt32LE())
-        let outputCount = Int(try reader.readUInt32LE())
+        let rawOutputOffset = UInt64(try reader.readUInt32LE())
+        let rawOutputCount = UInt64(try reader.readUInt32LE())
         try reader.skip(count: 8)
-        guard outputOffset + outputCount <= bytes.count else { throw SMBCodecError.truncated }
+        guard rawOutputOffset + rawOutputCount <= UInt64(bytes.count) else {
+            throw SMBCodecError.truncated
+        }
+        let outputOffset = Int(rawOutputOffset)
+        let outputCount = Int(rawOutputCount)
         return SMB2IoctlResponse(status: header.status, output: Array(bytes[outputOffset..<outputOffset + outputCount]))
     }
 }
@@ -1370,23 +1376,30 @@ enum SMB2QueryDirectory {
         guard try reader.readUInt16LE() == 9 else {
             throw SMBCodecError.invalidValue("invalid QUERY_DIRECTORY response structure size")
         }
-        let dataOffset = Int(try reader.readUInt16LE())
-        let length = Int(try reader.readUInt32LE())
-        guard dataOffset + length <= bytes.count else { throw SMBCodecError.truncated }
+        let rawDataOffset = UInt64(try reader.readUInt16LE())
+        let rawLength = UInt64(try reader.readUInt32LE())
+        guard rawDataOffset + rawLength <= UInt64(bytes.count) else {
+            throw SMBCodecError.truncated
+        }
+        let dataOffset = Int(rawDataOffset)
+        let length = Int(rawLength)
         let data = bytes[dataOffset..<dataOffset + length]
         var entries: [SMBDirectoryEntry] = []
         var entryOffset = 0
-        while entryOffset + 104 <= data.count {
-            let next = Int(readUInt32LE(data, at: entryOffset))
+        while entryOffset <= data.count, data.count - entryOffset >= 104 {
+            let rawNext = UInt64(readUInt32LE(data, at: entryOffset))
             let creationTime = readUInt64LE(data, at: entryOffset + 8)
             let lastWriteTime = readUInt64LE(data, at: entryOffset + 24)
             let attributes = readUInt32LE(data, at: entryOffset + 56)
             let endOfFile = readUInt64LE(data, at: entryOffset + 40)
-            let nameLength = Int(readUInt32LE(data, at: entryOffset + 60))
+            let rawNameLength = UInt64(readUInt32LE(data, at: entryOffset + 60))
             let rawFileId = readUInt64LE(data, at: entryOffset + 96)
             let fileId = rawFileId == 0 ? nil : rawFileId
             let nameOffset = entryOffset + 104
-            guard nameOffset + nameLength <= data.count else { throw SMBCodecError.truncated }
+            guard UInt64(nameOffset) + rawNameLength <= UInt64(data.count) else {
+                throw SMBCodecError.truncated
+            }
+            let nameLength = Int(rawNameLength)
             let nameStart = data.startIndex + nameOffset
             let name = decodeUTF16LE(Array(data[nameStart..<nameStart + nameLength]))
             if name != "." && name != ".." {
@@ -1400,8 +1413,11 @@ enum SMB2QueryDirectory {
                     creationTime: filetimeToDate(creationTime)
                 ))
             }
-            if next == 0 { break }
-            guard next >= 104, entryOffset + next <= data.count else { throw SMBCodecError.truncated }
+            if rawNext == 0 { break }
+            guard rawNext >= 104, UInt64(entryOffset) + rawNext <= UInt64(data.count) else {
+                throw SMBCodecError.truncated
+            }
+            let next = Int(rawNext)
             entryOffset += next
         }
         return entries

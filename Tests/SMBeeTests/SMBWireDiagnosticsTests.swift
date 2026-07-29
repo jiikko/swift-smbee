@@ -2,6 +2,53 @@ import XCTest
 @testable import SMBee
 
 final class SMBWireDiagnosticsTests: XCTestCase {
+    func testCreditWindowLogsActualWaitAndGrant() async throws {
+        let capture = SMBWireLogCapture()
+        SMBPerfLog.enabledOverride = true
+        SMBPerfLog.testSink = { capture.append($0) }
+        defer {
+            SMBPerfLog.testSink = nil
+            SMBPerfLog.enabledOverride = nil
+        }
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "credit-test")
+
+        let reserve = Task { try await window.reserve(charge: 2) }
+        while await window.pendingWaiterCount == 0 {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(capture.messages.contains {
+            $0 == "[wire] credit_wait session=credit-test charge=2 available=0 waiters=1"
+        })
+        _ = await window.grant(2)
+        _ = try await reserve.value
+
+        let grants = capture.messages.filter {
+            $0.hasPrefix("[wire] credit_granted session=credit-test charge=2 waited_ms=")
+        }
+        XCTAssertEqual(grants.count, 1)
+        XCTAssertNotNil(grants.first.flatMap {
+            Double($0.split(separator: "=").last.map(String.init) ?? "")
+        })
+    }
+
+    func testCreditWindowDoesNotLogWhenReserveDoesNotWait() async throws {
+        let capture = SMBWireLogCapture()
+        SMBPerfLog.enabledOverride = true
+        SMBPerfLog.testSink = { capture.append($0) }
+        defer {
+            SMBPerfLog.testSink = nil
+            SMBPerfLog.enabledOverride = nil
+        }
+        let window = SMB2CreditWindow(initialCredits: 2, diagnosticSessionId: "credit-test")
+
+        _ = try await window.reserve(charge: 2)
+
+        XCTAssertFalse(capture.messages.contains {
+            $0.hasPrefix("[wire] credit_wait ") || $0.hasPrefix("[wire] credit_granted ")
+        })
+    }
+
     func testFirstFaultIsLoggedOnce() async {
         let capture = SMBWireLogCapture()
         SMBPerfLog.enabledOverride = true

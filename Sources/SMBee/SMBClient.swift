@@ -5670,12 +5670,6 @@ actor SMBSession {
         // would let charge-0 requests inflate the window (each response still grants), so
         // the effective charge is what gets reserved and later refunded on send failure.
         let effectiveCharge = max(1, header.creditCharge)
-        if SMBPerfLog.effectiveIsEnabled {
-            let available = await creditWindow.balance
-            if available < UInt32(effectiveCharge) {
-                SMBPerfLog.line("[wire] credit_wait session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) charge=\(effectiveCharge) available=\(available)")
-            }
-        }
         let balance = try await creditWindow.reserve(charge: effectiveCharge)
         debugLine("SMB credit charge=\(effectiveCharge) balance=\(balance)")
         return effectiveCharge

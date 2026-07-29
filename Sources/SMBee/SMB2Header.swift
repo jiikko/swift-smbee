@@ -158,6 +158,7 @@ actor SMB2CreditWindow {
     private struct Waiter {
         let charge: UInt16
         let id: UInt64
+        let enqueuedAt: ContinuousClock.Instant?
         let continuation: CheckedContinuation<UInt32, Error>
     }
 
@@ -205,7 +206,17 @@ actor SMB2CreditWindow {
                     continuation.resume(throwing: error)
                     return
                 }
-                waiters.append(Waiter(charge: charge, id: id, continuation: continuation))
+                let enqueuedAt = SMBPerfLog.effectiveIsEnabled ? ContinuousClock.now : nil
+                waiters.append(Waiter(
+                    charge: charge,
+                    id: id,
+                    enqueuedAt: enqueuedAt,
+                    continuation: continuation
+                ))
+                SMBPerfLog.line(
+                    "[wire] credit_wait session=\(diagnosticSessionId) charge=\(charge) " +
+                        "available=\(available) waiters=\(waiters.count)"
+                )
                 resumeReadyWaiters()
             }
         } onCancel: {
@@ -266,6 +277,13 @@ actor SMB2CreditWindow {
         while let waiter = waiters.first, available >= UInt32(waiter.charge) {
             waiters.removeFirst()
             available -= UInt32(waiter.charge)
+            if let enqueuedAt = waiter.enqueuedAt {
+                let waited = SMBPerfLog.milliseconds(ContinuousClock.now - enqueuedAt)
+                SMBPerfLog.line(
+                    "[wire] credit_granted session=\(diagnosticSessionId) " +
+                        "charge=\(waiter.charge) waited_ms=\(waited)"
+                )
+            }
             waiter.continuation.resume(returning: available)
         }
     }

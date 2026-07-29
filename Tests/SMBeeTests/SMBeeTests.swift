@@ -481,17 +481,19 @@ private final class BlockingPOSIXWriter: @unchecked Sendable {
     private var started = false
     private var callCountStorage = 0
     private var outboundStorage: [UInt8] = []
+    private var descriptorsStorage: [Int32] = []
     private var didBlockStorage = false
 
     var isStarted: Bool { lock.withLock { started } }
     var callCount: Int { lock.withLock { callCountStorage } }
     var outbound: [UInt8] { lock.withLock { outboundStorage } }
+    var descriptors: [Int32] { lock.withLock { descriptorsStorage } }
 
     func write(_ descriptor: Int32, _ bytes: [UInt8], _ offset: Int) -> Int {
-        _ = descriptor
         lock.withLock {
             started = true
             callCountStorage += 1
+            descriptorsStorage.append(descriptor)
         }
         let shouldBlock = lock.withLock { () -> Bool in
             guard offset == 0, !didBlockStorage else { return false }
@@ -510,6 +512,37 @@ private final class BlockingPOSIXWriter: @unchecked Sendable {
         lock.withLock { outboundStorage.append(contentsOf: bytes[offset...]) }
         startedCounter.increment()
         return bytes.count - offset
+    }
+
+    func release() {
+        gate.signal()
+    }
+
+    func waitForStart() async {
+        await startedCounter.wait(until: 1)
+    }
+}
+
+private final class BlockingPOSIXReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private let startedCounter = POSIXAsyncCounter()
+    private var callCountStorage = 0
+    private var descriptorsStorage: [Int32] = []
+
+    var callCount: Int { lock.withLock { callCountStorage } }
+    var descriptors: [Int32] { lock.withLock { descriptorsStorage } }
+
+    func read(_ descriptor: Int32, _ buffer: UnsafeMutableRawPointer?, _ maxLength: Int) -> Int {
+        lock.withLock {
+            callCountStorage += 1
+            descriptorsStorage.append(descriptor)
+        }
+        startedCounter.increment()
+        gate.wait()
+        guard maxLength > 0 else { return 0 }
+        buffer?.storeBytes(of: UInt8(1), as: UInt8.self)
+        return 1
     }
 
     func release() {
@@ -587,28 +620,50 @@ private func setPOSIXErrno(_ value: Int32) {
 #endif
 }
 
+private enum POSIXLifecycleOperation: Equatable {
+    case shutdown
+    case close
+}
+
+private struct POSIXLifecycleEvent: Equatable {
+    let operation: POSIXLifecycleOperation
+    let descriptor: Int32
+}
+
 private final class POSIXLifecycleRecorder: @unchecked Sendable {
     private let lock = NSLock()
+    private let shutdownCounter = POSIXAsyncCounter()
     private let closeCounter = POSIXAsyncCounter()
     private var shutdownCountStorage = 0
     private var closeCountStorage = 0
+    private var eventsStorage: [POSIXLifecycleEvent] = []
 
     var shutdownCount: Int { lock.withLock { shutdownCountStorage } }
     var closeCount: Int { lock.withLock { closeCountStorage } }
+    var events: [POSIXLifecycleEvent] { lock.withLock { eventsStorage } }
 
     func shutdown(_ descriptor: Int32) {
-        _ = descriptor
-        lock.withLock { shutdownCountStorage += 1 }
+        lock.withLock {
+            shutdownCountStorage += 1
+            eventsStorage.append(POSIXLifecycleEvent(operation: .shutdown, descriptor: descriptor))
+        }
+        shutdownCounter.increment()
     }
 
     func close(_ descriptor: Int32) {
-        _ = descriptor
-        lock.withLock { closeCountStorage += 1 }
+        lock.withLock {
+            closeCountStorage += 1
+            eventsStorage.append(POSIXLifecycleEvent(operation: .close, descriptor: descriptor))
+        }
         closeCounter.increment()
     }
 
     func waitForClose() async {
         await closeCounter.wait(until: 1)
+    }
+
+    func waitForShutdown() async {
+        await shutdownCounter.wait(until: 1)
     }
 }
 
@@ -1177,11 +1232,17 @@ final class SMBeeTests: XCTestCase {
         try await awaitWithTimeout("active POSIX writer start") { await writer.waitForStart() }
         XCTAssertTrue(writer.isStarted)
         XCTAssertEqual(writer.outbound, [1], "the cancellation must exercise a partial write")
+        let writerDescriptor = try XCTUnwrap(writer.descriptors.first)
+        XCTAssertEqual(writer.descriptors, [writerDescriptor])
 
         sendTask.cancel()
-        try await awaitWithTimeout("active POSIX send poison") { await lifecycle.waitForClose() }
+        try await awaitWithTimeout("active POSIX send shutdown") { await lifecycle.waitForShutdown() }
         XCTAssertEqual(lifecycle.shutdownCount, 1)
-        XCTAssertEqual(lifecycle.closeCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 0, "physical close must wait for the writer lease")
+        XCTAssertEqual(
+            lifecycle.events,
+            [POSIXLifecycleEvent(operation: .shutdown, descriptor: writerDescriptor)]
+        )
         writer.release()
 
         do {
@@ -1189,6 +1250,16 @@ final class SMBeeTests: XCTestCase {
             XCTFail("active send unexpectedly succeeded after cancellation")
         } catch is CancellationError {
         }
+        try await awaitWithTimeout("active POSIX send lease drain") { await lifecycle.waitForClose() }
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 1)
+        XCTAssertEqual(
+            lifecycle.events,
+            [
+                POSIXLifecycleEvent(operation: .shutdown, descriptor: writerDescriptor),
+                POSIXLifecycleEvent(operation: .close, descriptor: writerDescriptor)
+            ]
+        )
         do {
             try await transport.send([9])
             XCTFail("send after poison unexpectedly succeeded")
@@ -1199,6 +1270,56 @@ final class SMBeeTests: XCTestCase {
             XCTFail("receive after poison unexpectedly succeeded")
         } catch SMBTransportError.connectionClosed {
         }
+        transport.close()
+        transport.close()
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 1)
+    }
+
+    func testPOSIXSocketTransportCloseDuringActiveSendDefersCloseAndStopsNextWrite() async throws {
+        let writer = BlockingPOSIXWriter()
+        let lifecycle = POSIXLifecycleRecorder()
+        let transport = POSIXSocketTransport(
+            writer: writer.write,
+            shutdown: lifecycle.shutdown,
+            close: lifecycle.close
+        )
+
+        let sendTask = Task { try await transport.send([1, 2, 3]) }
+        try await awaitWithTimeout("active POSIX writer before close") { await writer.waitForStart() }
+        XCTAssertEqual(writer.outbound, [1])
+        let writerDescriptor = try XCTUnwrap(writer.descriptors.first)
+        XCTAssertEqual(writer.descriptors, [writerDescriptor])
+
+        transport.close()
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 0, "physical close must wait for the writer lease")
+        XCTAssertEqual(
+            lifecycle.events,
+            [POSIXLifecycleEvent(operation: .shutdown, descriptor: writerDescriptor)]
+        )
+        writer.release()
+
+        do {
+            try await awaitWithTimeout("active POSIX send after close") { try await sendTask.value }
+            XCTFail("active send unexpectedly succeeded after close")
+        } catch SMBTransportError.connectionClosed {
+        }
+        try await awaitWithTimeout("active POSIX close lease drain") { await lifecycle.waitForClose() }
+        XCTAssertEqual(writer.callCount, 1, "retired descriptors must be rechecked before the next write")
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 1)
+        XCTAssertEqual(
+            lifecycle.events,
+            [
+                POSIXLifecycleEvent(operation: .shutdown, descriptor: writerDescriptor),
+                POSIXLifecycleEvent(operation: .close, descriptor: writerDescriptor)
+            ]
+        )
+
+        transport.close()
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 1)
     }
 
     func testPOSIXSocketTransportPartialWriteErrorPoisonsConnection() async throws {
@@ -1309,6 +1430,56 @@ final class SMBeeTests: XCTestCase {
             XCTFail("receive unexpectedly succeeded after cancellation")
         } catch is CancellationError {
         }
+    }
+
+    func testPOSIXSocketTransportActiveReceiveCancellationDefersCloseUntilReaderReturns() async throws {
+        let reader = BlockingPOSIXReader()
+        let lifecycle = POSIXLifecycleRecorder()
+        let transport = POSIXSocketTransport(
+            writer: { _, bytes, offset in bytes.count - offset },
+            reader: reader.read,
+            shutdown: lifecycle.shutdown,
+            close: lifecycle.close
+        )
+
+        let receiveTask = Task { try await transport.receive(maxLength: 1) }
+        try await awaitWithTimeout("active POSIX reader start") { await reader.waitForStart() }
+        XCTAssertEqual(reader.callCount, 1)
+        let readerDescriptor = try XCTUnwrap(reader.descriptors.first)
+        XCTAssertEqual(reader.descriptors, [readerDescriptor])
+
+        receiveTask.cancel()
+        try await awaitWithTimeout("active POSIX receive shutdown") { await lifecycle.waitForShutdown() }
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 0, "physical close must wait for the reader lease")
+        XCTAssertEqual(
+            lifecycle.events,
+            [POSIXLifecycleEvent(operation: .shutdown, descriptor: readerDescriptor)]
+        )
+        reader.release()
+
+        do {
+            _ = try await awaitWithTimeout("active POSIX receive cancellation") {
+                try await receiveTask.value
+            }
+            XCTFail("active receive unexpectedly succeeded after cancellation")
+        } catch is CancellationError {
+        }
+        try await awaitWithTimeout("active POSIX receive lease drain") { await lifecycle.waitForClose() }
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 1)
+        XCTAssertEqual(
+            lifecycle.events,
+            [
+                POSIXLifecycleEvent(operation: .shutdown, descriptor: readerDescriptor),
+                POSIXLifecycleEvent(operation: .close, descriptor: readerDescriptor)
+            ]
+        )
+
+        transport.close()
+        transport.close()
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 1)
     }
 
     func testPOSIXSocketTransportReceiveTimeout() async throws {

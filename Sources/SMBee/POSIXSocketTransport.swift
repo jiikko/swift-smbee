@@ -7,6 +7,7 @@ import Darwin
 #endif
 
 internal typealias POSIXSocketWriter = @Sendable (Int32, [UInt8], Int) throws -> Int
+internal typealias POSIXSocketReader = @Sendable (Int32, UnsafeMutableRawPointer?, Int) -> Int
 internal typealias POSIXSocketLifecycleHook = @Sendable (Int32) -> Void
 internal typealias POSIXSocketSendEnqueueHook = @Sendable () -> Void
 
@@ -19,11 +20,22 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         case poisoned
     }
 
+    private struct DescriptorLeaseRecord {
+        var leaseCount = 0
+        var retired = false
+        var shutdownRequired = false
+        // This records completion of the shutdown attempt, not shutdown success.
+        var shutdownAttemptCompleted = true
+        var closeClaimed = false
+    }
+
     private let connectionLock = NSLock()
     private var connectionState: ConnectionState = .idle
     private var connectingDescriptor: Int32 = -1
+    private var descriptorLeaseRecords: [Int32: DescriptorLeaseRecord] = [:]
     private let timeout: Duration?
     private let writer: POSIXSocketWriter
+    private let reader: POSIXSocketReader
     private let shutdownDescriptor: POSIXSocketLifecycleHook
     private let closeDescriptor: POSIXSocketLifecycleHook
     private let sendEnqueueHook: POSIXSocketSendEnqueueHook
@@ -43,6 +55,9 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
                 )
             }
         }
+        self.reader = { descriptor, buffer, maxLength in
+            DarwinOrGlibc.recv(descriptor, buffer, maxLength, 0)
+        }
         self.shutdownDescriptor = { descriptor in DarwinOrGlibc.shutdown(descriptor) }
         self.closeDescriptor = { descriptor in DarwinOrGlibc.close(descriptor) }
         self.sendEnqueueHook = {}
@@ -51,16 +66,21 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     internal init(
         socketFileDescriptor: Int32 = 1,
         writer: @escaping POSIXSocketWriter,
+        reader: @escaping POSIXSocketReader = { descriptor, buffer, maxLength in
+            DarwinOrGlibc.recv(descriptor, buffer, maxLength, 0)
+        },
         shutdown: @escaping POSIXSocketLifecycleHook = { _ in },
         close: @escaping POSIXSocketLifecycleHook = { _ in },
         sendEnqueued: @escaping POSIXSocketSendEnqueueHook = {}
     ) {
         self.timeout = nil
         self.writer = writer
+        self.reader = reader
         self.shutdownDescriptor = shutdown
         self.closeDescriptor = close
         self.sendEnqueueHook = sendEnqueued
         self.connectionState = .open(socketFileDescriptor)
+        self.descriptorLeaseRecords[socketFileDescriptor] = DescriptorLeaseRecord()
     }
 
     public func connect(host: String, port: UInt16) async throws {
@@ -108,13 +128,15 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         return bytes
     }
 
-    /// Permanently closes this transport. This instance is one-shot: `connect()` after
-    /// `close()` always throws `connectionClosed`. Reopening the terminal state could let
-    /// queued sends from the old connection reach a new socket, so reconnect creates a new
-    /// transport instance instead (as SMBee's internal reconnect path already does).
+    /// Makes this transport terminal and starts interrupting its blocking I/O.
+    ///
+    /// This instance is one-shot: `connect()` after `close()` always throws
+    /// `connectionClosed`. The physical descriptor close happens after all in-flight
+    /// descriptor leases drain; this method does not wait for that drain. Reopening the
+    /// terminal state could let queued sends from the old connection reach a new socket,
+    /// so reconnect creates a new transport instance instead.
     public func close() {
-        let descriptors = transitionToTerminal(.closed)
-        closeDescriptors(descriptors)
+        retireAndInterruptDescriptors(transitionToTerminal(.closed))
     }
 
     // Task cancel 時に blocking syscall を「起こす」ための操作。
@@ -122,8 +144,7 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     // その syscall は起きない (POSIX 上、close は他スレッドの blocking I/O を
     // 中断する保証がない)。shutdown(SHUT_RDWR) は blocked recv/send を確実に
     // エラー復帰させるため、cancel 経路では close ではなく shutdown で起こしてから
-    // fd を close する。実装は terminal 状態へ遷移して fd を state から外し、その後
-    // closeDescriptors が shutdown → close を行う。
+    // physical close は lease が drain し、shutdown の試行が完了してから行う。
     private func interruptBlockingIO() {
         close()
     }
@@ -162,24 +183,14 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
                     throw SMBTransportError.connectionClosed
                 }
                 do {
-                    try disableSIGPIPEIfNeeded(descriptor)
-                    try connectSocket(
+                    try connectInstalledCandidate(
                         descriptor,
                         address: candidate.pointee.ai_addr,
                         length: candidate.pointee.ai_addrlen
                     )
-                    try applySocketTimeoutIfNeeded(descriptor)
-                    guard promoteConnectedDescriptor(descriptor) else {
-                        if clearConnectingDescriptor(descriptor) {
-                            closeDescriptor(descriptor)
-                        }
-                        throw SMBTransportError.connectionClosed
-                    }
                     return
                 } catch {
-                    if clearConnectingDescriptor(descriptor) {
-                        closeDescriptor(descriptor)
-                    }
+                    if isConnectionTerminal() { throw SMBTransportError.connectionClosed }
                     if case SMBTransportError.timedOut = error { throw error }
                 }
             }
@@ -192,21 +203,34 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         _ segments: [[UInt8]],
         beforeWriterCall: () -> Bool
     ) throws -> Int32 {
-        guard let descriptor = currentSocketFileDescriptor() else { throw SMBTransportError.connectionClosed }
+        let descriptor = try acquireOpenDescriptorLease()
+        defer { releaseDescriptorLease(descriptor) }
+
         for segment in segments where !segment.isEmpty {
             var sent = 0
             while sent < segment.count {
-                guard isSocketOpen(descriptor), beforeWriterCall() else {
+                guard beforeWriterCall(), descriptorAllowsSyscall(descriptor) else {
                     throw SMBTransportError.connectionClosed
                 }
-                let count = try writer(descriptor, segment, sent)
+                let count: Int
+                do {
+                    count = try writer(descriptor, segment, sent)
+                } catch {
+                    // The write boundary is unknown once the writer has been entered.
+                    // Retire the connection before returning this lease so no new send
+                    // can start in the partial-write failure window.
+                    poison()
+                    throw error
+                }
                 if count < 0, DarwinOrGlibc.errnoValue == EINTR {
                     // EINTR is retryable; the next attempt rechecks cancellation/poison
                     // so an interrupted send cannot spin forever.
                     continue
                 }
                 guard count > 0, count <= segment.count - sent else {
-                    throw socketError(operation: "send")
+                    let error = socketError(operation: "send")
+                    poison()
+                    throw error
                 }
                 sent += count
             }
@@ -215,10 +239,15 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     }
 
     private func receiveBlocking(maxLength: Int) throws -> [UInt8] {
-        guard let descriptor = currentSocketFileDescriptor() else { throw SMBTransportError.connectionClosed }
+        let descriptor = try acquireOpenDescriptorLease()
+        defer { releaseDescriptorLease(descriptor) }
+
         var buffer = [UInt8](repeating: 0, count: maxLength)
+        guard descriptorAllowsSyscall(descriptor) else {
+            throw SMBTransportError.connectionClosed
+        }
         let count = buffer.withUnsafeMutableBytes { rawBuffer in
-            DarwinOrGlibc.recv(descriptor, rawBuffer.baseAddress, maxLength, 0)
+            reader(descriptor, rawBuffer.baseAddress, maxLength)
         }
         guard count > 0 else {
             if count == 0 { throw SMBTransportError.connectionClosed }
@@ -227,31 +256,64 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         return Array(buffer.prefix(count))
     }
 
+    private func connectInstalledCandidate(
+        _ descriptor: Int32,
+        address: UnsafePointer<sockaddr>?,
+        length: socklen_t
+    ) throws {
+        var candidateFinished = false
+        defer {
+            if !candidateFinished {
+                let completion = finishConnectingCandidate(descriptor, promote: false)
+                closeClaimedDescriptorIfNeeded(descriptor, claimed: completion.closeClaimed)
+            }
+        }
+
+        try disableSIGPIPEIfNeeded(descriptor)
+        try connectSocket(descriptor, address: address, length: length)
+        try applySocketTimeoutIfNeeded(descriptor)
+
+        let completion = finishConnectingCandidate(descriptor, promote: true)
+        candidateFinished = true
+        closeClaimedDescriptorIfNeeded(descriptor, claimed: completion.closeClaimed)
+        guard completion.promoted else { throw SMBTransportError.connectionClosed }
+    }
+
     private func connectSocket(_ descriptor: Int32, address: UnsafePointer<sockaddr>?, length: socklen_t) throws {
         guard let timeout else {
+            guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
             if DarwinOrGlibc.connect(descriptor, address, length) == 0 { return }
             throw socketError(operation: "connect", descriptor: descriptor)
         }
 
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
         let flags = DarwinOrGlibc.fcntl(descriptor, F_GETFL, 0)
         guard flags >= 0 else { throw socketError(operation: "fcntl(F_GETFL)", descriptor: descriptor) }
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
         guard DarwinOrGlibc.fcntl(descriptor, F_SETFL, flags | DarwinOrGlibc.oNonBlock) >= 0 else {
             throw socketError(operation: "fcntl(F_SETFL)", descriptor: descriptor)
         }
-        defer { _ = DarwinOrGlibc.fcntl(descriptor, F_SETFL, flags) }
+        defer {
+            if descriptorAllowsSyscall(descriptor) {
+                _ = DarwinOrGlibc.fcntl(descriptor, F_SETFL, flags)
+            }
+        }
 
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
         if DarwinOrGlibc.connect(descriptor, address, length) == 0 { return }
         guard DarwinOrGlibc.errnoValue == EINPROGRESS else {
             throw socketError(operation: "connect", descriptor: descriptor)
         }
 
         var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
         let pollResult = DarwinOrGlibc.poll(&pollDescriptor, 1, timeout.pollMilliseconds)
         if pollResult == 0 { throw SMBTransportError.timedOut }
         guard pollResult > 0 else { throw socketError(operation: "poll", descriptor: descriptor) }
 
         var socketErrorValue: Int32 = 0
         var socketErrorLength = socklen_t(MemoryLayout<Int32>.size)
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
         guard DarwinOrGlibc.getsockopt(
             descriptor,
             SOL_SOCKET,
@@ -276,6 +338,7 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         #if !os(Linux)
         var enabled: Int32 = 1
         let length = socklen_t(MemoryLayout<Int32>.size)
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
         guard DarwinOrGlibc.setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, length) == 0 else {
             throw socketError(operation: "setsockopt(SO_NOSIGPIPE)", descriptor: descriptor)
         }
@@ -286,10 +349,12 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         guard let timeout else { return }
         var value = timeout.timevalValue
         let length = socklen_t(MemoryLayout<timeval>.size)
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
         guard DarwinOrGlibc.setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &value, length) == 0 else {
             throw socketError(operation: "setsockopt(SO_RCVTIMEO)", descriptor: descriptor)
         }
         var sendValue = timeout.timevalValue
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
         guard DarwinOrGlibc.setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &sendValue, length) == 0 else {
             throw socketError(operation: "setsockopt(SO_SNDTIMEO)", descriptor: descriptor)
         }
@@ -336,18 +401,71 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         }
     }
 
-    private func currentSocketFileDescriptor() -> Int32? {
+    private func acquireOpenDescriptorLease() throws -> Int32 {
         connectionLock.lock()
         defer { connectionLock.unlock() }
-        guard case .open(let descriptor) = connectionState else { return nil }
+        guard case .open(let descriptor) = connectionState,
+              var record = descriptorLeaseRecords[descriptor],
+              !record.retired else {
+            throw SMBTransportError.connectionClosed
+        }
+        record.leaseCount += 1
+        descriptorLeaseRecords[descriptor] = record
         return descriptor
+    }
+
+    private func releaseDescriptorLease(_ descriptor: Int32) {
+        connectionLock.lock()
+        guard var record = descriptorLeaseRecords[descriptor] else {
+            connectionLock.unlock()
+            assertionFailure("released an unknown POSIX descriptor lease")
+            return
+        }
+        assert(record.leaseCount > 0, "POSIX descriptor lease count underflow")
+        record.leaseCount -= 1
+        let closeClaimed = claimCloseIfEligible(record: &record)
+        descriptorLeaseRecords[descriptor] = record
+        connectionLock.unlock()
+
+        closeClaimedDescriptorIfNeeded(descriptor, claimed: closeClaimed)
+    }
+
+    /// Admission check for a syscall on a leased descriptor.
+    ///
+    /// This is deliberately not atomic with the syscall itself: a terminal transition can
+    /// land between the check and the call, so one in-flight syscall may still run after
+    /// retirement. That is safe for the race this lease machinery exists to prevent
+    /// (issues/073) — the lease keeps the descriptor from being closed and reused, so the
+    /// late syscall reaches the same, already shut-down open-file description rather than an
+    /// unrelated fd. Making it strictly atomic would require holding `connectionLock` across
+    /// a blocking syscall, which deadlocks the terminal transition that must interrupt it.
+    private func descriptorAllowsSyscall(_ descriptor: Int32) -> Bool {
+        connectionLock.lock()
+        defer { connectionLock.unlock() }
+        guard let record = descriptorLeaseRecords[descriptor] else { return false }
+        return record.leaseCount > 0 && !record.retired
     }
 
     private func isSocketOpen(_ descriptor: Int32) -> Bool {
         connectionLock.lock()
         defer { connectionLock.unlock() }
-        guard case .open(let currentDescriptor) = connectionState else { return false }
-        return currentDescriptor == descriptor
+        guard case .open(let currentDescriptor) = connectionState,
+              currentDescriptor == descriptor,
+              let record = descriptorLeaseRecords[descriptor] else {
+            return false
+        }
+        return !record.retired
+    }
+
+    private func isConnectionTerminal() -> Bool {
+        connectionLock.lock()
+        defer { connectionLock.unlock() }
+        switch connectionState {
+        case .closed, .poisoned:
+            return true
+        case .idle, .connecting, .open:
+            return false
+        }
     }
 
     private func beginConnect() throws {
@@ -362,26 +480,47 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         defer { connectionLock.unlock() }
         guard case .connecting = connectionState else { return false }
         connectingDescriptor = descriptor
+        descriptorLeaseRecords[descriptor] = DescriptorLeaseRecord(leaseCount: 1)
         return true
     }
 
-    private func clearConnectingDescriptor(_ descriptor: Int32) -> Bool {
+    private func finishConnectingCandidate(
+        _ descriptor: Int32,
+        promote: Bool
+    ) -> (promoted: Bool, closeClaimed: Bool) {
         connectionLock.lock()
         defer { connectionLock.unlock() }
-        if connectingDescriptor == descriptor {
-            connectingDescriptor = -1
-            return true
+        guard var record = descriptorLeaseRecords[descriptor] else {
+            assertionFailure("finished an unknown POSIX connecting descriptor")
+            return (false, false)
         }
-        return false
-    }
+        assert(record.leaseCount > 0, "POSIX candidate lease count underflow")
 
-    private func promoteConnectedDescriptor(_ descriptor: Int32) -> Bool {
-        connectionLock.lock()
-        defer { connectionLock.unlock() }
-        guard case .connecting = connectionState, connectingDescriptor == descriptor else { return false }
-        connectingDescriptor = -1
-        connectionState = .open(descriptor)
-        return true
+        let canPromote: Bool
+        if case .connecting = connectionState {
+            canPromote = promote && connectingDescriptor == descriptor && !record.retired
+        } else {
+            canPromote = false
+        }
+
+        if canPromote {
+            connectingDescriptor = -1
+            connectionState = .open(descriptor)
+        } else {
+            if connectingDescriptor == descriptor {
+                connectingDescriptor = -1
+            }
+            if !record.retired {
+                record.retired = true
+                record.shutdownRequired = false
+                record.shutdownAttemptCompleted = true
+            }
+        }
+
+        record.leaseCount -= 1
+        let closeClaimed = claimCloseIfEligible(record: &record)
+        descriptorLeaseRecords[descriptor] = record
+        return (canPromote, closeClaimed)
     }
 
     private func resetFailedConnectionAttempt() {
@@ -402,6 +541,7 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         case .idle, .connecting, .open:
             break
         }
+
         var descriptors: [Int32] = []
         if case .open(let descriptor) = connectionState, descriptor >= 0 {
             descriptors.append(descriptor)
@@ -411,28 +551,81 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         }
         connectingDescriptor = -1
         connectionState = terminalState
+
+        for descriptor in descriptors {
+            guard var record = descriptorLeaseRecords[descriptor] else {
+                assertionFailure("terminal transition found an unknown POSIX descriptor")
+                continue
+            }
+            record.retired = true
+            record.shutdownRequired = true
+            record.shutdownAttemptCompleted = false
+            descriptorLeaseRecords[descriptor] = record
+        }
         return descriptors
     }
 
     private func poison() {
-        closeDescriptors(transitionToTerminal(.poisoned))
+        retireAndInterruptDescriptors(transitionToTerminal(.poisoned))
     }
 
-    private func closeDescriptors(_ descriptors: [Int32]) {
+    private func retireAndInterruptDescriptors(_ descriptors: [Int32]) {
         for descriptor in descriptors {
             shutdownDescriptor(descriptor)
-            closeDescriptor(descriptor)
+            markShutdownAttemptCompleted(descriptor)
         }
+    }
+
+    private func markShutdownAttemptCompleted(_ descriptor: Int32) {
+        connectionLock.lock()
+        guard var record = descriptorLeaseRecords[descriptor] else {
+            connectionLock.unlock()
+            assertionFailure("completed shutdown for an unknown POSIX descriptor")
+            return
+        }
+        assert(record.shutdownRequired, "completed an unrequired POSIX descriptor shutdown")
+        record.shutdownAttemptCompleted = true
+        let closeClaimed = claimCloseIfEligible(record: &record)
+        descriptorLeaseRecords[descriptor] = record
+        connectionLock.unlock()
+
+        closeClaimedDescriptorIfNeeded(descriptor, claimed: closeClaimed)
+    }
+
+    private func claimCloseIfEligible(record: inout DescriptorLeaseRecord) -> Bool {
+        guard record.retired,
+              record.leaseCount == 0,
+              record.shutdownAttemptCompleted,
+              !record.closeClaimed else {
+            return false
+        }
+        record.closeClaimed = true
+        return true
+    }
+
+    private func closeClaimedDescriptorIfNeeded(_ descriptor: Int32, claimed: Bool) {
+        guard claimed else { return }
+        closeDescriptor(descriptor)
+
+        connectionLock.lock()
+        if descriptorLeaseRecords[descriptor]?.closeClaimed == true {
+            descriptorLeaseRecords.removeValue(forKey: descriptor)
+        }
+        connectionLock.unlock()
     }
 
     private func socketError(operation: String, descriptor: Int32? = nil) -> Error {
         let errnoValue = DarwinOrGlibc.errnoValue
+        if isConnectionTerminal() {
+            return SMBTransportError.connectionClosed
+        }
         if errnoValue == EAGAIN || errnoValue == EWOULDBLOCK || errnoValue == ETIMEDOUT {
             return SMBTransportError.timedOut
         }
-        if errnoValue == EBADF || errnoValue == EINTR || (descriptor == nil && currentSocketFileDescriptor() == nil) {
+        if errnoValue == EBADF || errnoValue == EINTR {
             return SMBTransportError.connectionClosed
         }
+        _ = descriptor
         return SMBTransportError.socketFailure("\(operation) failed: errno \(errnoValue)")
     }
 }

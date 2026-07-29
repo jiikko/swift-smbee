@@ -1,6 +1,6 @@
 # 072 bug: POSIXSocketTransport の並列 send が frame バイトを交錯させ、サーバが接続を落とす
 
-状態: **open（P1。コード上の競合経路は確定・server 側の復号失敗も実測。観測 A の根因としては有力仮説 — バイト交錯そのものの直接観測は未取得）**
+状態: **解決済み (2026-07-29、commit cd75c30)。送信 executor で直列化し、再現条件 (16 並列 readPrefix + list、4 MiB、encrypted Samba) で 3 run × 5,100 ops 無障害・サーバ側 DECRYPTION_FAILED 新規ゼロを確認 = 観測 A の因果も閉じた。派生の既存問題は issue 073 に分離。**
 起票: 2026-07-29（wire 診断 + ストレスハーネスによる P2-0 計測で特定）
 関連: `Sources/SMBee/POSIXSocketTransport.swift`（`send` / `sendBlocking`） /
 `Sources/SMBee/SMBTransport.swift`（segments の default 実装） /

@@ -22,6 +22,39 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         XCTAssertTrue(faults[0].contains("SMBTransportError"))
     }
 
+    func testWireEventsCarryDistinctSessionIdentifiers() async {
+        let capture = SMBWireLogCapture()
+        SMBPerfLog.enabledOverride = true
+        SMBPerfLog.testSink = { capture.append($0) }
+        defer {
+            SMBPerfLog.testSink = nil
+            SMBPerfLog.enabledOverride = nil
+        }
+        let firstSession = SMBSession(
+            host: "test", port: 445,
+            credential: .anonymous,
+            transport: InMemoryTransport()
+        )
+        let secondSession = SMBSession(
+            host: "test", port: 445,
+            credential: .anonymous,
+            transport: InMemoryTransport()
+        )
+
+        await firstSession.failWireForTesting(error: SMBTransportError.timedOut)
+        await secondSession.failWireForTesting(error: SMBTransportError.timedOut)
+
+        let wireEvents = capture.messages.filter { $0.hasPrefix("[wire] ") }
+        XCTAssertFalse(wireEvents.isEmpty)
+        XCTAssertTrue(wireEvents.allSatisfy { event in
+            event.split(separator: " ").dropFirst(2).first?.hasPrefix("session=") == true
+        })
+        let sessionIds = wireEvents.compactMap { event in
+            event.split(separator: " ").first { $0.hasPrefix("session=") }
+        }
+        XCTAssertEqual(Set(sessionIds).count, 2)
+    }
+
     func testCloseCauseAndVictimSnapshotAreLogged() async {
         let capture = SMBWireLogCapture()
         SMBPerfLog.enabledOverride = true
@@ -47,8 +80,12 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         _ = try? await first.value
         _ = try? await second.value
 
-        XCTAssertTrue(capture.messages.contains { $0.contains("[wire] close_transport cause=unit_test") })
-        XCTAssertTrue(capture.messages.contains { $0.contains("[wire] victim count=2") })
+        XCTAssertTrue(capture.messages.contains {
+            $0.contains("[wire] close_transport session=") && $0.contains("cause=unit_test")
+        })
+        XCTAssertTrue(capture.messages.contains {
+            $0.contains("[wire] victim session=") && $0.contains("count=2")
+        })
     }
 
     func testBestEffortCloseTimeoutClosesTransportAndFailsConcurrentPendingOperations() async throws {
@@ -92,7 +129,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             $0.contains("[wire] cleanup_close_failed") && $0.contains("timeout=true")
         })
         XCTAssertTrue(capture.messages.contains {
-            $0.contains("[wire] close_transport cause=best_effort_close")
+            $0.contains("[wire] close_transport session=") && $0.contains("cause=best_effort_close")
         })
     }
 }

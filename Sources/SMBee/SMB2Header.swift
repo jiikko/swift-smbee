@@ -162,12 +162,14 @@ actor SMB2CreditWindow {
     }
 
     private var available: UInt32
+    private let diagnosticSessionId: String
     private var waiters: [Waiter] = []
     private var nextWaiterId: UInt64 = 0
     private var state: State = .active
 
-    init(initialCredits: UInt32 = 1) {
+    init(initialCredits: UInt32 = 1, diagnosticSessionId: String) {
         self.available = initialCredits
+        self.diagnosticSessionId = diagnosticSessionId
     }
 
     var balance: UInt32 {
@@ -215,7 +217,7 @@ actor SMB2CreditWindow {
     /// leak when the session dies while credits are exhausted (issues/010 §B — grant only
     /// arrives from received responses, which stop on transport failure).
     func failAllWaiters(_ error: Error) {
-        SMBPerfLog.line("[wire] victim_credit_waiters count=\(waiters.count)")
+        SMBPerfLog.line("[wire] victim_credit_waiters session=\(diagnosticSessionId) count=\(waiters.count)")
         state = .failed(error)
         let parked = waiters
         waiters.removeAll()

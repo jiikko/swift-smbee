@@ -3813,6 +3813,16 @@ private struct SMBPendingResponse {
 /// SMB server と呼び出し元の ordering に依存するため、共有 session API を公開する際に別途整理する。
 actor SMBSession {
     private static let defaultCleanupTimeout: Duration = .seconds(5)
+    private static let diagnosticSessionIdLock = NSLock()
+    nonisolated(unsafe) private static var nextDiagnosticSessionNumber: UInt64 = 1
+
+    private static func makeDiagnosticSessionId() -> String {
+        diagnosticSessionIdLock.withLock {
+            let number = nextDiagnosticSessionNumber
+            nextDiagnosticSessionNumber += 1
+            return String(number, radix: 36)
+        }
+    }
 
     private static func diagnosticError(_ error: Error) -> String {
         let description = String(describing: error).replacingOccurrences(of: "\n", with: " ")
@@ -3825,6 +3835,7 @@ actor SMBSession {
 
     private let host: String
     private let port: UInt16
+    private let diagnosticSessionId: String
     // The source credential is needed only while SESSION_SETUP is being built. Derived session
     // keys are sufficient afterwards; reconnect obtains a fresh value from its provider.
     private var authenticationCredential: SMBCredential?
@@ -3866,8 +3877,11 @@ actor SMBSession {
         initialCredits: UInt32 = 1,
         cleanupTimeout: Duration = SMBSession.defaultCleanupTimeout
     ) {
+        // A locked monotonic base-36 ID is short, non-secret, collision-free within a run, and reproducible.
+        let diagnosticSessionId = Self.makeDiagnosticSessionId()
         self.host = host
         self.port = port
+        self.diagnosticSessionId = diagnosticSessionId
         self.authenticationCredential = credential
         self.transport = transport
         self.signingKey = signingKey
@@ -3879,7 +3893,10 @@ actor SMBSession {
         self.signingAlgorithm = signingAlgorithm
         self.signingRequired = signingRequired
         self.initialCredits = initialCredits
-        self.creditWindow = SMB2CreditWindow(initialCredits: initialCredits)
+        self.creditWindow = SMB2CreditWindow(
+            initialCredits: initialCredits,
+            diagnosticSessionId: diagnosticSessionId
+        )
         self.cleanupTimeout = cleanupTimeout
     }
 
@@ -4986,7 +5003,7 @@ actor SMBSession {
         debugDump("CLOSE request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response")
         if SMBPerfLog.effectiveIsEnabled, let header = try? SMB2Header.decode(response) {
-            SMBPerfLog.line("[wire] close_status file=\(Self.fileIdPrefix(fileId)) status=0x\(String(format: "%08x", header.status))")
+            SMBPerfLog.line("[wire] close_status session=\(diagnosticSessionId) file=\(Self.fileIdPrefix(fileId)) status=0x\(String(format: "%08x", header.status))")
         }
     }
 
@@ -5016,7 +5033,7 @@ actor SMBSession {
                 if let started {
                     let elapsed = SMBPerfLog.milliseconds(ContinuousClock.now - started)
                     let timedOut = error is SMBTransportError && (error as? SMBTransportError) == .timedOut
-                    SMBPerfLog.line("[wire] cleanup_close_failed file=\(Self.fileIdPrefix(fileId)) elapsed_ms=\(elapsed) error=\(Self.diagnosticError(error)) timeout=\(timedOut)")
+                    SMBPerfLog.line("[wire] cleanup_close_failed session=\(diagnosticSessionId) file=\(Self.fileIdPrefix(fileId)) elapsed_ms=\(elapsed) error=\(Self.diagnosticError(error)) timeout=\(timedOut)")
                 }
                 await self.closeTransport(cause: "best_effort_close", diagnosticError: error)
             }
@@ -5104,7 +5121,7 @@ actor SMBSession {
         guard !transportClosed else { return }
         if SMBPerfLog.effectiveIsEnabled {
             let diagnostic = diagnosticError.map(Self.diagnosticError) ?? "none"
-            SMBPerfLog.line("[wire] close_transport cause=\(cause) error=\(diagnostic)")
+            SMBPerfLog.line("[wire] close_transport session=\(diagnosticSessionId) cause=\(cause) error=\(diagnostic)")
         }
         transportClosed = true
         transport.close()
@@ -5267,7 +5284,7 @@ actor SMBSession {
                 cancellationRequested: false,
                 continuationResumed: false
             )
-            SMBPerfLog.line("[wire] pending message_id=\(requestHeader.messageId) command=\(requestHeader.command) label=\(responseLabel)")
+            SMBPerfLog.line("[wire] pending session=\(diagnosticSessionId) message_id=\(requestHeader.messageId) command=\(requestHeader.command) label=\(responseLabel)")
             let sendTask = Task {
                 do {
                     try await send(packet, requestHeader.messageId)
@@ -5276,7 +5293,7 @@ actor SMBSession {
                         await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
                     }
                 } catch {
-                    SMBPerfLog.line("[wire] send_failed message_id=\(requestHeader.messageId) error=\(Self.diagnosticError(error))")
+                    SMBPerfLog.line("[wire] send_failed session=\(diagnosticSessionId) message_id=\(requestHeader.messageId) error=\(Self.diagnosticError(error))")
                     if error is CancellationError {
                         self.failPendingResponse(messageId: requestHeader.messageId, error: error)
                     } else {
@@ -5465,7 +5482,7 @@ actor SMBSession {
     private func dispatchReceivedPacket(_ frame: SMBReceivedFrame) throws {
         let packet = frame.bytes
         let header = try SMB2Header.decode(packet)
-        SMBPerfLog.line("[wire] recv message_id=\(header.messageId) command=\(header.command) status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "")")
+        SMBPerfLog.line("[wire] recv session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "")")
         // Server-initiated notifications (oplock/lease break) arrive with MessageId
         // 0xFFFFFFFFFFFFFFFF and never correspond to a request. This client never requests
         // oplocks or leases (CREATE RequestedOplockLevel is always NONE), so drop them
@@ -5542,7 +5559,7 @@ actor SMBSession {
         guard let pending = pendingResponses[messageId] else {
             return false
         }
-        SMBPerfLog.line("[wire] sent message_id=\(messageId)")
+        SMBPerfLog.line("[wire] sent session=\(diagnosticSessionId) message_id=\(messageId)")
         sentResponseMessageIds.insert(messageId)
         if pending.cancellationRequested {
             pendingResponses.removeValue(forKey: messageId)
@@ -5600,7 +5617,7 @@ actor SMBSession {
             }
             let remaining = pending.count - details.count
             let detail = details.joined(separator: ",") + (remaining > 0 ? ",(+\(remaining) more)" : "")
-            SMBPerfLog.line("[wire] victim count=\(pending.count) resumed=\(resumed) pending=\(pending.count - resumed) detail=\(detail)")
+            SMBPerfLog.line("[wire] victim session=\(diagnosticSessionId) count=\(pending.count) resumed=\(resumed) pending=\(pending.count - resumed) detail=\(detail)")
         }
         pendingResponses.removeAll()
         sentResponseMessageIds.removeAll()
@@ -5629,7 +5646,7 @@ actor SMBSession {
         let failure = wireFailure ?? error
         wireFailure = failure
         if firstFault {
-            SMBPerfLog.line("[wire] first_fault error=\(Self.diagnosticError(error))")
+            SMBPerfLog.line("[wire] first_fault session=\(diagnosticSessionId) error=\(Self.diagnosticError(error))")
         }
         failAllPendingResponses(error: failure)
     }
@@ -5656,7 +5673,7 @@ actor SMBSession {
         if SMBPerfLog.effectiveIsEnabled {
             let available = await creditWindow.balance
             if available < UInt32(effectiveCharge) {
-                SMBPerfLog.line("[wire] credit_wait message_id=\(header.messageId) command=\(header.command) charge=\(effectiveCharge) available=\(available)")
+                SMBPerfLog.line("[wire] credit_wait session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) charge=\(effectiveCharge) available=\(available)")
             }
         }
         let balance = try await creditWindow.reserve(charge: effectiveCharge)

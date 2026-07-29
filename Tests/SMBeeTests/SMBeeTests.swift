@@ -2640,7 +2640,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMB2CreditWindowWaitsForGrant() async throws {
-        let window = SMB2CreditWindow(initialCredits: 1)
+        let window = SMB2CreditWindow(initialCredits: 1, diagnosticSessionId: "test")
 
         let firstReserve = try await window.reserve(charge: 1)
         XCTAssertEqual(firstReserve, 0)
@@ -2668,7 +2668,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMB2CreditWindowAccountsForChargeTwoGrant() async throws {
-        let window = SMB2CreditWindow(initialCredits: 1)
+        let window = SMB2CreditWindow(initialCredits: 1, diagnosticSessionId: "test")
 
         let parked = Task { try await window.reserve(charge: 2) }
         while await window.pendingWaiterCount == 0 {
@@ -2686,7 +2686,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMB2CreditWindowReserveIsCancellable() async throws {
-        let window = SMB2CreditWindow(initialCredits: 0)
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "test")
         let task = Task {
             try await window.reserve(charge: 1)
         }
@@ -2927,7 +2927,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMB2CreditWindowFailAllWaitersDrainsParkedReserves() async throws {
-        let window = SMB2CreditWindow(initialCredits: 0)
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "test")
         let task = Task {
             try await window.reserve(charge: 1)
         }
@@ -2963,7 +2963,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMB2CreditWindowResetReactivatesWindowAndOldFailureCanWinRace() async throws {
-        let window = SMB2CreditWindow(initialCredits: 0)
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "test")
         let parked = Task { try await window.reserve(charge: 1) }
         while await window.pendingWaiterCount == 0 { await Task.yield() }
 
@@ -2984,7 +2984,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMB2CreditWindowDoesNotConsumeZeroChargeRequests() async throws {
-        let window = SMB2CreditWindow(initialCredits: 1)
+        let window = SMB2CreditWindow(initialCredits: 1, diagnosticSessionId: "test")
 
         let reserve = try await window.reserve(charge: 0)
         XCTAssertEqual(reserve, 1)

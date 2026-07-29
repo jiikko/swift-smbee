@@ -1,6 +1,7 @@
 # 071 bug: 32bit 環境で Int(UInt32.max) 変換が trap する（read 経路に複数箇所）
 
-状態: **open**
+状態: **解決済み (2026-07-29、commit e20bf26)。read/write/credit 経路の該当変換を Int(clamping:) /
+guard 先行に置換。64bit は挙動不変 (既存テスト green が担保)。32bit 実環境が無いため実機検証は不可**
 起票: 2026-07-27（issue 067 A の敵対的レビューで検出）
 関連: `Sources/SMBee/SMBClient.swift`（`negotiatedChunkSize` 周辺 / `creditAwareReadChunkSize`） /
 `Sources/SMBee/SMB2ReadCodecs.swift`（READ response の dataLength 処理）

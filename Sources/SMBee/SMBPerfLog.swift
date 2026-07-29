@@ -9,11 +9,11 @@ enum SMBPerfLog {
     /// Test-seam gate that stays race-free without an atomic (the package still targets
     /// macOS 13, so `Synchronization.Atomic` is unavailable): the only mutable state
     /// (`enabledOverrideStorage` / `testSinkStorage`) is read and written strictly under
-    /// `lock`. The lock-free fast path below reads nothing mutable — `isEnabled` and
-    /// `isTestProcess` are both immutable `let`s — so production (no XCTest loaded,
-    /// SMBEE_PERF unset) never takes the lock and never races. TSan flagged the previous
-    /// unguarded `overrideIsSet` flag read as a data race (macos-tsan, 2026-07-29).
-    private static let isTestProcess = NSClassFromString("XCTestCase") != nil
+    /// `lock`, and DEBUG builds always take the lock. RELEASE builds compile the seam out
+    /// entirely and read only the immutable `isEnabled`, so production stays lock-free.
+    /// Rejected alternatives: an unguarded fast-path flag is a data race (macos-tsan,
+    /// 2026-07-29), and `NSClassFromString("XCTestCase")` detection does not work on Linux
+    /// (corelibs runtime has no ObjC class lookup — linux-build-test, 2026-07-29).
     private static let lock = NSLock()
     nonisolated(unsafe) private static var enabledOverrideStorage: Bool?
     nonisolated(unsafe) private static var testSinkStorage: (@Sendable (String) -> Void)?
@@ -29,12 +29,15 @@ enum SMBPerfLog {
     }
 
     static var effectiveIsEnabled: Bool {
-        guard isEnabled || isTestProcess else { return false }
+        #if DEBUG
         return lock.withLock { enabledOverrideStorage ?? isEnabled }
+        #else
+        return isEnabled
+        #endif
     }
 
     static func line(_ message: @autoclosure () -> String) {
-        guard isEnabled || isTestProcess else { return }
+        #if DEBUG
         lock.lock()
         defer { lock.unlock() }
         guard enabledOverrideStorage ?? isEnabled else { return }
@@ -44,6 +47,10 @@ enum SMBPerfLog {
         } else {
             FileHandle.standardError.write(Data("[smbee-perf] \(value)\n".utf8))
         }
+        #else
+        guard isEnabled else { return }
+        FileHandle.standardError.write(Data("[smbee-perf] \(message())\n".utf8))
+        #endif
     }
 
     static func milliseconds(_ duration: Duration) -> String {

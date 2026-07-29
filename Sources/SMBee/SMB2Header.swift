@@ -215,6 +215,7 @@ actor SMB2CreditWindow {
     /// leak when the session dies while credits are exhausted (issues/010 §B — grant only
     /// arrives from received responses, which stop on transport failure).
     func failAllWaiters(_ error: Error) {
+        SMBPerfLog.line("[wire] victim_credit_waiters count=\(waiters.count)")
         state = .failed(error)
         let parked = waiters
         waiters.removeAll()

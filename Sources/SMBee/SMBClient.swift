@@ -721,7 +721,7 @@ public actor SMBClientSession {
         guard let info = reconnectInfo else {
             throw SMBError.connectionLost(operation: "RECONNECT")
         }
-        await session.closeTransport()
+        await session.closeTransport(cause: "reconnect_old_session")
         let credential = try await info.credentialProvider()
         let newSession = SMBSession(
             host: info.host,
@@ -735,7 +735,7 @@ public actor SMBClientSession {
             session = newSession
             treeId = newTreeId
         } catch {
-            await newSession.closeTransport()
+            await newSession.closeTransport(cause: "reconnect_new_session", diagnosticError: error)
             throw error
         }
     }
@@ -821,7 +821,7 @@ public actor SMBClientSession {
                 } catch is CancellationError {
                     break
                 } catch {
-                    await session.closeTransport()
+                    await session.closeTransport(cause: "keepalive_echo", diagnosticError: error)
                     break
                 }
             }
@@ -1691,7 +1691,7 @@ public enum SMBClient {
                 await session.disconnect(treeId: treeId)
                 return result
             } catch {
-                await session.closeTransport()
+                await session.closeTransport(cause: "with_session_failure", diagnosticError: error)
                 guard error.isSMBConnectionLoss else {
                     throw error
                 }
@@ -1769,7 +1769,7 @@ public enum SMBClient {
             )
             return SMBClientSession(session: session, treeId: treeId, reconnectInfo: reconnectInfo)
         } catch {
-            await session.closeTransport()
+            await session.closeTransport(cause: "connect_failure", diagnosticError: error)
             throw error
         }
     }
@@ -1791,7 +1791,7 @@ public enum SMBClient {
             await session.disconnect(treeId: treeId)
             return shares
         } catch {
-            await session.closeTransport()
+            await session.closeTransport(cause: "list_shares_failure", diagnosticError: error)
             throw error
         }
     }
@@ -1830,7 +1830,7 @@ public enum SMBClient {
             await session.disconnect(treeId: treeId)
             return names
         } catch {
-            await session.closeTransport()
+            await session.closeTransport(cause: "lookup_sids_failure", diagnosticError: error)
             throw error
         }
     }
@@ -3814,6 +3814,10 @@ private struct SMBPendingResponse {
 actor SMBSession {
     private static let defaultCleanupTimeout: Duration = .seconds(5)
 
+    private static func fileIdPrefix(_ fileId: [UInt8]) -> String {
+        fileId.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
+
     private let host: String
     private let port: UInt16
     // The source credential is needed only while SESSION_SETUP is being built. Derived session
@@ -4974,7 +4978,10 @@ actor SMBSession {
     func close(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Close.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("CLOSE request", packet)
-        _ = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response")
+        let response = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response")
+        if SMBPerfLog.effectiveIsEnabled, let header = try? SMB2Header.decode(response) {
+            SMBPerfLog.line("[wire] close_status file=\(Self.fileIdPrefix(fileId)) status=0x\(String(format: "%08x", header.status))")
+        }
     }
 
     /// CLOSE is part of the operation result for create/delete-on-close paths. If it fails,
@@ -4985,7 +4992,7 @@ actor SMBSession {
                 try await self.close(treeId: treeId, fileId: fileId)
             }
         } catch {
-            closeTransport()
+            closeTransport(cause: "close_created_handle", diagnosticError: error)
             throw error
         }
     }
@@ -4994,12 +5001,16 @@ actor SMBSession {
     func bestEffortClose(treeId: UInt32, fileId: [UInt8]) async {
         let timeout = cleanupTimeout
         let task = Task.detached { [self] in
+            let started = ContinuousClock.now
             do {
                 try await SMBOperationDeadline.run(timeout: timeout) {
                     try await self.close(treeId: treeId, fileId: fileId)
                 }
             } catch {
-                await self.closeTransport()
+                let elapsed = SMBPerfLog.milliseconds(ContinuousClock.now - started)
+                let timedOut = error is SMBTransportError && (error as? SMBTransportError) == .timedOut
+                SMBPerfLog.line("[wire] cleanup_close_failed file=\(Self.fileIdPrefix(fileId)) elapsed_ms=\(elapsed) error=\(String(reflecting: type(of: error))) timeout=\(timedOut)")
+                await self.closeTransport(cause: "best_effort_close", diagnosticError: error)
             }
         }
         await task.value
@@ -5023,7 +5034,7 @@ actor SMBSession {
                     try await self.treeDisconnect(treeId: treeId)
                 }
             } catch {
-                await self.closeTransport()
+                await self.closeTransport(cause: "best_effort_tree_disconnect", diagnosticError: error)
             }
         }
         await task.value
@@ -5063,6 +5074,7 @@ actor SMBSession {
     func disconnect(treeId: UInt32) async {
         let timeout = cleanupTimeout
         let task = Task.detached { [self] in
+            var diagnosticError: Error?
             do {
                 try await SMBOperationDeadline.run(timeout: timeout) {
                     try await self.treeDisconnect(treeId: treeId)
@@ -5071,19 +5083,51 @@ actor SMBSession {
                     try await self.logoff()
                 }
             } catch {
+                diagnosticError = error
                 // A graceful cleanup response is missing or invalid. The connection is now
                 // suspect; closing it is the only bounded way to release server-side state.
             }
-            await self.closeTransport()
+            await self.closeTransport(cause: "disconnect", diagnosticError: diagnosticError)
         }
         await task.value
     }
 
-    func closeTransport() {
+    func closeTransport(cause: String = "unspecified", diagnosticError: Error? = nil) {
         guard !transportClosed else { return }
+        if SMBPerfLog.effectiveIsEnabled {
+            let diagnostic = diagnosticError.map { "\(String(reflecting: type(of: $0))): \($0)" } ?? "none"
+            SMBPerfLog.line("[wire] close_transport cause=\(cause) error=\(diagnostic)")
+        }
         transportClosed = true
         transport.close()
         failWire(error: SMBTransportError.connectionClosed)
+    }
+
+    // Internal-only seams keep deterministic diagnostics tests independent of the process
+    // environment. They are not used by production code paths.
+    func failWireForTesting(error: Error) {
+        failWire(error: error)
+    }
+
+    func parkPendingForTesting(messageId: UInt64, command: UInt16) async throws {
+        _ = try await withCheckedThrowingContinuation { continuation in
+            pendingResponses[messageId] = SMBPendingResponse(
+                label: "testing",
+                longPoll: false,
+                expectedCommand: command,
+                expectedSessionId: 0,
+                expectedTreeId: 0,
+                continuation: continuation,
+                sendTask: nil,
+                sendStarted: false,
+                cancellationRequested: false,
+                continuationResumed: false
+            )
+        }
+    }
+
+    func pendingCountForTesting() -> Int {
+        pendingResponses.count
     }
 
     private func unsignedWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
@@ -5188,6 +5232,7 @@ actor SMBSession {
                 cancellationRequested: false,
                 continuationResumed: false
             )
+            SMBPerfLog.line("[wire] pending message_id=\(requestHeader.messageId) command=\(requestHeader.command) label=\(responseLabel)")
             let sendTask = Task {
                 do {
                     try await send(packet, requestHeader.messageId)
@@ -5196,6 +5241,7 @@ actor SMBSession {
                         await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
                     }
                 } catch {
+                    SMBPerfLog.line("[wire] send_failed message_id=\(requestHeader.messageId) error=\(error)")
                     self.failPendingResponse(messageId: requestHeader.messageId, error: error)
                 }
             }
@@ -5380,6 +5426,7 @@ actor SMBSession {
     private func dispatchReceivedPacket(_ frame: SMBReceivedFrame) throws {
         let packet = frame.bytes
         let header = try SMB2Header.decode(packet)
+        SMBPerfLog.line("[wire] recv message_id=\(header.messageId) command=\(header.command) status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "")")
         // Server-initiated notifications (oplock/lease break) arrive with MessageId
         // 0xFFFFFFFFFFFFFFFF and never correspond to a request. This client never requests
         // oplocks or leases (CREATE RequestedOplockLevel is always NONE), so drop them
@@ -5456,6 +5503,7 @@ actor SMBSession {
         guard let pending = pendingResponses[messageId] else {
             return false
         }
+        SMBPerfLog.line("[wire] sent message_id=\(messageId)")
         sentResponseMessageIds.insert(messageId)
         if pending.cancellationRequested {
             pendingResponses.removeValue(forKey: messageId)
@@ -5506,6 +5554,15 @@ actor SMBSession {
 
     private func failAllPendingResponses(error: Error) {
         let pending = pendingResponses
+        if SMBPerfLog.effectiveIsEnabled {
+            let resumed = pending.values.filter(\.continuationResumed).count
+            let details = pending.sorted { $0.key < $1.key }.prefix(16).map {
+                "\($0.key):\($0.value.expectedCommand):\($0.value.continuationResumed ? 1 : 0)"
+            }
+            let remaining = pending.count - details.count
+            let detail = details.joined(separator: ",") + (remaining > 0 ? ",(+\(remaining) more)" : "")
+            SMBPerfLog.line("[wire] victim count=\(pending.count) resumed=\(resumed) pending=\(pending.count - resumed) detail=\(detail)")
+        }
         pendingResponses.removeAll()
         sentResponseMessageIds.removeAll()
         orphanResponses.removeAll()
@@ -5529,8 +5586,12 @@ actor SMBSession {
     }
 
     private func failWire(error: Error) {
+        let firstFault = wireFailure == nil
         let failure = wireFailure ?? error
         wireFailure = failure
+        if firstFault {
+            SMBPerfLog.line("[wire] first_fault type=\(String(reflecting: type(of: error))) description=\(error)")
+        }
         failAllPendingResponses(error: failure)
     }
 
@@ -5553,6 +5614,12 @@ actor SMBSession {
         // would let charge-0 requests inflate the window (each response still grants), so
         // the effective charge is what gets reserved and later refunded on send failure.
         let effectiveCharge = max(1, header.creditCharge)
+        if SMBPerfLog.effectiveIsEnabled {
+            let available = await creditWindow.balance
+            if available < UInt32(effectiveCharge) {
+                SMBPerfLog.line("[wire] credit_wait message_id=\(header.messageId) command=\(header.command) charge=\(effectiveCharge) available=\(available)")
+            }
+        }
         let balance = try await creditWindow.reserve(charge: effectiveCharge)
         debugLine("SMB credit charge=\(effectiveCharge) balance=\(balance)")
         return effectiveCharge

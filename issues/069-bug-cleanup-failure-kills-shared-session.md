@@ -42,8 +42,8 @@
 
 「CLOSE 無応答 → closeTransport → 並行 operation 全滅」を fixture（応答を返さない
 InMemoryTransport）で再現する unit を書き、現挙動を固定してから対応方針を決める。
-これは今回のセッションでは未実施である。072 で追加したのは send failure 経路のテストであり、
-この CLOSE 無応答から並行 operation 全滅までを再現する要求とは別物である。
+✅ unit で固定済み (2026-07-29、`testBestEffortCloseTimeoutClosesTransportAndFailsConcurrentPendingOperations`)。
+072 で追加した send failure 経路のテストとは別に、CLOSE 無応答から並行 operation 全滅までを再現する。
 
 ## 関連
 

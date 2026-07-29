@@ -493,7 +493,6 @@ private final class BlockingPOSIXWriter: @unchecked Sendable {
             started = true
             callCountStorage += 1
         }
-        startedCounter.increment()
         let shouldBlock = lock.withLock { () -> Bool in
             guard offset == 0, !didBlockStorage else { return false }
             didBlockStorage = true
@@ -501,10 +500,15 @@ private final class BlockingPOSIXWriter: @unchecked Sendable {
         }
         if shouldBlock {
             lock.withLock { outboundStorage.append(bytes[0]) }
+            // Signal only after the partial byte is visible: waitForStart() callers assert
+            // on `outbound`, and incrementing earlier lets a slow runner observe an empty
+            // buffer between the signal and the append (observed on Linux CI).
+            startedCounter.increment()
             gate.wait()
             return 1
         }
         lock.withLock { outboundStorage.append(contentsOf: bytes[offset...]) }
+        startedCounter.increment()
         return bytes.count - offset
     }
 

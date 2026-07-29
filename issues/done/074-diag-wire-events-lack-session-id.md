@@ -1,6 +1,6 @@
 # 074: [wire] 診断イベントに session 識別子がない
 
-状態: **open（P3）**
+状態: **解決済み (2026-07-29、commit 697eec6)。全 [wire] イベントに session= を付与済み**
 
 `[wire]` 診断イベントに SMBClientSession の識別子がないため、複数 session を並行利用する
 ケース（obaket のマルチタブなど）では、`first_fault` の因果を別 session と混同しうる。

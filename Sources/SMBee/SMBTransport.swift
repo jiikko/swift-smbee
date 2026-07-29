@@ -10,7 +10,14 @@ public enum SMBTransportError: Error, Equatable, Sendable {
 
 public protocol SMBTransport: Sendable {
     func connect(host: String, port: UInt16) async throws
+
+    /// Sends one logical byte stream. Concurrent invocations are allowed, but the bytes
+    /// from each invocation must not be interleaved with another invocation. The order in
+    /// which concurrent invocations become visible is unspecified.
     func send(_ bytes: [UInt8]) async throws
+
+    /// Sends the concatenation of all segments as one logical byte stream. It has the same
+    /// non-interleaving and unspecified concurrent-order contract as `send(_:)`.
     func send(_ segments: [[UInt8]]) async throws
     func receive(maxLength: Int) async throws -> [UInt8]
     func close()
@@ -18,7 +25,8 @@ public protocol SMBTransport: Sendable {
 
 public extension SMBTransport {
     /// Sends one logical byte stream assembled from multiple buffers. Transports can
-    /// override this to use vectored I/O; the default preserves source compatibility.
+    /// override this to use vectored I/O; the default preserves the contract by joining
+    /// the segments before making one bytes-send invocation.
     func send(_ segments: [[UInt8]]) async throws {
         var bytes: [UInt8] = []
         bytes.reserveCapacity(segments.reduce(0) { $0 + $1.count })

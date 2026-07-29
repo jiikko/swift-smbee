@@ -3841,6 +3841,7 @@ actor SMBSession {
     private let creditWindow: SMB2CreditWindow
     private let initialCredits: UInt32
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
+    private var pendingCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var sentResponseMessageIds: Set<UInt64> = []
     private var orphanResponses: [UInt64: SMBReceivedFrame] = [:]
     private static let maxOrphanResponses = 64
@@ -5123,11 +5124,38 @@ actor SMBSession {
                 cancellationRequested: false,
                 continuationResumed: false
             )
+            resumePendingCountWaiters()
+        }
+    }
+
+    func waitForPendingCountForTesting(atLeast count: Int) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            if pendingResponses.count >= count {
+                continuation.resume()
+            } else {
+                pendingCountWaiters.append((count, continuation))
+            }
         }
     }
 
     func pendingCountForTesting() -> Int {
         pendingResponses.count
+    }
+
+    private func resumePendingCountWaiters() {
+        var ready: [CheckedContinuation<Void, Never>] = []
+        var pending: [(Int, CheckedContinuation<Void, Never>)] = []
+        for (target, continuation) in pendingCountWaiters {
+            if pendingResponses.count >= target {
+                ready.append(continuation)
+            } else {
+                pending.append((target, continuation))
+            }
+        }
+        pendingCountWaiters = pending
+        for continuation in ready {
+            continuation.resume()
+        }
     }
 
     private func unsignedWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
@@ -5242,7 +5270,11 @@ actor SMBSession {
                     }
                 } catch {
                     SMBPerfLog.line("[wire] send_failed message_id=\(requestHeader.messageId) error=\(error)")
-                    self.failPendingResponse(messageId: requestHeader.messageId, error: error)
+                    if error is CancellationError {
+                        self.failPendingResponse(messageId: requestHeader.messageId, error: error)
+                    } else {
+                        self.closeTransport(cause: "send_failure", diagnosticError: error)
+                    }
                 }
             }
             pendingResponses[requestHeader.messageId]?.sendTask = sendTask

@@ -90,6 +90,50 @@ private func closeFD(_ fd: Int32) {
     #endif
 }
 
+private final class POSIXAsyncCounter: @unchecked Sendable {
+    private struct Waiter {
+        let target: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private let lock = NSLock()
+    private var value = 0
+    private var waiters: [Waiter] = []
+
+    func increment() {
+        lock.lock()
+        value += 1
+        var ready: [CheckedContinuation<Void, Never>] = []
+        var pending: [Waiter] = []
+        for waiter in waiters {
+            if waiter.target <= value {
+                ready.append(waiter.continuation)
+            } else {
+                pending.append(waiter)
+            }
+        }
+        waiters = pending
+        lock.unlock()
+
+        for continuation in ready {
+            continuation.resume()
+        }
+    }
+
+    func wait(until target: Int) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if value >= target {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                waiters.append(Waiter(target: target, continuation: continuation))
+                lock.unlock()
+            }
+        }
+    }
+}
+
 private final class POSIXLoopbackServer: @unchecked Sendable {
     enum Mode {
         case echoOnce
@@ -376,6 +420,194 @@ private final class BlockingSendTransport: SMBTransport, @unchecked Sendable {
     func close() {}
 }
 
+private final class InterleavingPOSIXWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let aRestGate = DispatchSemaphore(value: 0)
+    private let aRestCounter = POSIXAsyncCounter()
+    private let enqueueCounter = POSIXAsyncCounter()
+    private var didEnterARest = false
+    private var enqueueCount = 0
+    private var outboundStorage: [UInt8] = []
+
+    var outbound: [UInt8] { lock.withLock { outboundStorage } }
+    var isARestBlocked: Bool { lock.withLock { didEnterARest } }
+    var didEnqueueBothSends: Bool { lock.withLock { enqueueCount >= 2 } }
+
+    func markEnqueued() {
+        lock.withLock { enqueueCount += 1 }
+        enqueueCounter.increment()
+    }
+
+    func write(_ descriptor: Int32, _ bytes: [UInt8], _ offset: Int) -> Int {
+        _ = descriptor
+        if bytes == [1, 2, 3], offset == 0 {
+            lock.withLock { outboundStorage.append(1) }
+            return 1
+        }
+        if bytes == [1, 2, 3], offset == 1 {
+            lock.withLock { didEnterARest = true }
+            aRestCounter.increment()
+            aRestGate.wait()
+            lock.withLock { outboundStorage.append(contentsOf: [2, 3]) }
+            return 2
+        }
+        if bytes == [9, 9] {
+            lock.withLock {
+                outboundStorage.append(contentsOf: bytes[offset...])
+            }
+            return bytes.count - offset
+        }
+        lock.withLock { outboundStorage.append(contentsOf: bytes[offset...]) }
+        return bytes.count - offset
+    }
+
+    func releaseA() {
+        aRestGate.signal()
+    }
+
+    func waitForARest() async {
+        await aRestCounter.wait(until: 1)
+    }
+
+    func waitForEnqueues(_ count: Int) async {
+        await enqueueCounter.wait(until: count)
+    }
+}
+
+private final class BlockingPOSIXWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let gate = DispatchSemaphore(value: 0)
+    private let startedCounter = POSIXAsyncCounter()
+    private var started = false
+    private var callCountStorage = 0
+    private var outboundStorage: [UInt8] = []
+    private var didBlockStorage = false
+
+    var isStarted: Bool { lock.withLock { started } }
+    var callCount: Int { lock.withLock { callCountStorage } }
+    var outbound: [UInt8] { lock.withLock { outboundStorage } }
+
+    func write(_ descriptor: Int32, _ bytes: [UInt8], _ offset: Int) -> Int {
+        _ = descriptor
+        lock.withLock {
+            started = true
+            callCountStorage += 1
+        }
+        startedCounter.increment()
+        let shouldBlock = lock.withLock { () -> Bool in
+            guard offset == 0, !didBlockStorage else { return false }
+            didBlockStorage = true
+            return true
+        }
+        if shouldBlock {
+            lock.withLock { outboundStorage.append(bytes[0]) }
+            gate.wait()
+            return 1
+        }
+        lock.withLock { outboundStorage.append(contentsOf: bytes[offset...]) }
+        return bytes.count - offset
+    }
+
+    func release() {
+        gate.signal()
+    }
+
+    func waitForStart() async {
+        await startedCounter.wait(until: 1)
+    }
+}
+
+private final class POSIXSendEnqueueRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let counter = POSIXAsyncCounter()
+    private var countStorage = 0
+
+    var count: Int { lock.withLock { countStorage } }
+
+    func mark() {
+        lock.withLock { countStorage += 1 }
+        counter.increment()
+    }
+
+    func waitForCount(_ count: Int) async {
+        await counter.wait(until: count)
+    }
+}
+
+private final class FailingPOSIXWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCountStorage = 0
+
+    var callCount: Int { lock.withLock { callCountStorage } }
+
+    func write(_ descriptor: Int32, _ bytes: [UInt8], _ offset: Int) throws -> Int {
+        _ = descriptor
+        _ = bytes
+        _ = offset
+        let callCount = lock.withLock { () -> Int in
+            callCountStorage += 1
+            return callCountStorage
+        }
+        if callCount == 1 {
+            return 1
+        }
+        throw SMBTransportError.socketFailure("injected send failure")
+    }
+}
+
+private final class EINTRPOSIXWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCountStorage = 0
+
+    var callCount: Int { lock.withLock { callCountStorage } }
+
+    func write(_ descriptor: Int32, _ bytes: [UInt8], _ offset: Int) -> Int {
+        _ = descriptor
+        let callCount = lock.withLock { () -> Int in
+            callCountStorage += 1
+            return callCountStorage
+        }
+        if callCount == 1 {
+            setPOSIXErrno(EINTR)
+            return -1
+        }
+        return bytes.count - offset
+    }
+}
+
+private func setPOSIXErrno(_ value: Int32) {
+#if os(Linux)
+    Glibc.errno = value
+#else
+    Darwin.errno = value
+#endif
+}
+
+private final class POSIXLifecycleRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let closeCounter = POSIXAsyncCounter()
+    private var shutdownCountStorage = 0
+    private var closeCountStorage = 0
+
+    var shutdownCount: Int { lock.withLock { shutdownCountStorage } }
+    var closeCount: Int { lock.withLock { closeCountStorage } }
+
+    func shutdown(_ descriptor: Int32) {
+        _ = descriptor
+        lock.withLock { shutdownCountStorage += 1 }
+    }
+
+    func close(_ descriptor: Int32) {
+        _ = descriptor
+        lock.withLock { closeCountStorage += 1 }
+        closeCounter.increment()
+    }
+
+    func waitForClose() async {
+        await closeCounter.wait(until: 1)
+    }
+}
+
 private final class FailingReceiveTransport: SMBTransport, @unchecked Sendable {
     let failure: Error
 
@@ -401,6 +633,42 @@ private final class FailingReceiveTransport: SMBTransport, @unchecked Sendable {
     }
 
     func close() {}
+}
+
+private final class FailingSendTransport: SMBTransport, @unchecked Sendable {
+    let failure: Error
+    // Recorded so tests can prove the session actually closed the transport (not just
+    // failed the pending requests) after a non-cancellation send failure.
+    private let lock = NSLock()
+    private var closeCallCount = 0
+
+    var closeCount: Int { lock.withLock { closeCallCount } }
+
+    init(failure: Error) {
+        self.failure = failure
+    }
+
+    func connect(host: String, port: UInt16) async throws {
+        try Task.checkCancellation()
+        _ = host
+        _ = port
+    }
+
+    func send(_ bytes: [UInt8]) async throws {
+        try Task.checkCancellation()
+        _ = bytes
+        throw failure
+    }
+
+    func receive(maxLength: Int) async throws -> [UInt8] {
+        try Task.checkCancellation()
+        _ = maxLength
+        return []
+    }
+
+    func close() {
+        lock.withLock { closeCallCount += 1 }
+    }
 }
 
 private final class FailingConnectTransport: SMBTransport, @unchecked Sendable {
@@ -784,6 +1052,233 @@ final class SMBeeTests: XCTestCase {
         }
 
         XCTAssertEqual(received, [0xde, 0xad, 0xbe, 0xef])
+    }
+
+    func testPOSIXSocketTransportSendBeforeConnectDoesNotPoisonTransport() async throws {
+        let server = try POSIXLoopbackServer(mode: .echoOnce)
+        server.start()
+        defer { server.close() }
+
+        let transport = POSIXSocketTransport(timeout: .seconds(1))
+        defer { transport.close() }
+
+        do {
+            try await transport.send([0x01])
+            XCTFail("send before connect unexpectedly succeeded")
+        } catch SMBTransportError.connectionClosed {
+        }
+
+        try await awaitWithTimeout("connect after pre-connect send") {
+            try await transport.connect(host: "127.0.0.1", port: server.port)
+        }
+        try await awaitWithTimeout("send after pre-connect failure") {
+            try await transport.send([0x01])
+        }
+        let received = try await awaitWithTimeout("receive after pre-connect failure") {
+            try await transport.receive(maxLength: 1)
+        }
+        XCTAssertEqual(received, [0x01])
+    }
+
+    func testPOSIXSocketTransportRetriesInterruptedWriter() async throws {
+        let writer = EINTRPOSIXWriter()
+        let lifecycle = POSIXLifecycleRecorder()
+        let transport = POSIXSocketTransport(
+            writer: writer.write,
+            shutdown: lifecycle.shutdown,
+            close: lifecycle.close
+        )
+
+        try await awaitWithTimeout("retry interrupted POSIX send") {
+            try await transport.send([1, 2, 3])
+        }
+
+        XCTAssertEqual(writer.callCount, 2)
+        XCTAssertEqual(lifecycle.shutdownCount, 0)
+        XCTAssertEqual(lifecycle.closeCount, 0)
+    }
+
+    func testPOSIXSocketTransportConcurrentSendsDoNotInterleave() async throws {
+        let writer = InterleavingPOSIXWriter()
+        let transport = POSIXSocketTransport(writer: writer.write, sendEnqueued: writer.markEnqueued)
+
+        let first = Task { try await transport.send([[1, 2, 3], [4, 5, 6]]) }
+        try await awaitWithTimeout("first POSIX writer rest") { await writer.waitForARest() }
+        XCTAssertTrue(writer.isARestBlocked)
+
+        let second = Task { try await transport.send([9, 9]) }
+        try await awaitWithTimeout("both POSIX sends enqueued") { await writer.waitForEnqueues(2) }
+        XCTAssertTrue(writer.didEnqueueBothSends)
+        writer.releaseA()
+
+        try await awaitWithTimeout("first POSIX concurrent send") { try await first.value }
+        try await awaitWithTimeout("second POSIX concurrent send") { try await second.value }
+
+        let firstThenSecond: [UInt8] = [1, 2, 3, 4, 5, 6, 9, 9]
+        let secondThenFirst: [UInt8] = [9, 9, 1, 2, 3, 4, 5, 6]
+        XCTAssertTrue(
+            writer.outbound == firstThenSecond || writer.outbound == secondThenFirst,
+            "concurrent sends interleaved: \(writer.outbound)"
+        )
+    }
+
+    func testPOSIXSocketTransportQueuedSendCancellationIsIsolated() async throws {
+        let writer = BlockingPOSIXWriter()
+        let enqueueRecorder = POSIXSendEnqueueRecorder()
+        let lifecycle = POSIXLifecycleRecorder()
+        let transport = POSIXSocketTransport(
+            writer: writer.write,
+            shutdown: lifecycle.shutdown,
+            close: lifecycle.close,
+            sendEnqueued: enqueueRecorder.mark
+        )
+
+        let first = Task { try await transport.send([1, 2, 3]) }
+        try await awaitWithTimeout("first POSIX writer start") { await writer.waitForStart() }
+        XCTAssertTrue(writer.isStarted)
+
+        let second = Task { try await transport.send([4, 5, 6]) }
+        try await awaitWithTimeout("both POSIX sends enqueued") { await enqueueRecorder.waitForCount(2) }
+        XCTAssertEqual(enqueueRecorder.count, 2)
+        second.cancel()
+
+        do {
+            try await awaitWithTimeout("queued POSIX send cancellation") { try await second.value }
+            XCTFail("queued send unexpectedly succeeded after cancellation")
+        } catch is CancellationError {
+        }
+        XCTAssertEqual(writer.callCount, 1, "queued cancellation must not reach the writer")
+        XCTAssertEqual(lifecycle.shutdownCount, 0)
+        XCTAssertEqual(lifecycle.closeCount, 0)
+
+        writer.release()
+        try await awaitWithTimeout("active POSIX send after queued cancellation") { try await first.value }
+        try await awaitWithTimeout("send after isolated queued cancellation") {
+            try await transport.send([7, 8])
+        }
+        XCTAssertEqual(lifecycle.shutdownCount, 0)
+        XCTAssertEqual(lifecycle.closeCount, 0)
+    }
+
+    func testPOSIXSocketTransportActiveSendCancellationPoisonsConnection() async throws {
+        let writer = BlockingPOSIXWriter()
+        let lifecycle = POSIXLifecycleRecorder()
+        let transport = POSIXSocketTransport(
+            writer: writer.write,
+            shutdown: lifecycle.shutdown,
+            close: lifecycle.close
+        )
+
+        let sendTask = Task { try await transport.send([1, 2, 3]) }
+        try await awaitWithTimeout("active POSIX writer start") { await writer.waitForStart() }
+        XCTAssertTrue(writer.isStarted)
+        XCTAssertEqual(writer.outbound, [1], "the cancellation must exercise a partial write")
+
+        sendTask.cancel()
+        try await awaitWithTimeout("active POSIX send poison") { await lifecycle.waitForClose() }
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 1)
+        writer.release()
+
+        do {
+            try await awaitWithTimeout("active POSIX send cancellation") { try await sendTask.value }
+            XCTFail("active send unexpectedly succeeded after cancellation")
+        } catch is CancellationError {
+        }
+        do {
+            try await transport.send([9])
+            XCTFail("send after poison unexpectedly succeeded")
+        } catch SMBTransportError.connectionClosed {
+        }
+        do {
+            _ = try await transport.receive(maxLength: 1)
+            XCTFail("receive after poison unexpectedly succeeded")
+        } catch SMBTransportError.connectionClosed {
+        }
+    }
+
+    func testPOSIXSocketTransportPartialWriteErrorPoisonsConnection() async throws {
+        let writer = FailingPOSIXWriter()
+        let lifecycle = POSIXLifecycleRecorder()
+        let transport = POSIXSocketTransport(
+            writer: writer.write,
+            shutdown: lifecycle.shutdown,
+            close: lifecycle.close
+        )
+
+        do {
+            try await transport.send([1, 2, 3])
+            XCTFail("send unexpectedly succeeded after injected writer error")
+        } catch SMBTransportError.socketFailure("injected send failure") {
+        }
+        XCTAssertEqual(writer.callCount, 2)
+        XCTAssertEqual(lifecycle.shutdownCount, 1)
+        XCTAssertEqual(lifecycle.closeCount, 1)
+
+        do {
+            try await transport.send([4])
+            XCTFail("send after writer error unexpectedly succeeded")
+        } catch SMBTransportError.connectionClosed {
+        }
+    }
+
+    func testPOSIXSocketTransportSegmentedSendsDoNotInterleave() async throws {
+        let writer = InterleavingPOSIXWriter()
+        let transport = POSIXSocketTransport(writer: writer.write, sendEnqueued: writer.markEnqueued)
+
+        let first = Task { try await transport.send([[1, 2, 3]]) }
+        try await awaitWithTimeout("segmented POSIX writer rest") { await writer.waitForARest() }
+        XCTAssertTrue(writer.isARestBlocked)
+        let second = Task { try await transport.send([[9, 9]]) }
+        try await awaitWithTimeout("both segmented POSIX sends enqueued") { await writer.waitForEnqueues(2) }
+        XCTAssertTrue(writer.didEnqueueBothSends)
+        writer.releaseA()
+
+        try await awaitWithTimeout("first segmented POSIX send") { try await first.value }
+        try await awaitWithTimeout("second segmented POSIX send") { try await second.value }
+        let firstThenSecond: [UInt8] = [1, 2, 3, 9, 9]
+        let secondThenFirst: [UInt8] = [9, 9, 1, 2, 3]
+        XCTAssertTrue(writer.outbound == firstThenSecond || writer.outbound == secondThenFirst)
+    }
+
+    func testSessionSendFailureClosesTransportAndFailsOtherPendingRequests() async throws {
+        let transport = FailingSendTransport(failure: SMBTransportError.socketFailure("send failed"))
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            initialCredits: 3
+        )
+        let firstPending = Task { try await session.parkPendingForTesting(messageId: 1, command: 8) }
+        let secondPending = Task { try await session.parkPendingForTesting(messageId: 2, command: 9) }
+        try await awaitWithTimeout("park pending session requests") {
+            await session.waitForPendingCountForTesting(atLeast: 2)
+        }
+        let pendingBeforeSend = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingBeforeSend, 2)
+
+        let sendFailure = Task { try await session.echo() }
+        do {
+            try await awaitWithTimeout("session send failure") { try await sendFailure.value }
+            XCTFail("echo unexpectedly succeeded with a failing transport")
+        } catch SMBTransportError.connectionClosed {
+        }
+        do {
+            try await awaitWithTimeout("first pending failed by send_failure") { _ = try await firstPending.value }
+            XCTFail("first pending unexpectedly succeeded")
+        } catch SMBTransportError.connectionClosed {
+        }
+        do {
+            try await awaitWithTimeout("second pending failed by send_failure") { _ = try await secondPending.value }
+            XCTFail("second pending unexpectedly succeeded")
+        } catch SMBTransportError.connectionClosed {
+        }
+        let pendingAfterSendFailure = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterSendFailure, 0)
+        // Pin the transport actually being closed: failing the pendings via failWire alone
+        // (without closeTransport) would leave closeCount == 0 and must fail this test.
+        XCTAssertEqual(transport.closeCount, 1)
     }
 
     func testPOSIXSocketTransportReceiveCancellationClosesSocket() async throws {

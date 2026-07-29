@@ -410,7 +410,7 @@ public struct SMBReadRange: Equatable, Sendable {
 
 enum SMBTransferLimits {
     static func negotiatedChunkSize(localLimit: Int, negotiatedLimit: UInt32, transformOverhead: Int = 0) -> Int {
-        let usableNegotiatedLimit = max(0, Int(negotiatedLimit) - transformOverhead)
+        let usableNegotiatedLimit = max(0, Int(clamping: negotiatedLimit) - transformOverhead)
         return max(1, min(localLimit, usableNegotiatedLimit))
     }
 
@@ -1343,7 +1343,7 @@ public actor SMBClientSession {
             try await session.write(treeId: treeId, fileId: fileId, offset: remoteSize) { maxLength in
                 let remaining = totalBytes - bytesTransferred
                 guard remaining > 0 else { return [] }
-                let length = min(maxLength, Self.localWriteChunkLimit, Int(remaining))
+                let length = min(maxLength, Self.localWriteChunkLimit, Int(clamping: remaining))
                 let data = try handle.read(upToCount: length) ?? Data()
                 guard !data.isEmpty else {
                     throw SMBCodecError.invalidValue("local source file ended before its initial size")
@@ -5688,7 +5688,7 @@ actor SMBSession {
         }
         guard header.sessionId == sessionId else { throw SMBCodecError.invalidValue("SMB3 transform session id mismatch") }
         let ciphertext = Array(packet.dropFirst(SMB3TransformHeader.encodedSize))
-        guard ciphertext.count == Int(header.originalMessageSize) else {
+        guard UInt64(ciphertext.count) == UInt64(header.originalMessageSize) else {
             throw SMBCodecError.invalidValue("SMB3 transform original message size mismatch")
         }
         let perfStart = ContinuousClock.now
@@ -5779,7 +5779,7 @@ actor SMBSession {
             negotiatedLimit: maxWriteSize,
             transformOverhead: transformOverhead,
         )
-        return Int(await creditCappedLength(UInt32(min(negotiated, Int(UInt32.max)))))
+        return Int(clamping: await creditCappedLength(UInt32(min(negotiated, Int(clamping: UInt32.max)))))
     }
 
     private func creditAwareReadChunkSize() async -> Int {
@@ -5789,7 +5789,7 @@ actor SMBSession {
             negotiatedLimit: maxReadSize,
             transformOverhead: transformOverhead,
         )
-        return Int(await creditCappedLength(UInt32(min(negotiated, Int(UInt32.max)))))
+        return Int(clamping: await creditCappedLength(UInt32(min(negotiated, Int(clamping: UInt32.max)))))
     }
 
     private func creditCappedLength(_ requested: UInt32) async -> UInt32 {

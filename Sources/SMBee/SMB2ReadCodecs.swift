@@ -707,10 +707,12 @@ enum SMB2Read {
         guard try reader.readUInt16LE() == 17 else {
             throw SMBCodecError.invalidValue("invalid READ response structure size")
         }
-        let dataOffset = Int(try reader.readUInt8())
+        let rawDataOffset = UInt64(try reader.readUInt8())
         try reader.skip(count: 1)
-        let dataLength = Int(try reader.readUInt32LE())
-        guard dataOffset + dataLength <= bytes.count else { throw SMBCodecError.truncated }
+        let rawDataLength = UInt64(try reader.readUInt32LE())
+        guard rawDataOffset + rawDataLength <= UInt64(bytes.count) else { throw SMBCodecError.truncated }
+        let dataOffset = Int(rawDataOffset)
+        let dataLength = Int(rawDataLength)
         return Array(bytes[dataOffset..<dataOffset + dataLength])
     }
 }
@@ -1031,7 +1033,7 @@ enum SMB2CopyChunk {
         guard !chunks.isEmpty else {
             throw SMBCodecError.invalidValue("SMB copychunk request must contain at least one chunk")
         }
-        guard chunks.count <= Int(UInt32.max) else {
+        guard UInt64(chunks.count) <= UInt64(UInt32.max) else {
             throw SMBCodecError.invalidValue("SMB copychunk chunk count overflow")
         }
 

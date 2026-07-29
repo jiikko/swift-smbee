@@ -108,6 +108,10 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         return bytes
     }
 
+    /// Permanently closes this transport. This instance is one-shot: `connect()` after
+    /// `close()` always throws `connectionClosed`. Reopening the terminal state could let
+    /// queued sends from the old connection reach a new socket, so reconnect creates a new
+    /// transport instance instead (as SMBee's internal reconnect path already does).
     public func close() {
         let descriptors = transitionToTerminal(.closed)
         closeDescriptors(descriptors)
@@ -118,8 +122,8 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     // その syscall は起きない (POSIX 上、close は他スレッドの blocking I/O を
     // 中断する保証がない)。shutdown(SHUT_RDWR) は blocked recv/send を確実に
     // エラー復帰させるため、cancel 経路では close ではなく shutdown で起こしてから
-    // fd を close する。fd は奪わず残すので、blocked syscall は自分が握る fd 値から
-    // 正常にエラー復帰できる (その後 close() が実際の解放を行う)。
+    // fd を close する。実装は terminal 状態へ遷移して fd を state から外し、その後
+    // closeDescriptors が shutdown → close を行う。
     private func interruptBlockingIO() {
         close()
     }

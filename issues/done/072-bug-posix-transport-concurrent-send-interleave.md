@@ -48,24 +48,30 @@ obaket `macOS/issues/437` 観測 A / `issues/069`（巻き添え範囲の議論�
 複数 op が同時に connection-lost → controller の retry で自己回復（観測どおり）。
 並列度が低いと交錯確率が下がるため「たまにしか起きない」観測とも整合する。
 
-## 対応方針（未着手）
+## 対応方針（実装済み）
 
 - **修正の本命: transport 層で「1 論理 frame = 1 atomic 送信」を保証する**。候補:
   (a) `POSIXSocketTransport` に送信 lock を持たせ、`send` 全体（segments ループ + partial write）を
   直列化する（最小・確実）。
   (b) `SMBSession` 側に send queue を置く（transport 実装非依存になるが変更が大きい）。
+  実装では (a) の送信 executor により、1 論理 frame の全 segments と partial write を直列化した。
 - 修正の要件（codex 反証レビューで追加）:
   - `send(bytes:)` と `send(segments:)` を**同じ primitive** で直列化する（lock 範囲は全 segments +
     全 partial-write ループ）
+    実装で満たした。
   - frame を一部でも送った後の失敗 / cancel は、その接続を再利用せず必ず poison / close する
+    実装で満たした。
   - `SMBTransport` の契約に「同時 send 可・各 send の byte 列は交錯しない」を明記する
+    実装で満たした。
   - `writev` 化だけでは partial write が残るため lock の代替にならない
+    実装で満たした。EINTR も送信実装で扱う。
 - 検証: ストレス E2E だけでは弱い。**fake blocking writer で A/B の send を意図的に停止・再開し、
   交錯を決定論的に再現する unit**（修正前に落ち、修正後は frameA+frameB / frameB+frameA のいずれかに
   必ずなる）を足す。加えて修正後に `SMBeeWireStressE2ETests` の同条件で connection-lost が
   消える（または大幅減する）ことを確認し、消えたら観測 A の根因としての因果も閉じる。
 - 併せて「既定 transport を macOS では NW にすべきか」は別判断（POSIX を直せば必須ではない。
   Linux は POSIX しか無いのでどのみち修正は必要）。
+  fake writer の unit と Samba stress E2E を追加・実行し、交錯しないことを確認した（実装済み）。
 
 ## 再現手順
 

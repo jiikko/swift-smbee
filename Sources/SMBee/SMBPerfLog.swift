@@ -39,10 +39,12 @@ enum SMBPerfLog {
     static func line(_ message: @autoclosure () -> String) {
         #if DEBUG
         lock.lock()
-        defer { lock.unlock() }
-        guard enabledOverrideStorage ?? isEnabled else { return }
+        let enabled = enabledOverrideStorage ?? isEnabled
+        let testSink = testSinkStorage
+        lock.unlock()
+        guard enabled else { return }
         let value = message()
-        if let testSink = testSinkStorage {
+        if let testSink {
             testSink(value)
         } else {
             FileHandle.standardError.write(Data("[smbee-perf] \(value)\n".utf8))

@@ -3,7 +3,7 @@
 状態: **open（既存問題。issue 072 の敵対的レビュー round 2 で言語化。072 の修正は退行させていない）**
 起票: 2026-07-29
 関連: `Sources/SMBee/POSIXSocketTransport.swift`（terminal 遷移の close / `interruptBlockingIO`） /
-`issues/072`（送信直列化。この issue はそのレビュー副産物）
+`issues/done/072-bug-posix-transport-concurrent-send-interleave.md`（送信直列化。この issue はそのレビュー副産物）
 
 ## 問題
 

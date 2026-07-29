@@ -1687,7 +1687,7 @@ public enum SMBClient {
                 let result = try await operation(session, treeId)
                 // Graceful teardown on success (best-effort TREE_DISCONNECT → LOGOFF → TCP close),
                 // matching listShares / the persistent SMBClientSession.close() path. Error paths
-                // below stay bare closeTransport() since the session is already suspect.
+                // below close the already-suspect session and retain the failure as a diagnostic.
                 await session.disconnect(treeId: treeId)
                 return result
             } catch {
@@ -3814,6 +3814,11 @@ private struct SMBPendingResponse {
 actor SMBSession {
     private static let defaultCleanupTimeout: Duration = .seconds(5)
 
+    private static func diagnosticError(_ error: Error) -> String {
+        let description = String(describing: error).replacingOccurrences(of: "\n", with: " ")
+        return "\(String(reflecting: type(of: error))): \(description)"
+    }
+
     private static func fileIdPrefix(_ fileId: [UInt8]) -> String {
         fileId.prefix(4).map { String(format: "%02x", $0) }.joined()
     }
@@ -5002,15 +5007,17 @@ actor SMBSession {
     func bestEffortClose(treeId: UInt32, fileId: [UInt8]) async {
         let timeout = cleanupTimeout
         let task = Task.detached { [self] in
-            let started = ContinuousClock.now
+            let started = SMBPerfLog.effectiveIsEnabled ? ContinuousClock.now : nil
             do {
                 try await SMBOperationDeadline.run(timeout: timeout) {
                     try await self.close(treeId: treeId, fileId: fileId)
                 }
             } catch {
-                let elapsed = SMBPerfLog.milliseconds(ContinuousClock.now - started)
-                let timedOut = error is SMBTransportError && (error as? SMBTransportError) == .timedOut
-                SMBPerfLog.line("[wire] cleanup_close_failed file=\(Self.fileIdPrefix(fileId)) elapsed_ms=\(elapsed) error=\(String(reflecting: type(of: error))) timeout=\(timedOut)")
+                if let started {
+                    let elapsed = SMBPerfLog.milliseconds(ContinuousClock.now - started)
+                    let timedOut = error is SMBTransportError && (error as? SMBTransportError) == .timedOut
+                    SMBPerfLog.line("[wire] cleanup_close_failed file=\(Self.fileIdPrefix(fileId)) elapsed_ms=\(elapsed) error=\(Self.diagnosticError(error)) timeout=\(timedOut)")
+                }
                 await self.closeTransport(cause: "best_effort_close", diagnosticError: error)
             }
         }
@@ -5096,7 +5103,7 @@ actor SMBSession {
     func closeTransport(cause: String = "unspecified", diagnosticError: Error? = nil) {
         guard !transportClosed else { return }
         if SMBPerfLog.effectiveIsEnabled {
-            let diagnostic = diagnosticError.map { "\(String(reflecting: type(of: $0))): \($0)" } ?? "none"
+            let diagnostic = diagnosticError.map(Self.diagnosticError) ?? "none"
             SMBPerfLog.line("[wire] close_transport cause=\(cause) error=\(diagnostic)")
         }
         transportClosed = true
@@ -5269,7 +5276,7 @@ actor SMBSession {
                         await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
                     }
                 } catch {
-                    SMBPerfLog.line("[wire] send_failed message_id=\(requestHeader.messageId) error=\(error)")
+                    SMBPerfLog.line("[wire] send_failed message_id=\(requestHeader.messageId) error=\(Self.diagnosticError(error))")
                     if error is CancellationError {
                         self.failPendingResponse(messageId: requestHeader.messageId, error: error)
                     } else {
@@ -5622,7 +5629,7 @@ actor SMBSession {
         let failure = wireFailure ?? error
         wireFailure = failure
         if firstFault {
-            SMBPerfLog.line("[wire] first_fault type=\(String(reflecting: type(of: error))) description=\(error)")
+            SMBPerfLog.line("[wire] first_fault error=\(Self.diagnosticError(error))")
         }
         failAllPendingResponses(error: failure)
     }

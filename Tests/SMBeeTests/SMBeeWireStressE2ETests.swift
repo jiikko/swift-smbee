@@ -57,8 +57,6 @@ final class SMBeeWireStressE2ETests: XCTestCase {
                     }
                 }
             }
-            try await session.delete(path: path)
-            await session.close()
         } catch {
             try? await session.delete(path: path)
             await session.close()
@@ -66,8 +64,15 @@ final class SMBeeWireStressE2ETests: XCTestCase {
         }
 
         let summary = await counters.summary
-        print("[wire-stress] operations-before-fault=\(summary.operationsBeforeFault) connection-loss=\(summary.connectionLossOccurred) waves-aborted-after-fault=\(summary.wavesAbortedAfterFault)")
+        print("[wire-stress] operations-before-fault=\(summary.operationsBeforeFault) connection-loss=\(summary.connectionLossOccurred) connection-losses=\(summary.connectionLosses) waves-aborted-after-fault=\(summary.wavesAbortedAfterFault)")
         XCTAssertTrue(summary.unexpected.isEmpty, summary.unexpected.joined(separator: "; "))
+        if environment["SMBEE_STRESS_FAIL_ON_CONNECTION_LOSS"] == "1" {
+            if summary.connectionLosses > 0 {
+                XCTFail("wire stress detected \(summary.connectionLosses) connection-loss operation(s)")
+            }
+        }
+        try? await session.delete(path: path)
+        await session.close()
     }
 
     func testCreditFIFOHeadOfLineBlockingMeasurement() async throws {
@@ -581,7 +586,19 @@ private actor StressCounters {
         wavesAbortedAfterFault += count
     }
 
-    var summary: (operationsBeforeFault: Int, connectionLossOccurred: Bool, wavesAbortedAfterFault: Int, unexpected: [String]) {
-        (connectionLossOccurred ? operationsBeforeFault : operations, connectionLossOccurred, wavesAbortedAfterFault, unexpected)
+    var summary: (
+        operationsBeforeFault: Int,
+        connectionLossOccurred: Bool,
+        connectionLosses: Int,
+        wavesAbortedAfterFault: Int,
+        unexpected: [String]
+    ) {
+        (
+            connectionLossOccurred ? operationsBeforeFault : operations,
+            connectionLossOccurred,
+            connectionLosses,
+            wavesAbortedAfterFault,
+            unexpected
+        )
     }
 }

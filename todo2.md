@@ -168,7 +168,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - `SMB2CreditWindow` actor と messageId keyed demux は実装済み。
 - multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグは修正済み。
 - local read/write chunk cap は 1 MiB へ引き上げ済み。
-- PR/push には 4GiB 境界 range-read E2E（境界前後の点読み + `UInt32.max − 64KiB` から 2MiB の境界横断 streaming read）がある。週次の 4GiB 全読 workflow は Linux pure-Swift CCM の throughput（issue 075）で CI 完走不可のため廃止した（P0-0 参照）。
+- PR/push には 4GiB 境界 range-read E2E（境界前後の点読み + `UInt32.max − 64KiB` から 2MiB の境界横断 streaming read）がある。週次の 4GiB 全読 workflow は Linux pure-Swift CCM の throughput（issue 075、外挿約 3.8 時間）が現実的な job 時間に収まらないため廃止した（P0-0 参照）。
 - SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
 
 継続検証:

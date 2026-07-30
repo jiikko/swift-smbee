@@ -24,10 +24,11 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Start Samba
+        # The 4GiB+ sparse fixture is created inside the container by
+        # test/e2e/start-samba-ci.sh (single source). A separate `docker exec truncate`
+        # step here raced the container's own init (mkdir -p not done yet) and failed
+        # with ENOENT for three consecutive scheduled runs (2026-07-12/19/26).
         run: bash test/e2e/start-samba-ci.sh
-
-      - name: Create sparse 4GiB+ fixture
-        run: docker exec "${SAMBA_CONTAINER}" truncate -s "$((4 * 1024 * 1024 * 1024 + 1))" /srv/smbee/public/large-4gib-plus.bin
 
       - name: Run large read-stream test
         env:

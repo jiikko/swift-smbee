@@ -61,10 +61,12 @@ syscall bundle injection が必要になるため今回は見送った。候補 
 強制しているが、Darwin / Linux 双方で blocking connect / poll を停止させ、terminal 遷移後の
 shutdown 1 / close 0 → syscall 復帰 → close 1 と deferred `fcntl(F_SETFL)` を固定する integration test は残る。
 
-## 残リスク
+## 残課題（未解決経路 1 件 + 残リスク）
 
-- `timeout == nil` の blocking connect は、別 thread からの shutdown でも復帰しない可能性がある。
-  SMBee 内部と Obaket は timeout を渡すが、public API の nil timeout では残る。
+- **[未解決経路・格上げ済み]** `timeout == nil` の blocking connect は、別 thread からの shutdown でも
+  復帰しない可能性がある。当初「残リスク」としたが、**`POSIXSocketTransport()` の public initializer は
+  timeout の既定が nil** なので、既定 API の通常経路であって edge case ではない（セクション別 codex
+  レビュー 2026-07-29 で格上げ）。SMBee 内部と Obaket は timeout を渡すため実害は出ていない。
   **具体的な発火列**（敵対レビューで構築）: C1 が candidate を leaseCount=1 で install → C1 が
   `connect()` 内で停止 → C2 が terminal 遷移で retired=true → C2 は shutdown 試行完了を記録するが
   leaseCount=1 のため close claim 不成立 → C1 が復帰せず `finishConnectingCandidate` も走らない

@@ -6,9 +6,9 @@
 
 ## 監査時点
 
-- 最終更新: 2026-07-26
+- 最終更新: 2026-07-30
 - 対象 branch: `master`
-- 対象 commit: `af4f939944d030f120de949119848d7d1701cb97`
+- 対象 commit: `096fc4b22813a1a6e89d862d88457b449b0e1bcb`
 - 正本仕様:
   - MS-SMB2: SMB2/3 command、dialect、signing/encryption、credit、durable handle、CHANGE_NOTIFY
   - MS-FSCC: file info / filesystem info / FSCTL / reparse point / security descriptor
@@ -29,15 +29,17 @@
 
 | 優先度 | 項目 | 現在の残作業 |
 |---|---|---|
-| P0 | scheduled Large-file E2E | fixture path回帰を修正し、replacement runをgreenにする。 |
+| P0 | scheduled Large-file E2E | fixture path回帰を修正し、replacement runをgreenにする（2026-07-12/19/26 と 3 週連続 red のまま）。 |
 | P0 | compatibility matrix | Windows SMB Server、NAS、macOS SMBXのrepresentative smokeを記録する。 |
 | P1 | offload copychunk | offload-capable serverで実経路を確認する。 |
+| P1 | prefix read の往復削減 続き（issue 067 B/C/D） | B: CREATE+READ+CLOSE の compound（3→1 往復の本命）、C: READ パイプライン、D: 同時 open handle 上限。実測レイテンシと consumer 実害を見てから着手判断。 |
 | P1 | Kerberos / GSS | 0.1では非対応。将来実装する場合はauth backend、SPNEGO、session key、実サーバ検証が必要。 |
 | P1 | durable / persistent handle | 現在は非対応。実装する場合は切断・復旧state machineと実サーバE2Eが必要。 |
+| P2 | credit FIFO HoL の再計測（issue 068 reopen） | 実 waiter ベース診断（2026-07-30 修正済み）で、charge の大きい request を先頭に置き後続へ小 READ を複数投入する条件で再計測する。 |
+| P2 | fd close race の残課題（issue 073） | `timeout==nil` の blocking connect が別 thread の shutdown で復帰しない未解決経路（public initializer の既定経路）。nonblocking connect + poll 反復への作り替えが必要。 |
 | P2 | 実サーバ固有機能 | Unicode、share/volume、ACL/SID、reparse、sparse、deadline、keepalive、lockをmatrixで確認する。 |
+| P2 | WRITE 競合時の prefix read 遅延（issue 068 副産物） | 大 WRITE と重なると prefix read p50 が 5-6 倍（credit ではない。送信直列化 or 帯域競合、未切り分け）。wire イベントに request 側 timestamp が無く送信待ちとサーバ応答待ちを分離できない。 |
 | P3 | optional protocol surface | compression、multichannel、QUIC、RDMA、SMB1、POSIX extensions等は明示的非対応を維持する。 |
-
-上記以外のP1/P2項目は、原則として実装済みであり、残件はcompatibility matrixまたは継続的な性能回帰監視である。
 
 ## 既にカバーしている範囲
 
@@ -480,6 +482,11 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - operation timeout: CLI と `SMBee.read(...)`、upload、recursive download/upload/copy/delete に実装済み。残件は Windows / NAS の cancellation 実測。
 - durable handle: 現時点では unsupported として明記する。
 - shared-session READ cancel: 送信中 task を cancel せず response を drain する修正済み。blocking-send unit / Samba E2E / 実 NAS 確認あり。Windows / 他 NAS の互換確認は残る。
+- prefix read (issue 067 A): 実装済み。`SMBClientSession.readPrefix` / `withPrefixReadStream`。QUERY_INFO を出さず 3 コマンド。static facade 未公開。B/C/D は未着手。
+- POSIX transport 並列 send: issue 072 で送信 executor による frame 直列化を実装済み（並列 send の byte 交錯がスクロール中セッション断の根因だった）。既定 transport は全プラットフォームで POSIX。
+- fd close race (issue 073): descriptor lease で physical close を drain 後に遅延、実装済み。`timeout==nil` connect 未復帰の未解決経路が残る。
+- wire 診断 (issue 069/074): `SMBEE_PERF=1` で session ID 付き `[wire]` イベント。credit 待ちは実 waiter ベース (2026-07-30 修正)。
+- credit FIFO HoL (issue 068): 一度 close したが計測不備で撤回・reopen。実 waiter 診断で再計測が必要。
 
 ## README に書くべき limitations
 

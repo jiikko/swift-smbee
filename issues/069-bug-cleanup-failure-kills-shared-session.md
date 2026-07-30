@@ -42,8 +42,12 @@
 
 「CLOSE 無応答 → closeTransport → 並行 operation 全滅」を fixture（応答を返さない
 InMemoryTransport）で再現する unit を書き、現挙動を固定してから対応方針を決める。
-✅ unit で固定済み (2026-07-29、`testBestEffortCloseTimeoutClosesTransportAndFailsConcurrentPendingOperations`)。
-072 で追加した send failure 経路のテストとは別に、CLOSE 無応答から並行 operation 全滅までを再現する。
+⚠️ 部分的に固定済み (2026-07-29、`testBestEffortCloseTimeoutClosesTransportAndFailsConcurrentPendingOperations`)。
+固定できているのは「CLOSE timeout → closeTransport → **人工的に park した pending response 2 件**が
+connectionClosed で解放される」経路まで。**実際の list/read/write operation と credit waiter の巻き添えは
+未検証**（fixture は全受信を止める blackhole で、「CLOSE だけ選択的に無応答」なサーバとも乖離がある —
+セクション別 codex レビュー 2026-07-29 の指摘）。invalidation 範囲を再検討する際は、実 wire operation を
+pending 化した形での再現をこの上に足すこと。
 
 ## 関連
 

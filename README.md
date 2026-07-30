@@ -30,7 +30,7 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 ## ドキュメント
 
 - [docs/smb-protocol.md](docs/smb-protocol.md) — 実装する SMB wire 仕様と一次ソース（MS-SMB2 / MS-NLMP / NIST 等）
-- [docs/architecture.md](docs/architecture.md) — 内部構成と transport 抽象（macOS=NWConnection / Linux=POSIX|NIO）
+- [docs/architecture.md](docs/architecture.md) — 内部構成と transport 抽象（既定は全プラットフォームで POSIX socket。NWConnection は明示 injection の opt-in）
 - [docs/testing.md](docs/testing.md) — テスト戦略（unit vector / コンテナ Samba で E2E: ローカル=Apple container・CI=Docker / 実サーバ smoke）
 - [docs/coverage.md](docs/coverage.md) — SMBee が実装済み・未検証・未対応の SMB surface とテスト状況
 - [docs/api-stability.md](docs/api-stability.md) — 0.1 public API freeze、error / concurrency / credential migration 方針
@@ -50,6 +50,8 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 - single-file download/upload の byte-level resume と `--verify size|hash` (SHA-256 read-back) は対応済み。sparse file は `smbcli sparse` (SET_SPARSE / hole punch / allocated-range query) と `stat`/JSON の `allocationSize` に対応 (FS 依存)。通常の get/put/copy は file size と byte content を保証する logical-content policy であり、転送時の hole topology preservation は未対応。
 - keepalive は authenticated ECHO の失敗時に session を invalid にして transport を閉じるだけで、自動 reconnect はしない。通知監視の再接続は `withChangeNotifications(autoReconnect:)` / `smbcli watch --reconnect` の責務とする。
 - macOS の転送は data fork only。resource fork、Finder metadata、extended attribute、SMB alternate data stream は保存・列挙せず、Finder 相当コピーを保証しない。
+- サムネイル生成などの「多数ファイルの先頭だけ読む」用途向けに `SMBClientSession.readPrefix` / `withPrefixReadStream` がある（QUERY_INFO を発行せず CREATE→READ→CLOSE の 3 コマンド。EOF / short success は正常終了として取れた分だけ返す best-effort。offset 0 専用）。static facade には未公開で、persistent session からのみ呼べる。
+- `SMBEE_PERF=1` で wire 診断（`[wire]` prefix・session ID 付きの first fault / victim / credit 待ち等の構造化イベント）を stderr に出せる。opt-in の開発用診断で常設ログではない。
 - `SMBee.read(...)`、単一/再帰 upload、recursive download/copy/delete は credential / credential-provider の両方で `operationTimeout` による操作全体の deadline を指定できる。provider 版では、既存の非escaping呼び出しとのソース互換性を保つため `operationTimeout` を明示した overload を使う。`timeout` は socket I/O、`perFileTimeout` は再帰転送の各ファイルに適用され、deadline 超過は `SMBTransportError.timedOut` になる。deadline はクライアント側taskへcooperativeなキャンセルを要求し、そのtaskの終了を待ってから返るため、実際のreturnは指定時間を超える場合がある。hard wall-clock deadlineではなく、既に完了したlocal/remoteの変更もrollbackしない。mutating operationを再試行する前にdestination stateを確認すること。
 - SMB1 / NetBIOS port 139 / printer share / SMB Direct(RDMA) / SMB over QUIC / multichannel / compression は未対応。
 

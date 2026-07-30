@@ -17,25 +17,36 @@ protocol SMBTransport            // TCP 445 上の双方向バイトストリー
         ▲                         ▲
         │                         │
  NWConnectionTransport      POSIXSocketTransport
- (macOS 本番)               (Linux CI / E2E / cross-platform)
+ (opt-in / 明示 injection)   (既定。macOS 本番 / Linux CI / E2E 共通)
 ```
 
 ### なぜ抽象化するか
 
-- **本番 (macOS app)** は `Network.framework` の `NWConnection` を使いたい（省電力・接続管理・
-  Apple 統合）。
+- **既定の transport は全プラットフォームで `POSIXSocketTransport`**
+  （`SMBClient.resolvedTransportFactory` が OS 分岐なしで返す）。macOS の本番 consumer
+  （obaket）も `makeTransport` を渡さないため POSIX を使っている（2026-07-29 の issue 072
+  調査で確定した実態。かつて本ドキュメントは「macOS 本番は NWConnection」と書いていたが、
+  それは実装されなかった構想であり実態と乖離していたため訂正した）。
 - **CI の E2E** は **Linux runner + Docker の Samba** で回す（無料・再現可能）。Linux では
-  `Network.framework` が無いため、実装済みの **POSIX socket transport** を使う。
-- 両者を `SMBTransport` protocol の差し替えで吸収する＝ **best of both**。SMB の本体ロジックは
-  一切プラットフォーム分岐を持たない。
+  `Network.framework` が無いため POSIX 一択。
+- 両者を `SMBTransport` protocol の差し替えで吸収する。SMB の本体ロジックは
+  一切プラットフォーム分岐を持たない。`NWConnection` へ切り替えたい場合は
+  `makeTransport` で明示的に注入する（省電力・接続管理を優先したい場合の opt-in）。
 
 ### 実装方針
 
 - `SMBTransport` は SMB に固有の概念を持たない（純粋に「接続して send/receive」だけ）。
   direct-TCP の **4 byte length framing** は `DirectTCPFraming` としてtransportの外側に実装済み。
-- `NWConnectionTransport`: macOS。`#if canImport(Network)` でガード。
-- `POSIXSocketTransport`: Linux + macOS 両対応（テスト・E2E・CI用）。SwiftNIO依存は採用していない。
+  protocol 契約として「同時 send 可・各 send の byte 列は非交錯・同時 send 間の順序は未規定」を
+  明文化してある（issue 072）。
+- `NWConnectionTransport`: `#if canImport(Network)` でガード。既定では使われない（明示 injection）。
+- `POSIXSocketTransport`: Linux + macOS 両対応の**既定実装**。SwiftNIO依存は採用していない。
+  送信は serial executor で frame 単位に直列化し（issue 072）、fd の physical close は
+  descriptor lease が drain した後に一度だけ行う（issue 073）。`close()` は「terminal 化と
+  blocking I/O interrupt の開始」であり、同一 instance の再接続は不可（one-shot）。
 - テスト（unit）は transport を **in-memory fake / loopback** に差し替えて framing を検証できる。
+  POSIX の writer / reader / lifecycle hook は internal injection seam を持ち、送信交錯・
+  lease・poison の決定論的テストに使う。
 
 ### プラットフォーム条件
 

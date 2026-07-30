@@ -36,8 +36,12 @@ docker run -d --name "${SAMBA_CONTAINER}" -p "${SMBEE_E2E_PORT}:445" \
     ln -s "msdfs:127.0.0.1\\dfsroot\\public-link" /srv/smbee/dfsroot/chain-link
     ln -s "msdfs:127.0.0.1\\dfsroot\\loop-b" /srv/smbee/dfsroot/loop-a
     ln -s "msdfs:127.0.0.1\\dfsroot\\loop-a" /srv/smbee/dfsroot/loop-b
-    # Keep the boundary-range smoke fixture sparse; SMBee never uploads 4GiB.
-    truncate -s 4295032833 /srv/smbee/public/large-4gib-plus.bin
+    # Sparse size = (UInt32.max - 64KiB) + 2MiB + 1 byte of end headroom.
+    truncate -s 4296998912 /srv/smbee/public/large-4gib-plus.bin
+    # Non-zero sentinel after 4GiB detects READ offset wrap to UInt32.
+    dd if=/dev/zero bs=4096 count=1 iflag=fullblock status=none | LC_ALL=C tr "\\0" "\\245" | dd of=/srv/smbee/public/large-4gib-plus.bin bs=4096 seek=1048588 count=1 conv=notrunc iflag=fullblock status=none
+    # 2 個目以降の READ offset の wrap 検出用（第 1 sentinel は最初の chunk 内に収まるため）。
+    dd if=/dev/zero bs=4096 count=1 iflag=fullblock status=none | LC_ALL=C tr "\\0" "\\132" | dd of=/srv/smbee/public/large-4gib-plus.bin bs=4096 seek=1048817 count=1 conv=notrunc iflag=fullblock status=none
     chown -R smbee:smbee /srv/smbee
     smbd --version
     testparm -s

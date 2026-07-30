@@ -29,13 +29,13 @@
 
 | 優先度 | 項目 | 現在の残作業 |
 |---|---|---|
-| P0 | scheduled Large-file E2E | fixture path回帰を修正し、replacement runをgreenにする（2026-07-12/19/26 と 3 週連続 red のまま）。 |
 | P0 | compatibility matrix | Windows SMB Server、NAS、macOS SMBXのrepresentative smokeを記録する。 |
 | P1 | offload copychunk | offload-capable serverで実経路を確認する。 |
 | P1 | prefix read の往復削減 続き（issue 067 B/C/D） | B: CREATE+READ+CLOSE の compound（3→1 往復の本命）、C: READ パイプライン、D: 同時 open handle 上限。実測レイテンシと consumer 実害を見てから着手判断。 |
 | P1 | Kerberos / GSS | 0.1では非対応。将来実装する場合はauth backend、SPNEGO、session key、実サーバ検証が必要。 |
 | P1 | durable / persistent handle | 現在は非対応。実装する場合は切断・復旧state machineと実サーバE2Eが必要。 |
 | P2 | credit FIFO HoL の再計測（issue 068 reopen） | 実 waiter ベース診断（2026-07-30 修正済み）で、charge の大きい request を先頭に置き後続へ小 READ を複数投入する条件で再計測する。 |
+| P2 | Linux AES-CCM throughput（issue 075） | pure-Swift CCM fallback が実測 ~0.3 MiB/s（Linux runner）で 4GiB 全読 E2E が現実的な job 時間に収まらない。高速化方式の選定後に scheduled 全読 E2E の復活を判断する。 |
 | P2 | fd close race の残課題（issue 073） | `timeout==nil` の blocking connect が別 thread の shutdown で復帰しない未解決経路（public initializer の既定経路）。nonblocking connect + poll 反復への作り替えが必要。 |
 | P2 | 実サーバ固有機能 | Unicode、share/volume、ACL/SID、reparse、sparse、deadline、keepalive、lockをmatrixで確認する。 |
 | P2 | WRITE 競合時の prefix read 遅延（issue 068 副産物） | 大 WRITE と重なると prefix read p50 が 5-6 倍（credit ではない。送信直列化 or 帯域競合、未切り分け）。wire イベントに request 側 timestamp が無く送信待ちとサーバ応答待ちを分離できない。 |
@@ -76,27 +76,24 @@
 
 ## P0: 0.1.0 前の release blocker
 
-2026-07-26 時点で、repo とローカル Apple Container の Samba だけで完結する主要な 0.1 機能実装は完了している。ただし、scheduled Large-file E2E の fixture 作成回帰と、実 Windows / NAS / macOS SMBX または offload-capable server を必要とする互換検証が残る。Windows 対応は pending とする。`explicitly-unsupported` の項目は 0.1 の実装残件には数えない。
+2026-07-30 時点で、repo とローカル Apple Container の Samba だけで完結する主要な 0.1 機能実装は完了している。残るのは実 Windows / NAS / macOS SMBX または offload-capable server を必要とする互換検証。Windows 対応は pending とする。`explicitly-unsupported` の項目は 0.1 の実装残件には数えない。
 
-### P0-0. scheduled Large-file E2E を green に戻す
+### P0-0. scheduled Large-file E2E（クローズ: workflow 廃止・全読検証は issue 075 へ deferred）
 
-状態: `missing`（CI fixture regression）
+状態: `closed`（2026-07-30。境界横断検証のみ PR/push E2E に置換。offset 0 からの通読・
+累積 byte count の UInt32.max 超過・実 EOF 到達の検証は CI から外れ、issue 075 で追跡）
 
-現状:
-
-- commit `af4f939944d030f120de949119848d7d1701cb97` の push `Test` / `E2E` / `Performance` は green。
-- 2026-07-26 の scheduled `Large-file E2E` run
-  [30189847461](https://github.com/jiikko/swift-smbee/actions/runs/30189847461) は red。
-- `Create sparse 4GiB+ fixture` が `/srv/smbee/public/large-4gib-plus.bin: No such file or directory` で失敗し、read-stream test 自体は実行されていない。
-
-やること:
-
-- `test/e2e/start-samba-ci.sh` が実際に作るshare pathとworkflowのfixture pathを一致させる。
-- workflow dispatchまたは次回scheduled runで、4GiB+ read-stream testがskipされずgreenになることを確認する。
-
-完了条件:
-
-- replacement `Large-file E2E` runがfixture作成と`testReadStreamCountsFileLargerThan4GiB`を完走してgreenになる。
+- fixture 作成回帰は commit `febd147` で修正したが、その後の run
+  [30509016532](https://github.com/jiikko/swift-smbee/actions/runs/30509016532) で
+  Linux pure-Swift AES-CCM fallback の実効 throughput が約 0.30 MiB/s（27 分で約 487 MiB）と
+  実測され、4GiB 全読は外挿で約 3.8 時間。30 分の job timeout に収まらず、週次 4 時間級の
+  runner 占有は scheduled E2E として非現実的と判断した。
+- 対応: scheduled `Large-file E2E` workflow を廃止し、PR/push E2E の
+  `testReadRangesAround4GiBBoundary` に `UInt32.max − 64KiB` から 2MiB の境界横断
+  streaming read を追加して置換した。全読テスト
+  `testReadStreamCountsFileLargerThan4GiB` は `SMBEE_E2E_LARGE=1` gate で温存。
+- CCM throughput の高速化と scheduled 全読 E2E の復活判断は
+  `issues/075-perf-linux-aes-ccm-pure-swift-throughput.md` で追跡する。
 
 ### P0-1. 互換 matrix を実サーバで埋める
 
@@ -171,7 +168,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - `SMB2CreditWindow` actor と messageId keyed demux は実装済み。
 - multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグは修正済み。
 - local read/write chunk cap は 1 MiB へ引き上げ済み。
-- PR/push には 4GiB 境界 range-read E2E がある。週次 `Large-file E2E` workflow は sparse 4GiB+ fixture でread-streamとEOFを検証する設計だが、2026-07-26 runはfixture path不整合でtest実行前に失敗しており、P0-0で追跡する。
+- PR/push には 4GiB 境界 range-read E2E（境界前後の点読み + `UInt32.max − 64KiB` から 2MiB の境界横断 streaming read）がある。週次の 4GiB 全読 workflow は Linux pure-Swift CCM の throughput（issue 075）で CI 完走不可のため廃止した（P0-0 参照）。
 - SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
 
 継続検証:
@@ -505,11 +502,10 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 
 ## 推奨実装順
 
-1. P0-0 scheduled Large-file E2E のfixture regressionを直し、replacement runをgreenにする。
-2. P0-1 compatibility matrix の実サーバ結果埋め。Windows は環境待ち pending、NAS / macOS SMBX は継続実測。
-3. offload-capable server の copychunk と各実サーバ固有機能の smoke。
-4. P1-4 Kerberos / GSS。0.1 では unsupported を明示し、実ユーザー要件と AD / GSS 検証環境が揃った段階で着手。
-5. P3 optional features は roadmap として維持し、実装までは unsupported を明記する。
+1. P0-1 compatibility matrix の実サーバ結果埋め。Windows は環境待ち pending、NAS / macOS SMBX は継続実測。
+2. offload-capable server の copychunk と各実サーバ固有機能の smoke。
+3. P1-4 Kerberos / GSS。0.1 では unsupported を明示し、実ユーザー要件と AD / GSS 検証環境が揃った段階で着手。
+4. P3 optional features は roadmap として維持し、実装までは unsupported を明記する。
 
 ## 完了の定義
 
@@ -518,7 +514,7 @@ SMBee を Linux/macOS smbclient として `0.1.0` にする最低条件:
 - Samba / macOS SMBX / Windows SMB Server の smoke matrix がある。
 - README に unsupported features が明記されている。
 - 3.0.2 encrypted と 3.1.1 signing/encrypted の authenticated path が CI または scheduled compat で継続検証される。
-- scheduled 4GiB+ read-stream E2E がskipされずgreenである。
+- PR/push の 4GiB 境界横断 range-read E2E が skip されず green である（4GiB 全読の自動化は issue 075 の解決後に判断する deferred 項目）。
 - `docs/coverage.md` で spec feature と実装・テスト・未実装を辿れる。
 - 未対応項目は runtime error / CLI error / README limitation のどれかで明示され、暗黙に失敗しない。
 

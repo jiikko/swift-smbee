@@ -600,6 +600,11 @@ final class SMBeeE2ETests: XCTestCase {
         }
     }
 
+    /// This full-file test is intentionally not run in CI. The Linux pure-Swift CCM
+    /// fallback measured ~0.3 MiB/s on ubuntu-latest (run 30509016532), so reading 4 GiB
+    /// extrapolates to ~3.8 hours — impractical for a scheduled job (issue 075). PR/push
+    /// E2E covers the boundary crossing with `testReadRangesAround4GiBBoundary`;
+    /// set `SMBEE_E2E_LARGE=1` for an explicit full read.
     func testReadStreamCountsFileLargerThan4GiB() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["SMBEE_E2E"] == "1" else {
@@ -621,9 +626,11 @@ final class SMBeeE2ETests: XCTestCase {
         let path = environment["SMBEE_E2E_LARGE_PATH"] ?? "large-4gib-plus.bin"
         let credential = SMBCredential(username: username, password: password)
 
-        // Prepare this file manually; do not store it in git or require it in CI.
-        // With test/e2e/start-local-samba.sh:
-        //   docker exec smbee-samba-local truncate -s 4294967297 /srv/smbee/public/large-4gib-plus.bin
+        // The sparse fixture (4296998912 bytes) is created automatically by
+        // bin/e2e/container-samba.sh and test/e2e/start-samba-ci.sh; nothing is
+        // stored in git and creating it writes almost no data (sparse). Note that
+        // running this full read still makes the server read, encrypt, and send
+        // ~4.3 GB — that transfer is what exceeds CI job time (issue 075).
         //
         // This test validates that the streaming read path keeps offsets and
         // lengths on the UInt64 route while crossing the 4GiB boundary. It only
@@ -648,6 +655,11 @@ final class SMBeeE2ETests: XCTestCase {
         XCTAssertEqual(total, stat.size)
     }
 
+    /// Uses a 2 MiB range instead of a full-file read because the Linux pure-Swift CCM
+    /// fallback runs at ~0.3 MiB/s (issue 075). Starting 64 KiB before `UInt32.max` makes
+    /// the stream cursor and later READ offsets cross it, and the non-zero sentinel placed
+    /// after the boundary proves those offsets were not truncated to UInt32 (an offset wrap
+    /// into the all-zero sparse region would otherwise return identical bytes).
     func testReadRangesAround4GiBBoundary() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["SMBEE_E2E"] == "1" else {
@@ -665,10 +677,23 @@ final class SMBeeE2ETests: XCTestCase {
         let path = environment["SMBEE_E2E_LARGE_PATH"] ?? "large-4gib-plus.bin"
         let credential = SMBCredential(username: username, password: password)
         let boundary = UInt64(UInt32.max)
+        // Keep these sentinel offsets and bytes in sync with the fixture scripts.
+        // Both fixture sentinels share the same 4,096-byte length.
+        // Fixture contract: the file must be all-zero sparse EXCEPT the two sentinel
+        // windows below. A fixture supplied via SMBEE_E2E_LARGE_PATH must satisfy the
+        // same contract (an all-zero file cannot prove READ offsets were not truncated).
+        let sentinelOffset: UInt64 = 4_295_016_448
+        let sentinelByte: UInt8 = 0xA5
+        let sentinel2Offset: UInt64 = 4_295_954_432
+        let sentinel2Byte: UInt8 = 0x5A
+        let sentinelLength: UInt64 = 4_096
         let ranges = [
             SMBReadRange(offset: boundary - 64 * 1024, length: 64 * 1024),
             SMBReadRange(offset: boundary, length: 1),
-            SMBReadRange(offset: boundary + 1, length: 64 * 1024)
+            SMBReadRange(
+                offset: boundary + 1,
+                length: sentinelOffset - (boundary + 1)
+            )
         ]
 
         let stat = try await SMBee.stat(
@@ -683,6 +708,72 @@ final class SMBeeE2ETests: XCTestCase {
             XCTAssertEqual(data.count, Int(range.length))
             XCTAssertTrue(data.allSatisfy { $0 == 0 }, "unwritten sparse range was not zero-filled")
         }
+
+        let sentinel = try await SMBee.read(
+            host: host, port: port, credential: credential, share: share,
+            path: path, range: SMBReadRange(offset: sentinelOffset, length: sentinelLength)
+        )
+        XCTAssertEqual(sentinel.count, Int(sentinelLength))
+        XCTAssertTrue(
+            sentinel.allSatisfy { $0 == sentinelByte },
+            "sentinel read did not return the fixture bytes after the 4GiB boundary"
+        )
+
+        let sentinel2 = try await SMBee.read(
+            host: host, port: port, credential: credential, share: share,
+            path: path, range: SMBReadRange(offset: sentinel2Offset, length: sentinelLength)
+        )
+        XCTAssertEqual(sentinel2.count, Int(sentinelLength))
+        XCTAssertTrue(
+            sentinel2.allSatisfy { $0 == sentinel2Byte },
+            "second sentinel read did not return the fixture bytes after the 4GiB boundary"
+        )
+
+        let crossingRange = SMBReadRange(offset: boundary - 64 * 1024, length: 2 * 1024 * 1024)
+        XCTAssertTrue(
+            crossingRange.offset <= sentinelOffset
+                && crossingRange.offset + crossingRange.length >= sentinelOffset + sentinelLength,
+            "crossing range must contain the complete sentinel"
+        )
+        XCTAssertTrue(
+            crossingRange.offset <= sentinel2Offset
+                && crossingRange.offset + crossingRange.length >= sentinel2Offset + sentinelLength,
+            "crossing range must contain the complete second sentinel"
+        )
+        XCTAssertGreaterThanOrEqual(stat.size, crossingRange.offset + crossingRange.length)
+        let crossingRead = LargeReadAccumulator()
+        try await SMBee.withReadStream(
+            host: host,
+            port: port,
+            credential: credential,
+            share: share,
+            path: path,
+            range: crossingRange
+        ) { chunk in
+            XCTAssertFalse(chunk.isEmpty)
+            await crossingRead.record(chunk)
+        }
+        let crossingTotal = await crossingRead.total
+        let crossingChunkCount = await crossingRead.chunkCount
+        let crossingBytes = await crossingRead.bytes
+        XCTAssertEqual(crossingTotal, crossingRange.length)
+        XCTAssertGreaterThanOrEqual(crossingChunkCount, 2)
+        // 約1MiB chunk 前提（local read cap）。READ length が 64KiB へ縮退する回帰は
+        // 32 chunk になるため 16 で検出できる。credit 縮小や小さめの negotiated
+        // maxReadSize（例: 256KiB → 9 chunk）による正常な分割は許容する上限。
+        XCTAssertLessThanOrEqual(crossingChunkCount, 16)
+        XCTAssertTrue(
+            crossingBytes.enumerated().allSatisfy { index, byte in
+                let offset = crossingRange.offset + UInt64(index)
+                let isSentinel = offset >= sentinelOffset
+                    && offset < sentinelOffset + sentinelLength
+                let isSentinel2 = offset >= sentinel2Offset
+                    && offset < sentinel2Offset + sentinelLength
+                let expectedByte = isSentinel ? sentinelByte : (isSentinel2 ? sentinel2Byte : 0)
+                return byte == expectedByte
+            },
+            "crossing read did not match the sparse zero regions and non-zero sentinels"
+        )
     }
 
     func testChangeNotifyReceivesFileCreation() async throws {
@@ -1001,13 +1092,30 @@ private func awaitWithTimeout<T: Sendable>(
 
 private actor LargeReadAccumulator {
     private var byteCount: UInt64 = 0
+    private var chunks: Int = 0
+    private var collectedBytes: [UInt8] = []
 
     var total: UInt64 {
         byteCount
     }
 
+    var chunkCount: Int {
+        chunks
+    }
+
+    var bytes: [UInt8] {
+        collectedBytes
+    }
+
     func record(byteCount: Int) {
         self.byteCount += UInt64(byteCount)
+        chunks += 1
+    }
+
+    func record(_ chunk: [UInt8]) {
+        byteCount += UInt64(chunk.count)
+        chunks += 1
+        collectedBytes.append(contentsOf: chunk)
     }
 }
 

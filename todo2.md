@@ -34,7 +34,7 @@
 | P1 | prefix read の往復削減 続き（issue 067 B/C/D） | B: CREATE+READ+CLOSE の compound（3→1 往復の本命）、C: READ パイプライン、D: 同時 open handle 上限。実測レイテンシと consumer 実害を見てから着手判断。 |
 | P1 | Kerberos / GSS | 0.1では非対応。将来実装する場合はauth backend、SPNEGO、session key、実サーバ検証が必要。 |
 | P1 | durable / persistent handle | 現在は非対応。実装する場合は切断・復旧state machineと実サーバE2Eが必要。 |
-| P2 | Linux AES-CCM throughput（issue 075） | pure-Swift CCM fallback が実測 ~0.3 MiB/s（Linux runner）で 4GiB 全読 E2E が現実的な job 時間に収まらない。高速化方式の選定後に scheduled 全読 E2E の復活を判断する。 |
+| P2 | Linux AES-CCM throughput（issue 075） | 2026-08-01: key schedule hoisting で release 34.5 MiB/s（4.1 倍）。旧 CI の ~0.3 MiB/s は debug ビルドが支配要因と確定。残: x86 で release exact-filter の one-shot 実測（25 分以下確認）→ scheduled 全読 E2E 復活、production 性能（NAS 実効の 1/3）は trigger 数値付きで継続。 |
 | P3 | fd close race の残リスク（issue 073） | 2026-08-01 に `timeout==nil` connect の未解決経路を nonblocking connect + 100ms poll heartbeat で解消。残りは getaddrinfo の停止不能・send/recv の shutdown wake 依存・将来 parallel connect 時の (generation,fd)。 |
 | P2 | 実サーバ固有機能 | Unicode、share/volume、ACL/SID、reparse、sparse、deadline、keepalive、lockをmatrixで確認する。 |
 | P3 | WRITE 競合時の prefix read 遅延（issue 068 で切り分け済み） | 2026-08-01 に request 側 ts_ns で切り分け完了: 送信側（credit / 送信直列化）は不変で、増分は全てサーバ応答待ち（localhost でも ~3.5 倍）。実害 gate（p50 +16.7ms）未達のため QoS 対応せず。consumer 実害が出たら CREDIT_FIFO_HOL_READ_TIMING を実環境で再実行。 |

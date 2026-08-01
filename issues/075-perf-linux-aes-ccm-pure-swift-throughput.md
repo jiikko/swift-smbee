@@ -56,3 +56,35 @@ scheduled 全読 E2E を復活させる選択肢がある。env gate 付きの
 - 公開・安定 API と保守コストを満たす高速化方式を選定し、暗号 correctness の test vector と
   encrypted Samba E2E を維持したまま実装する。
 - 4 GiB 全読が現実的な job 時間（目安: 30 分以内）に収まるかを実測し、scheduled 全読 E2E を復活させるか判断する。
+
+## 2026-08-01 実測と部分対応（key schedule hoisting）
+
+### 実測（Apple container swift:6.2 Linux arm64、AESCCM micro-bench、1 MiB chunk。
+Tests/SMBeeTests/AESCCMBenchmarkTests.swift = SMBEE_BENCH_CCM=1 gate で再現可能）
+
+| 構成 | seal / open (改修前) | seal / open (hoisting 後) |
+|---|---|---|
+| Linux debug | 0.38 / 0.41 MiB/s | 1.11 / 1.10 MiB/s |
+| Linux release | 8.51 / 8.79 MiB/s | **34.5 / 34.1 MiB/s (4.1 倍)** |
+| macOS release (CommonCrypto) | ~1,100-1,260 MiB/s | 変化なし（経路不変） |
+
+- **CI の ~0.30 MiB/s は debug ビルドが支配要因**（debug 実測 0.38-0.41 と整合。
+  run 30509016532 の workflow は `-c release` なしで debug と確定）。
+- 律速は AES block 暗号で、さらに **16-byte block ごとに key schedule を再展開していた**
+  （1 MiB あたり ~13 万回）。seal/open ごとに 1 回の展開に hoisting し、CBC-MAC を in-place 化
+  （T-table 化はしない: data-dependent lookup の拡大は side-channel 特性を変えるため今回対象外）。
+- RFC 3610 vector / SMB3 transform round-trip / encrypted Samba smoke で correctness 維持。
+
+### 残作業
+
+1. **scheduled 4GiB 全読 E2E の復活は「x86 one-shot 実測」が前提**: ubuntu-latest で
+   `swift test -c release --filter SMBeeE2ETests.testReadStreamCountsFileLargerThan4GiB` を
+   workflow_dispatch で 1 回実測し、25 分以下（timeout 余裕 5 分）を確認してから schedule 化する。
+   arm64 実測の外挿だけで確定しない。release lane は exact filter 限定
+   （`swift test -c release` の全 suite 実行は SMBPerfLog の release 挙動で
+   SMBWireDiagnosticsTests が壊れるため不可）。34.5 MiB/s なら 4 GiB ≈ 2 分 + build ~3-6 分。
+2. **production 性能は未解決のまま open**: hoisting 後も 1GbE NAS 実効 (~100 MiB/s) の 1/3。
+   対象は SMB 3.0/3.0.2 encrypted (CCM) の Linux client に限定（3.1.1 GCM は swift-crypto 経路）。
+   着手 trigger（数値）: 実 Linux 利用で CCM read が 25 MiB/s 未満かつ CPU 律速、または
+   10 GiB 級転送が 5 分超。次の候補は monomorphic な word 単位 AES 実装の見直しで、
+   T-table 採用時は side-channel threat model の明文化を必須とする。

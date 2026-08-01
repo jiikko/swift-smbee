@@ -12,15 +12,16 @@ public enum AESCCM {
         tagLength: Int = 16
     ) throws -> (ciphertext: [UInt8], tag: [UInt8]) {
         try validate(key: key, nonce: nonce, tagLength: tagLength)
+        let operationKey = try prepareOperationKey(key)
         let tag = try authenticationTag(
-            key: key,
+            operationKey: operationKey,
             nonce: nonce,
             message: plaintext,
             authenticatedData: authenticatedData,
             tagLength: tagLength
         )
-        let stream = try ctrCrypt(key: key, nonce: nonce, input: plaintext)
-        let encryptedTag = try encryptTag(tag, key: key, nonce: nonce)
+        let stream = try ctrCrypt(operationKey: operationKey, nonce: nonce, input: plaintext)
+        let encryptedTag = try encryptTag(tag, operationKey: operationKey, nonce: nonce)
         return (stream, encryptedTag)
     }
 
@@ -32,26 +33,29 @@ public enum AESCCM {
         tag: [UInt8]
     ) throws -> [UInt8] {
         try validate(key: key, nonce: nonce, tagLength: tag.count)
-        let plaintext = try ctrCrypt(key: key, nonce: nonce, input: ciphertext)
+        let operationKey = try prepareOperationKey(key)
+        let plaintext = try ctrCrypt(operationKey: operationKey, nonce: nonce, input: ciphertext)
         // Recompute the CBC-MAC over the decrypted plaintext directly (issues/014):
         // routing through seal() here would run the CTR keystream a second time for
         // nothing — the MAC only needs the plaintext and S0.
         let expectedTag = try authenticationTag(
-            key: key,
+            operationKey: operationKey,
             nonce: nonce,
             message: plaintext,
             authenticatedData: authenticatedData,
             tagLength: tag.count
         )
-        let expected = try encryptTag(expectedTag, key: key, nonce: nonce)
+        let expected = try encryptTag(expectedTag, operationKey: operationKey, nonce: nonce)
         guard constantTimeEqual(expected, tag) else {
             throw SMBCodecError.invalidValue("AES-CCM authentication failed")
         }
         return plaintext
     }
 
-    private static func encryptTag(_ tag: [UInt8], key: [UInt8], nonce: [UInt8]) throws -> [UInt8] {
-        let s0 = try encryptBlock(key: key, block: counterBlock(nonce: nonce, counter: 0))
+    private static func encryptTag(
+        _ tag: [UInt8], operationKey: [UInt8], nonce: [UInt8]
+    ) throws -> [UInt8] {
+        let s0 = try encryptBlock(operationKey: operationKey, block: counterBlock(nonce: nonce, counter: 0))
         var encryptedTag = Array(tag)
         for index in 0..<tag.count {
             encryptedTag[index] ^= s0[index]
@@ -68,7 +72,7 @@ public enum AESCCM {
     }
 
     private static func authenticationTag(
-        key: [UInt8],
+        operationKey: [UInt8],
         nonce: [UInt8],
         message: [UInt8],
         authenticatedData: [UInt8],
@@ -91,7 +95,7 @@ public enum AESCCM {
         }
         macInput += message
         while macInput.count % 16 != 0 { macInput.append(0) }
-        return Array(try cbcMACLastBlock(key: key, paddedInput: macInput).prefix(tagLength))
+        return Array(try cbcMACLastBlock(operationKey: operationKey, paddedInput: macInput).prefix(tagLength))
     }
 
     private static func counterBlock(nonce: [UInt8], counter: Int) -> [UInt8] {
@@ -136,7 +140,7 @@ public enum AESCCM {
     // 暗号化 SMB read の実効スループットを 0.08 MB/s に落としていた)。
     // CommonCrypto が無い platform (Linux) は従来の pure-Swift AES128 に落ちる。
 
-    private static func ctrCrypt(key: [UInt8], nonce: [UInt8], input: [UInt8]) throws -> [UInt8] {
+    private static func ctrCrypt(operationKey: [UInt8], nonce: [UInt8], input: [UInt8]) throws -> [UInt8] {
         guard !input.isEmpty else { return [] }
         #if canImport(CommonCrypto)
         // CCM の counter block は先頭が flags(1 byte) + nonce、末尾 q バイトが big-endian
@@ -147,7 +151,7 @@ public enum AESCCM {
         var cryptorOrNil: CCCryptorRef?
         let iv = counterBlock(nonce: nonce, counter: 1)
         let createStatus = iv.withUnsafeBufferPointer { ivPointer in
-            key.withUnsafeBufferPointer { keyPointer in
+            operationKey.withUnsafeBufferPointer { keyPointer in
                 CCCryptorCreateWithMode(
                     CCOperation(kCCEncrypt),
                     CCMode(kCCModeCTR),
@@ -155,7 +159,7 @@ public enum AESCCM {
                     CCPadding(ccNoPadding),
                     ivPointer.baseAddress,
                     keyPointer.baseAddress,
-                    key.count,
+                    operationKey.count,
                     nil,
                     0,
                     0,
@@ -195,7 +199,8 @@ public enum AESCCM {
         var counter = 1
         var offset = 0
         while offset < input.count {
-            let stream = try AES128.encryptBlock(key: key, block: counterBlock(nonce: nonce, counter: counter))
+            var stream = counterBlock(nonce: nonce, counter: counter)
+            try AES128.encryptBlockInPlace(expandedKey: operationKey, state: &stream)
             let blockLength = min(16, input.count - offset)
             for index in 0..<blockLength {
                 output[offset + index] ^= stream[index]
@@ -208,20 +213,20 @@ public enum AESCCM {
     }
 
     /// CBC-MAC = zero-IV CBC 暗号化の最終ブロック。`paddedInput` は 16 の倍数であること。
-    private static func cbcMACLastBlock(key: [UInt8], paddedInput: [UInt8]) throws -> [UInt8] {
+    private static func cbcMACLastBlock(operationKey: [UInt8], paddedInput: [UInt8]) throws -> [UInt8] {
         precondition(paddedInput.count % 16 == 0)
         #if canImport(CommonCrypto)
         var output = [UInt8](repeating: 0, count: paddedInput.count)
         var moved = 0
         let status = paddedInput.withUnsafeBufferPointer { inputPointer in
-            key.withUnsafeBufferPointer { keyPointer in
+            operationKey.withUnsafeBufferPointer { keyPointer in
                 output.withUnsafeMutableBufferPointer { outputPointer in
                     CCCrypt(
                         CCOperation(kCCEncrypt),
                         CCAlgorithm(kCCAlgorithmAES),
                         0,
                         keyPointer.baseAddress,
-                        key.count,
+                        operationKey.count,
                         nil,
                         inputPointer.baseAddress,
                         paddedInput.count,
@@ -239,27 +244,26 @@ public enum AESCCM {
         #else
         var x = [UInt8](repeating: 0, count: 16)
         for offset in stride(from: 0, to: paddedInput.count, by: 16) {
-            var block = Array(paddedInput[offset..<offset + 16])
-            for index in 0..<16 { block[index] ^= x[index] }
-            x = try AES128.encryptBlock(key: key, block: block)
+            for index in 0..<16 { x[index] ^= paddedInput[offset + index] }
+            try AES128.encryptBlockInPlace(expandedKey: operationKey, state: &x)
         }
         return x
         #endif
     }
 
-    private static func encryptBlock(key: [UInt8], block: [UInt8]) throws -> [UInt8] {
+    private static func encryptBlock(operationKey: [UInt8], block: [UInt8]) throws -> [UInt8] {
         #if canImport(CommonCrypto)
         var output = [UInt8](repeating: 0, count: 16)
         var moved = 0
         let status = block.withUnsafeBufferPointer { blockPointer in
-            key.withUnsafeBufferPointer { keyPointer in
+            operationKey.withUnsafeBufferPointer { keyPointer in
                 output.withUnsafeMutableBufferPointer { outputPointer in
                     CCCrypt(
                         CCOperation(kCCEncrypt),
                         CCAlgorithm(kCCAlgorithmAES),
                         CCOptions(kCCOptionECBMode),
                         keyPointer.baseAddress,
-                        key.count,
+                        operationKey.count,
                         nil,
                         blockPointer.baseAddress,
                         block.count,
@@ -275,7 +279,16 @@ public enum AESCCM {
         }
         return output
         #else
-        return try AES128.encryptBlock(key: key, block: block)
+        return try AES128.encryptBlock(expandedKey: operationKey, block: block)
+        #endif
+    }
+
+    /// CommonCrypto consumes the raw key; the fallback expands it once per CCM operation.
+    private static func prepareOperationKey(_ key: [UInt8]) throws -> [UInt8] {
+        #if canImport(CommonCrypto)
+        return key
+        #else
+        return try AES128.expandedKey(key)
         #endif
     }
 }

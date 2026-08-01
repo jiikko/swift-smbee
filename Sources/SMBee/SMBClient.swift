@@ -3845,6 +3845,9 @@ private struct SMBPendingResponse {
     let expectedSessionId: UInt64
     let expectedTreeId: UInt32
     var pendingCount: Int = 0
+    /// AsyncId observed on the first STATUS_PENDING interim (MS-SMB2 §3.2.5.1.5 requires
+    /// storing it); nil until the request is seen going async.
+    var asyncId: UInt64?
     let continuation: CheckedContinuation<SMBReceivedFrame, Error>
     var sendTask: Task<Void, Never>?
     var timeoutTask: Task<Void, Never>?
@@ -5203,15 +5206,9 @@ actor SMBSession {
         try SMB2Echo.decodeResponse(response)
     }
 
-    func sendCancel(messageId: UInt64, treeId: UInt32 = 0) async throws {
-        let packet = try SMB2Cancel.encodeRequest(messageId: messageId, sessionId: sessionId, treeId: treeId)
-        debugDump("CANCEL request", packet)
-        try await sendSigned(packet)
-    }
-
-    private func sendCancelWithoutGate(messageId: UInt64, treeId: UInt32) async {
+    private func sendCancelWithoutGate(target: SMB2Cancel.Target) async {
         do {
-            let packet = try SMB2Cancel.encodeRequest(messageId: messageId, sessionId: sessionId, treeId: treeId)
+            let packet = try SMB2Cancel.encodeRequest(target: target, sessionId: sessionId)
             debugDump("CANCEL request", packet)
             try await sendSigned(packet)
         } catch {
@@ -5399,8 +5396,8 @@ actor SMBSession {
             )
         } onCancel: {
             Task {
-                if await self.cancelInFlightRequest(messageId: requestHeader.messageId) {
-                    await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+                if let target = await self.cancelInFlightRequest(messageId: requestHeader.messageId) {
+                    await self.sendCancelWithoutGate(target: target)
                 }
             }
         }
@@ -5422,8 +5419,8 @@ actor SMBSession {
             )
         } onCancel: {
             Task {
-                if await self.cancelInFlightRequest(messageId: requestHeader.messageId) {
-                    await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+                if let target = await self.cancelInFlightRequest(messageId: requestHeader.messageId) {
+                    await self.sendCancelWithoutGate(target: target)
                 }
             }
         }
@@ -5477,9 +5474,8 @@ actor SMBSession {
                         diagnosticSessionId: diagnosticSessionId,
                         send: send
                     )
-                    let shouldSendCancel = self.markRequestSent(messageId: requestHeader.messageId)
-                    if shouldSendCancel {
-                        await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
+                    if let target = self.markRequestSent(messageId: requestHeader.messageId) {
+                        await self.sendCancelWithoutGate(target: target)
                     }
                 } catch {
                     SMBPerfLog.line("[wire] send_failed session=\(diagnosticSessionId) message_id=\(requestHeader.messageId) error=\(Self.diagnosticError(error))")
@@ -5704,7 +5700,7 @@ actor SMBSession {
         guard var pending = pendingResponses[header.messageId] else {
             if sentResponseMessageIds.contains(header.messageId) {
                 // A cancelled request still owns its wire response until the final frame.
-                if try SMB2AsyncInterim.shouldDiscard(packet) {
+                if try SMB2AsyncInterim.isInterim(header) {
                     debugLine("ignoring interim response for cancelled message id \(header.messageId)")
                     return
                 }
@@ -5729,11 +5725,29 @@ actor SMBSession {
         // before the authenticated context is established; once populated, both are
         // part of the correlation key.
         guard header.command == pending.expectedCommand,
-              pending.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == pending.expectedSessionId,
-              pending.expectedTreeId == 0 || header.treeId == 0 || header.treeId == pending.expectedTreeId else {
-            throw SMBCodecError.invalidValue("SMB response correlation mismatch command=\(header.command)/\(pending.expectedCommand) session=\(header.sessionId)/\(pending.expectedSessionId) tree=\(header.treeId)/\(pending.expectedTreeId)")
+              pending.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == pending.expectedSessionId else {
+            throw SMBCodecError.invalidValue("SMB response correlation mismatch command=\(header.command)/\(pending.expectedCommand) session=\(header.sessionId)/\(pending.expectedSessionId)")
         }
-        if try SMB2AsyncInterim.shouldDiscard(packet) {
+        // Async responses carry an AsyncId instead of a TreeId (MS-SMB2 §2.2.1.1); the
+        // TreeId correlation below therefore applies to sync responses only. The AsyncId
+        // itself becomes the correlation key once the first interim establishes it.
+        // Violations of the async invariants fail only the affected request: unlike a
+        // command/session mismatch they cannot misattribute a frame to another request,
+        // and treating a single nonconforming server frame as session-fatal would take
+        // down every unrelated in-flight operation (issues/078 review M1/M2).
+        if try SMB2AsyncInterim.isInterim(header) {
+            guard let interimAsyncId = header.asyncId, interimAsyncId != 0 else {
+                failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 STATUS_PENDING interim carries a zero AsyncId")
+                return
+            }
+            if let storedAsyncId = pending.asyncId {
+                guard storedAsyncId == interimAsyncId else {
+                    failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 interim AsyncId mismatch \(interimAsyncId)/\(storedAsyncId)")
+                    return
+                }
+            } else {
+                pending.asyncId = interimAsyncId
+            }
             pending.pendingCount += 1
             if !pending.longPoll && pending.pendingCount > SMB2AsyncInterim.maxPendingResponses {
                 pendingResponses.removeValue(forKey: header.messageId)
@@ -5749,6 +5763,26 @@ actor SMBSession {
             pendingResponses[header.messageId] = pending
             debugLine("\(pending.label) ignored interim STATUS_PENDING async response")
             return
+        }
+        if header.isAsync {
+            // A final async response is only valid for a request that was seen going
+            // async, and it must carry the AsyncId stored from the interim.
+            guard let storedAsyncId = pending.asyncId, header.asyncId == storedAsyncId else {
+                failCorrelatedRequest(
+                    messageId: header.messageId,
+                    pending: pending,
+                    reason: "SMB2 async final AsyncId mismatch \(header.asyncId.map(String.init) ?? "nil")/\(pending.asyncId.map(String.init) ?? "no interim")"
+                )
+                return
+            }
+        } else if !pending.continuationResumed {
+            guard pending.asyncId == nil else {
+                failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 sync final response after async interim (message id \(header.messageId))")
+                return
+            }
+            guard pending.expectedTreeId == 0 || header.treeId == 0 || header.treeId == pending.expectedTreeId else {
+                throw SMBCodecError.invalidValue("SMB response correlation mismatch tree=\(header.treeId)/\(pending.expectedTreeId)")
+            }
         }
         pendingResponses.removeValue(forKey: header.messageId)
         sentResponseMessageIds.remove(header.messageId)
@@ -5769,14 +5803,16 @@ actor SMBSession {
     }
 
     @discardableResult
-    private func markRequestSent(messageId: UInt64) -> Bool {
+    private func markRequestSent(messageId: UInt64) -> SMB2Cancel.Target? {
         guard var pending = pendingResponses[messageId] else {
-            return false
+            return nil
         }
         requestSentCountForTestingStorage += 1
         sentResponseMessageIds.insert(messageId)
         if pending.cancellationRequested {
-            pendingResponses.removeValue(forKey: messageId)
+            // Keep the cancellation tombstone: a later interim must still be able to
+            // store its AsyncId so the final response can be correlated (issues/078).
+            pendingResponses[messageId] = pending
         } else if pending.requestTimeoutPolicy.isEligible, let requestTimeout {
             let command = pending.expectedCommand
             pending.timeoutTask = Task { [weak self] in
@@ -5795,13 +5831,19 @@ actor SMBSession {
                 try dispatchReceivedPacket(orphan)
             } catch {
                 failPendingResponse(messageId: messageId, error: error)
-                return false
+                return nil
             }
         }
         startReceiveLoopIfNeeded()
         // An orphan can be the final response. In that case dispatchReceivedPacket
         // already consumed it, so there is no wire request left to cancel.
-        return pending.cancellationRequested && sentResponseMessageIds.contains(messageId)
+        guard pending.cancellationRequested, sentResponseMessageIds.contains(messageId) else {
+            return nil
+        }
+        if let asyncId = pendingResponses[messageId]?.asyncId {
+            return .async(messageId: messageId, asyncId: asyncId)
+        }
+        return .sync(messageId: messageId)
     }
 
     private func requestDidTimeOut(messageId: UInt64, command: UInt16) {
@@ -5822,6 +5864,25 @@ actor SMBSession {
         // deliberately not refunded because the request reached the wire.
         closeTransport(cause: "request_timeout", diagnosticError: SMBTransportError.timedOut)
         requestTimeoutCompletionCountForTestingStorage += 1
+    }
+
+    /// Fails a single correlated request whose response frame violated an async-header
+    /// invariant. The frame is addressed to this MessageId, so unlike a command/session
+    /// mismatch it cannot belong to another request — the violation is contained to this
+    /// transaction and must not tear down the shared session. Cancellation tombstones
+    /// have nobody waiting; they are drained with a diagnostic only.
+    private func failCorrelatedRequest(messageId: UInt64, pending: SMBPendingResponse, reason: String) {
+        var pending = pending
+        pending.timeoutTask?.cancel()
+        pending.timeoutTask = nil
+        pendingResponses.removeValue(forKey: messageId)
+        sentResponseMessageIds.remove(messageId)
+        if pending.continuationResumed {
+            debugLine("drained cancelled request after async correlation violation: \(reason)")
+            return
+        }
+        pending.continuationResumed = true
+        pending.continuation.resume(throwing: SMBCodecError.invalidValue(reason))
     }
 
     private func failPendingResponse(messageId: UInt64, error: Error) {
@@ -5850,10 +5911,22 @@ actor SMBSession {
         }
     }
 
-    private func cancelInFlightRequest(messageId: UInt64) -> Bool {
+    /// Resolves the CANCEL form in the same actor turn that observes the cancellation:
+    /// if an interim already stored an AsyncId the async form is required, otherwise sync.
+    /// The decision is atomic (no suspension between reading the pending state and
+    /// choosing the form) and at most one CANCEL is ever produced per request; however
+    /// the actual send suspends afterwards, so an interim processed in that window can
+    /// make an already-decided sync CANCEL stale on the wire. That is harmless: servers
+    /// fall back to MessageId lookup for sync CANCEL (MS-SMB2 §3.3.5.16).
+    private func cancelInFlightRequest(messageId: UInt64) -> SMB2Cancel.Target? {
         let wasSent = sentResponseMessageIds.contains(messageId)
+        let asyncId = pendingResponses[messageId]?.asyncId
         failPendingResponse(messageId: messageId, error: CancellationError())
-        return wasSent
+        guard wasSent else { return nil }
+        if let asyncId {
+            return .async(messageId: messageId, asyncId: asyncId)
+        }
+        return .sync(messageId: messageId)
     }
 
     private func failAllPendingResponses(error: Error) {
@@ -6144,10 +6217,9 @@ enum SMB2Flags {
 enum SMB2AsyncInterim {
     static let maxPendingResponses = 16
 
-    static func shouldDiscard(_ packet: [UInt8]) throws -> Bool {
-        let header = try SMB2Header.decode(packet)
+    static func isInterim(_ header: SMB2Header) throws -> Bool {
         guard header.status == SMB2Status.pending else { return false }
-        guard (header.flags & SMB2Flags.asyncCommand) != 0 else {
+        guard header.isAsync else {
             throw SMBCodecError.invalidValue("SMB2 STATUS_PENDING response missing ASYNC_COMMAND flag")
         }
         return true

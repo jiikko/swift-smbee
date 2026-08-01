@@ -13,6 +13,15 @@ public struct SMB2Header: Equatable, Sendable {
     public var treeId: UInt32
     public var sessionId: UInt64
     public var signature: [UInt8]
+    /// MS-SMB2 §2.2.1.1: with SMB2_FLAGS_ASYNC_COMMAND, header bytes 32–39 are a single
+    /// 64-bit AsyncId — there is no TreeId in an async header. Invariant maintained by
+    /// encode/decode: async headers carry `asyncId != nil` and `treeId == 0`; sync headers
+    /// carry `asyncId == nil`.
+    public var asyncId: UInt64?
+
+    public var isAsync: Bool {
+        (flags & SMB2Flags.asyncCommand) != 0
+    }
 
     public init(
         creditCharge: UInt16 = 0,
@@ -24,7 +33,8 @@ public struct SMB2Header: Equatable, Sendable {
         messageId: UInt64,
         treeId: UInt32 = 0,
         sessionId: UInt64 = 0,
-        signature: [UInt8] = Array(repeating: 0, count: 16)
+        signature: [UInt8] = Array(repeating: 0, count: 16),
+        asyncId: UInt64? = nil
     ) {
         self.creditCharge = creditCharge
         self.status = status
@@ -36,11 +46,53 @@ public struct SMB2Header: Equatable, Sendable {
         self.treeId = treeId
         self.sessionId = sessionId
         self.signature = signature
+        self.asyncId = asyncId
+    }
+
+    /// Builds an async-form header (SMB2_FLAGS_ASYNC_COMMAND set, AsyncId in bytes 32–39).
+    public static func asyncHeader(
+        creditCharge: UInt16 = 0,
+        status: UInt32 = 0,
+        command: UInt16,
+        credits: UInt16 = 1,
+        flags: UInt32 = 0,
+        nextCommand: UInt32 = 0,
+        messageId: UInt64,
+        asyncId: UInt64,
+        sessionId: UInt64 = 0,
+        signature: [UInt8] = Array(repeating: 0, count: 16)
+    ) -> SMB2Header {
+        SMB2Header(
+            creditCharge: creditCharge,
+            status: status,
+            command: command,
+            credits: credits,
+            flags: flags | SMB2Flags.asyncCommand,
+            nextCommand: nextCommand,
+            messageId: messageId,
+            treeId: 0,
+            sessionId: sessionId,
+            signature: signature,
+            asyncId: asyncId
+        )
     }
 
     public func encode() throws -> [UInt8] {
         guard signature.count == 16 else {
             throw SMBCodecError.invalidValue("SMB2 signature must be 16 bytes")
+        }
+        if isAsync {
+            // Client-side encoding only produces async headers for CANCEL, whose AsyncId
+            // comes from a server interim; server-generated AsyncIds are nonzero
+            // (MS-SMB2 §3.3.4.2), so zero here always means lost tracking.
+            guard let asyncId, asyncId != 0 else {
+                throw SMBCodecError.invalidValue("SMB2 async header requires a nonzero asyncId")
+            }
+            guard treeId == 0 else {
+                throw SMBCodecError.invalidValue("SMB2 async header carries no TreeId")
+            }
+        } else if asyncId != nil {
+            throw SMBCodecError.invalidValue("SMB2 sync header must not carry an asyncId")
         }
         var writer = SMBByteWriter()
         writer.writeBytes([0xfe, 0x53, 0x4d, 0x42])
@@ -52,8 +104,12 @@ public struct SMB2Header: Equatable, Sendable {
         writer.writeUInt32LE(flags)
         writer.writeUInt32LE(nextCommand)
         writer.writeUInt64LE(messageId)
-        writer.writeUInt32LE(0)
-        writer.writeUInt32LE(treeId)
+        if let asyncId {
+            writer.writeUInt64LE(asyncId)
+        } else {
+            writer.writeUInt32LE(0)
+            writer.writeUInt32LE(treeId)
+        }
         writer.writeUInt64LE(sessionId)
         writer.writeBytes(signature)
         return writer.bytes
@@ -78,8 +134,16 @@ public struct SMB2Header: Equatable, Sendable {
         let flags = try reader.readUInt32LE()
         let nextCommand = try reader.readUInt32LE()
         let messageId = try reader.readUInt64LE()
-        try reader.skip(count: 4)
-        let treeId = try reader.readUInt32LE()
+        let asyncId: UInt64?
+        let treeId: UInt32
+        if (flags & SMB2Flags.asyncCommand) != 0 {
+            asyncId = try reader.readUInt64LE()
+            treeId = 0
+        } else {
+            try reader.skip(count: 4)
+            treeId = try reader.readUInt32LE()
+            asyncId = nil
+        }
         let sessionId = try reader.readUInt64LE()
         let signature = try reader.readBytes(count: 16)
         return SMB2Header(
@@ -92,7 +156,8 @@ public struct SMB2Header: Equatable, Sendable {
             messageId: messageId,
             treeId: treeId,
             sessionId: sessionId,
-            signature: signature
+            signature: signature,
+            asyncId: asyncId
         )
     }
 }

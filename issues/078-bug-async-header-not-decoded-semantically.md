@@ -41,3 +41,23 @@
    いる。AsyncId として decode・assert し、STATUS_PENDING fixture に SMB2 ERROR response body を付ける。
 5. 実測（Tier 3 手動 smoke）: Windows Server / macOS SMBX に対する CHANGE_NOTIFY → STATUS_PENDING →
    cancel で CANCEL の効果（server 側 watch 解放）を確認する。
+
+## 対応結果（2026-08-02、Claude 実装 + subagent レビュー。codex は usage limit のため設計フェーズのみ）
+
+- `SMB2Header` に `asyncId: UInt64?` を追加（async flag で bytes 32-39 を AsyncId として decode、
+  treeId=0 固定。encode は flag/asyncId/treeId の不整合と AsyncId=0 を拒否）。
+- 相関: async response は TreeId 照合をやめ、interim で AsyncId を保存（§3.2.5.1.5）、final async は
+  保存済み AsyncId との一致を必須化。**invariant 違反は当該 request のみ失敗**させ session を落とさない
+  （レビュー M1/M2: 実装差のある server の 1 フレームで無関係な in-flight を全滅させない）。
+  cancel 済み tombstone は寛容 drain。
+- CANCEL: `SMB2Cancel.Target`（sync=TreeId 0 / async=保存 AsyncId + ASYNC flag）。**MessageId は元 request の
+  値を維持**（Windows の 0 は 3.1.1 signing-only AES-GMAC で nonce 再利用になるため不採用）。
+  形式確定は actor 同一 turn（interim 先着→async / cancel 先着→sync、2 本目は送らない）。
+  未使用の `sendCancel(messageId:)` は nonce 再利用の誤用穴として削除。
+- TREE_CONNECT decode は treeId=0 の成功を拒否（async 化した場合の silent poison 防止）。
+- テスト: codec round-trip / encode rejection / 相関状態遷移表 / CANCEL 3 競合順序 / tombstone drain /
+  実時間 fixture（SMB2 ERROR body 付き interim）。ミューテーション 3 変異（相関 guard 除去・
+  decode 退行・CANCEL 常時 sync 化）の検知確認済み。
+
+残: 対応方針 5 の実サーバ手動実測（Windows / macOS SMBX の CHANGE_NOTIFY → STATUS_PENDING → cancel で
+server 側 watch 解放を確認、Tier 3）。done への移動はこの実測を踏まえて判断する。

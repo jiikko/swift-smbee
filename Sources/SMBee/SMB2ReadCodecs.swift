@@ -97,10 +97,31 @@ enum SMB2Logoff {
 }
 
 enum SMB2Cancel {
-    static func encodeRequest(messageId: UInt64, sessionId: UInt64, treeId: UInt32 = 0) throws -> [UInt8] {
-        let header = try SMB2Header(command: SMB2Commands.cancel, messageId: messageId, treeId: treeId, sessionId: sessionId).encode()
+    /// MS-SMB2 §3.2.4.24: a request that has been seen going async (STATUS_PENDING carrying
+    /// an AsyncId) must be cancelled with an ASYNC-form header carrying that AsyncId; before
+    /// any interim was processed the sync form is used. Both keep the original MessageId —
+    /// the spec allows reuse (CANCEL consumes no sequence number), and reusing it keeps the
+    /// SMB 3.1.1 AES-GMAC signing nonce (MessageId + CANCEL flag) unique per request, which
+    /// a fixed MessageId of 0 would not (nonce reuse across distinct cancelled requests on
+    /// signing-only sessions).
+    enum Target: Sendable, Equatable {
+        case sync(messageId: UInt64)
+        case async(messageId: UInt64, asyncId: UInt64)
+    }
+
+    static func encodeRequest(target: Target, sessionId: UInt64) throws -> [UInt8] {
+        let header: SMB2Header
+        switch target {
+        case .sync(let messageId):
+            // SYNC-form CANCEL: TreeId SHOULD be 0 (MS-SMB2 §2.2.1.2); servers correlate
+            // sync CANCEL by MessageId, not TreeId.
+            header = SMB2Header(command: SMB2Commands.cancel, messageId: messageId, treeId: 0, sessionId: sessionId)
+        case .async(let messageId, let asyncId):
+            // Zero AsyncIds are rejected by SMB2Header.encode() (nonzero per MS-SMB2 §3.3.4.2).
+            header = SMB2Header.asyncHeader(command: SMB2Commands.cancel, messageId: messageId, asyncId: asyncId, sessionId: sessionId)
+        }
         var writer = SMBByteWriter()
-        writer.writeBytes(header)
+        writer.writeBytes(try header.encode())
         writer.writeUInt16LE(4)
         writer.writeUInt16LE(0)
         return writer.bytes
@@ -202,6 +223,12 @@ enum SMB2TreeConnect {
     static func decodeResponse(_ bytes: [UInt8]) throws -> SMBTreeConnectResult {
         let header = try SMB2Header.decode(bytes)
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_CONNECT")
+        // An async-form success (treeId decodes as 0) cannot yield a usable tree: 0 is
+        // not a valid TreeId and silently accepting it would poison every later request
+        // on this tree (issues/078 review L4).
+        guard header.treeId != 0 else {
+            throw SMBCodecError.invalidValue("TREE_CONNECT response carries no usable TreeId")
+        }
         var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
         guard try reader.readUInt16LE() == 16 else {
             throw SMBCodecError.invalidValue("invalid TREE_CONNECT response structure size")

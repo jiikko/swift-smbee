@@ -3465,19 +3465,86 @@ final class SMBeeTests: XCTestCase {
 
     func testSMB2CancelRequestShape() throws {
         let request = try SMB2Cancel.encodeRequest(
-            messageId: 22,
-            sessionId: 0x1122_3344,
-            treeId: 0x5566_7788
+            target: .sync(messageId: 22),
+            sessionId: 0x1122_3344
         )
 
         let header = try SMB2Header.decode(request)
         XCTAssertEqual(header.command, SMB2Commands.cancel)
         XCTAssertEqual(header.messageId, 22)
-        XCTAssertEqual(header.treeId, 0x5566_7788)
+        // MS-SMB2 §2.2.1.2: sync CANCEL TreeId SHOULD be 0 (servers correlate by MessageId).
+        XCTAssertEqual(header.treeId, 0)
+        XCTAssertNil(header.asyncId)
         XCTAssertEqual(header.sessionId, 0x1122_3344)
+        // CreditRequest stays at the encoder default and is never patched for CANCEL
+        // (credit-exempt, MS-SMB2 §3.2.4.1.2).
+        XCTAssertEqual(readUInt16LE(request, at: 14), 1)
         XCTAssertEqual(request.count, 68)
         XCTAssertEqual(readUInt16LE(request, at: 64), 4)
         XCTAssertEqual(readUInt16LE(request, at: 66), 0)
+    }
+
+    func testSMB2AsyncCancelRequestShape() throws {
+        let request = try SMB2Cancel.encodeRequest(
+            target: .async(messageId: 22, asyncId: 0x8899_aabb_ccdd_eeff),
+            sessionId: 0x1122_3344
+        )
+
+        let header = try SMB2Header.decode(request)
+        XCTAssertEqual(header.command, SMB2Commands.cancel)
+        // Original MessageId is reused (MS-SMB2 §3.2.4.24 SHOULD; also keeps the SMB 3.1.1
+        // AES-GMAC nonce unique per cancelled request, unlike a fixed MessageId of 0).
+        XCTAssertEqual(header.messageId, 22)
+        XCTAssertTrue(header.isAsync)
+        XCTAssertEqual(header.asyncId, 0x8899_aabb_ccdd_eeff)
+        XCTAssertEqual(header.treeId, 0)
+        // Wire bytes 32-39 are the little-endian AsyncId.
+        XCTAssertEqual(Array(request[32..<40]), [0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88])
+        XCTAssertEqual(request.count, 68)
+        XCTAssertEqual(readUInt16LE(request, at: 64), 4)
+        XCTAssertEqual(readUInt16LE(request, at: 66), 0)
+    }
+
+    func testSMB2AsyncCancelRejectsZeroAsyncId() {
+        XCTAssertThrowsError(try SMB2Cancel.encodeRequest(
+            target: .async(messageId: 22, asyncId: 0),
+            sessionId: 1
+        ))
+    }
+
+    func testSMB2HeaderAsyncEncodeDecodeRoundTrip() throws {
+        let header = SMB2Header.asyncHeader(
+            status: SMB2Status.pending,
+            command: SMB2Commands.changeNotify,
+            messageId: 41,
+            asyncId: 0x8899_aabb_0000_0007,
+            sessionId: 9
+        )
+        let decoded = try SMB2Header.decode(header.encode())
+        XCTAssertTrue(decoded.isAsync)
+        XCTAssertEqual(decoded.asyncId, 0x8899_aabb_0000_0007)
+        XCTAssertEqual(decoded.treeId, 0)
+        XCTAssertEqual(decoded.messageId, 41)
+    }
+
+    func testSMB2HeaderRejectsInconsistentAsyncEncodings() {
+        // Async flag without an AsyncId (the shape the old fixtures produced).
+        XCTAssertThrowsError(try SMB2Header(
+            command: SMB2Commands.flush,
+            flags: SMB2Flags.asyncCommand,
+            messageId: 1,
+            treeId: 0x5566_7788
+        ).encode())
+        // Sync header carrying an AsyncId.
+        XCTAssertThrowsError(try SMB2Header(
+            command: SMB2Commands.flush,
+            messageId: 1,
+            asyncId: 7
+        ).encode())
+        // Async header carrying a TreeId.
+        var header = SMB2Header.asyncHeader(command: SMB2Commands.flush, messageId: 1, asyncId: 7)
+        header.treeId = 3
+        XCTAssertThrowsError(try header.encode())
     }
 
     func testSMB2CreditChargeAndBalanceHelpers() {
@@ -5329,7 +5396,9 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(changeHeader.command, SMB2Commands.changeNotify)
         XCTAssertEqual(cancelHeader.command, SMB2Commands.cancel)
         XCTAssertEqual(cancelHeader.messageId, changeHeader.messageId)
-        XCTAssertEqual(cancelHeader.treeId, changeHeader.treeId)
+        // Pre-interim cancellation uses the sync CANCEL form with TreeId 0 (MS-SMB2 §2.2.1.2).
+        XCTAssertEqual(cancelHeader.treeId, 0)
+        XCTAssertNil(cancelHeader.asyncId)
 
         transport.enqueueInbound(try framed([
             try smb2StatusResponse(
@@ -5347,6 +5416,288 @@ final class SMBeeTests: XCTestCase {
             XCTFail("cancelled CHANGE_NOTIFY unexpectedly completed")
         } catch is CancellationError {
         }
+    }
+
+    /// STATUS_PENDING interim: async-form header + SMB2 ERROR response body
+    /// (StructureSize=9, MS-SMB2 §2.2.2 — servers attach it to interim responses too).
+    private func smb2AsyncPendingResponse(
+        command: UInt16,
+        messageId: UInt64,
+        asyncId: UInt64,
+        sessionId: UInt64 = 0,
+        credits: UInt16 = 1
+    ) throws -> [UInt8] {
+        var response = try SMB2Header.asyncHeader(
+            status: SMB2Status.pending,
+            command: command,
+            credits: credits,
+            messageId: messageId,
+            asyncId: asyncId,
+            sessionId: sessionId
+        ).encode()
+        response.append(contentsOf: [9, 0, 0, 0, 0, 0, 0, 0])
+        return response
+    }
+
+    private func smb2AsyncReadResponse(
+        _ payload: [UInt8],
+        messageId: UInt64,
+        asyncId: UInt64,
+        credits: UInt16 = 1
+    ) throws -> [UInt8] {
+        var response = try SMB2Header.asyncHeader(
+            command: SMB2Commands.read,
+            credits: credits,
+            messageId: messageId,
+            asyncId: asyncId
+        ).encode()
+        response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
+        writeUInt16LE(17, to: &response, at: 64)
+        response[66] = 80
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+        return response
+    }
+
+    private func makeAsyncCorrelationSession(_ transport: ControlledReceiveTransport) -> SMBSession {
+        SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+    }
+
+    private func waitForDispatchCount(_ expected: Int, session: SMBSession) async throws {
+        try await awaitWithTimeout("dispatch count \(expected)") {
+            while await session.receivedPacketDispatchCountForTesting() < expected {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+    }
+
+    // AsyncId 上位 32bit が非 zero でも treeId 照合に落ちない (issues/078 の相関バグの直接回帰)。
+    func testAsyncInterimThenMatchingAsyncFinalCompletes() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = makeAsyncCorrelationSession(transport)
+        let asyncId: UInt64 = 0x5566_7788_0000_0001
+
+        let task = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let readHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+
+        transport.enqueueInbound(try framed([
+            try smb2AsyncPendingResponse(command: SMB2Commands.read, messageId: readHeader.messageId, asyncId: asyncId)
+        ]))
+        try await waitForDispatchCount(1, session: session)
+        transport.enqueueInbound(try framed([
+            try smb2AsyncReadResponse(Array("abc".utf8), messageId: readHeader.messageId, asyncId: asyncId)
+        ]))
+
+        let data = try await awaitWithTimeout("async final read") { try await task.value }
+        XCTAssertEqual(data, Array("abc".utf8))
+        let pendingCount = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingCount, 0)
+    }
+
+    func testAsyncFinalWithMismatchedAsyncIdFailsRequest() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = makeAsyncCorrelationSession(transport)
+
+        let task = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        }
+        defer { task.cancel() }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let readHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+
+        transport.enqueueInbound(try framed([
+            try smb2AsyncPendingResponse(command: SMB2Commands.read, messageId: readHeader.messageId, asyncId: 7)
+        ]))
+        try await waitForDispatchCount(1, session: session)
+        transport.enqueueInbound(try framed([
+            try smb2AsyncReadResponse([0x61], messageId: readHeader.messageId, asyncId: 8)
+        ]))
+
+        do {
+            _ = try await awaitWithTimeout("mismatched async final") { try await task.value }
+            XCTFail("mismatched AsyncId final unexpectedly completed")
+        } catch is CancellationError {
+            XCTFail("expected a correlation failure, got cancellation")
+        } catch is SMBTestTimeoutError {
+            XCTFail("expected a correlation failure, got a timeout (possible hang)")
+        } catch {
+        }
+    }
+
+    func testAsyncFinalWithoutInterimIsRejected() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = makeAsyncCorrelationSession(transport)
+
+        let task = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        }
+        defer { task.cancel() }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let readHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+
+        transport.enqueueInbound(try framed([
+            try smb2AsyncReadResponse([0x61], messageId: readHeader.messageId, asyncId: 9)
+        ]))
+
+        do {
+            _ = try await awaitWithTimeout("async final without interim") { try await task.value }
+            XCTFail("async final without interim unexpectedly completed")
+        } catch is CancellationError {
+            XCTFail("expected a correlation failure, got cancellation")
+        } catch is SMBTestTimeoutError {
+            XCTFail("expected a correlation failure, got a timeout (possible hang)")
+        } catch {
+        }
+    }
+
+    func testSecondInterimWithDifferentAsyncIdIsRejected() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = makeAsyncCorrelationSession(transport)
+
+        let task = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        }
+        defer { task.cancel() }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let readHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+
+        transport.enqueueInbound(try framed([
+            try smb2AsyncPendingResponse(command: SMB2Commands.read, messageId: readHeader.messageId, asyncId: 7)
+        ]))
+        try await waitForDispatchCount(1, session: session)
+        transport.enqueueInbound(try framed([
+            try smb2AsyncPendingResponse(command: SMB2Commands.read, messageId: readHeader.messageId, asyncId: 8)
+        ]))
+
+        do {
+            _ = try await awaitWithTimeout("second interim mismatch") { try await task.value }
+            XCTFail("AsyncId change across interims unexpectedly completed")
+        } catch is CancellationError {
+            XCTFail("expected a correlation failure, got cancellation")
+        } catch is SMBTestTimeoutError {
+            XCTFail("expected a correlation failure, got a timeout (possible hang)")
+        } catch {
+        }
+    }
+
+    func testSyncFinalAfterAsyncInterimIsRejected() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = makeAsyncCorrelationSession(transport)
+
+        let task = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        }
+        defer { task.cancel() }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let readHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+
+        transport.enqueueInbound(try framed([
+            try smb2AsyncPendingResponse(command: SMB2Commands.read, messageId: readHeader.messageId, asyncId: 7)
+        ]))
+        try await waitForDispatchCount(1, session: session)
+        transport.enqueueInbound(try framed([
+            try smb2ReadResponse([0x61], messageId: readHeader.messageId, treeId: 0x3344)
+        ]))
+
+        do {
+            _ = try await awaitWithTimeout("sync final after interim") { try await task.value }
+            XCTFail("sync final after async interim unexpectedly completed")
+        } catch is CancellationError {
+            XCTFail("expected a correlation failure, got cancellation")
+        } catch is SMBTestTimeoutError {
+            XCTFail("expected a correlation failure, got a timeout (possible hang)")
+        } catch {
+        }
+    }
+
+    // interim を処理済みの request の cancel は async CANCEL (保存済み AsyncId + 元 MessageId)。
+    func testCancellationAfterInterimSendsAsyncCancel() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = makeAsyncCorrelationSession(transport)
+        let asyncId: UInt64 = 0xdead_beef_0000_0042
+
+        let task = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let readHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+
+        transport.enqueueInbound(try framed([
+            try smb2AsyncPendingResponse(command: SMB2Commands.read, messageId: readHeader.messageId, asyncId: asyncId)
+        ]))
+        try await waitForDispatchCount(1, session: session)
+
+        task.cancel()
+        try await waitForOutboundFrameCount(2, transport: transport)
+        let cancelHeader = try SMB2Header.decode(try unframed(transport.outbound)[1])
+        XCTAssertEqual(cancelHeader.command, SMB2Commands.cancel)
+        XCTAssertTrue(cancelHeader.isAsync)
+        XCTAssertEqual(cancelHeader.asyncId, asyncId)
+        XCTAssertEqual(cancelHeader.messageId, readHeader.messageId)
+
+        do {
+            _ = try await awaitWithTimeout("cancelled async read") { try await task.value }
+            XCTFail("cancelled READ unexpectedly completed")
+        } catch is CancellationError {
+        }
+    }
+
+    // cancel 先着なら sync CANCEL を送り、後着 interim では 2 本目の CANCEL を送らない。
+    // tombstone は interim の AsyncId を保存し、async final を相関検査のうえ drain する。
+    func testCancelBeforeInterimDrainsTombstoneWithAsyncFinal() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let session = makeAsyncCorrelationSession(transport)
+        let asyncId: UInt64 = 0x0bad_cafe_0000_0001
+
+        let task = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 3)
+        }
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let readHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+
+        task.cancel()
+        try await waitForOutboundFrameCount(2, transport: transport)
+        let cancelHeader = try SMB2Header.decode(try unframed(transport.outbound)[1])
+        XCTAssertEqual(cancelHeader.treeId, 0)
+        XCTAssertNil(cancelHeader.asyncId)
+        do {
+            _ = try await awaitWithTimeout("cancelled read") { try await task.value }
+            XCTFail("cancelled READ unexpectedly completed")
+        } catch is CancellationError {
+        }
+
+        let dispatchBase = await session.receivedPacketDispatchCountForTesting()
+        transport.enqueueInbound(try framed([
+            try smb2AsyncPendingResponse(command: SMB2Commands.read, messageId: readHeader.messageId, asyncId: asyncId)
+        ]))
+        try await waitForDispatchCount(dispatchBase + 1, session: session)
+        transport.enqueueInbound(try framed([
+            try smb2AsyncReadResponse([0x61], messageId: readHeader.messageId, asyncId: asyncId)
+        ]))
+        try await waitForDispatchCount(dispatchBase + 2, session: session)
+
+        // No second CANCEL was sent for the late interim, and the tombstone drained.
+        let requests = try unframed(transport.outbound)
+        XCTAssertEqual(requests.count, 2)
+        let pendingCount = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingCount, 0)
     }
 
     func testReadCancellationSendsSMB2Cancel() async throws {
@@ -5374,7 +5725,9 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(readHeader.command, SMB2Commands.read)
         XCTAssertEqual(cancelHeader.command, SMB2Commands.cancel)
         XCTAssertEqual(cancelHeader.messageId, readHeader.messageId)
-        XCTAssertEqual(cancelHeader.treeId, readHeader.treeId)
+        // Pre-interim cancellation uses the sync CANCEL form with TreeId 0 (MS-SMB2 §2.2.1.2).
+        XCTAssertEqual(cancelHeader.treeId, 0)
+        XCTAssertNil(cancelHeader.asyncId)
 
         transport.enqueueInbound(try framed([
             try smb2StatusResponse(
@@ -9366,12 +9719,11 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testAsyncPendingInterimResponseIsDiscardedBeforeFinalResponse() throws {
-        let pending = try SMB2Header(
+        let pending = try SMB2Header.asyncHeader(
             status: SMB2Status.pending,
             command: SMB2Commands.flush,
-            flags: SMB2Flags.asyncCommand,
             messageId: 17,
-            treeId: 0x5566_7788,
+            asyncId: 0x5566_7788_0000_0001,
             sessionId: 0x1122_3344
         ).encode()
         let final = try SMB2Header(
@@ -9382,7 +9734,7 @@ final class SMBeeTests: XCTestCase {
         ).encode()
         var mockResponses = [pending, final]
 
-        while try SMB2AsyncInterim.shouldDiscard(mockResponses[0]) {
+        while try SMB2AsyncInterim.isInterim(SMB2Header.decode(mockResponses[0])) {
             mockResponses.removeFirst()
         }
 
@@ -9399,7 +9751,7 @@ final class SMBeeTests: XCTestCase {
             messageId: 18
         ).encode()
 
-        XCTAssertThrowsError(try SMB2AsyncInterim.shouldDiscard(pending)) { error in
+        XCTAssertThrowsError(try SMB2AsyncInterim.isInterim(SMB2Header.decode(pending))) { error in
             XCTAssertEqual(error as? SMBCodecError, .invalidValue("SMB2 STATUS_PENDING response missing ASYNC_COMMAND flag"))
         }
     }

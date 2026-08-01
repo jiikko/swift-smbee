@@ -90,3 +90,22 @@ API を追加する:
   onChunk 逐次・順序保証）を変えない。
 - unit で EOF 到達・0 バイトファイル・N > size・N == size の境界を固定する。
 - production の wire を触るため、`bin/e2e/smoke-all`（3 プロファイル）を commit 後に通す。
+
+## 2026-08-01 追記: B/C/D の着手判断（issue 068 の実測データによる）
+
+issue 068 close 時の再計測（container Samba・64KiB prefix read、`432c261` / `9e6cde7` の
+CREDIT_FIFO_HOL_READ_TIMING）で B の価値判断に使える実測が取れた:
+
+- prefix read 全体（CREATE+READ+CLOSE）: baseline ~2ms、大 WRITE 競合時 p50 10-14ms
+- うち READ transaction 単体（pending→recv）: baseline ~0.85ms、競合時 ~3ms
+- → **prefix 全体の 60-70% は CREATE/CLOSE と処理間の残差**。B（compound、3→1 往復）は
+  localhost でも件数比例の削減余地があり、実 NAS（RTT が ms 級）では 2×RTT×件数の削減になる
+
+判断: **B は「価値の見込みあり」だが着手は保留のまま**。理由:
+1. issue の gate（consumer 実害）が未発火（obaket からのサムネイル遅延報告なし）
+2. compound (related requests) は wire 中核（credit・署名・demux の複合 request 対応）の
+   大きめ実装で、issue 010 §方針 1（single reader 構造改修）と同時期にやると危険
+3. 実 NAS の RTT 実測（compatibility matrix 作業）が先。localhost の 1.5ms/件では
+   30-60 件でも 50-90ms で、実害 gate（issue 068 と同じ基準）未達
+
+C / D は B より優先度が下がる（C は full fetch 経路で今回の用途外、D は A の運用実績待ち）。

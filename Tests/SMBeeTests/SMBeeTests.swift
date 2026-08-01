@@ -667,6 +667,243 @@ private final class POSIXLifecycleRecorder: @unchecked Sendable {
     }
 }
 
+private enum POSIXConnectFakeEvent: Equatable {
+    case pollStarted
+    case shutdown
+    case pollReturned
+    case restoreStarted
+    case restoreReturned
+    case close
+}
+
+private final class POSIXConnectFakeEventRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [POSIXConnectFakeEvent] = []
+
+    var events: [POSIXConnectFakeEvent] { lock.withLock { storage } }
+
+    func append(_ event: POSIXConnectFakeEvent) {
+        lock.withLock { storage.append(event) }
+    }
+}
+
+private struct POSIXConnectFakePollStep {
+    let result: Int32
+    let errno: Int32
+    let revents: Int16
+    let clockAdvance: Duration
+
+    init(
+        result: Int32,
+        errno: Int32 = 0,
+        revents: Int16 = 0,
+        clockAdvance: Duration = .zero
+    ) {
+        self.result = result
+        self.errno = errno
+        self.revents = revents
+        self.clockAdvance = clockAdvance
+    }
+}
+
+private final class POSIXConnectSyscallFake: @unchecked Sendable {
+    let descriptor: Int32 = 73
+    let originalFlags: Int32 = 0
+    let events = POSIXConnectFakeEventRecorder()
+
+    private let lock = NSLock()
+    private let pollCondition = NSCondition()
+    private let restoreCondition = NSCondition()
+    private let pollStartCounter = POSIXAsyncCounter()
+    private let restoreStartCounter = POSIXAsyncCounter()
+    private var nowStorage = ContinuousClock().now
+    private var connectResults: [POSIXSocketCallResult<Int32>]
+    private var pollSteps: [POSIXConnectFakePollStep]
+    private var socketErrors: [POSIXSocketCallResult<Int32>]
+    private var restoreResult: POSIXSocketCallResult<Int32>
+    private var shouldBlockPoll = false
+    private var shouldBlockRestore = false
+    private var releasePoll = false
+    private var releaseRestore = false
+    private var pollTimeoutStorage: [Int32] = []
+    private var connectCountStorage = 0
+    private var getSocketErrorCountStorage = 0
+    private var restoreCountStorage = 0
+
+    init(
+        connectResults: [POSIXSocketCallResult<Int32>] = [POSIXSocketCallResult(-1, errno: EINPROGRESS)],
+        pollSteps: [POSIXConnectFakePollStep] = [
+            POSIXConnectFakePollStep(result: 1, revents: Int16(POLLOUT))
+        ],
+        socketErrors: [POSIXSocketCallResult<Int32>] = [POSIXSocketCallResult(0)],
+        restoreResult: POSIXSocketCallResult<Int32> = POSIXSocketCallResult(0),
+        blockPoll: Bool = false,
+        blockRestore: Bool = false
+    ) {
+        self.connectResults = connectResults
+        self.pollSteps = pollSteps
+        self.socketErrors = socketErrors
+        self.restoreResult = restoreResult
+        self.shouldBlockPoll = blockPoll
+        self.shouldBlockRestore = blockRestore
+    }
+
+    var pollTimeouts: [Int32] { lock.withLock { pollTimeoutStorage } }
+    var connectCount: Int { lock.withLock { connectCountStorage } }
+    var getSocketErrorCount: Int { lock.withLock { getSocketErrorCountStorage } }
+    var restoreCount: Int { lock.withLock { restoreCountStorage } }
+
+    private func validateDescriptor(_ actual: Int32, operation: String) -> Bool {
+        guard actual == descriptor else {
+            XCTFail("\(operation) used descriptor \(actual), expected \(descriptor)")
+            return false
+        }
+        return true
+    }
+
+    var syscalls: POSIXSocketSyscalls {
+        POSIXSocketSyscalls(
+            socket: { [self] _, _, _ in POSIXSocketCallResult(descriptor) },
+            connect: { [self] actualDescriptor, _, _ in
+                guard validateDescriptor(actualDescriptor, operation: "connect") else {
+                    return POSIXSocketCallResult<Int32>(-1, errno: EIO)
+                }
+                return lock.withLock {
+                    connectCountStorage += 1
+                    guard !connectResults.isEmpty else {
+                        XCTFail("connectResults script exhausted")
+                        return POSIXSocketCallResult<Int32>(-1, errno: EIO)
+                    }
+                    return connectResults.removeFirst()
+                }
+            },
+            fcntl: { [self] actualDescriptor, command, value in
+                guard validateDescriptor(actualDescriptor, operation: "fcntl") else {
+                    return POSIXSocketCallResult<Int32>(-1, errno: EIO)
+                }
+                if command == F_GETFL { return POSIXSocketCallResult(originalFlags) }
+                guard command == F_SETFL else {
+                    XCTFail("fcntl used command \(command), expected F_GETFL or F_SETFL")
+                    return POSIXSocketCallResult<Int32>(-1, errno: EIO)
+                }
+                if value != originalFlags { return POSIXSocketCallResult(0) }
+
+                lock.withLock { restoreCountStorage += 1 }
+                events.append(.restoreStarted)
+                restoreStartCounter.increment()
+                restoreCondition.lock()
+                while shouldBlockRestore && !releaseRestore {
+                    restoreCondition.wait()
+                }
+                restoreCondition.unlock()
+                events.append(.restoreReturned)
+                return restoreResult
+            },
+            poll: { [self] actualDescriptor, requestedEvents, timeout in
+                guard validateDescriptor(actualDescriptor, operation: "poll") else {
+                    return POSIXSocketCallResult(
+                        POSIXSocketPollValue(result: -1, revents: 0),
+                        errno: EIO
+                    )
+                }
+                guard requestedEvents == Int16(POLLOUT) else {
+                    XCTFail("poll requested events \(requestedEvents), expected POLLOUT")
+                    return POSIXSocketCallResult(
+                        POSIXSocketPollValue(result: -1, revents: 0),
+                        errno: EIO
+                    )
+                }
+                let step = lock.withLock { () -> POSIXConnectFakePollStep in
+                    pollTimeoutStorage.append(timeout)
+                    guard !pollSteps.isEmpty else {
+                        XCTFail("pollSteps script exhausted")
+                        return POSIXConnectFakePollStep(result: -1, errno: EIO)
+                    }
+                    return pollSteps.removeFirst()
+                }
+                events.append(.pollStarted)
+                pollStartCounter.increment()
+                pollCondition.lock()
+                while shouldBlockPoll && !releasePoll {
+                    pollCondition.wait()
+                }
+                pollCondition.unlock()
+                lock.withLock { nowStorage = nowStorage.advanced(by: step.clockAdvance) }
+                events.append(.pollReturned)
+                return POSIXSocketCallResult(
+                    POSIXSocketPollValue(result: step.result, revents: step.revents),
+                    errno: step.errno
+                )
+            },
+            getSocketError: { [self] actualDescriptor in
+                guard validateDescriptor(actualDescriptor, operation: "getsockopt(SO_ERROR)") else {
+                    return POSIXSocketCallResult(
+                        POSIXSocketErrorValue(result: -1, socketError: 0),
+                        errno: EIO
+                    )
+                }
+                return lock.withLock {
+                    getSocketErrorCountStorage += 1
+                    guard !socketErrors.isEmpty else {
+                        XCTFail("socketErrors script exhausted")
+                        return POSIXSocketCallResult(
+                            POSIXSocketErrorValue(result: -1, socketError: 0),
+                            errno: EIO
+                        )
+                    }
+                    let entry = socketErrors.removeFirst()
+                    return POSIXSocketCallResult(
+                        POSIXSocketErrorValue(
+                            result: entry.errno == 0 ? 0 : -1,
+                            socketError: entry.value
+                        ),
+                        errno: entry.errno
+                    )
+                }
+            },
+            setSocketOption: { [self] actualDescriptor, _, _, _, _ in
+                guard validateDescriptor(actualDescriptor, operation: "setsockopt") else {
+                    return POSIXSocketCallResult<Int32>(-1, errno: EIO)
+                }
+                return POSIXSocketCallResult(0)
+            },
+            now: { [self] in lock.withLock { nowStorage } }
+        )
+    }
+
+    func shutdown(_ descriptor: Int32) {
+        XCTAssertEqual(descriptor, self.descriptor)
+        events.append(.shutdown)
+    }
+
+    func close(_ descriptor: Int32) {
+        XCTAssertEqual(descriptor, self.descriptor)
+        events.append(.close)
+    }
+
+    func waitForPollStart() async {
+        await pollStartCounter.wait(until: 1)
+    }
+
+    func waitForRestoreStart() async {
+        await restoreStartCounter.wait(until: 1)
+    }
+
+    func unblockPoll() {
+        pollCondition.lock()
+        releasePoll = true
+        pollCondition.broadcast()
+        pollCondition.unlock()
+    }
+
+    func unblockRestore() {
+        restoreCondition.lock()
+        releaseRestore = true
+        restoreCondition.broadcast()
+        restoreCondition.unlock()
+    }
+}
+
 private final class FailingReceiveTransport: SMBTransport, @unchecked Sendable {
     let failure: Error
 
@@ -1189,6 +1426,371 @@ final class SMBeeTests: XCTestCase {
         }
 
         XCTAssertEqual(received, [0xde, 0xad, 0xbe, 0xef])
+    }
+
+    func testPOSIXConnectNilTimeoutCloseInterruptsLiveBlackholeConnect() async throws {
+        let transport = POSIXSocketTransport()
+        let connectTask = Task {
+            try await transport.connect(host: "10.255.255.1", port: 445)
+        }
+        defer {
+            connectTask.cancel()
+            transport.close()
+        }
+
+        var earlyCompletion: Result<Void, Error>?
+        do {
+            try await awaitWithTimeout(seconds: 0.4, "live blackhole connect remains pending") {
+                try await connectTask.value
+            }
+            earlyCompletion = .success(())
+        } catch is SMBTestTimeoutError {
+            // Expected: the live connect is still parked in the OS after several heartbeats.
+        } catch {
+            earlyCompletion = .failure(error)
+        }
+
+        if let earlyCompletion {
+            transport.close()
+            switch earlyCompletion {
+            case .success:
+                throw XCTSkip("10.255.255.1:445 accepted the connection before close; no blackhole path")
+            case .failure(let error):
+                throw XCTSkip("10.255.255.1:445 failed before close (\(error)); no blackhole path")
+            }
+        }
+
+        transport.close()
+        do {
+            try await awaitWithTimeout(seconds: 5, "live nil-timeout connect completion after close") {
+                try await connectTask.value
+            }
+            XCTFail("live blackhole connect unexpectedly succeeded after close")
+        } catch SMBTransportError.connectionClosed {
+        }
+
+        // A second operation must observe the terminal state; the connecting descriptor must
+        // not have been promoted or left usable after its lease drained and was closed.
+        do {
+            try await transport.send([0])
+            XCTFail("closed live transport remained usable after connect retirement")
+        } catch SMBTransportError.connectionClosed {
+        }
+    }
+
+    func testPOSIXConnectNilTimeoutCloseDrainsCandidateLeaseAfterPollReturns() async throws {
+        let fake = POSIXConnectSyscallFake(
+            pollSteps: [POSIXConnectFakePollStep(result: 0)],
+            blockPoll: true
+        )
+        let transport = POSIXSocketTransport(
+            timeout: nil,
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+        let connectTask = Task { try await transport.connect(host: "127.0.0.1", port: 445) }
+        defer {
+            fake.unblockPoll()
+            connectTask.cancel()
+            transport.close()
+        }
+
+        try await awaitWithTimeout("fake poll start before close") {
+            await fake.waitForPollStart()
+        }
+        transport.close()
+        XCTAssertEqual(fake.events.events, [.pollStarted, .shutdown])
+        XCTAssertEqual(fake.restoreCount, 0)
+        XCTAssertEqual(fake.getSocketErrorCount, 0)
+
+        fake.unblockPoll()
+        do {
+            try await awaitWithTimeout("connect completion after close") {
+                try await connectTask.value
+            }
+            XCTFail("connect unexpectedly succeeded after close")
+        } catch SMBTransportError.connectionClosed {
+        }
+        XCTAssertEqual(fake.events.events, [.pollStarted, .shutdown, .pollReturned, .close])
+    }
+
+    func testPOSIXConnectNilTimeoutCancellationDrainsCandidateLeaseAfterPollReturns() async throws {
+        let fake = POSIXConnectSyscallFake(
+            pollSteps: [POSIXConnectFakePollStep(result: 0)],
+            blockPoll: true
+        )
+        let transport = POSIXSocketTransport(
+            timeout: nil,
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+        let connectTask = Task { try await transport.connect(host: "127.0.0.1", port: 445) }
+        defer {
+            fake.unblockPoll()
+            connectTask.cancel()
+            transport.close()
+        }
+
+        try await awaitWithTimeout("fake poll start before cancellation") {
+            await fake.waitForPollStart()
+        }
+        connectTask.cancel()
+        XCTAssertEqual(fake.events.events, [.pollStarted, .shutdown])
+        fake.unblockPoll()
+
+        do {
+            try await awaitWithTimeout("connect completion after cancellation") {
+                try await connectTask.value
+            }
+            XCTFail("connect unexpectedly succeeded after cancellation")
+        } catch is CancellationError {
+        }
+        XCTAssertEqual(fake.events.events, [.pollStarted, .shutdown, .pollReturned, .close])
+        XCTAssertEqual(fake.restoreCount, 0)
+        XCTAssertEqual(fake.getSocketErrorCount, 0)
+    }
+
+    func testPOSIXConnectCloseDuringFlagRestorationDoesNotPromoteCandidate() async throws {
+        let fake = POSIXConnectSyscallFake(blockRestore: true)
+        let transport = POSIXSocketTransport(
+            timeout: nil,
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+        let connectTask = Task { try await transport.connect(host: "127.0.0.1", port: 445) }
+        defer {
+            fake.unblockRestore()
+            connectTask.cancel()
+            transport.close()
+        }
+
+        try await awaitWithTimeout("fake flag restoration start before close") {
+            await fake.waitForRestoreStart()
+        }
+        transport.close()
+        XCTAssertEqual(
+            fake.events.events,
+            [.pollStarted, .pollReturned, .restoreStarted, .shutdown]
+        )
+        fake.unblockRestore()
+
+        do {
+            try await awaitWithTimeout("connect completion after close during restoration") {
+                try await connectTask.value
+            }
+            XCTFail("connect unexpectedly promoted a retired candidate")
+        } catch SMBTransportError.connectionClosed {
+        }
+        XCTAssertEqual(
+            fake.events.events,
+            [.pollStarted, .pollReturned, .restoreStarted, .shutdown, .restoreReturned, .close]
+        )
+        do {
+            try await awaitWithTimeout("send after retired connect candidate") {
+                try await transport.send([1])
+            }
+            XCTFail("retired candidate remained usable")
+        } catch SMBTransportError.connectionClosed {
+        }
+    }
+
+    func testPOSIXConnectErrnoTransitionsUsePollWithoutReissuingConnect() async throws {
+        let cases: [(name: String, result: POSIXSocketCallResult<Int32>, expectedPolls: Int)] = [
+            ("success", POSIXSocketCallResult(0), 0),
+            ("EINTR", POSIXSocketCallResult(-1, errno: EINTR), 1),
+            ("EINPROGRESS", POSIXSocketCallResult(-1, errno: EINPROGRESS), 1),
+            ("EALREADY", POSIXSocketCallResult(-1, errno: EALREADY), 1),
+            ("EISCONN", POSIXSocketCallResult(-1, errno: EISCONN), 0)
+        ]
+
+        for testCase in cases {
+            let fake = POSIXConnectSyscallFake(connectResults: [testCase.result])
+            let transport = POSIXSocketTransport(
+                timeout: nil,
+                syscalls: fake.syscalls,
+                shutdown: fake.shutdown,
+                close: fake.close
+            )
+            try await transport.connect(host: "127.0.0.1", port: 445)
+            XCTAssertEqual(fake.pollTimeouts.count, testCase.expectedPolls, testCase.name)
+            XCTAssertEqual(fake.connectCount, 1, testCase.name)
+            XCTAssertEqual(fake.restoreCount, 1, testCase.name)
+            transport.close()
+        }
+    }
+
+    func testPOSIXConnectPollHeartbeatAndEINTRRetryUntilReady() async throws {
+        let fake = POSIXConnectSyscallFake(
+            pollSteps: [
+                POSIXConnectFakePollStep(result: 0),
+                POSIXConnectFakePollStep(result: -1, errno: EINTR),
+                POSIXConnectFakePollStep(result: 1, revents: Int16(POLLERR | POLLHUP))
+            ]
+        )
+        let transport = POSIXSocketTransport(
+            timeout: nil,
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+
+        try await transport.connect(host: "127.0.0.1", port: 445)
+
+        XCTAssertEqual(fake.pollTimeouts, [100, 100, 100])
+        XCTAssertEqual(fake.getSocketErrorCount, 1, "SO_ERROR must only follow positive poll readiness")
+        XCTAssertEqual(fake.restoreCount, 1)
+        transport.close()
+    }
+
+    func testPOSIXConnectAbsoluteDeadlineIsNotExtendedByPollEINTR() async throws {
+        let fake = POSIXConnectSyscallFake(
+            pollSteps: [
+                POSIXConnectFakePollStep(
+                    result: -1,
+                    errno: EINTR,
+                    clockAdvance: .milliseconds(60)
+                ),
+                POSIXConnectFakePollStep(result: 0, clockAdvance: .milliseconds(90))
+            ]
+        )
+        let transport = POSIXSocketTransport(
+            timeout: .milliseconds(150),
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 445)
+            XCTFail("connect unexpectedly outlived its absolute deadline")
+        } catch SMBTransportError.timedOut {
+        }
+        XCTAssertEqual(fake.pollTimeouts, [100, 90])
+        XCTAssertEqual(fake.getSocketErrorCount, 0)
+        XCTAssertEqual(fake.restoreCount, 0)
+    }
+
+    func testPOSIXConnectRoundsPositivePollRemainderUpToOneMillisecond() async throws {
+        let fake = POSIXConnectSyscallFake()
+        let transport = POSIXSocketTransport(
+            timeout: .nanoseconds(1),
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+
+        try await transport.connect(host: "127.0.0.1", port: 445)
+
+        XCTAssertEqual(fake.pollTimeouts, [1])
+        transport.close()
+    }
+
+    func testPOSIXConnectSocketErrorTable() async throws {
+        let cases: [(name: String, socketError: Int32, timedOut: Bool)] = [
+            ("success", 0, false),
+            ("ECONNREFUSED", ECONNREFUSED, false),
+            ("ETIMEDOUT", ETIMEDOUT, true)
+        ]
+
+        for testCase in cases {
+            let fake = POSIXConnectSyscallFake(
+                socketErrors: [POSIXSocketCallResult(testCase.socketError)]
+            )
+            let transport = POSIXSocketTransport(
+                timeout: nil,
+                syscalls: fake.syscalls,
+                shutdown: fake.shutdown,
+                close: fake.close
+            )
+            do {
+                try await transport.connect(host: "127.0.0.1", port: 445)
+                XCTAssertEqual(testCase.socketError, 0, testCase.name)
+                transport.close()
+            } catch SMBTransportError.timedOut {
+                XCTAssertTrue(testCase.timedOut, testCase.name)
+            } catch let error as SMBTransportError {
+                guard case .socketFailure = error else {
+                    XCTFail("\(testCase.name): unexpected error \(error)")
+                    continue
+                }
+                XCTAssertEqual(testCase.socketError, ECONNREFUSED, testCase.name)
+            }
+            XCTAssertEqual(fake.getSocketErrorCount, 1, testCase.name)
+        }
+    }
+
+    func testPOSIXConnectPollNVALIsNeverTreatedAsSuccess() async throws {
+        let fake = POSIXConnectSyscallFake(
+            pollSteps: [
+                POSIXConnectFakePollStep(result: 1, revents: Int16(POLLOUT | POLLNVAL))
+            ]
+        )
+        let transport = POSIXSocketTransport(
+            timeout: nil,
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 445)
+            XCTFail("POLLNVAL unexpectedly completed connect")
+        } catch let error as SMBTransportError {
+            guard case .socketFailure = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+        XCTAssertEqual(fake.getSocketErrorCount, 0)
+        XCTAssertEqual(fake.restoreCount, 0)
+    }
+
+    func testPOSIXConnectPollEAGAINIsSocketFailureNotTimeout() async throws {
+        let fake = POSIXConnectSyscallFake(
+            pollSteps: [POSIXConnectFakePollStep(result: -1, errno: EAGAIN)]
+        )
+        let transport = POSIXSocketTransport(
+            timeout: .seconds(1),
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 445)
+            XCTFail("poll EAGAIN unexpectedly completed connect")
+        } catch SMBTransportError.timedOut {
+            XCTFail("poll EAGAIN was incorrectly normalized to timedOut")
+        } catch let error as SMBTransportError {
+            guard case .socketFailure = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+    }
+
+    func testPOSIXConnectFlagRestorationFailureRetiresCandidate() async throws {
+        let fake = POSIXConnectSyscallFake(
+            restoreResult: POSIXSocketCallResult(-1, errno: EIO)
+        )
+        let transport = POSIXSocketTransport(
+            timeout: nil,
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+
+        do {
+            try await transport.connect(host: "127.0.0.1", port: 445)
+            XCTFail("connect unexpectedly promoted after restoration failure")
+        } catch let error as SMBTransportError {
+            guard case .socketFailure = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+        XCTAssertEqual(fake.restoreCount, 1)
+        XCTAssertEqual(fake.events.events.suffix(3), [.restoreStarted, .restoreReturned, .close])
     }
 
     func testPOSIXSocketTransportSendBeforeConnectDoesNotPoisonTransport() async throws {

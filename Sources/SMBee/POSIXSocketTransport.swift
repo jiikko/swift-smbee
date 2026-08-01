@@ -11,6 +11,96 @@ internal typealias POSIXSocketReader = @Sendable (Int32, UnsafeMutableRawPointer
 internal typealias POSIXSocketLifecycleHook = @Sendable (Int32) -> Void
 internal typealias POSIXSocketSendEnqueueHook = @Sendable () -> Void
 
+internal struct POSIXSocketCallResult<Value> {
+    let value: Value
+    let errno: Int32
+
+    init(_ value: Value, errno: Int32 = 0) {
+        self.value = value
+        self.errno = errno
+    }
+}
+
+internal struct POSIXSocketPollValue {
+    let result: Int32
+    let revents: Int16
+}
+
+internal struct POSIXSocketErrorValue {
+    let result: Int32
+    let socketError: Int32
+}
+
+/// The syscall boundary used while establishing a POSIX connection.
+///
+/// Each operation captures its return value and `errno` together so a test fake (and the
+/// live implementation) cannot observe an `errno` subsequently changed by another call.
+internal struct POSIXSocketSyscalls: @unchecked Sendable {
+    let socket: @Sendable (Int32, Int32, Int32) -> POSIXSocketCallResult<Int32>
+    let connect: @Sendable (
+        Int32,
+        UnsafePointer<sockaddr>?,
+        socklen_t
+    ) -> POSIXSocketCallResult<Int32>
+    let fcntl: @Sendable (Int32, Int32, Int32) -> POSIXSocketCallResult<Int32>
+    let poll: @Sendable (Int32, Int16, Int32) -> POSIXSocketCallResult<POSIXSocketPollValue>
+    let getSocketError: @Sendable (Int32) -> POSIXSocketCallResult<POSIXSocketErrorValue>
+    let setSocketOption: @Sendable (
+        Int32,
+        Int32,
+        Int32,
+        UnsafeRawPointer?,
+        socklen_t
+    ) -> POSIXSocketCallResult<Int32>
+    let now: @Sendable () -> ContinuousClock.Instant
+
+    static var live: POSIXSocketSyscalls {
+        let clock = ContinuousClock()
+        return POSIXSocketSyscalls(
+            socket: { family, type, protocolValue in
+                let value = DarwinOrGlibc.socket(family, type, protocolValue)
+                return POSIXSocketCallResult(value, errno: value < 0 ? DarwinOrGlibc.errnoValue : 0)
+            },
+            connect: { descriptor, address, length in
+                let value = DarwinOrGlibc.connect(descriptor, address, length)
+                return POSIXSocketCallResult(value, errno: value < 0 ? DarwinOrGlibc.errnoValue : 0)
+            },
+            fcntl: { descriptor, command, value in
+                let result = DarwinOrGlibc.fcntl(descriptor, command, value)
+                return POSIXSocketCallResult(result, errno: result < 0 ? DarwinOrGlibc.errnoValue : 0)
+            },
+            poll: { descriptor, events, timeout in
+                var pollDescriptor = pollfd(fd: descriptor, events: events, revents: 0)
+                let result = DarwinOrGlibc.poll(&pollDescriptor, 1, timeout)
+                return POSIXSocketCallResult(
+                    POSIXSocketPollValue(result: result, revents: pollDescriptor.revents),
+                    errno: result < 0 ? DarwinOrGlibc.errnoValue : 0
+                )
+            },
+            getSocketError: { descriptor in
+                var socketErrorValue: Int32 = 0
+                var socketErrorLength = socklen_t(MemoryLayout<Int32>.size)
+                let result = DarwinOrGlibc.getsockopt(
+                    descriptor,
+                    SOL_SOCKET,
+                    SO_ERROR,
+                    &socketErrorValue,
+                    &socketErrorLength
+                )
+                return POSIXSocketCallResult(
+                    POSIXSocketErrorValue(result: result, socketError: socketErrorValue),
+                    errno: result < 0 ? DarwinOrGlibc.errnoValue : 0
+                )
+            },
+            setSocketOption: { descriptor, level, name, value, length in
+                let result = DarwinOrGlibc.setsockopt(descriptor, level, name, value, length)
+                return POSIXSocketCallResult(result, errno: result < 0 ? DarwinOrGlibc.errnoValue : 0)
+            },
+            now: { clock.now }
+        )
+    }
+}
+
 public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     private enum ConnectionState {
         case idle
@@ -39,6 +129,7 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     private let shutdownDescriptor: POSIXSocketLifecycleHook
     private let closeDescriptor: POSIXSocketLifecycleHook
     private let sendEnqueueHook: POSIXSocketSendEnqueueHook
+    private let syscalls: POSIXSocketSyscalls
     private let sendQueue = DispatchQueue(label: "dev.smbee.posix.send")
 
     // POSIX is used instead of SwiftNIO for Phase 0 to keep the transport dependency-free
@@ -61,6 +152,35 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         self.shutdownDescriptor = { descriptor in DarwinOrGlibc.shutdown(descriptor) }
         self.closeDescriptor = { descriptor in DarwinOrGlibc.close(descriptor) }
         self.sendEnqueueHook = {}
+        self.syscalls = .live
+    }
+
+    internal init(
+        timeout: Duration?,
+        syscalls: POSIXSocketSyscalls,
+        writer: @escaping POSIXSocketWriter = { descriptor, bytes, offset in
+            bytes.withUnsafeBytes { buffer in
+                DarwinOrGlibc.send(
+                    descriptor,
+                    buffer.baseAddress!.advanced(by: offset),
+                    bytes.count - offset,
+                    DarwinOrGlibc.sendFlagsSuppressingSIGPIPE
+                )
+            }
+        },
+        reader: @escaping POSIXSocketReader = { descriptor, buffer, maxLength in
+            DarwinOrGlibc.recv(descriptor, buffer, maxLength, 0)
+        },
+        shutdown: @escaping POSIXSocketLifecycleHook,
+        close: @escaping POSIXSocketLifecycleHook
+    ) {
+        self.timeout = timeout
+        self.writer = writer
+        self.reader = reader
+        self.shutdownDescriptor = shutdown
+        self.closeDescriptor = close
+        self.sendEnqueueHook = {}
+        self.syscalls = syscalls
     }
 
     internal init(
@@ -79,10 +199,16 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         self.shutdownDescriptor = shutdown
         self.closeDescriptor = close
         self.sendEnqueueHook = sendEnqueued
+        self.syscalls = .live
         self.connectionState = .open(socketFileDescriptor)
         self.descriptorLeaseRecords[socketFileDescriptor] = DescriptorLeaseRecord()
     }
 
+    /// Connects to an SMB endpoint.
+    ///
+    /// Once address resolution has completed, cancellation/`close()` is observed by a
+    /// nonblocking-connect heartbeat within about 100 ms plus scheduler delay. DNS
+    /// resolution itself is performed by `getaddrinfo` and is not bounded by this guarantee.
     public func connect(host: String, port: UInt16) async throws {
         try Task.checkCancellation()
         try beginConnect()
@@ -176,7 +302,12 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
 
         var current: UnsafeMutablePointer<addrinfo>? = first
         while let candidate = current {
-            let descriptor = socket(candidate.pointee.ai_family, candidate.pointee.ai_socktype, candidate.pointee.ai_protocol)
+            let socketResult = syscalls.socket(
+                candidate.pointee.ai_family,
+                candidate.pointee.ai_socktype,
+                candidate.pointee.ai_protocol
+            )
+            let descriptor = socketResult.value
             if descriptor >= 0 {
                 guard installConnectingDescriptor(descriptor) else {
                     closeDescriptor(descriptor)
@@ -280,53 +411,119 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     }
 
     private func connectSocket(_ descriptor: Int32, address: UnsafePointer<sockaddr>?, length: socklen_t) throws {
-        guard let timeout else {
+        let deadline = timeout.map { syscalls.now().advanced(by: $0) }
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
+        let getFlagsResult = syscalls.fcntl(descriptor, F_GETFL, 0)
+        let flags = getFlagsResult.value
+        guard flags >= 0 else {
+            throw socketError(
+                operation: "fcntl(F_GETFL)",
+                descriptor: descriptor,
+                errnoValue: getFlagsResult.errno
+            )
+        }
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
+        let setNonblockingResult = syscalls.fcntl(descriptor, F_SETFL, flags | DarwinOrGlibc.oNonBlock)
+        guard setNonblockingResult.value >= 0 else {
+            throw socketError(
+                operation: "fcntl(F_SETFL)",
+                descriptor: descriptor,
+                errnoValue: setNonblockingResult.errno
+            )
+        }
+
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
+        let connectResult = syscalls.connect(descriptor, address, length)
+        if connectResult.value == 0 || connectResult.errno == EISCONN {
+            try restoreBlockingFlags(flags, descriptor: descriptor)
+            return
+        }
+        switch connectResult.errno {
+        case EINTR, EINPROGRESS, EALREADY:
+            break
+        default:
+            throw socketError(
+                operation: "connect",
+                descriptor: descriptor,
+                errnoValue: connectResult.errno
+            )
+        }
+
+        while true {
             guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-            if DarwinOrGlibc.connect(descriptor, address, length) == 0 { return }
-            throw socketError(operation: "connect", descriptor: descriptor)
-        }
+            let pollTimeout = try connectPollTimeout(deadline: deadline)
+            let pollResult = syscalls.poll(descriptor, Int16(POLLOUT), pollTimeout)
 
-        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-        let flags = DarwinOrGlibc.fcntl(descriptor, F_GETFL, 0)
-        guard flags >= 0 else { throw socketError(operation: "fcntl(F_GETFL)", descriptor: descriptor) }
-        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-        guard DarwinOrGlibc.fcntl(descriptor, F_SETFL, flags | DarwinOrGlibc.oNonBlock) >= 0 else {
-            throw socketError(operation: "fcntl(F_SETFL)", descriptor: descriptor)
-        }
-        defer {
-            if descriptorAllowsSyscall(descriptor) {
-                _ = DarwinOrGlibc.fcntl(descriptor, F_SETFL, flags)
+            if pollResult.value.result == 0 {
+                // For an unbounded connect this is only the 100 ms retirement heartbeat.
+                // For a finite connect, an early poll timeout is likewise not terminal
+                // until the absolute monotonic deadline has actually elapsed.
+                guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
+                if let deadline, syscalls.now() >= deadline { throw SMBTransportError.timedOut }
+                continue
             }
-        }
+            if pollResult.value.result < 0 {
+                guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
+                if pollResult.errno == EINTR {
+                    if let deadline, syscalls.now() >= deadline { throw SMBTransportError.timedOut }
+                    continue
+                }
+                // In particular, Darwin's poll(2) EAGAIN is a syscall failure, not a
+                // connect timeout (the generic socket error normalizer maps EAGAIN).
+                throw SMBTransportError.socketFailure("poll failed: errno \(pollResult.errno)")
+            }
 
-        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-        if DarwinOrGlibc.connect(descriptor, address, length) == 0 { return }
-        guard DarwinOrGlibc.errnoValue == EINPROGRESS else {
-            throw socketError(operation: "connect", descriptor: descriptor)
-        }
+            let revents = pollResult.value.revents
+            if revents & Int16(POLLNVAL) != 0 {
+                throw SMBTransportError.socketFailure("poll lease invariant violated: POLLNVAL")
+            }
+            let completionEvents = Int16(POLLOUT | POLLERR | POLLHUP)
+            guard revents & completionEvents != 0 else {
+                throw SMBTransportError.socketFailure("poll returned unexpected events: \(revents)")
+            }
 
-        var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
-        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-        let pollResult = DarwinOrGlibc.poll(&pollDescriptor, 1, timeout.pollMilliseconds)
-        if pollResult == 0 { throw SMBTransportError.timedOut }
-        guard pollResult > 0 else { throw socketError(operation: "poll", descriptor: descriptor) }
+            // SO_ERROR is meaningful only after poll reports a positive completion event.
+            guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
+            let socketErrorResult = syscalls.getSocketError(descriptor)
+            guard socketErrorResult.value.result == 0 else {
+                throw socketError(
+                    operation: "getsockopt(SO_ERROR)",
+                    descriptor: descriptor,
+                    errnoValue: socketErrorResult.errno
+                )
+            }
+            let socketErrorValue = socketErrorResult.value.socketError
+            guard socketErrorValue == 0 else {
+                if socketErrorValue == ETIMEDOUT { throw SMBTransportError.timedOut }
+                throw SMBTransportError.socketFailure("connect failed: errno \(socketErrorValue)")
+            }
 
-        var socketErrorValue: Int32 = 0
-        var socketErrorLength = socklen_t(MemoryLayout<Int32>.size)
+            try restoreBlockingFlags(flags, descriptor: descriptor)
+            return
+        }
+    }
+
+    private func connectPollTimeout(deadline: ContinuousClock.Instant?) throws -> Int32 {
+        guard let deadline else { return 100 }
+        let remaining = syscalls.now().duration(to: deadline)
+        guard remaining > .zero else { throw SMBTransportError.timedOut }
+        return remaining.pollMillisecondsCeiling(maximum: 100)
+    }
+
+    private func restoreBlockingFlags(_ flags: Int32, descriptor: Int32) throws {
+        // Restoration is part of confirming the connection. A terminal transition
+        // prevents a new restoration syscall, and a transition during the syscall is
+        // detected before the caller can promote the candidate.
         guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-        guard DarwinOrGlibc.getsockopt(
-            descriptor,
-            SOL_SOCKET,
-            SO_ERROR,
-            &socketErrorValue,
-            &socketErrorLength
-        ) == 0 else {
-            throw socketError(operation: "getsockopt(SO_ERROR)", descriptor: descriptor)
+        let restoreResult = syscalls.fcntl(descriptor, F_SETFL, flags)
+        guard restoreResult.value >= 0 else {
+            throw socketError(
+                operation: "fcntl(F_SETFL restore)",
+                descriptor: descriptor,
+                errnoValue: restoreResult.errno
+            )
         }
-        guard socketErrorValue == 0 else {
-            if socketErrorValue == ETIMEDOUT { throw SMBTransportError.timedOut }
-            throw SMBTransportError.socketFailure("connect failed: errno \(socketErrorValue)")
-        }
+        guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
     }
 
     // ピアが切断済みのソケットへの send() は SIGPIPE を発生させ、デフォルト動作は
@@ -339,8 +536,13 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         var enabled: Int32 = 1
         let length = socklen_t(MemoryLayout<Int32>.size)
         guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-        guard DarwinOrGlibc.setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, length) == 0 else {
-            throw socketError(operation: "setsockopt(SO_NOSIGPIPE)", descriptor: descriptor)
+        let result = syscalls.setSocketOption(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, length)
+        guard result.value == 0 else {
+            throw socketError(
+                operation: "setsockopt(SO_NOSIGPIPE)",
+                descriptor: descriptor,
+                errnoValue: result.errno
+            )
         }
         #endif
     }
@@ -350,13 +552,23 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         var value = timeout.timevalValue
         let length = socklen_t(MemoryLayout<timeval>.size)
         guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-        guard DarwinOrGlibc.setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &value, length) == 0 else {
-            throw socketError(operation: "setsockopt(SO_RCVTIMEO)", descriptor: descriptor)
+        let receiveResult = syscalls.setSocketOption(descriptor, SOL_SOCKET, SO_RCVTIMEO, &value, length)
+        guard receiveResult.value == 0 else {
+            throw socketError(
+                operation: "setsockopt(SO_RCVTIMEO)",
+                descriptor: descriptor,
+                errnoValue: receiveResult.errno
+            )
         }
         var sendValue = timeout.timevalValue
         guard descriptorAllowsSyscall(descriptor) else { throw SMBTransportError.connectionClosed }
-        guard DarwinOrGlibc.setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &sendValue, length) == 0 else {
-            throw socketError(operation: "setsockopt(SO_SNDTIMEO)", descriptor: descriptor)
+        let sendResult = syscalls.setSocketOption(descriptor, SOL_SOCKET, SO_SNDTIMEO, &sendValue, length)
+        guard sendResult.value == 0 else {
+            throw socketError(
+                operation: "setsockopt(SO_SNDTIMEO)",
+                descriptor: descriptor,
+                errnoValue: sendResult.errno
+            )
         }
     }
 
@@ -614,8 +826,12 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         connectionLock.unlock()
     }
 
-    private func socketError(operation: String, descriptor: Int32? = nil) -> Error {
-        let errnoValue = DarwinOrGlibc.errnoValue
+    private func socketError(
+        operation: String,
+        descriptor: Int32? = nil,
+        errnoValue: Int32? = nil
+    ) -> Error {
+        let errnoValue = errnoValue ?? DarwinOrGlibc.errnoValue
         if isConnectionTerminal() {
             return SMBTransportError.connectionClosed
         }
@@ -755,13 +971,14 @@ private extension Duration {
         return timeval(tv_sec: DarwinOrGlibc.time(seconds), tv_usec: DarwinOrGlibc.suseconds(microseconds))
     }
 
-    var pollMilliseconds: Int32 {
-        let components = self.components
+    func pollMillisecondsCeiling(maximum: Int32) -> Int32 {
+        precondition(maximum > 0)
+        guard self < .milliseconds(Int64(maximum)) else { return maximum }
         let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
-        let secondsMilliseconds = max(0, components.seconds) * 1_000
-        let fractionalMilliseconds = max(0, components.attoseconds / attosecondsPerMillisecond)
-        let milliseconds = secondsMilliseconds + fractionalMilliseconds
-        return Int32(min(milliseconds, Int64(Int32.max)))
+        let attoseconds = max(0, components.attoseconds)
+        let roundedFraction = (attoseconds + attosecondsPerMillisecond - 1) / attosecondsPerMillisecond
+        let milliseconds = max(1, max(0, components.seconds) * 1_000 + roundedFraction)
+        return Int32(min(milliseconds, Int64(maximum)))
     }
 }
 
@@ -789,6 +1006,14 @@ private enum DarwinOrGlibc {
         Int32(Glibc.O_NONBLOCK)
         #else
         Int32(Darwin.O_NONBLOCK)
+        #endif
+    }
+
+    static func socket(_ family: Int32, _ type: Int32, _ protocolValue: Int32) -> Int32 {
+        #if os(Linux)
+        Glibc.socket(family, type, protocolValue)
+        #else
+        Darwin.socket(family, type, protocolValue)
         #endif
     }
 

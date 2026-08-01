@@ -35,7 +35,7 @@
 | P1 | Kerberos / GSS | 0.1では非対応。将来実装する場合はauth backend、SPNEGO、session key、実サーバ検証が必要。 |
 | P1 | durable / persistent handle | 現在は非対応。実装する場合は切断・復旧state machineと実サーバE2Eが必要。 |
 | P2 | Linux AES-CCM throughput（issue 075） | pure-Swift CCM fallback が実測 ~0.3 MiB/s（Linux runner）で 4GiB 全読 E2E が現実的な job 時間に収まらない。高速化方式の選定後に scheduled 全読 E2E の復活を判断する。 |
-| P2 | fd close race の残課題（issue 073） | `timeout==nil` の blocking connect が別 thread の shutdown で復帰しない未解決経路（public initializer の既定経路）。nonblocking connect + poll 反復への作り替えが必要。 |
+| P3 | fd close race の残リスク（issue 073） | 2026-08-01 に `timeout==nil` connect の未解決経路を nonblocking connect + 100ms poll heartbeat で解消。残りは getaddrinfo の停止不能・send/recv の shutdown wake 依存・将来 parallel connect 時の (generation,fd)。 |
 | P2 | 実サーバ固有機能 | Unicode、share/volume、ACL/SID、reparse、sparse、deadline、keepalive、lockをmatrixで確認する。 |
 | P3 | WRITE 競合時の prefix read 遅延（issue 068 で切り分け済み） | 2026-08-01 に request 側 ts_ns で切り分け完了: 送信側（credit / 送信直列化）は不変で、増分は全てサーバ応答待ち（localhost でも ~3.5 倍）。実害 gate（p50 +16.7ms）未達のため QoS 対応せず。consumer 実害が出たら CREDIT_FIFO_HOL_READ_TIMING を実環境で再実行。 |
 | P3 | optional protocol surface | compression、multichannel、QUIC、RDMA、SMB1、POSIX extensions等は明示的非対応を維持する。 |

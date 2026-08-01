@@ -1,6 +1,6 @@
 # 073 bug: POSIX transport の fd close と blocking syscall の間に fd 再利用 race がある（既存）
 
-状態: **実装済み（残リスクあり）**
+状態: **実装済み（2026-08-01 に未解決経路も解消。残リスクは getaddrinfo と (generation,fd) のみ）**
 起票: 2026-07-29
 関連: `Sources/SMBee/POSIXSocketTransport.swift`（terminal 遷移の close / `interruptBlockingIO`） /
 `issues/done/072-bug-posix-transport-concurrent-send-interleave.md`（送信直列化。この issue はそのレビュー副産物）
@@ -63,17 +63,18 @@ shutdown 1 / close 0 → syscall 復帰 → close 1 と deferred `fcntl(F_SETFL)
 
 ## 残課題（未解決経路 1 件 + 残リスク）
 
-- **[未解決経路・格上げ済み]** `timeout == nil` の blocking connect は、別 thread からの shutdown でも
-  復帰しない可能性がある。当初「残リスク」としたが、**`POSIXSocketTransport()` の public initializer は
-  timeout の既定が nil** なので、既定 API の通常経路であって edge case ではない（セクション別 codex
-  レビュー 2026-07-29 で格上げ）。SMBee 内部と Obaket は timeout を渡すため実害は出ていない。
-  **具体的な発火列**（敵対レビューで構築）: C1 が candidate を leaseCount=1 で install → C1 が
-  `connect()` 内で停止 → C2 が terminal 遷移で retired=true → C2 は shutdown 試行完了を記録するが
-  leaseCount=1 のため close claim 不成立 → C1 が復帰せず `finishConnectingCandidate` も走らない
-  → **close が一度も claim されず descriptor が残る**。
-  **対応案**: `timeout == nil` でも nonblocking connect + 短い poll と state 再確認の反復にして、
-  terminal 後に必ず candidate lease を返せるようにする（今回スコープ外。connect の実装方式変更のため）。
-- syscall が復帰しない場合、transport は terminal だが lease と descriptor を保持した zombie transport になる。
+- **[解消済み 2026-08-01]** `timeout == nil` の blocking connect が shutdown で復帰しない未解決経路は、
+  connect を timeout 有無に関わらず「nonblocking connect + 最大 100ms poll heartbeat + 反復ごとの
+  retired 再確認」に統一して解消した。nil の poll slice 満了は heartbeat であり終端ではない
+  （nil の無期限契約は維持。OS の SO_ERROR=ETIMEDOUT は従来どおり）。有限 timeout は monotonic
+  absolute deadline（EINTR で非延長）。SO_ERROR は poll 正値後のみ・O_NONBLOCK 復元成功後のみ
+  promote・candidate lease は install〜finish まで単一保持。cancel 応答上限 ~100ms + scheduler 遅延。
+  テスト: syscall bundle injection による決定論 lifecycle テスト 12 件（poll 中 close /
+  cancellation / F_SETFL 復元中 close の shutdown 1 → close 1 イベント列固定、errno/deadline 表）
+  + 実 OS blackhole integration テスト（heartbeat 復帰の実測。blackhole しない環境は skip）。
+  ミューテーション（heartbeat 無効化）は pollTimeouts assert が検知することを確認済み。
+- send / receive の blocked syscall が復帰しない場合の zombie transport は従来どおり残る
+  （connect は heartbeat で bounded になった。send/recv は shutdown wake 依存のまま）。
 - **retired 判定と syscall の間の窓は意図的に残している**: `descriptorAllowsSyscall` は syscall と
   atomic ではないため、terminal 遷移直後に in-flight の syscall が 1 回だけ通り得る。lease が close を
   抑止しているので fd 再利用は起きず（= 本 issue の対象 race は防げている）、「shutdown 済みの同じ

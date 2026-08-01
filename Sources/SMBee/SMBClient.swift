@@ -679,6 +679,7 @@ public actor SMBClientSession {
         let share: String
         let credentialProvider: SMBCredentialProvider
         let makeTransport: @Sendable () -> SMBTransport
+        let requestTimeout: Duration?
     }
 
     private var session: SMBSession
@@ -727,7 +728,8 @@ public actor SMBClientSession {
             host: info.host,
             port: info.port,
             credential: credential,
-            transport: info.makeTransport()
+            transport: info.makeTransport(),
+            requestTimeout: info.requestTimeout
         )
         do {
             try await newSession.connect()
@@ -1603,6 +1605,7 @@ public enum SMBClient {
         credential: SMBCredential,
         path: String,
         timeout: Duration?,
+        requestTimeout: Duration?,
         makeTransport: (@Sendable () -> SMBTransport)?,
         maxHops: Int
     ) async throws -> SMBDfsResolvedPath {
@@ -1622,7 +1625,7 @@ public enum SMBClient {
             do {
                 let referral = try await cachedDFSReferral(
                     host: endpoint.host, port: port, credential: credential, path: currentPath,
-                    timeout: timeout, makeTransport: makeTransport
+                    timeout: timeout, requestTimeout: requestTimeout, makeTransport: makeTransport
                 )
                 guard let target = referral.targets.first,
                       let networkAddress = referral.referrals.first(where: { $0.target == target })?.networkAddress else {
@@ -1644,13 +1647,14 @@ public enum SMBClient {
 
     private static func cachedDFSReferral(
         host: String, port: UInt16, credential: SMBCredential, path: String,
-        timeout: Duration?, makeTransport: (@Sendable () -> SMBTransport)?
+        timeout: Duration?, requestTimeout: Duration?,
+        makeTransport: (@Sendable () -> SMBTransport)?
     ) async throws -> SMBDfsReferralResult {
         let key = SMBDfsReferralCache.Key(host: host, port: port, path: path, credential: credential)
         if let cached = await dfsReferralCache.get(key) { return cached }
         let referral = try await dfsReferral(
             host: host, port: port, credential: credential, path: path,
-            timeout: timeout, makeTransport: makeTransport
+            timeout: timeout, requestTimeout: requestTimeout, makeTransport: makeTransport
         )
         if let ttl = referral.referrals.map(\.timeToLive).min(), ttl > 0 {
             await dfsReferralCache.put(referral, for: key, ttl: ttl)
@@ -1726,13 +1730,18 @@ public enum SMBClient {
         )
     }
 
-    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameters:
+    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
+    ///     request is sent. This is independent of the socket-level `timeout`; `nil` preserves
+    ///     unbounded response waiting for ordinary requests.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         share: String,
         credential: SMBCredential,
         timeout: Duration? = nil,
+        requestTimeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
         try await connect(
@@ -1741,22 +1750,34 @@ public enum SMBClient {
             share: share,
             credentialProvider: { credential },
             timeout: timeout,
+            requestTimeout: requestTimeout,
             makeTransport: makeTransport
         )
     }
 
-    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameters:
+    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
+    ///     request is sent. This is independent of the socket-level `timeout`; `nil` preserves
+    ///     unbounded response waiting for ordinary requests.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         share: String,
         credentialProvider: @escaping SMBCredentialProvider,
         timeout: Duration? = nil,
+        requestTimeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
         let makeTransport = resolvedTransportFactory(makeTransport, timeout: timeout)
         let credential = try await credentialProvider()
-        let session = SMBSession(host: host, port: port, credential: credential, transport: makeTransport())
+        let session = SMBSession(
+            host: host,
+            port: port,
+            credential: credential,
+            transport: makeTransport(),
+            requestTimeout: requestTimeout
+        )
         do {
             try await session.connect()
             let treeId = try await session.treeConnect(share: share)
@@ -1765,7 +1786,8 @@ public enum SMBClient {
                 port: port,
                 share: share,
                 credentialProvider: credentialProvider,
-                makeTransport: makeTransport
+                makeTransport: makeTransport,
+                requestTimeout: requestTimeout
             )
             return SMBClientSession(session: session, treeId: treeId, reconnectInfo: reconnectInfo)
         } catch {
@@ -1883,12 +1905,13 @@ public enum SMBClient {
         credential: SMBCredential,
         path: String,
         timeout: Duration? = nil,
+        requestTimeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBDfsReferralResult {
         let share = try dfsShare(from: path)
         let session = try await connect(
             host: host, port: port, share: share, credential: credential,
-            timeout: timeout, makeTransport: makeTransport
+            timeout: timeout, requestTimeout: requestTimeout, makeTransport: makeTransport
         )
         let result = try await session.dfsReferral(share: share, path: path)
         await session.close()
@@ -1898,21 +1921,27 @@ public enum SMBClient {
     /// Resolve `path` through DFS referrals and connect using the same credential.
     /// The returned relative path must be used with the returned session for the
     /// original DFS suffix (for example, `link\\file`).
+    /// - Parameters:
+    ///   - timeout: Socket-level timeout for connect and each recv/send I/O.
+    ///   - requestTimeout: Per-request response timeout propagated to every referral-hop
+    ///     connection and the returned target session. `nil` keeps response waits unbounded.
     public static func connectFollowingDFS(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         path: String,
         timeout: Duration? = nil,
+        requestTimeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBDfsConnection {
         let target = try await resolveDFSPath(
             host: host, port: port, credential: credential, path: path,
-            timeout: timeout, makeTransport: makeTransport, maxHops: 8
+            timeout: timeout, requestTimeout: requestTimeout,
+            makeTransport: makeTransport, maxHops: 8
         )
         let session = try await connect(
             host: target.host, port: port, share: target.share, credential: credential,
-            timeout: timeout, makeTransport: makeTransport
+            timeout: timeout, requestTimeout: requestTimeout, makeTransport: makeTransport
         )
         return SMBDfsConnection(session: session, path: target.path, hops: target.hops)
     }
@@ -1924,7 +1953,8 @@ public enum SMBClient {
     ) async throws -> SMBDfsResolvedPath {
         try await resolveDFSPath(
             host: host, port: port, credential: credential, path: path,
-            timeout: timeout, makeTransport: makeTransport, maxHops: maxHops
+            timeout: timeout, requestTimeout: nil,
+            makeTransport: makeTransport, maxHops: maxHops
         )
     }
 
@@ -3789,15 +3819,35 @@ private struct SMBReceivedFrame {
     let decryptedFromTransform: Bool
 }
 
+/// Wire-path classification for the session request timeout. Ordinary transactions opt in
+/// by default; only protocol operations that are expected to wait indefinitely opt out.
+private enum SMBRequestTimeoutPolicy: Sendable {
+    enum Exclusion: Sendable {
+        case longPoll
+        case blockingLock
+        case namedPipeReadOrTransceive
+    }
+
+    case eligible
+    case excluded(Exclusion)
+
+    var isEligible: Bool {
+        if case .eligible = self { return true }
+        return false
+    }
+}
+
 private struct SMBPendingResponse {
     let label: String
     let longPoll: Bool
+    let requestTimeoutPolicy: SMBRequestTimeoutPolicy
     let expectedCommand: UInt16
     let expectedSessionId: UInt64
     let expectedTreeId: UInt32
     var pendingCount: Int = 0
     let continuation: CheckedContinuation<SMBReceivedFrame, Error>
     var sendTask: Task<Void, Never>?
+    var timeoutTask: Task<Void, Never>?
     var sendStarted = false
     var cancellationRequested = false
     var continuationResumed = false
@@ -3862,10 +3912,18 @@ actor SMBSession {
     private var orphanResponses: [UInt64: SMBReceivedFrame] = [:]
     private static let maxOrphanResponses = 64
     private var receiveLoopRunning = false
+    private var requestSentCountForTestingStorage = 0
+    private var requestTimeoutCompletionCountForTestingStorage = 0
+    private var receivedPacketDispatchCountForTestingStorage = 0
     private var wireFailure: Error?
     private var transportClosed = false
     private let cleanupTimeout: Duration
+    private let requestTimeout: Duration?
+    private let requestTimeoutSleeper: @Sendable (Duration) async throws -> Void
 
+    /// - Parameter requestTimeout: Per-request response timeout started only after the
+    ///   complete request has been sent. It is independent of transport socket timeouts;
+    ///   `nil` preserves the existing unbounded response wait.
     init(
         host: String,
         port: UInt16,
@@ -3875,7 +3933,11 @@ actor SMBSession {
         signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC,
         signingRequired: Bool = false,
         initialCredits: UInt32 = 1,
-        cleanupTimeout: Duration = SMBSession.defaultCleanupTimeout
+        cleanupTimeout: Duration = SMBSession.defaultCleanupTimeout,
+        requestTimeout: Duration? = nil,
+        requestTimeoutSleeper: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        }
     ) {
         // A locked monotonic base-36 ID is short, non-secret, collision-free within a run, and reproducible.
         let diagnosticSessionId = Self.makeDiagnosticSessionId()
@@ -3898,6 +3960,8 @@ actor SMBSession {
             diagnosticSessionId: diagnosticSessionId
         )
         self.cleanupTimeout = cleanupTimeout
+        self.requestTimeout = requestTimeout
+        self.requestTimeoutSleeper = requestTimeoutSleeper
     }
 
     func connect() async throws {
@@ -4289,7 +4353,13 @@ actor SMBSession {
     }
 
     func readChunk(treeId: UInt32, fileId: [UInt8], offset: UInt64, length: UInt64) async throws -> [UInt8] {
-        (try await readChunkReportingRequestedLength(treeId: treeId, fileId: fileId, offset: offset, length: length)).data
+        (try await readChunkReportingRequestedLength(
+            treeId: treeId,
+            fileId: fileId,
+            offset: offset,
+            length: length,
+            requestTimeoutPolicy: .eligible
+        )).data
     }
 
     // Prefix short-success detection must use the length encoded by this READ, not a
@@ -4299,6 +4369,22 @@ actor SMBSession {
         fileId: [UInt8],
         offset: UInt64,
         length: UInt64
+    ) async throws -> (data: [UInt8], requestedLength: UInt32) {
+        try await readChunkReportingRequestedLength(
+            treeId: treeId,
+            fileId: fileId,
+            offset: offset,
+            length: length,
+            requestTimeoutPolicy: .eligible
+        )
+    }
+
+    private func readChunkReportingRequestedLength(
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset: UInt64,
+        length: UInt64,
+        requestTimeoutPolicy: SMBRequestTimeoutPolicy
     ) async throws -> (data: [UInt8], requestedLength: UInt32) {
         guard length > 0 else { return ([], 0) }
         try Task.checkCancellation()
@@ -4314,7 +4400,11 @@ actor SMBSession {
         debugDump("READ request", packet)
         let perfCreditsBefore = SMBPerfLog.isEnabled ? await creditWindow.balance : 0
         let perfStart = ContinuousClock.now
-        let response = try await signedWireTransaction(packet: packet, responseLabel: "READ response")
+        let response = try await signedWireTransaction(
+            packet: packet,
+            responseLabel: "READ response",
+            requestTimeoutPolicy: requestTimeoutPolicy
+        )
         let header = try SMB2Header.decode(response)
         if header.status == SMB2Status.endOfFile {
             return ([], requestLength)
@@ -4329,6 +4419,20 @@ actor SMBSession {
         }
         try Task.checkCancellation()
         return (data, requestLength)
+    }
+
+    private func readNamedPipeChunk(
+        treeId: UInt32,
+        fileId: [UInt8],
+        length: UInt64
+    ) async throws -> [UInt8] {
+        try await readChunkReportingRequestedLength(
+            treeId: treeId,
+            fileId: fileId,
+            offset: 0,
+            length: length,
+            requestTimeoutPolicy: .excluded(.namedPipeReadOrTransceive)
+        ).data
     }
 
     func write(
@@ -4710,7 +4814,11 @@ actor SMBSession {
             maxOutputResponse: maxOutputResponse
         )
         debugDump("IOCTL FSCTL_PIPE_TRANSCEIVE request", packet)
-        let response = try await signedWireTransaction(packet: packet, responseLabel: "IOCTL FSCTL_PIPE_TRANSCEIVE response")
+        let response = try await signedWireTransaction(
+            packet: packet,
+            responseLabel: "IOCTL FSCTL_PIPE_TRANSCEIVE response",
+            requestTimeoutPolicy: .excluded(.namedPipeReadOrTransceive)
+        )
         let decoded = try SMB2Ioctl.decodeResponseWithStatus(
             response,
             allowedStatuses: [SMB2Status.success, SMB2Status.bufferOverflow]
@@ -4723,7 +4831,11 @@ actor SMBSession {
         var fragmentCount = 1
         while !(try DCERPC.validateResponseFragments(output, expectedCallId: expectedCallId)) {
             try Task.checkCancellation()
-            let chunk = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: UInt64(negotiatedReadChunkSize()))
+            let chunk = try await readNamedPipeChunk(
+                treeId: treeId,
+                fileId: fileId,
+                length: UInt64(negotiatedReadChunkSize())
+            )
             guard !chunk.isEmpty else {
                 throw SMBCodecError.invalidValue("short DCE/RPC pipe response")
             }
@@ -4745,7 +4857,18 @@ actor SMBSession {
             elements: elements
         )
         debugDump("LOCK request", packet)
-        let response = try await signedWireTransaction(packet: packet, responseLabel: "LOCK response")
+        let waitsForConflictingLock = elements.contains { element in
+            (element.flags & SMB2LockElement.unlock) == 0 &&
+                (element.flags & SMB2LockElement.failImmediately) == 0
+        }
+        let timeoutPolicy: SMBRequestTimeoutPolicy = waitsForConflictingLock
+            ? .excluded(.blockingLock)
+            : .eligible
+        let response = try await signedWireTransaction(
+            packet: packet,
+            responseLabel: "LOCK response",
+            requestTimeoutPolicy: timeoutPolicy
+        )
         try SMB2Lock.decodeResponse(response)
     }
 
@@ -4892,7 +5015,7 @@ actor SMBSession {
         do {
             let bind = try DCERPC.encodeBind(callId: 1, abstractSyntax: SRVSVC.interfaceUUID, abstractVersion: SRVSVC.interfaceVersion)
             try await write(treeId: treeId, fileId: fileId, data: bind)
-            let bindAck = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: 4_280)
+            let bindAck = try await readNamedPipeChunk(treeId: treeId, fileId: fileId, length: 4_280)
             try DCERPC.decodeBindAck(bindAck)
 
             let request = try DCERPC.encodeRequest(
@@ -4918,7 +5041,7 @@ actor SMBSession {
         do {
             let bind = try DCERPC.encodeBind(callId: 1, abstractSyntax: LSARPC.interfaceUUID, abstractVersion: LSARPC.interfaceVersion)
             try await write(treeId: treeId, fileId: fileId, data: bind)
-            let bindAck = try await readChunk(treeId: treeId, fileId: fileId, offset: 0, length: 4_280)
+            let bindAck = try await readNamedPipeChunk(treeId: treeId, fileId: fileId, length: 4_280)
             try DCERPC.decodeBindAck(bindAck)
 
             let openRequest = try DCERPC.encodeRequest(
@@ -5139,11 +5262,13 @@ actor SMBSession {
             pendingResponses[messageId] = SMBPendingResponse(
                 label: "testing",
                 longPoll: false,
+                requestTimeoutPolicy: .eligible,
                 expectedCommand: command,
                 expectedSessionId: 0,
                 expectedTreeId: 0,
                 continuation: continuation,
                 sendTask: nil,
+                timeoutTask: nil,
                 sendStarted: false,
                 cancellationRequested: false,
                 continuationResumed: false
@@ -5178,6 +5303,30 @@ actor SMBSession {
         pendingResponses.count
     }
 
+    func requestTimeoutTaskCountForTesting() -> Int {
+        pendingResponses.values.filter { $0.timeoutTask != nil }.count
+    }
+
+    func requestSentCountForTesting() -> Int {
+        requestSentCountForTestingStorage
+    }
+
+    func requestTimeoutCompletionCountForTesting() -> Int {
+        requestTimeoutCompletionCountForTestingStorage
+    }
+
+    func receiveLoopRunningForTesting() -> Bool {
+        receiveLoopRunning
+    }
+
+    func receivedPacketDispatchCountForTesting() -> Int {
+        receivedPacketDispatchCountForTestingStorage
+    }
+
+    func dispatchReceivedPacketForTesting(_ packet: [UInt8]) throws {
+        try dispatchReceivedPacket(SMBReceivedFrame(bytes: packet, decryptedFromTransform: false))
+    }
+
     private func resumePendingCountWaiters() {
         var ready: [CheckedContinuation<Void, Never>] = []
         var pending: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -5199,6 +5348,7 @@ actor SMBSession {
             packet: packet,
             responseLabel: responseLabel,
             longPoll: false,
+            requestTimeoutPolicy: .eligible,
             send: { packet, messageId in try await self.sendUnsigned(packet, messageId: messageId) }
         ).bytes
     }
@@ -5232,13 +5382,19 @@ actor SMBSession {
         return response
     }
 
-    private func signedWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
+    private func signedWireTransaction(
+        packet: [UInt8],
+        responseLabel: String,
+        verifySignature: Bool = true,
+        requestTimeoutPolicy: SMBRequestTimeoutPolicy = .eligible
+    ) async throws -> [UInt8] {
         let requestHeader = try SMB2Header.decode(packet)
         let response = try await withTaskCancellationHandler {
             try await demuxedWireTransaction(
                 packet: packet,
                 responseLabel: responseLabel,
                 longPoll: false,
+                requestTimeoutPolicy: requestTimeoutPolicy,
                 send: { packet, messageId in try await self.sendSigned(packet, messageId: messageId) }
             )
         } onCancel: {
@@ -5261,6 +5417,7 @@ actor SMBSession {
                 packet: packet,
                 responseLabel: responseLabel,
                 longPoll: true,
+                requestTimeoutPolicy: .excluded(.longPoll),
                 send: { packet, messageId in try await self.sendSigned(packet, messageId: messageId) }
             )
         } onCancel: {
@@ -5280,6 +5437,7 @@ actor SMBSession {
         packet: [UInt8],
         responseLabel: String,
         longPoll: Bool,
+        requestTimeoutPolicy: SMBRequestTimeoutPolicy,
         send: @escaping ([UInt8], UInt64) async throws -> Void
     ) async throws -> SMBReceivedFrame {
         let requestHeader = try SMB2Header.decode(packet)
@@ -5299,11 +5457,13 @@ actor SMBSession {
             pendingResponses[requestHeader.messageId] = SMBPendingResponse(
                 label: responseLabel,
                 longPoll: longPoll,
+                requestTimeoutPolicy: requestTimeoutPolicy,
                 expectedCommand: requestHeader.command,
                 expectedSessionId: requestHeader.sessionId,
                 expectedTreeId: requestHeader.treeId,
                 continuation: continuation,
                 sendTask: nil,
+                timeoutTask: nil,
                 sendStarted: false,
                 cancellationRequested: false,
                 continuationResumed: false
@@ -5509,6 +5669,7 @@ actor SMBSession {
     }
 
     private func dispatchReceivedPacket(_ frame: SMBReceivedFrame) throws {
+        defer { receivedPacketDispatchCountForTestingStorage += 1 }
         let packet = frame.bytes
         let header = try SMB2Header.decode(packet)
         SMBPerfLog.line("[wire] recv session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "")")
@@ -5556,18 +5717,22 @@ actor SMBSession {
             pending.pendingCount += 1
             if !pending.longPoll && pending.pendingCount > SMB2AsyncInterim.maxPendingResponses {
                 pendingResponses.removeValue(forKey: header.messageId)
+                pending.timeoutTask?.cancel()
                 if !pending.continuationResumed {
                     pending.continuationResumed = true
                     pending.continuation.resume(throwing: SMBCodecError.invalidValue("too many interim SMB2 STATUS_PENDING responses"))
                 }
                 return
             }
+            // STATUS_PENDING does not extend the response deadline. Operations allowed to
+            // remain pending indefinitely (notably CHANGE_NOTIFY) never install a timer.
             pendingResponses[header.messageId] = pending
             debugLine("\(pending.label) ignored interim STATUS_PENDING async response")
             return
         }
         pendingResponses.removeValue(forKey: header.messageId)
         sentResponseMessageIds.remove(header.messageId)
+        pending.timeoutTask?.cancel()
         if !pending.continuationResumed {
             pending.continuationResumed = true
             pending.continuation.resume(returning: frame)
@@ -5585,13 +5750,26 @@ actor SMBSession {
 
     @discardableResult
     private func markRequestSent(messageId: UInt64) -> Bool {
-        guard let pending = pendingResponses[messageId] else {
+        guard var pending = pendingResponses[messageId] else {
             return false
         }
+        requestSentCountForTestingStorage += 1
         SMBPerfLog.line("[wire] sent session=\(diagnosticSessionId) message_id=\(messageId)")
         sentResponseMessageIds.insert(messageId)
         if pending.cancellationRequested {
             pendingResponses.removeValue(forKey: messageId)
+        } else if pending.requestTimeoutPolicy.isEligible, let requestTimeout {
+            let command = pending.expectedCommand
+            pending.timeoutTask = Task { [weak self] in
+                do {
+                    guard let self else { return }
+                    try await self.requestTimeoutSleeper(requestTimeout)
+                    await self.requestDidTimeOut(messageId: messageId, command: command)
+                } catch {
+                    return
+                }
+            }
+            pendingResponses[messageId] = pending
         }
         if let orphan = orphanResponses.removeValue(forKey: messageId) {
             do {
@@ -5607,8 +5785,30 @@ actor SMBSession {
         return pending.cancellationRequested && sentResponseMessageIds.contains(messageId)
     }
 
+    private func requestDidTimeOut(messageId: UInt64, command: UInt16) {
+        guard var pending = pendingResponses.removeValue(forKey: messageId),
+              !pending.continuationResumed else {
+            return
+        }
+        pending.timeoutTask?.cancel()
+        pending.timeoutTask = nil
+        pending.continuationResumed = true
+        SMBPerfLog.line(
+            "[wire] request_timeout session=\(diagnosticSessionId) message_id=\(messageId) " +
+                "command=\(command) send_started=\(pending.sendStarted ? 1 : 0)"
+        )
+        pending.continuation.resume(throwing: SMBTransportError.timedOut)
+        // A timed-out sent MessageId cannot be abandoned while the connection remains usable:
+        // closing the whole session avoids creating a CommandSequenceWindow hole. Credits are
+        // deliberately not refunded because the request reached the wire.
+        closeTransport(cause: "request_timeout", diagnosticError: SMBTransportError.timedOut)
+        requestTimeoutCompletionCountForTestingStorage += 1
+    }
+
     private func failPendingResponse(messageId: UInt64, error: Error) {
         guard var pending = pendingResponses[messageId] else { return }
+        pending.timeoutTask?.cancel()
+        pending.timeoutTask = nil
         if pending.sendStarted {
             if error is CancellationError {
                 pending.cancellationRequested = true
@@ -5652,6 +5852,8 @@ actor SMBSession {
         sentResponseMessageIds.removeAll()
         orphanResponses.removeAll()
         for var waiter in pending.values {
+            waiter.timeoutTask?.cancel()
+            waiter.timeoutTask = nil
             // A cancellation tombstone may have already resumed its continuation;
             // wire failure must not resume it a second time.
             if waiter.continuationResumed { continue }

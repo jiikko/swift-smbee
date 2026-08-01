@@ -803,6 +803,8 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
     private var inbound: [UInt8] = []
     private var pending: PendingReceive?
     private var outboundStorage: [UInt8] = []
+    private var closeCountStorage = 0
+    private var isClosed = false
 
     var outbound: [UInt8] {
         lock.lock()
@@ -810,10 +812,15 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
         return outboundStorage
     }
 
+    var closeCount: Int {
+        lock.withLock { closeCountStorage }
+    }
+
     func connect(host: String, port: UInt16) async throws {
         try Task.checkCancellation()
         _ = host
         _ = port
+        lock.withLock { isClosed = false }
     }
 
     func send(_ bytes: [UInt8]) async throws {
@@ -831,19 +838,27 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
         try Task.checkCancellation()
         return try await withCheckedThrowingContinuation { continuation in
             let chunk: [UInt8]?
+            let closed: Bool
 
             lock.lock()
-            if inbound.isEmpty {
+            if isClosed {
+                closed = true
+                chunk = nil
+            } else if inbound.isEmpty {
+                closed = false
                 pending = PendingReceive(maxLength: maxLength, continuation: continuation)
                 chunk = nil
             } else {
+                closed = false
                 let count = min(maxLength, inbound.count)
                 chunk = Array(inbound.prefix(count))
                 inbound.removeFirst(count)
             }
             lock.unlock()
 
-            if let chunk {
+            if closed {
+                continuation.resume(throwing: SMBTransportError.connectionClosed)
+            } else if let chunk {
                 continuation.resume(returning: chunk)
             }
         }
@@ -872,7 +887,70 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
         }
     }
 
-    func close() {}
+    func close() {
+        let pendingReceive: PendingReceive? = lock.withLock {
+            closeCountStorage += 1
+            isClosed = true
+            defer { pending = nil }
+            return pending
+        }
+        pendingReceive?.continuation.resume(throwing: SMBTransportError.connectionClosed)
+    }
+}
+
+private final class RequestTimeoutSleeperGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callCountStorage = 0
+    private var order: [UUID] = []
+    private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+
+    var callCount: Int {
+        lock.withLock { callCountStorage }
+    }
+
+    var pendingCount: Int {
+        lock.withLock { waiters.count }
+    }
+
+    func sleep(for duration: Duration) async throws {
+        _ = duration
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { continuation in
+                let cancelled: Bool = lock.withLock {
+                    callCountStorage += 1
+                    guard !Task.isCancelled else { return true }
+                    order.append(id)
+                    waiters[id] = continuation
+                    return false
+                }
+                if cancelled {
+                    continuation.resume(throwing: CancellationError())
+                }
+            }
+        } onCancel: {
+            self.cancel(id: id)
+        }
+    }
+
+    func fireNext() {
+        let continuation: CheckedContinuation<Void, Error>? = lock.withLock {
+            while let id = order.first {
+                order.removeFirst()
+                if let continuation = waiters.removeValue(forKey: id) {
+                    return continuation
+                }
+            }
+            return nil
+        }
+        continuation?.resume()
+    }
+
+    private func cancel(id: UUID) {
+        let continuation = lock.withLock { waiters.removeValue(forKey: id) }
+        continuation?.resume(throwing: CancellationError())
+    }
 }
 
 private final class ReceiveState: @unchecked Sendable {
@@ -6482,6 +6560,663 @@ final class SMBeeTests: XCTestCase {
         transport.enqueueInbound(try framed([smb2ReadResponse(Array("hel".utf8), messageId: firstHeader.messageId, treeId: 0x3344)]))
         let firstData = try await awaitWithTimeout("first.readChunk") { try await first.value }
         XCTAssertEqual(firstData, Array("hel".utf8))
+    }
+
+    func testDefaultRequestTimeoutSleeperTimesOutSilentTransportAfterSend() async throws {
+        let transport = ControlledReceiveTransport()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            requestTimeout: .milliseconds(150)
+        )
+        let echo = Task { try await session.echo() }
+        defer { echo.cancel() }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        do {
+            try await awaitWithTimeout(seconds: 3, "default request-timeout sleeper") {
+                try await echo.value
+            }
+            XCTFail("silent ECHO unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        } catch {
+            XCTFail("expected timedOut, got \(error)")
+        }
+        XCTAssertEqual(transport.closeCount, 1)
+    }
+
+    func testSMBClientConnectPropagatesRequestTimeoutToConnectedSession() async throws {
+        let transport = ScriptedBlockingReceiveTransport(
+            inbound: try framed(authenticatedTreeResponses())
+        )
+        let client = try await awaitWithTimeout("SMBClient.connect request-timeout fixture") {
+            try await SMBClient.connect(
+                host: "server",
+                share: "share",
+                credential: SMBCredential(username: "user", password: "pass"),
+                // Generous deadline: it also applies to NEGOTIATE/SESSION_SETUP/TREE_CONNECT
+                // during connect, which must succeed even on a slow CI executor.
+                requestTimeout: .seconds(2),
+                makeTransport: { transport }
+            )
+        }
+
+        do {
+            try await awaitWithTimeout(seconds: 8, "public API propagated request timeout") {
+                try await client.echo()
+            }
+            XCTFail("silent ECHO unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        } catch {
+            XCTFail("expected timedOut, got \(error)")
+        }
+        XCTAssertTrue(transport.didBlockAfterScript)
+        XCTAssertEqual(transport.closeCount, 1)
+    }
+
+    func testRequestTimeoutDoesNotStartUntilBlockedTransportSendCompletes() async throws {
+        let transport = BlockingSendTransport(inbound: [])
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            requestTimeout: .milliseconds(100),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let echo = Task { try await session.echo() }
+        defer {
+            echo.cancel()
+            transport.releaseBlockedSend()
+        }
+
+        try await awaitWithTimeout("blocked transport send start") {
+            while !transport.isSendStarted {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        XCTAssertTrue(transport.outbound.isEmpty)
+        let timersDuringSend = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersDuringSend, 0)
+        XCTAssertEqual(sleeper.callCount, 0)
+
+        transport.releaseBlockedSend()
+        try await awaitWithTimeout("request timeout starts after send completion") {
+            while await session.requestSentCountForTesting() < 1 || sleeper.callCount < 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let request = try XCTUnwrap(try unframed(transport.outbound).first)
+        let header = try SMB2Header.decode(request)
+        let timersAfterSend = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersAfterSend, 1)
+        transport.appendInbound(try framed([smb2EchoResponse(messageId: header.messageId)]))
+
+        try await awaitWithTimeout("blocked-send ECHO response") {
+            try await echo.value
+        }
+        XCTAssertEqual(sleeper.callCount, 1)
+    }
+
+    func testNilRequestTimeoutNeverInvokesSleeperForSentOrdinaryRequest() async throws {
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            requestTimeout: nil,
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let echo = Task { try await session.echo() }
+        defer { echo.cancel() }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        try await awaitWithTimeout("nil request-timeout sent barrier") {
+            while await session.requestSentCountForTesting() < 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let timersAfterSend = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersAfterSend, 0)
+        XCTAssertEqual(sleeper.callCount, 0)
+
+        let request = try XCTUnwrap(try unframed(transport.outbound).first)
+        let header = try SMB2Header.decode(request)
+        transport.enqueueInbound(try framed([smb2EchoResponse(messageId: header.messageId)]))
+        try await awaitWithTimeout("nil request-timeout ECHO response") {
+            try await echo.value
+        }
+        XCTAssertEqual(sleeper.callCount, 0)
+    }
+
+    func testFailImmediatelyLockStartsAndFiresRequestTimeout() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            requestTimeout: .milliseconds(100),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let lock = Task {
+            try await session.lock(
+                treeId: 0x3344,
+                fileId: fileId,
+                elements: [.lock(offset: 0, length: 1, shared: false, failImmediately: true)]
+            )
+        }
+        defer { lock.cancel() }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        try await awaitWithTimeout("fail-immediately LOCK timeout installation") {
+            while await session.requestSentCountForTesting() < 1 || sleeper.callCount < 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let request = try XCTUnwrap(try unframed(transport.outbound).first)
+        XCTAssertEqual(try SMB2Header.decode(request).command, SMB2Commands.lock)
+        let timersAfterSend = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersAfterSend, 1)
+
+        sleeper.fireNext()
+        do {
+            try await awaitWithTimeout("fail-immediately LOCK request timeout") {
+                try await lock.value
+            }
+            XCTFail("silent fail-immediately LOCK unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        } catch {
+            XCTFail("expected timedOut, got \(error)")
+        }
+        XCTAssertEqual(transport.closeCount, 1)
+    }
+
+    func testNamedPipeFragmentFollowUpReadDoesNotStartRequestTimeout() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let stub = makeShareEnumStub([("public", 0, "Public share")])
+        let split = stub.count / 2
+        let firstFragment = try dcerpcResponsePDU(
+            stub: Array(stub[..<split]),
+            flags: DCERPC.pfcFirstFrag
+        )
+        let lastFragment = try dcerpcResponsePDU(
+            stub: Array(stub[split...]),
+            flags: DCERPC.pfcLastFrag
+        )
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            requestTimeout: .milliseconds(100),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let transceive = Task {
+            try await session.pipeTransceive(
+                treeId: 0x3344,
+                fileId: fileId,
+                input: [0xaa],
+                maxOutputResponse: 16
+            )
+        }
+        defer { transceive.cancel() }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let ioctlRequest = try XCTUnwrap(try unframed(transport.outbound).first)
+        let ioctlHeader = try SMB2Header.decode(ioctlRequest)
+        XCTAssertEqual(ioctlHeader.command, SMB2Commands.ioctl)
+        transport.enqueueInbound(try framed([
+            smb2IoctlResponse(
+                output: firstFragment,
+                status: SMB2Status.bufferOverflow,
+                messageId: ioctlHeader.messageId,
+                treeId: 0x3344,
+                fileId: fileId
+            )
+        ]))
+
+        try await waitForOutboundFrameCount(2, transport: transport)
+        try await awaitWithTimeout("named-pipe follow-up READ sent barrier") {
+            while await session.requestSentCountForTesting() < 2 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let requests = try unframed(transport.outbound)
+        let readHeader = try SMB2Header.decode(requests[1])
+        XCTAssertEqual(readHeader.command, SMB2Commands.read)
+        let timersAfterReadSend = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersAfterReadSend, 0)
+        XCTAssertEqual(sleeper.callCount, 0)
+
+        transport.enqueueInbound(try framed([
+            smb2ReadResponse(lastFragment, messageId: readHeader.messageId, treeId: 0x3344)
+        ]))
+        let response = try await awaitWithTimeout("named-pipe fragmented response") {
+            try await transceive.value
+        }
+        XCTAssertEqual(response, firstFragment + lastFragment)
+        XCTAssertEqual(sleeper.callCount, 0)
+    }
+
+    func testSentRequestTimeoutIsSessionFatalAndDrainsPendingAndCreditWaiters() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            initialCredits: 2,
+            requestTimeout: .milliseconds(300),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+
+        let first = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 1)
+        }
+        let second = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 1, length: 1)
+        }
+        let creditParked = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 2, length: 1)
+        }
+        let requests = [first, second, creditParked]
+        defer { requests.forEach { $0.cancel() } }
+
+        try await waitForOutboundFrameCount(2, transport: transport)
+        try await awaitWithTimeout("third READ parked on credits") {
+            while await session.creditWaiterCountForTesting() != 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        try await awaitWithTimeout("sent READ timeout installation") {
+            while await session.requestSentCountForTesting() < 2 || sleeper.callCount < 2 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let pendingBeforeTimeout = await session.pendingCountForTesting()
+        let timersBeforeTimeout = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(pendingBeforeTimeout, 3)
+        XCTAssertEqual(timersBeforeTimeout, 2)
+        sleeper.fireNext()
+        try await awaitWithTimeout("request timeout processing") {
+            while await session.requestTimeoutCompletionCountForTesting() < 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+
+        var timedOutCount = 0
+        var connectionClosedCount = 0
+        for (index, request) in requests.enumerated() {
+            do {
+                _ = try await awaitWithTimeout("request timeout victim \(index)") {
+                    try await request.value
+                }
+                XCTFail("request \(index) unexpectedly completed")
+            } catch SMBTransportError.timedOut {
+                timedOutCount += 1
+            } catch SMBTransportError.connectionClosed {
+                connectionClosedCount += 1
+            }
+        }
+
+        XCTAssertEqual(timedOutCount, 1)
+        XCTAssertEqual(connectionClosedCount, 2)
+        XCTAssertEqual(transport.closeCount, 1)
+        try await awaitWithTimeout("request-timeout drain") {
+            while true {
+                let pendingCount = await session.pendingCountForTesting()
+                let waiterCount = await session.creditWaiterCountForTesting()
+                if pendingCount == 0, waiterCount == 0 { break }
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let timersAfterTimeout = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersAfterTimeout, 0)
+        try await awaitWithTimeout("request-timeout receive loop termination") {
+            while await session.receiveLoopRunningForTesting() {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        XCTAssertEqual(sleeper.pendingCount, 0)
+    }
+
+    func testRequestResponseCancelsTimeoutWithoutClosingTransport() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            requestTimeout: .milliseconds(100),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let read = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 2)
+        }
+        defer { read.cancel() }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        try await awaitWithTimeout("READ timeout installation") {
+            while await session.requestSentCountForTesting() < 1 || sleeper.callCount < 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let timersWhilePending = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersWhilePending, 1)
+        let request = try XCTUnwrap(try unframed(transport.outbound).first)
+        let header = try SMB2Header.decode(request)
+        transport.enqueueInbound(try framed([
+            smb2ReadResponse(Array("ok".utf8), messageId: header.messageId, treeId: 0x3344)
+        ]))
+
+        let result = try await awaitWithTimeout("READ response beats request timeout") {
+            try await read.value
+        }
+        XCTAssertEqual(result, Array("ok".utf8))
+        let pendingAfterResponse = await session.pendingCountForTesting()
+        let timersAfterResponse = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(pendingAfterResponse, 0)
+        XCTAssertEqual(timersAfterResponse, 0)
+        try await awaitWithTimeout("cancelled READ timeout sleeper") {
+            while sleeper.pendingCount != 0 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        XCTAssertEqual(transport.closeCount, 0)
+    }
+
+    func testCreditParkedRequestDoesNotStartRequestTimeout() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            initialCredits: 0,
+            requestTimeout: .milliseconds(100),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let read = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 1)
+        }
+        defer { read.cancel() }
+
+        try await awaitWithTimeout("READ parked before wire send") {
+            while true {
+                let pendingCount = await session.pendingCountForTesting()
+                let waiterCount = await session.creditWaiterCountForTesting()
+                if pendingCount == 1, waiterCount == 1 { break }
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        XCTAssertTrue(transport.outbound.isEmpty)
+        let timersBeforeElapsedTimeout = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersBeforeElapsedTimeout, 0)
+        let pendingAfterElapsedTimeout = await session.pendingCountForTesting()
+        let waitersAfterElapsedTimeout = await session.creditWaiterCountForTesting()
+        let timersAfterElapsedTimeout = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(pendingAfterElapsedTimeout, 1)
+        XCTAssertEqual(waitersAfterElapsedTimeout, 1)
+        XCTAssertEqual(timersAfterElapsedTimeout, 0)
+        XCTAssertEqual(sleeper.callCount, 0)
+        XCTAssertEqual(transport.closeCount, 0)
+
+        read.cancel()
+        do {
+            _ = try await awaitWithTimeout("cancel credit-parked READ") { try await read.value }
+            XCTFail("cancelled READ unexpectedly completed")
+        } catch is CancellationError {
+        }
+        try await awaitWithTimeout("cancelled credit waiter drain") {
+            while true {
+                let pendingCount = await session.pendingCountForTesting()
+                let waiterCount = await session.creditWaiterCountForTesting()
+                if pendingCount == 0, waiterCount == 0 { break }
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+    }
+
+    func testLongPollDoesNotStartRequestTimeout() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            requestTimeout: .milliseconds(100),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let notify = Task {
+            try await session.changeNotify(
+                treeId: 0x3344,
+                fileId: fileId,
+                filter: .default,
+                watchTree: false
+            ) { _ in
+                XCTFail("cancelled CHANGE_NOTIFY should not deliver an event")
+            }
+        }
+        defer { notify.cancel() }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        try await awaitWithTimeout("CHANGE_NOTIFY sent barrier") {
+            while await session.requestSentCountForTesting() < 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let timersBeforeLongPollWait = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersBeforeLongPollWait, 0)
+        let pendingAfterLongPollWait = await session.pendingCountForTesting()
+        let timersAfterLongPollWait = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(pendingAfterLongPollWait, 1)
+        XCTAssertEqual(timersAfterLongPollWait, 0)
+        XCTAssertEqual(sleeper.callCount, 0)
+        XCTAssertEqual(transport.closeCount, 0)
+
+        let request = try XCTUnwrap(try unframed(transport.outbound).first)
+        let header = try SMB2Header.decode(request)
+        notify.cancel()
+        try await waitForOutboundFrameCount(2, transport: transport)
+        transport.enqueueInbound(try framed([
+            smb2StatusResponse(
+                status: SMB2Status.cancelled,
+                command: SMB2Commands.changeNotify,
+                messageId: header.messageId,
+                treeId: header.treeId
+            )
+        ]))
+        do {
+            try await awaitWithTimeout("cancel request-timeout-exempt CHANGE_NOTIFY") {
+                try await notify.value
+            }
+            XCTFail("cancelled CHANGE_NOTIFY unexpectedly completed")
+        } catch is CancellationError {
+        }
+    }
+
+    func testBlockingLockAndNamedPipeTransactionsDoNotStartRequestTimeout() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            initialCredits: 2,
+            requestTimeout: .milliseconds(100),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let blockingLock = Task {
+            try await session.lock(
+                treeId: 0x3344,
+                fileId: fileId,
+                elements: [.lock(offset: 0, length: 1, shared: false, failImmediately: false)]
+            )
+        }
+        let pipeIO = Task {
+            try await session.pipeTransceive(
+                treeId: 0x3344,
+                fileId: fileId,
+                input: [UInt8](repeating: 0, count: 16)
+            )
+        }
+        defer {
+            blockingLock.cancel()
+            pipeIO.cancel()
+        }
+
+        try await waitForOutboundFrameCount(2, transport: transport)
+        try await awaitWithTimeout("timeout-exempt requests sent barrier") {
+            while await session.requestSentCountForTesting() < 2 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let requests = try unframed(transport.outbound)
+        let requestHeaders = try requests.map(SMB2Header.decode)
+        XCTAssertEqual(Set(requestHeaders.map(\.command)), [SMB2Commands.lock, SMB2Commands.ioctl])
+        let timersBeforeWait = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(timersBeforeWait, 0)
+        let pendingAfterWait = await session.pendingCountForTesting()
+        let timersAfterWait = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(pendingAfterWait, 2)
+        XCTAssertEqual(timersAfterWait, 0)
+        XCTAssertEqual(sleeper.callCount, 0)
+        XCTAssertEqual(transport.closeCount, 0)
+
+        blockingLock.cancel()
+        pipeIO.cancel()
+        try await waitForOutboundFrameCount(4, transport: transport)
+        do {
+            try await awaitWithTimeout("cancel timeout-exempt blocking LOCK") {
+                try await blockingLock.value
+            }
+            XCTFail("cancelled LOCK unexpectedly completed")
+        } catch is CancellationError {
+        }
+        do {
+            _ = try await awaitWithTimeout("cancel timeout-exempt named-pipe I/O") {
+                try await pipeIO.value
+            }
+            XCTFail("cancelled named-pipe I/O unexpectedly completed")
+        } catch is CancellationError {
+        }
+        transport.enqueueInbound(try framed(requestHeaders.map { header in
+            try smb2StatusResponse(
+                status: SMB2Status.cancelled,
+                command: header.command,
+                messageId: header.messageId,
+                treeId: header.treeId
+            )
+        }))
+        try await awaitWithTimeout("timeout-exempt cancellation responses") {
+            while await session.pendingCountForTesting() != 0 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+    }
+
+    func testLateResponseAfterRequestTimeoutDoesNotResumeTwice() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = ControlledReceiveTransport()
+        let sleeper = RequestTimeoutSleeperGate()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            requestTimeout: .milliseconds(100),
+            requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
+        )
+        let read = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 1)
+        }
+        defer { read.cancel() }
+
+        try await waitForOutboundFrameCount(1, transport: transport)
+        try await awaitWithTimeout("late-response READ timeout installation") {
+            while await session.requestSentCountForTesting() < 1 || sleeper.callCount < 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        let request = try XCTUnwrap(try unframed(transport.outbound).first)
+        let header = try SMB2Header.decode(request)
+        sleeper.fireNext()
+        do {
+            _ = try await awaitWithTimeout("READ request timeout") { try await read.value }
+            XCTFail("READ unexpectedly completed")
+        } catch SMBTransportError.timedOut {
+        }
+        try await awaitWithTimeout("late-response timeout processing") {
+            while await session.requestTimeoutCompletionCountForTesting() < 1 {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+        XCTAssertEqual(transport.closeCount, 1)
+        try await awaitWithTimeout("late-response receive loop termination") {
+            while await session.receiveLoopRunningForTesting() {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+
+        let dispatchesBeforeLateResponse = await session.receivedPacketDispatchCountForTesting()
+        try await session.dispatchReceivedPacketForTesting(
+            smb2ReadResponse([0x2a], messageId: header.messageId, treeId: 0x3344)
+        )
+        let dispatchesAfterLateResponse = await session.receivedPacketDispatchCountForTesting()
+        let pendingAfterLateResponse = await session.pendingCountForTesting()
+        let timersAfterLateResponse = await session.requestTimeoutTaskCountForTesting()
+        XCTAssertEqual(pendingAfterLateResponse, 0)
+        XCTAssertEqual(timersAfterLateResponse, 0)
+        XCTAssertEqual(dispatchesAfterLateResponse, dispatchesBeforeLateResponse + 1)
+        XCTAssertEqual(transport.closeCount, 1)
     }
 
     func testUnsolicitedOplockBreakNotificationIsIgnoredByDemux() async throws {

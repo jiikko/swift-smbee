@@ -205,7 +205,12 @@ credit waiter / 登録済み未送信 pending という別クラスの待ち手�
   回帰 unit (`testSMB2CreditWindowFailAllWaitersDrainsParkedReserves`) あり。
 - ⬜ **§修正方針 1** (session 所有 single reader / loop 生存条件の撤去) — 未着手。wire 中核の
   構造変更で container smoke 必須。B の循環待ちの根治はここ。
-- ⬜ **§修正方針 3** (release request timeout) — 未着手。
+- ✅ **§修正方針 3** (release request timeout) — 2026-08-01 実装。`SMBSession.init` /
+  `SMBClient.connect` / `SMBee.connect` / `connectFollowingDFS` に `requestTimeout: Duration? = nil`
+  (opt-in・非破壊)。timer は wire 送信完了後にのみ開始 (未送信 MessageId を捨てると server の
+  CommandSequenceWindow に穴が開くため)、発火は session-fatal (`closeTransport(cause: request_timeout)`、
+  credit refund なし)。除外: longPoll (CHANGE_NOTIFY) / blocking LOCK (failImmediately なし) /
+  named-pipe READ・TRANSCEIVE。敵対テスト 6 本 + ミューテーション 4 変異の検知確認済み。
 - Linux 実機 backtrace での A 確定は未実施 (このマシンに container なし)。テスト修正後の
   Linux CI green 継続を代替観測とする。issues/013 の CI 観測 (sample/stdbuf) は継続。
 

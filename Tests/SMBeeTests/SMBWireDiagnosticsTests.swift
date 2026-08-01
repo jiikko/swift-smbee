@@ -135,6 +135,36 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         })
     }
 
+    func testRequestAfterWireFailureTearsDownTransportBeforeThrowing() async throws {
+        let capture = SMBWireLogCapture()
+        SMBPerfLog.enabledOverride = true
+        SMBPerfLog.testSink = { capture.append($0) }
+        defer {
+            SMBPerfLog.testSink = nil
+            SMBPerfLog.enabledOverride = nil
+        }
+        let session = SMBSession(
+            host: "test", port: 445,
+            credential: .anonymous,
+            transport: InMemoryTransport()
+        )
+        // The receive side can declare the wire dead without closing the transport yet
+        // (issue 077 review: the pre-registration fast path must not skip teardown).
+        await session.failWireForTesting(error: SMBTransportError.timedOut)
+
+        do {
+            try await awaitWithTimeout("ECHO after wire failure") { try await session.echo() }
+            XCTFail("ECHO unexpectedly completed after wire failure")
+        } catch SMBTransportError.timedOut {
+        }
+        let pendingCount = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingCount, 0)
+        XCTAssertTrue(capture.messages.contains {
+            $0.contains("[wire] close_transport session=") &&
+                $0.contains("cause=request_after_wire_failure")
+        })
+    }
+
     func testBestEffortCloseTimeoutClosesTransportAndFailsConcurrentPendingOperations() async throws {
         let capture = SMBWireLogCapture()
         SMBPerfLog.enabledOverride = true

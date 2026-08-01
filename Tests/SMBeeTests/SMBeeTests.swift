@@ -6401,6 +6401,46 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testOperationsAfterClosedTransportFailWithExistingWireFailureWithoutPendingResponse() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: InMemoryTransport(),
+            signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+
+        await session.failWireForTesting(error: SMBTransportError.timedOut)
+        await session.closeTransport(cause: "unit_test")
+
+        do {
+            try await awaitWithTimeout("ECHO after closed transport") {
+                try await session.echo()
+            }
+            XCTFail("ECHO unexpectedly completed after transport close")
+        } catch SMBTransportError.timedOut {
+            // The first wire failure remains the terminal session error.
+        } catch {
+            XCTFail("expected timedOut, got \(error)")
+        }
+        let pendingAfterEcho = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterEcho, 0)
+
+        do {
+            _ = try await awaitWithTimeout("READ after closed transport") {
+                try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 1)
+            }
+            XCTFail("READ unexpectedly completed after transport close")
+        } catch SMBTransportError.timedOut {
+            // The operation must fail before installing a pending continuation.
+        } catch {
+            XCTFail("expected timedOut, got \(error)")
+        }
+        let pendingAfterRead = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterRead, 0)
+    }
+
     func testConcurrentReadChunksDemuxOutOfOrderResponses() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let transport = ControlledReceiveTransport()

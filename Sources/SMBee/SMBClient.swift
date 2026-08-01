@@ -5283,6 +5283,18 @@ actor SMBSession {
         send: @escaping ([UInt8], UInt64) async throws -> Void
     ) async throws -> SMBReceivedFrame {
         let requestHeader = try SMB2Header.decode(packet)
+        // A continuation may only be registered while the wire can still make progress.
+        // Once failure/close is terminal, fail synchronously instead of creating a pending
+        // response that no later closeTransport call can drain.
+        if let wireFailure {
+            // The receive side may have declared the wire dead without tearing the
+            // transport down yet; failing fast here must not skip that teardown.
+            closeTransport(cause: "request_after_wire_failure", diagnosticError: wireFailure)
+            throw wireFailure
+        }
+        if transportClosed {
+            throw SMBTransportError.connectionClosed
+        }
         return try await withCheckedThrowingContinuation { continuation in
             pendingResponses[requestHeader.messageId] = SMBPendingResponse(
                 label: responseLabel,
@@ -5306,9 +5318,14 @@ actor SMBSession {
                     }
                 } catch {
                     SMBPerfLog.line("[wire] send_failed session=\(diagnosticSessionId) message_id=\(requestHeader.messageId) error=\(Self.diagnosticError(error))")
-                    if error is CancellationError {
-                        self.failPendingResponse(messageId: requestHeader.messageId, error: error)
-                    } else {
+                    let isCancellation = error is CancellationError
+                    let responseError: Error = isCancellation
+                        ? error
+                        : (self.wireFailure ?? SMBTransportError.connectionClosed)
+                    // Every failure after continuation registration must terminate this
+                    // transaction directly; closeTransport may already be a no-op.
+                    self.failPendingResponse(messageId: requestHeader.messageId, error: responseError)
+                    if !isCancellation {
                         self.closeTransport(cause: "send_failure", diagnosticError: error)
                     }
                 }

@@ -51,3 +51,15 @@
 - `demuxedWireTransaction` の pending 登録前に `wireFailure` を検査して即 throw する、または
   send/reserve 失敗の catch 経路で自分の pending エントリを必ず除去・resume する
   （「continuation を登録する箇所は全終端経路で resume される」不変条件、issue 010 §B と同じ）。
+
+## 対応結果（2026-08-01）
+
+- `demuxedWireTransaction` の pending 登録前に `wireFailure` / `transportClosed` を検査して即 throw。
+  `wireFailure` のみ（transport 未 teardown）の窓では `closeTransport(cause: request_after_wire_failure)`
+  で従来の teardown を維持してから throw する。
+- send Task の失敗経路は error 型に関わらず `failPendingResponse` で自 transaction を必ず終端してから
+  （非 cancellation の場合のみ）`closeTransport` する。closeTransport の冪等 guard に continuation 解放を
+  依存しない。
+- 回帰テスト: `testOperationsAfterClosedTransportFailWithExistingWireFailureWithoutPendingResponse` /
+  `testRequestAfterWireFailureTearsDownTransportBeforeThrowing`。完全 revert のミューテーションで
+  検知確認済み（2 つのサブ修正は同一シナリオに対して冗長な defense-in-depth）。

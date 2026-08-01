@@ -12,24 +12,97 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         }
         let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "credit-test")
 
-        let reserve = Task { try await window.reserve(charge: 2) }
+        let reserve = Task {
+            try await window.reserve(charge: 2, messageId: 42, command: SMB2Commands.read)
+        }
         while await window.pendingWaiterCount == 0 {
             await Task.yield()
         }
 
-        XCTAssertTrue(capture.messages.contains {
-            $0 == "[wire] credit_wait session=credit-test charge=2 available=0 waiters=1"
-        })
+        let waits = capture.messages.filter { $0.hasPrefix("[wire] credit_wait ") }
+        XCTAssertEqual(waits.count, 1)
+        XCTAssertTrue(waits[0].contains(
+            "session=credit-test message_id=42 command=8 charge=2 available=0 waiters=1"
+        ))
+        XCTAssertNotNil(Self.uint64Field("ts_ns", in: waits[0]))
         _ = await window.grant(2)
         _ = try await reserve.value
 
         let grants = capture.messages.filter {
-            $0.hasPrefix("[wire] credit_granted session=credit-test charge=2 waited_ms=")
+            $0.hasPrefix(
+                "[wire] credit_granted session=credit-test message_id=42 command=8 charge=2 waited_ms="
+            )
         }
         XCTAssertEqual(grants.count, 1)
-        XCTAssertNotNil(grants.first.flatMap {
-            Double($0.split(separator: "=").last.map(String.init) ?? "")
-        })
+        XCTAssertNotNil(Self.doubleField("waited_ms", in: grants[0]))
+        XCTAssertNotNil(Self.uint64Field("ts_ns", in: grants[0]))
+    }
+
+    func testCreditWindowPreservesFIFOHeadOfLineBlocking() async throws {
+        let capture = SMBWireLogCapture()
+        SMBPerfLog.enabledOverride = true
+        SMBPerfLog.testSink = { capture.append($0) }
+        defer {
+            SMBPerfLog.testSink = nil
+            SMBPerfLog.enabledOverride = nil
+        }
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "hol-test")
+
+        let large = Task {
+            try await window.reserve(
+                charge: 16,
+                messageId: 100,
+                command: SMB2Commands.read
+            )
+        }
+        defer { large.cancel() }
+        try await Self.waitForWaiterCount(1, in: window)
+
+        var small: [Task<UInt32, Error>] = []
+        defer { small.forEach { $0.cancel() } }
+        for messageId in UInt64(101)...UInt64(104) {
+            small.append(Task {
+                try await window.reserve(
+                    charge: 1,
+                    messageId: messageId,
+                    command: SMB2Commands.read
+                )
+            })
+            try await Self.waitForWaiterCount(Int(messageId - 99), in: window)
+        }
+
+        let partialBalance = await window.grant(1)
+        let waitersAfterPartialGrant = await window.pendingWaiterCount
+        let balanceAfterPartialGrant = await window.balance
+        XCTAssertEqual(partialBalance, 1)
+        XCTAssertEqual(waitersAfterPartialGrant, 5)
+        XCTAssertEqual(balanceAfterPartialGrant, 1)
+
+        let headBalance = await window.grant(15)
+        let waitersAfterHeadGrant = await window.pendingWaiterCount
+        let largeBalance = try await awaitWithTimeout("large HoL waiter released") {
+            try await large.value
+        }
+        XCTAssertEqual(headBalance, 0)
+        XCTAssertEqual(waitersAfterHeadGrant, 4)
+        XCTAssertEqual(largeBalance, 0)
+
+        let finalBalance = await window.grant(4)
+        let finalWaiterCount = await window.pendingWaiterCount
+        XCTAssertEqual(finalBalance, 0)
+        XCTAssertEqual(finalWaiterCount, 0)
+        var smallBalances: [UInt32] = []
+        for (index, task) in small.enumerated() {
+            smallBalances.append(try await awaitWithTimeout("small waiter \(index) released") {
+                try await task.value
+            })
+        }
+        XCTAssertEqual(smallBalances, [3, 2, 1, 0])
+
+        let grantedMessageIds = capture.messages
+            .filter { $0.hasPrefix("[wire] credit_granted ") }
+            .compactMap { Self.uint64Field("message_id", in: $0) }
+        XCTAssertEqual(grantedMessageIds, [100, 101, 102, 103, 104])
     }
 
     func testCreditWindowDoesNotLogWhenReserveDoesNotWait() async throws {
@@ -353,6 +426,33 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         XCTAssertTrue(capture.messages.contains {
             $0.contains("[wire] close_transport session=") && $0.contains("cause=best_effort_close")
         })
+    }
+
+    private static func waitForWaiterCount(
+        _ expectedCount: Int,
+        in window: SMB2CreditWindow
+    ) async throws {
+        try await awaitWithTimeout("credit waiter count \(expectedCount)") {
+            while await window.pendingWaiterCount != expectedCount {
+                try Task.checkCancellation()
+                await Task.yield()
+            }
+        }
+    }
+
+    private static func uint64Field(_ name: String, in message: String) -> UInt64? {
+        field(name, in: message).flatMap(UInt64.init)
+    }
+
+    private static func doubleField(_ name: String, in message: String) -> Double? {
+        field(name, in: message).flatMap(Double.init)
+    }
+
+    private static func field(_ name: String, in message: String) -> String? {
+        let prefix = "\(name)="
+        return message.split(separator: " ")
+            .first { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
     }
 }
 

@@ -158,6 +158,8 @@ actor SMB2CreditWindow {
     private struct Waiter {
         let charge: UInt16
         let id: UInt64
+        let messageId: UInt64?
+        let command: UInt16?
         let enqueuedAt: ContinuousClock.Instant?
         let continuation: CheckedContinuation<UInt32, Error>
     }
@@ -181,7 +183,11 @@ actor SMB2CreditWindow {
         waiters.count
     }
 
-    func reserve(charge requestedCharge: UInt16) async throws -> UInt32 {
+    func reserve(
+        charge requestedCharge: UInt16,
+        messageId: UInt64? = nil,
+        command: UInt16? = nil
+    ) async throws -> UInt32 {
         if case .failed(let error) = state {
             throw error
         }
@@ -210,12 +216,16 @@ actor SMB2CreditWindow {
                 waiters.append(Waiter(
                     charge: charge,
                     id: id,
+                    messageId: messageId,
+                    command: command,
                     enqueuedAt: enqueuedAt,
                     continuation: continuation
                 ))
                 SMBPerfLog.line(
-                    "[wire] credit_wait session=\(diagnosticSessionId) charge=\(charge) " +
-                        "available=\(available) waiters=\(waiters.count)"
+                    "[wire] credit_wait session=\(diagnosticSessionId) " +
+                        "\(Self.identityFields(messageId: messageId, command: command))" +
+                        "charge=\(charge) available=\(available) waiters=\(waiters.count) " +
+                        "ts_ns=\(SMBPerfLog.timestampNanoseconds())"
                 )
                 resumeReadyWaiters()
             }
@@ -278,13 +288,26 @@ actor SMB2CreditWindow {
             waiters.removeFirst()
             available -= UInt32(waiter.charge)
             if let enqueuedAt = waiter.enqueuedAt {
-                let waited = SMBPerfLog.milliseconds(ContinuousClock.now - enqueuedAt)
                 SMBPerfLog.line(
                     "[wire] credit_granted session=\(diagnosticSessionId) " +
-                        "charge=\(waiter.charge) waited_ms=\(waited)"
+                        "\(Self.identityFields(messageId: waiter.messageId, command: waiter.command))" +
+                        "charge=\(waiter.charge) " +
+                        "waited_ms=\(SMBPerfLog.milliseconds(ContinuousClock.now - enqueuedAt)) " +
+                        "ts_ns=\(SMBPerfLog.timestampNanoseconds())"
                 )
             }
             waiter.continuation.resume(returning: available)
         }
+    }
+
+    private static func identityFields(messageId: UInt64?, command: UInt16?) -> String {
+        var fields = ""
+        if let messageId {
+            fields += "message_id=\(messageId) "
+        }
+        if let command {
+            fields += "command=\(command) "
+        }
+        return fields
     }
 }

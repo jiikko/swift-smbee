@@ -5438,7 +5438,7 @@ actor SMBSession {
         responseLabel: String,
         longPoll: Bool,
         requestTimeoutPolicy: SMBRequestTimeoutPolicy,
-        send: @escaping ([UInt8], UInt64) async throws -> Void
+        send: @escaping @Sendable ([UInt8], UInt64) async throws -> Void
     ) async throws -> SMBReceivedFrame {
         let requestHeader = try SMB2Header.decode(packet)
         // A continuation may only be registered while the wire can still make progress.
@@ -5468,10 +5468,15 @@ actor SMBSession {
                 cancellationRequested: false,
                 continuationResumed: false
             )
-            SMBPerfLog.line("[wire] pending session=\(diagnosticSessionId) message_id=\(requestHeader.messageId) command=\(requestHeader.command) label=\(responseLabel)")
+            SMBPerfLog.line("[wire] pending session=\(diagnosticSessionId) message_id=\(requestHeader.messageId) command=\(requestHeader.command) label=\(responseLabel) ts_ns=\(SMBPerfLog.timestampNanoseconds())")
             let sendTask = Task {
                 do {
-                    try await send(packet, requestHeader.messageId)
+                    try await Self.sendAndLog(
+                        packet: packet,
+                        messageId: requestHeader.messageId,
+                        diagnosticSessionId: diagnosticSessionId,
+                        send: send
+                    )
                     let shouldSendCancel = self.markRequestSent(messageId: requestHeader.messageId)
                     if shouldSendCancel {
                         await self.sendCancelWithoutGate(messageId: requestHeader.messageId, treeId: requestHeader.treeId)
@@ -5492,6 +5497,21 @@ actor SMBSession {
             }
             pendingResponses[requestHeader.messageId]?.sendTask = sendTask
         }
+    }
+
+    nonisolated private static func sendAndLog(
+        packet: [UInt8],
+        messageId: UInt64,
+        diagnosticSessionId: String,
+        send: @Sendable ([UInt8], UInt64) async throws -> Void
+    ) async throws {
+        try await send(packet, messageId)
+        guard SMBPerfLog.effectiveIsEnabled else { return }
+        // Scheduling may still invert sent/recv; causality needs transport observation, so consumers reject inversions as invalid.
+        let timestamp = SMBPerfLog.timestampNanoseconds()
+        SMBPerfLog.line(
+            "[wire] sent session=\(diagnosticSessionId) message_id=\(messageId) ts_ns=\(timestamp)"
+        )
     }
 
     private func sendUnsigned(_ packet: [UInt8], messageId: UInt64? = nil) async throws {
@@ -5672,7 +5692,7 @@ actor SMBSession {
         defer { receivedPacketDispatchCountForTestingStorage += 1 }
         let packet = frame.bytes
         let header = try SMB2Header.decode(packet)
-        SMBPerfLog.line("[wire] recv session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "")")
+        SMBPerfLog.line("[wire] recv session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "") ts_ns=\(SMBPerfLog.timestampNanoseconds())")
         // Server-initiated notifications (oplock/lease break) arrive with MessageId
         // 0xFFFFFFFFFFFFFFFF and never correspond to a request. This client never requests
         // oplocks or leases (CREATE RequestedOplockLevel is always NONE), so drop them
@@ -5754,7 +5774,6 @@ actor SMBSession {
             return false
         }
         requestSentCountForTestingStorage += 1
-        SMBPerfLog.line("[wire] sent session=\(diagnosticSessionId) message_id=\(messageId)")
         sentResponseMessageIds.insert(messageId)
         if pending.cancellationRequested {
             pendingResponses.removeValue(forKey: messageId)
@@ -5901,7 +5920,11 @@ actor SMBSession {
         // would let charge-0 requests inflate the window (each response still grants), so
         // the effective charge is what gets reserved and later refunded on send failure.
         let effectiveCharge = max(1, header.creditCharge)
-        let balance = try await creditWindow.reserve(charge: effectiveCharge)
+        let balance = try await creditWindow.reserve(
+            charge: effectiveCharge,
+            messageId: header.messageId,
+            command: header.command
+        )
         debugLine("SMB credit charge=\(effectiveCharge) balance=\(balance)")
         return effectiveCharge
     }

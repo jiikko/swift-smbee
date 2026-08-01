@@ -5,6 +5,7 @@ import Foundation
 /// 環境変数はプロセス起動時に 1 回だけ評価してキャッシュする。
 enum SMBPerfLog {
     static let isEnabled = ProcessInfo.processInfo.environment["SMBEE_PERF"] == "1"
+    private static let timestampOrigin = ContinuousClock.now
 
     /// Test-seam gate that stays race-free without an atomic (the package still targets
     /// macOS 13, so `Synchronization.Atomic` is unavailable): the only mutable state
@@ -59,5 +60,15 @@ enum SMBPerfLog {
         let ms = Double(duration.components.seconds) * 1000
             + Double(duration.components.attoseconds) / 1e15
         return String(format: "%.1f", ms)
+    }
+
+    /// Monotonic nanoseconds relative to this process's first perf timestamp. Call only
+    /// from `line`'s autoclosure so disabled diagnostics never read `ContinuousClock.now`.
+    static func timestampNanoseconds() -> UInt64 {
+        let origin = timestampOrigin
+        let components = (ContinuousClock.now - origin).components
+        let seconds = UInt64(max(0, components.seconds))
+        let nanoseconds = UInt64(max(0, components.attoseconds / 1_000_000_000))
+        return seconds * 1_000_000_000 + nanoseconds
     }
 }

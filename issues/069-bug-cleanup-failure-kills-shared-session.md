@@ -42,12 +42,26 @@
 
 「CLOSE 無応答 → closeTransport → 並行 operation 全滅」を fixture（応答を返さない
 InMemoryTransport）で再現する unit を書き、現挙動を固定してから対応方針を決める。
-⚠️ 部分的に固定済み (2026-07-29、`testBestEffortCloseTimeoutClosesTransportAndFailsConcurrentPendingOperations`)。
-固定できているのは「CLOSE timeout → closeTransport → **人工的に park した pending response 2 件**が
-connectionClosed で解放される」経路まで。**実際の list/read/write operation と credit waiter の巻き添えは
-未検証**（fixture は全受信を止める blackhole で、「CLOSE だけ選択的に無応答」なサーバとも乖離がある —
-セクション別 codex レビュー 2026-07-29 の指摘）。invalidation 範囲を再検討する際は、実 wire operation を
-pending 化した形での再現をこの上に足すこと。
+✅ 実施済み (2026-08-01、`testBestEffortCloseTimeoutFailsWireReadsAndCreditWaiter`)。固定した範囲:
+
+- **実 wire operation の巻き添え**: 低レベル `readChunk`×2 + `write`×1 が production の
+  encode → demux 登録 → credit reserve → send → response 待ち経路で pending の状態で、
+  `bestEffortClose` の CLOSE timeout → `closeTransport` により全て `connectionClosed` で解放される。
+- **credit waiter の巻き添え**: 実 `SMB2CreditWindow.reserve` に park した waiter（seam 経由）と、
+  credit 枯渇で park した実 `queryDirectory` operation（外側 error = `connectionClosed`）の両方。
+- fixture は command-aware（CLOSE のみ応答を破棄・ECHO は正常応答・READ/WRITE は応答を生成して hold）
+  で、「blackhole ではない」ことを ECHO 往復でテスト自身が証明する。
+- ミューテーション検証済み: failAllWaiters 削除 / 非 READ pending の取りこぼし / closeTransport 省略 /
+  transport.close() 省略 / deadline 素通し、の 5 変異すべてをこのテストが検知する。
+
+固定していない範囲（意図的な限定。invalidation 範囲の再検討時に必要なら拡張する）:
+
+- public `list`/`read`/`write` facade の CREATE〜cleanup lifecycle 込みの巻き添え（低レベル層で代表）。
+- 内部 credit continuation の解放元が `failAllWaiters` であることの直接証明（cancellation との競合で
+  非決定。外側 operation の `connectionClosed` までを固定）。
+- held response の「遅延配信」（サーバが後から READ に応答するケース）。fixture は生成 + hold まで。
+- 早い旧 fixture (`testBestEffortCloseTimeoutClosesTransportAndFailsConcurrentPendingOperations`,
+  人工 park 版) はそのまま残置。
 
 ## 関連
 

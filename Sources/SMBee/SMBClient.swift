@@ -5152,6 +5152,18 @@ actor SMBSession {
         }
     }
 
+    func parkCreditWaiterForTesting(charge: UInt16) async throws {
+        _ = try await creditWindow.reserve(charge: charge)
+    }
+
+    func creditWaiterCountForTesting() async -> Int {
+        await creditWindow.pendingWaiterCount
+    }
+
+    func creditBalanceForTesting() async -> UInt32 {
+        await creditWindow.balance
+    }
+
     func waitForPendingCountForTesting(atLeast count: Int) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             if pendingResponses.count >= count {

@@ -6,6 +6,61 @@ import XCTest
 /// share enumeration. Connection loss is deliberately observational; other failures are real
 /// test failures because they usually indicate a broken harness or an unrelated regression.
 final class SMBeeWireStressE2ETests: XCTestCase {
+    func testCreditWaitCaptureParsesAndJoinsSyntheticWireTimeline() throws {
+        let capture = CreditWaitCapture()
+        capture.append("not a wire event")
+        capture.append("[wire] pending session=write-session message_id=40 command=9 label=WRITE ts_ns=500000")
+        let startIndex = capture.endIndex
+        capture.append("[wire] credit_wait session=read-session message_id=41 command=8 charge=1 available=0 waiters=1 ts_ns=1000000")
+        capture.append("[wire] credit_wait session=write-session message_id=40 command=9 charge=16 available=0 waiters=2 ts_ns=1100000")
+        capture.append("[wire] credit_wait session=legacy charge=1 available=0 waiters=3 ts_ns=1200000")
+        capture.append("[wire] pending session=read-session message_id=41 command=8 label=READ ts_ns=2000000")
+        capture.append("[wire] sent session=write-session message_id=40 ts_ns=2500000")
+        capture.append("[wire] sent session=read-session message_id=41 ts_ns=5000000")
+        capture.append("[wire] recv session=read-session message_id=41 command=8 status=0x00000103 STATUS_PENDING ts_ns=7000000")
+        capture.append("[wire] recv session=read-session message_id=41 command=8 status=0x00000000 ts_ns=11000000")
+
+        XCTAssertEqual(capture.endIndex, 9, "every [wire] line should be retained")
+        XCTAssertEqual(capture.counts.total, 3)
+        XCTAssertEqual(capture.counts.read, 1)
+        XCTAssertEqual(capture.counts.write, 1)
+        XCTAssertEqual(capture.counts.other, 1)
+
+        let timing = try XCTUnwrap(capture.readTiming(from: startIndex, to: capture.endIndex).timing)
+        XCTAssertEqual(timing.readPendingToSentMilliseconds, 3.0)
+        XCTAssertEqual(timing.readSentToRecvMilliseconds, 6.0)
+        XCTAssertEqual(timing.readPendingToRecvMilliseconds, 9.0)
+
+        let missingTimestampStart = capture.endIndex
+        capture.append("[wire] pending session=read-session message_id=42 command=8 label=READ")
+        capture.append("[wire] sent session=read-session message_id=42 ts_ns=13000000")
+        capture.append("[wire] recv session=read-session message_id=42 command=8 status=0x00000000 ts_ns=14000000")
+        XCTAssertTrue(capture.readTiming(from: missingTimestampStart, to: capture.endIndex).isInvalid)
+
+        let duplicateStart = capture.endIndex
+        capture.append("[wire] pending session=read-session message_id=43 command=8 label=READ ts_ns=15000000")
+        capture.append("[wire] sent session=read-session message_id=43 ts_ns=16000000")
+        capture.append("[wire] sent session=read-session message_id=43 ts_ns=17000000")
+        capture.append("[wire] recv session=read-session message_id=43 command=8 status=0x00000000 ts_ns=18000000")
+        XCTAssertTrue(capture.readTiming(from: duplicateStart, to: capture.endIndex).isInvalid)
+
+        let inversionStart = capture.endIndex
+        capture.append("[wire] pending session=read-session message_id=44 command=8 label=READ ts_ns=19000000")
+        capture.append("[wire] sent session=read-session message_id=44 ts_ns=22000000")
+        capture.append("[wire] recv session=read-session message_id=44 command=8 status=0x00000000 ts_ns=21000000")
+        XCTAssertTrue(capture.readTiming(from: inversionStart, to: capture.endIndex).isInvalid)
+
+        let duplicateTimestampStart = capture.endIndex
+        capture.append("[wire] pending session=read-session message_id=45 command=8 label=READ ts_ns=23000000")
+        capture.append("[wire] sent session=read-session message_id=45 ts_ns=23000000")
+        capture.append("[wire] recv session=read-session message_id=45 command=8 status=0x00000000 ts_ns=24000000")
+        XCTAssertTrue(capture.readTiming(from: duplicateTimestampStart, to: capture.endIndex).isInvalid)
+
+        XCTAssertEqual(nearestRankPercentile([9, 3, 6, 12], 0.50), 6)
+        XCTAssertEqual(nearestRankPercentile([9, 3, 6, 12], 0.95), 12)
+        XCTAssertEqual(nearestRankPercentile([], 0.95), 0)
+    }
+
     func testPersistentSessionReadPrefixAndListStress() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["SMBEE_E2E"] == "1" else {
@@ -127,6 +182,8 @@ final class SMBeeWireStressE2ETests: XCTestCase {
         var baselineCreditWaits = CreditWaitCounts()
         var competingCreditWaits = CreditWaitCounts()
         var competingOverlaps = WriteOverlapCounts()
+        var baselineReadTimings = ReadTimingSummary()
+        var competingReadTimings = ReadTimingSummary()
 
         do {
             try await session.upload(path: readPath, data: readPayload)
@@ -142,6 +199,7 @@ final class SMBeeWireStressE2ETests: XCTestCase {
                     )
                     baselineMilliseconds.append(baseline.milliseconds)
                     baselineCreditWaits += baseline.creditWaits
+                    baselineReadTimings.record(baseline.readTiming)
                     printCreditFIFOSample(
                         condition: "baseline",
                         iteration: iteration,
@@ -160,6 +218,7 @@ final class SMBeeWireStressE2ETests: XCTestCase {
                     competingMilliseconds.append(competing.milliseconds)
                     competingCreditWaits += competing.creditWaits
                     competingOverlaps.record(competing.writeOverlap)
+                    competingReadTimings.record(competing.readTiming)
                     printCreditFIFOSample(
                         condition: "competing",
                         iteration: iteration,
@@ -178,6 +237,7 @@ final class SMBeeWireStressE2ETests: XCTestCase {
                     competingMilliseconds.append(competing.milliseconds)
                     competingCreditWaits += competing.creditWaits
                     competingOverlaps.record(competing.writeOverlap)
+                    competingReadTimings.record(competing.readTiming)
                     printCreditFIFOSample(
                         condition: "competing",
                         iteration: iteration,
@@ -193,6 +253,7 @@ final class SMBeeWireStressE2ETests: XCTestCase {
                     )
                     baselineMilliseconds.append(baseline.milliseconds)
                     baselineCreditWaits += baseline.creditWaits
+                    baselineReadTimings.record(baseline.readTiming)
                     printCreditFIFOSample(
                         condition: "baseline",
                         iteration: iteration,
@@ -229,13 +290,15 @@ final class SMBeeWireStressE2ETests: XCTestCase {
                 counts: competingCreditWaits,
                 captured: capturesCreditWaits
             )
-            printReadTimingAvailability(
+            printReadTimingSummary(
                 condition: "baseline",
-                capturesWireEvents: capturesCreditWaits
+                capturesWireEvents: capturesCreditWaits,
+                summary: baselineReadTimings
             )
-            printReadTimingAvailability(
+            printReadTimingSummary(
                 condition: "competing",
-                capturesWireEvents: capturesCreditWaits
+                capturesWireEvents: capturesCreditWaits,
+                summary: competingReadTimings
             )
 
             try await session.delete(path: readPath)
@@ -256,15 +319,23 @@ final class SMBeeWireStressE2ETests: XCTestCase {
         perfCapture: CreditWaitCapture?
     ) async throws -> CreditFIFOObservation {
         let creditWaitsBefore = perfCapture?.counts ?? CreditWaitCounts()
+        let captureStartIndex = perfCapture?.endIndex
         let start = ContinuousClock.now
         let data = try await session.readPrefix(path: path, maxLength: maxLength)
+        let captureEndIndex = perfCapture?.endIndex
         let elapsed = milliseconds(start.duration(to: .now))
+        let readTiming = capturedReadTiming(
+            capture: perfCapture,
+            startIndex: captureStartIndex,
+            endIndex: captureEndIndex
+        )
         XCTAssertEqual(data.count, Int(maxLength))
         let creditWaitsAfter = perfCapture?.counts ?? CreditWaitCounts()
         return CreditFIFOObservation(
             milliseconds: elapsed,
             creditWaits: creditWaitsAfter - creditWaitsBefore,
-            writeOverlap: .none
+            writeOverlap: .none,
+            readTiming: readTiming
         )
     }
 
@@ -300,17 +371,25 @@ final class SMBeeWireStressE2ETests: XCTestCase {
                 try await writeTask.value
                 throw CreditFIFOMeasurementError.writeCompletedBeforeRead
             }
+            let captureStartIndex = perfCapture?.endIndex
             let start = ContinuousClock.now
             let data = try await session.readPrefix(path: readPath, maxLength: maxLength)
+            let captureEndIndex = perfCapture?.endIndex
             let writeOverlap: WriteOverlap = writeStarted.isWriteActive ? .full : .partial
             let elapsed = milliseconds(start.duration(to: .now))
+            let readTiming = capturedReadTiming(
+                capture: perfCapture,
+                startIndex: captureStartIndex,
+                endIndex: captureEndIndex
+            )
             XCTAssertEqual(data.count, Int(maxLength))
             try await writeTask.value
             let creditWaitsAfter = perfCapture?.counts ?? CreditWaitCounts()
             return CreditFIFOObservation(
                 milliseconds: elapsed,
                 creditWaits: creditWaitsAfter - creditWaitsBefore,
-                writeOverlap: writeOverlap
+                writeOverlap: writeOverlap,
+                readTiming: readTiming
             )
         } catch {
             writeTask.cancel()
@@ -367,7 +446,8 @@ final class SMBeeWireStressE2ETests: XCTestCase {
                 "credit_wait_total=\(observation.creditWaits.total) " +
                 "credit_wait_read=\(observation.creditWaits.read) " +
                 "credit_wait_write=\(observation.creditWaits.write) " +
-                "credit_wait_other=\(observation.creditWaits.other)"
+                "credit_wait_other=\(observation.creditWaits.other) " +
+                readTimingSampleFields(observation.readTiming)
         )
     }
 
@@ -383,19 +463,57 @@ final class SMBeeWireStressE2ETests: XCTestCase {
         )
     }
 
-    private func printReadTimingAvailability(condition: String, capturesWireEvents: Bool) {
-        let reason = capturesWireEvents
-            ? "wire_events_have_no_request_timestamps"
-            : "SMBEE_PERF_disabled"
+    private func printReadTimingSummary(
+        condition: String,
+        capturesWireEvents: Bool,
+        summary: ReadTimingSummary
+    ) {
+        guard capturesWireEvents else {
+            print(
+                "CREDIT_FIFO_HOL_READ_TIMING condition=\(condition) " +
+                    "available=false reason=SMBEE_PERF_disabled"
+            )
+            return
+        }
         print(
-            "CREDIT_FIFO_HOL_READ_TIMING condition=\(condition) available=false reason=\(reason)"
+            "CREDIT_FIFO_HOL_READ_TIMING condition=\(condition) available=true " +
+                "samples=\(summary.samples.count) invalid_samples=\(summary.invalidSamples) " +
+                "pending_to_sent_p50_ms=\(formatReadTimingPercentile(summary.pendingToSentMilliseconds, 0.50)) " +
+                "pending_to_sent_p95_ms=\(formatReadTimingPercentile(summary.pendingToSentMilliseconds, 0.95)) " +
+                "sent_to_recv_p50_ms=\(formatReadTimingPercentile(summary.sentToRecvMilliseconds, 0.50)) " +
+                "sent_to_recv_p95_ms=\(formatReadTimingPercentile(summary.sentToRecvMilliseconds, 0.95))"
         )
     }
 
+    private func formatReadTimingPercentile(_ values: [Double], _ quantile: Double) -> String {
+        guard !values.isEmpty else { return "n/a" }
+        return format(nearestRankPercentile(values, quantile))
+    }
+
+    private func capturedReadTiming(
+        capture: CreditWaitCapture?,
+        startIndex: Int?,
+        endIndex: Int?
+    ) -> ReadTimingCaptureResult {
+        guard let capture, let startIndex, let endIndex else { return .unavailable }
+        return capture.readTiming(from: startIndex, to: endIndex)
+    }
+
+    private func readTimingSampleFields(_ result: ReadTimingCaptureResult) -> String {
+        switch result {
+        case .unavailable:
+            return "pending_to_sent_ms=unavailable sent_to_recv_ms=unavailable pending_to_recv_ms=unavailable"
+        case .invalid:
+            return "pending_to_sent_ms=invalid sent_to_recv_ms=invalid pending_to_recv_ms=invalid"
+        case .valid(let timing):
+            return "pending_to_sent_ms=\(format(timing.readPendingToSentMilliseconds)) " +
+                "sent_to_recv_ms=\(format(timing.readSentToRecvMilliseconds)) " +
+                "pending_to_recv_ms=\(format(timing.readPendingToRecvMilliseconds))"
+        }
+    }
+
     private func percentile(_ values: [Double], _ quantile: Double) -> Double {
-        let sorted = values.sorted()
-        let rank = max(1, Int(ceil(quantile * Double(sorted.count))))
-        return sorted[min(rank - 1, sorted.count - 1)]
+        nearestRankPercentile(values, quantile)
     }
 
     private func milliseconds(_ duration: Duration) -> Double {
@@ -417,6 +535,7 @@ private struct CreditFIFOObservation {
     let milliseconds: Double
     let creditWaits: CreditWaitCounts
     let writeOverlap: WriteOverlap
+    let readTiming: ReadTimingCaptureResult
 }
 
 private enum WriteOverlap: String {
@@ -466,25 +585,162 @@ private struct CreditWaitCounts {
     }
 }
 
+private struct ReadTransactionTiming {
+    let readPendingToSentMilliseconds: Double
+    let readSentToRecvMilliseconds: Double
+    let readPendingToRecvMilliseconds: Double
+}
+
+private enum ReadTimingCaptureResult {
+    case unavailable
+    case invalid
+    case valid(ReadTransactionTiming)
+
+    var timing: ReadTransactionTiming? {
+        guard case .valid(let timing) = self else { return nil }
+        return timing
+    }
+
+    var isInvalid: Bool {
+        if case .invalid = self { return true }
+        return false
+    }
+}
+
+private struct ReadTimingSummary {
+    private(set) var samples: [ReadTransactionTiming] = []
+    private(set) var invalidSamples = 0
+
+    var pendingToSentMilliseconds: [Double] {
+        samples.map(\.readPendingToSentMilliseconds)
+    }
+
+    var sentToRecvMilliseconds: [Double] {
+        samples.map(\.readSentToRecvMilliseconds)
+    }
+
+    mutating func record(_ result: ReadTimingCaptureResult) {
+        switch result {
+        case .unavailable:
+            break
+        case .invalid:
+            invalidSamples += 1
+        case .valid(let timing):
+            samples.append(timing)
+        }
+    }
+}
+
+private struct WireTimelineEvent {
+    let name: String
+    let fields: [String: String]
+    let flags: Set<String>
+
+    init?(_ message: String) {
+        let tokens = message.split(whereSeparator: \Character.isWhitespace).map(String.init)
+        guard tokens.count >= 2, tokens[0] == "[wire]" else { return nil }
+        name = tokens[1]
+        var fields: [String: String] = [:]
+        var flags: Set<String> = []
+        for token in tokens.dropFirst(2) {
+            if let separator = token.firstIndex(of: "=") {
+                fields[String(token[..<separator])] = String(token[token.index(after: separator)...])
+            } else {
+                flags.insert(token)
+            }
+        }
+        self.fields = fields
+        self.flags = flags
+    }
+
+    var session: String? { fields["session"] }
+    var messageID: UInt64? { fields["message_id"].flatMap(UInt64.init) }
+    var command: UInt16? { fields["command"].flatMap(UInt16.init) }
+    var timestampNanoseconds: UInt64? { fields["ts_ns"].flatMap(UInt64.init) }
+    var isFinalResponse: Bool {
+        name == "recv" && fields["status"] != nil && !flags.contains("STATUS_PENDING")
+    }
+}
+
 private final class CreditWaitCapture: @unchecked Sendable {
     private let lock = NSLock()
-    private var storage = CreditWaitCounts()
+    private var timeline: [WireTimelineEvent] = []
+    private var waitCounts = CreditWaitCounts()
+
+    var endIndex: Int {
+        lock.withLock { timeline.endIndex }
+    }
 
     var counts: CreditWaitCounts {
-        lock.withLock { storage }
+        lock.withLock { waitCounts }
     }
 
     func append(_ message: String) {
-        guard message.hasPrefix("[wire] credit_wait ") else { return }
+        guard let event = WireTimelineEvent(message) else { return }
         lock.withLock {
-            storage.total += 1
-            if message.contains(" command=8 ") {
-                storage.read += 1
-            } else if message.contains(" command=9 ") {
-                storage.write += 1
+            timeline.append(event)
+            guard event.name == "credit_wait" else { return }
+            waitCounts.total += 1
+            switch event.command {
+            case 8:
+                waitCounts.read += 1
+            case 9:
+                waitCounts.write += 1
+            default:
+                break
             }
         }
     }
+
+    func readTiming(from startIndex: Int, to endIndex: Int) -> ReadTimingCaptureResult {
+        let events: [WireTimelineEvent]? = lock.withLock {
+            guard timeline.indices.contains(startIndex) || startIndex == timeline.endIndex,
+                  endIndex >= startIndex,
+                  endIndex <= timeline.endIndex else {
+                return nil
+            }
+            return Array(timeline[startIndex..<endIndex])
+        }
+        guard let events else { return .invalid }
+        let pendingReads = events.filter { $0.name == "pending" && $0.command == 8 }
+        guard pendingReads.count == 1,
+              let pending = pendingReads.first,
+              let session = pending.session,
+              let messageID = pending.messageID,
+              let pendingTimestamp = pending.timestampNanoseconds else {
+            return .invalid
+        }
+        let sentEvents = events.filter {
+            $0.name == "sent" && $0.session == session && $0.messageID == messageID
+        }
+        let finalResponses = events.filter {
+            $0.isFinalResponse && $0.session == session && $0.messageID == messageID && $0.command == 8
+        }
+        guard sentEvents.count == 1,
+              finalResponses.count == 1,
+              let sentTimestamp = sentEvents[0].timestampNanoseconds,
+              let recvTimestamp = finalResponses[0].timestampNanoseconds,
+              pendingTimestamp < sentTimestamp,
+              sentTimestamp < recvTimestamp else {
+            return .invalid
+        }
+        return .valid(ReadTransactionTiming(
+            readPendingToSentMilliseconds: nanosecondsToMilliseconds(sentTimestamp - pendingTimestamp),
+            readSentToRecvMilliseconds: nanosecondsToMilliseconds(recvTimestamp - sentTimestamp),
+            readPendingToRecvMilliseconds: nanosecondsToMilliseconds(recvTimestamp - pendingTimestamp)
+        ))
+    }
+}
+
+private func nanosecondsToMilliseconds(_ nanoseconds: UInt64) -> Double {
+    Double(nanoseconds) / 1_000_000
+}
+
+private func nearestRankPercentile(_ values: [Double], _ quantile: Double) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let rank = max(1, Int(ceil(quantile * Double(sorted.count))))
+    return sorted[min(rank - 1, sorted.count - 1)]
 }
 
 private final class WriteProgressSignal: @unchecked Sendable {

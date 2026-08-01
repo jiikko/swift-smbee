@@ -34,11 +34,10 @@
 | P1 | prefix read の往復削減 続き（issue 067 B/C/D） | B: CREATE+READ+CLOSE の compound（3→1 往復の本命）、C: READ パイプライン、D: 同時 open handle 上限。実測レイテンシと consumer 実害を見てから着手判断。 |
 | P1 | Kerberos / GSS | 0.1では非対応。将来実装する場合はauth backend、SPNEGO、session key、実サーバ検証が必要。 |
 | P1 | durable / persistent handle | 現在は非対応。実装する場合は切断・復旧state machineと実サーバE2Eが必要。 |
-| P2 | credit FIFO HoL の再計測（issue 068 reopen） | 実 waiter ベース診断（2026-07-30 修正済み）で、charge の大きい request を先頭に置き後続へ小 READ を複数投入する条件で再計測する。 |
 | P2 | Linux AES-CCM throughput（issue 075） | pure-Swift CCM fallback が実測 ~0.3 MiB/s（Linux runner）で 4GiB 全読 E2E が現実的な job 時間に収まらない。高速化方式の選定後に scheduled 全読 E2E の復活を判断する。 |
 | P2 | fd close race の残課題（issue 073） | `timeout==nil` の blocking connect が別 thread の shutdown で復帰しない未解決経路（public initializer の既定経路）。nonblocking connect + poll 反復への作り替えが必要。 |
 | P2 | 実サーバ固有機能 | Unicode、share/volume、ACL/SID、reparse、sparse、deadline、keepalive、lockをmatrixで確認する。 |
-| P2 | WRITE 競合時の prefix read 遅延（issue 068 副産物） | 大 WRITE と重なると prefix read p50 が 5-6 倍（credit ではない。送信直列化 or 帯域競合、未切り分け）。wire イベントに request 側 timestamp が無く送信待ちとサーバ応答待ちを分離できない。 |
+| P3 | WRITE 競合時の prefix read 遅延（issue 068 で切り分け済み） | 2026-08-01 に request 側 ts_ns で切り分け完了: 送信側（credit / 送信直列化）は不変で、増分は全てサーバ応答待ち（localhost でも ~3.5 倍）。実害 gate（p50 +16.7ms）未達のため QoS 対応せず。consumer 実害が出たら CREDIT_FIFO_HOL_READ_TIMING を実環境で再実行。 |
 | P3 | optional protocol surface | compression、multichannel、QUIC、RDMA、SMB1、POSIX extensions等は明示的非対応を維持する。 |
 
 ## 既にカバーしている範囲
@@ -483,7 +482,7 @@ file browser / backup / macOS metadata preservation を本格的にやるなら�
 - POSIX transport 並列 send: issue 072 で送信 executor による frame 直列化を実装済み（並列 send の byte 交錯がスクロール中セッション断の根因だった）。既定 transport は全プラットフォームで POSIX。
 - fd close race (issue 073): descriptor lease で physical close を drain 後に遅延、実装済み。`timeout==nil` connect 未復帰の未解決経路が残る。
 - wire 診断 (issue 069/074): `SMBEE_PERF=1` で session ID 付き `[wire]` イベント。credit 待ちは実 waiter ベース (2026-07-30 修正)。
-- credit FIFO HoL (issue 068): 一度 close したが計測不備で撤回・reopen。実 waiter 診断で再計測が必要。
+- credit FIFO HoL (issue 068): 2026-08-01 done。実 waiter 診断 + request ts_ns で再計測し、credit HoL 未観測・遅延はサーバ応答待ちと確定（issues/done/068）。FIFO 意味論は unit で決定論固定済み。
 
 ## README に書くべき limitations
 

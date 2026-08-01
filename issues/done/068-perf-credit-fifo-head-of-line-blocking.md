@@ -1,6 +1,6 @@
 # 068 perf: prefix read 並行時の credit FIFO head-of-line blocking を実測する
 
-状態: **open (2026-07-29 reopen)。既存計測では credit FIFO の HoL blocking の有無を判定できなかった。実 waiter ベースの診断で再計測が必要**
+状態: **done (2026-08-01)。実 waiter ベース診断で再計測し、credit HoL 未観測・遅延はサーバ応答待ちと確定。issue 012 の FIFO 判断を追認して close**
 起票: 2026-07-27（issue 067 A の敵対的レビューで検出、codex 反証レビューで訂正済み）
 関連: `Sources/SMBee/SMB2Header.swift`（`SMB2CreditWindow.resumeReadyWaiters` — 「FIFO on purpose」の
 rationale コメントあり） / `issues/done/012-credit-window-followups.md`（FIFO 採用の判断） /
@@ -73,3 +73,30 @@ credit ではないので、原因の候補は (a) issue 072 で導入した送�
 
 - `issues/done/012-credit-window-followups.md` — FIFO 意図的採用の一次情報
 - issue 067 / 069 / obaket `macOS/issues/437`
+
+## 再計測結果（2026-08-01、container Samba smb302-encrypted-required、localhost、M1 診断後）
+
+計測: 同テストを 2 run（baseline / competing 各 20 sample、AB/BA 交互、write_overlap=full 20/20）。
+M1（commit 432c261）で credit_wait / credit_granted は実 waiter ベース + request 相関
+（message_id / command）になり、READ の pending → sent → recv を ts_ns で分解できるようになった。
+
+| 区間 | baseline p50 / p95 | competing p50 / p95 |
+|---|---|---|
+| pending→sent（credit 待ち + sign/encrypt + 送信直列化 + socket write） | 0.068–0.077 / 0.075–0.089 ms | **0.069–0.079 / 0.087–0.088 ms（不変）** |
+| sent→recv（サーバ処理 + 応答） | 0.774–0.803 / 0.985–1.151 ms | **2.708–2.904 / 3.305–4.913 ms** |
+| credit_wait 発生数（実 waiter ベース） | **0 / 40 sample** | **0 / 40 sample** |
+
+## 結論（close）
+
+1. **credit FIFO HoL blocking は対象 workload（96MiB WRITE + 64KiB prefix read）で未観測**。
+   実 waiter ベース診断で credit_wait は baseline / competing とも 0 件。構造的に不可能とは
+   言わない（packet 構築と reserve の間の競合窓は理論上残る）が、FIFO 意味論自体は
+   `testCreditWindowPreservesFIFOHeadOfLineBlocking`（M1）で決定論固定した。issue 012 の
+   FIFO 採用判断を追認する。
+2. **5〜6 倍遅延の正体は送信側ではない**: pending→sent が完全に不変なので、issue 072 の
+   送信直列化も credit も原因ではない。増分は全て sent→recv（サーバ処理 / 帯域競合）と、
+   prefix 全体（CREATE + READ + CLOSE）への同様の競合。localhost Samba でも WRITE 負荷中は
+   サーバ応答が ~3.5 倍遅くなる、という結果。
+3. **実害 gate 未達**: competing の追加遅延は p50 で +10ms 前後（gate: +16.7ms 以上で QoS 検討）。
+   QoS 対応・session 分離は現時点で行わない。consumer（obaket）で実害が出たら、この診断
+   （CREDIT_FIFO_HOL_READ_TIMING）をそのまま実環境で回して再評価する。

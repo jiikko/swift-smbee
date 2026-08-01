@@ -24,6 +24,21 @@ if "${SCRIPT_DIR}/smoke-all" 2>&1 \
         fflush()
       }
     '; then
+  # Keep a per-tree copy of the full log next to the marker (issues/079) so the
+  # audit trail for earlier wire commits survives later runs overwriting the
+  # "latest" log. The tree hash is taken from smoke-all's own output so the log
+  # copy can never diverge from the marker it documents. Only these bulky logs
+  # are pruned (newest SMBEE_SMOKE_RETAIN kept); markers are never pruned.
+  tree="$(sed -n 's/^E2E smoke verified Sources\/SMBee tree: //p' "${log_file}" | tail -1)"
+  if [ -n "${tree}" ]; then
+    cp "${log_file}" "${REPO_ROOT}/tmp/e2e-smoke-tree-${tree}.log"
+    retain="${SMBEE_SMOKE_RETAIN:-10}"
+    # find -exec ls -t {} + runs nothing when no log matches, so an empty tmp/
+    # cannot fail the pipeline under set -o pipefail (issues/079 refutation P1).
+    find "${REPO_ROOT}/tmp" -maxdepth 1 -name 'e2e-smoke-tree-*.log' -exec ls -t {} + 2>/dev/null \
+      | tail -n "+$((retain + 1))" \
+      | while IFS= read -r stale; do rm -f "${stale}"; done
+  fi
   echo "Samba smoke passed. Full log: ${log_file}"
 else
   status=$?

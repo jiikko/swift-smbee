@@ -13,6 +13,10 @@ if [ -n "$(git status --porcelain --untracked-files=all -- Sources/SMBee)" ]; th
   exit 1
 fi
 
+# Snapshot the subtree identity up front: the marker must describe the code that the
+# profiles below actually exercised, so a mid-run commit invalidates the run (issues/079).
+tree="$(git rev-parse HEAD:Sources/SMBee)"
+
 printf '== E2E smoke: smb302-encrypted-required ==\n'
 SMBEE_E2E_PROFILE=smb302-encrypted-required \
 SAMBA_CONFIG=test/e2e/smb/smb302-encrypted-required.conf \
@@ -33,8 +37,23 @@ SAMBA_CONFIG=test/e2e/smb/smb422-reparse.conf \
   bin/e2e/container-samba.sh
 
 mkdir -p tmp
+# The run is only valid if the subtree the profiles exercised is still what HEAD points
+# at (and still clean); otherwise refuse to certify it.
+if [ "$(git rev-parse HEAD:Sources/SMBee)" != "${tree}" ] ||
+   [ -n "$(git status --porcelain --untracked-files=all -- Sources/SMBee)" ]; then
+  printf 'ERROR: Sources/SMBee changed while smoke-all was running; not writing a marker.\n' >&2
+  exit 1
+fi
 # Key the marker to the Sources/SMBee subtree hash: docs-only commits keep it valid,
-# any wire-code change invalidates it.
-tree="$(git rev-parse HEAD:Sources/SMBee)"
-touch "./tmp/e2e-verified-tree-${tree}"
+# any wire-code change invalidates it. The pre-push gate only tests existence, so the
+# marker body is free to carry an audit trail (issues/079): when, which HEAD, which
+# profiles were exercised. Markers are deliberately never pruned — deleting one would
+# silently change the push-gate behavior for older trees; only the bulky per-tree logs
+# (written by smoke-agent) are subject to retention.
+{
+  printf 'verified_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf 'head_commit=%s\n' "$(git rev-parse HEAD)"
+  printf 'sources_tree=%s\n' "${tree}"
+  printf 'profiles=smb302-encrypted-required,smb311-signing-required,smb422-reparse\n'
+} > "./tmp/e2e-verified-tree-${tree}"
 printf '\nE2E smoke verified Sources/SMBee tree: %s\n' "${tree}"

@@ -7618,6 +7618,14 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(sleeper.callCount, 1)
     }
 
+    /// 既定値の契約を pin する (issue 010 §修正方針 3 / obaket issue 453)。
+    /// 「公開エントリの省略時に response 待ちが unbounded に戻る」退行 (= 呼び忘れた
+    /// consumer が無言ハングする footgun の再導入) を、値の変更が意図的な diff として
+    /// 現れる形で検出する。
+    func testDefaultRequestTimeoutIsSixtySecondsAndOptOutIsExplicitNil() {
+        XCTAssertEqual(SMBClient.defaultRequestTimeout, .seconds(60))
+    }
+
     func testNilRequestTimeoutNeverInvokesSleeperForSentOrdinaryRequest() async throws {
         let transport = ControlledReceiveTransport()
         let sleeper = RequestTimeoutSleeperGate()

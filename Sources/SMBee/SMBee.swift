@@ -13,15 +13,15 @@ public enum SMBee {
     /// - Parameters:
     ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
-    ///     request is sent. This is independent of the socket-level `timeout`; `nil` preserves
-    ///     unbounded response waiting for ordinary requests.
+    ///     request is sent. This is independent of the socket-level `timeout`. Defaults to
+    ///     `SMBClient.defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         share: String,
         timeout: Duration? = nil,
-        requestTimeout: Duration? = nil
+        requestTimeout: Duration? = SMBClient.defaultRequestTimeout
     ) async throws -> SMBClientSession {
         try await SMBClient.connect(
             host: host,
@@ -36,15 +36,15 @@ public enum SMBee {
     /// - Parameters:
     ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
-    ///     request is sent. This is independent of the socket-level `timeout`; `nil` preserves
-    ///     unbounded response waiting for ordinary requests.
+    ///     request is sent. This is independent of the socket-level `timeout`. Defaults to
+    ///     `SMBClient.defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         credentialProvider: @escaping SMBCredentialProvider,
         share: String,
         timeout: Duration? = nil,
-        requestTimeout: Duration? = nil
+        requestTimeout: Duration? = SMBClient.defaultRequestTimeout
     ) async throws -> SMBClientSession {
         try await SMBClient.connect(
             host: host,
@@ -129,14 +129,15 @@ public enum SMBee {
     /// - Parameters:
     ///   - timeout: Socket-level timeout for connect and each recv/send I/O.
     ///   - requestTimeout: Per-request response timeout propagated to every referral-hop
-    ///     connection and the returned target session. `nil` keeps response waits unbounded.
+    ///     connection and the returned target session. Defaults to
+    ///     `SMBClient.defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
     public static func connectFollowingDFS(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         path: String,
         timeout: Duration? = nil,
-        requestTimeout: Duration? = nil
+        requestTimeout: Duration? = SMBClient.defaultRequestTimeout
     ) async throws -> SMBDfsConnection {
         try await SMBClient.connectFollowingDFS(
             host: host, port: port, credential: credential, path: path,

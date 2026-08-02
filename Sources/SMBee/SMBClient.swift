@@ -1730,18 +1730,33 @@ public enum SMBClient {
         )
     }
 
+    /// 既定の per-request response timeout (issue 010 §修正方針 3 の原設計値 60s)。
+    ///
+    /// 「server が応答を返さない / RST 無しの half-dead TCP (スリープ復帰後の典型)」は
+    /// **本番の失敗モード**であり、応答待ちが unbounded だと consumer は無言でハングする
+    /// (obaket issue 453 で実観測: 約 12.5h スリープ後の初回 read が永久に待った。
+    /// エラーが出ないため上位のリトライも発火しない)。smbclient / macOS SMBX も
+    /// request timeout を持つ。opt-in (nil 既定) は呼び忘れた consumer が全員この罠を
+    /// 踏むため、**既定で有効**にする。無効化したい caller は明示的に
+    /// `requestTimeout: nil` を渡す。long-poll 系 (change notify / blocking lock /
+    /// named-pipe read) は `SMBRequestTimeoutPolicy` の除外により timer 対象外なので、
+    /// この値を上げる必要はない。60s は 1 READ/WRITE 応答 (数 MiB frame) が低速回線でも
+    /// 収まる寛容側の値。timeout 発火時は `requestDidTimeOut` が transport ごと閉じる
+    /// (CommandSequenceWindow の穴を作らないため)。
+    public static let defaultRequestTimeout: Duration = .seconds(60)
+
     /// - Parameters:
     ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
-    ///     request is sent. This is independent of the socket-level `timeout`; `nil` preserves
-    ///     unbounded response waiting for ordinary requests.
+    ///     request is sent. This is independent of the socket-level `timeout`. Defaults to
+    ///     `defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         share: String,
         credential: SMBCredential,
         timeout: Duration? = nil,
-        requestTimeout: Duration? = nil,
+        requestTimeout: Duration? = SMBClient.defaultRequestTimeout,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
         try await connect(
@@ -1758,15 +1773,15 @@ public enum SMBClient {
     /// - Parameters:
     ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
-    ///     request is sent. This is independent of the socket-level `timeout`; `nil` preserves
-    ///     unbounded response waiting for ordinary requests.
+    ///     request is sent. This is independent of the socket-level `timeout`. Defaults to
+    ///     `defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
     public static func connect(
         host: String,
         port: UInt16 = 445,
         share: String,
         credentialProvider: @escaping SMBCredentialProvider,
         timeout: Duration? = nil,
-        requestTimeout: Duration? = nil,
+        requestTimeout: Duration? = SMBClient.defaultRequestTimeout,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBClientSession {
         let makeTransport = resolvedTransportFactory(makeTransport, timeout: timeout)
@@ -1905,7 +1920,7 @@ public enum SMBClient {
         credential: SMBCredential,
         path: String,
         timeout: Duration? = nil,
-        requestTimeout: Duration? = nil,
+        requestTimeout: Duration? = SMBClient.defaultRequestTimeout,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBDfsReferralResult {
         let share = try dfsShare(from: path)
@@ -1924,14 +1939,15 @@ public enum SMBClient {
     /// - Parameters:
     ///   - timeout: Socket-level timeout for connect and each recv/send I/O.
     ///   - requestTimeout: Per-request response timeout propagated to every referral-hop
-    ///     connection and the returned target session. `nil` keeps response waits unbounded.
+    ///     connection and the returned target session. Defaults to
+    ///     `SMBClient.defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
     public static func connectFollowingDFS(
         host: String,
         port: UInt16 = 445,
         credential: SMBCredential,
         path: String,
         timeout: Duration? = nil,
-        requestTimeout: Duration? = nil,
+        requestTimeout: Duration? = SMBClient.defaultRequestTimeout,
         makeTransport: (@Sendable () -> SMBTransport)? = nil
     ) async throws -> SMBDfsConnection {
         let target = try await resolveDFSPath(
@@ -1953,7 +1969,7 @@ public enum SMBClient {
     ) async throws -> SMBDfsResolvedPath {
         try await resolveDFSPath(
             host: host, port: port, credential: credential, path: path,
-            timeout: timeout, requestTimeout: nil,
+            timeout: timeout, requestTimeout: SMBClient.defaultRequestTimeout,
             makeTransport: makeTransport, maxHops: maxHops
         )
     }

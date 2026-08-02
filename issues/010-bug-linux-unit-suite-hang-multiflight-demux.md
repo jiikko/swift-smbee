@@ -1,7 +1,10 @@
 # 010 bug: Linux ユニットスイートが hang する (multi-flight demux の messageId 順 race + 未 resume continuation)
 
 状態: **一部対応済み** (A のテスト側修正 + §修正方針 2 + awaitWithTimeout の穴 = 2026-07-03 対応。
-構造修正 §1 (session 所有 reader) と §3 (release request timeout) が残)
+§3 (release request timeout) = **完了**: `55d635e` で opt-in 導入 (2026-08-01)、`18443c2` で
+原設計どおり既定 60s に引き上げ (2026-08-02。opt-out は明示 `requestTimeout: nil`。
+既定化の動機 = obaket issue 453: スリープ復帰後の half-dead TCP で read が無言に永久ハング)。
+構造修正 §1 (session 所有 reader) のみ残)
 起票: 2026-07-03
 関連:
 - `Sources/SMBee/SMBClient.swift`: `demuxedWireTransaction` / `startReceiveLoopIfNeeded` / `receiveLoop` /

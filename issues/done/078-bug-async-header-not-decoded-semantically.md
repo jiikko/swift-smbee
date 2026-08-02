@@ -1,6 +1,7 @@
 # 078 bug: async header を意味的に decode せず、STATUS_PENDING 後の CANCEL が規範形式にならない
 
 - 種別: bug / protocol compliance / interoperability
+- 状態: done（2026-08-02。実装 + Samba CI + macOS SMBX 実測済み。Windows は compatibility matrix へ統合）
 - 重要度: medium（根拠は下記「影響」の response correlation。CANCEL 形式単体なら low）
 - 起票: 2026-08-01（issue 010 §修正方針 3 の敵対的設計レビューで検出、codex 反証レビューで範囲を訂正）
 - 関連: `Sources/SMBee/SMB2Header.swift`（`SMB2Header`）/
@@ -61,3 +62,18 @@
 
 残: 対応方針 5 の実サーバ手動実測（Windows / macOS SMBX の CHANGE_NOTIFY → STATUS_PENDING → cancel で
 server 側 watch 解放を確認、Tier 3）。done への移動はこの実測を踏まえて判断する。
+
+## Tier 3 実測（2026-08-02、macOS SMBX 実サーバ 169.254.69.111、dialect 3.0.2 signing+encryption）
+
+`smbcli watch --trace-wire` で CHANGE_NOTIFY → SIGINT cancel を実測:
+
+1. SMBX が STATUS_PENDING interim を返却（decrypted transform 内、AsyncId=2、MessageId=5）。
+2. CANCEL が **async 形式**で送信された: command=0x000C / flags=0x00000002 (ASYNC_COMMAND) /
+   bytes 32-39 = AsyncId 2（interim と一致）/ MessageId=5（元 request 維持）。
+3. サーバは受理し session 継続（直後の CLOSE が正常応答）。
+4. 同ディレクトリへ watch を再購読 → ファイル作成で change 通知（overflow）を受信 =
+   サーバ側 watch 処理は cancel 後も健全。
+
+Windows Server は手元に環境がないため、todo2 P0 の compatibility matrix 作業（実サーバ smoke）に
+統合して確認する。本 issue の対応（decode / 相関 / CANCEL 形式）は Samba (CI) + macOS SMBX (実測) で
+検証済みとして close する。

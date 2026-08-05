@@ -1108,16 +1108,19 @@ public actor SMBClientSession {
         }
     }
 
+    /// - Parameter knownSize: `withReadStream(path:range:knownSize:...)` と同じ意味
+    ///   (渡すと QUERY_INFO を送らない)。
     public func read(
         path: String,
         range: SMBReadRange? = nil,
+        knownSize: UInt64? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws -> [UInt8] {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, path: path, directory: false)
         do {
-            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
-            let (start, requested) = try readBounds(stat: stat, range: range)
+            let size = try await resolvedSize(knownSize: knownSize, fileId: fileId)
+            let (start, requested) = try readBounds(size: size, range: range)
             let data = try await SMBClient.readAll(session: session, treeId: treeId, fileId: fileId, offset: start, length: requested, onProgress: onProgress)
             guard UInt64(data.count) == requested else {
                 throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
@@ -1130,9 +1133,15 @@ public actor SMBClientSession {
         }
     }
 
+    /// - Parameter knownSize: 呼び出し側が既に知っているファイルサイズ。渡すと EOF
+    ///   クランプのための **QUERY_INFO を送らない** (往復 1 回の削減)。listing で size を
+    ///   得ている consumer が、同一ファイルを複数の range に分けて読むときに効く
+    ///   (`issues/067` の「動画 range read profile」)。値が実サイズより大きい場合は
+    ///   short read として loud に失敗する (`resolvedSize` の doc 参照)。
     public func withReadStream(
         path: String,
         range: SMBReadRange? = nil,
+        knownSize: UInt64? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
@@ -1140,8 +1149,8 @@ public actor SMBClientSession {
         let progress = SMBReadStreamProgress()
         let fileId = try await session.create(treeId: treeId, path: path, directory: false)
         do {
-            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
-            let (start, requested) = try readBounds(stat: stat, range: range)
+            let size = try await resolvedSize(knownSize: knownSize, fileId: fileId)
+            let (start, requested) = try readBounds(size: size, range: range)
             try await SMBClient.streamRead(
                 session: session,
                 treeId: treeId,
@@ -1463,13 +1472,25 @@ public actor SMBClientSession {
         }
     }
 
-    private func readBounds(stat: SMBFileStat, range: SMBReadRange?) throws -> (offset: UInt64, length: UInt64) {
+    private func readBounds(size: UInt64, range: SMBReadRange?) throws -> (offset: UInt64, length: UInt64) {
         let start = range?.offset ?? 0
-        guard start <= stat.size else {
+        guard start <= size else {
             throw SMBCodecError.invalidValue("read range starts past end of file")
         }
-        let available = stat.size - start
+        let available = size - start
         return (start, range.map { min($0.length, available) } ?? available)
+    }
+
+    /// EOF クランプに使うファイルサイズを決める。`knownSize` が渡されていれば
+    /// QUERY_INFO を **送らずに** それを使う (往復 1 回の削減)。
+    ///
+    /// `knownSize` が実サイズより大きいと、要求長がファイル末尾を超えるため
+    /// READ が要求より少なく返り、呼び出し元の契約 (`read` は short read = error、
+    /// `withReadStream` は `streamRead` の short read 判定) で **loud に失敗**する。
+    /// silent な truncation にはならないが、正しさの責任は呼び出し側にある。
+    private func resolvedSize(knownSize: UInt64?, fileId: [UInt8]) async throws -> UInt64 {
+        if let knownSize { return knownSize }
+        return try await session.queryInfo(treeId: treeId, fileId: fileId).size
     }
 }
 

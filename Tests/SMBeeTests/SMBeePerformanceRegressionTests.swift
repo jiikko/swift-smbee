@@ -74,6 +74,47 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         readCounter.assertMetric("read.commands.CLOSE", command: SMB2Commands.close, expected: 1)
     }
 
+    /// issue 067「動画 range read profile」: 同一ファイルを複数 range に分けて読む
+    /// consumer は listing で size を持っているので、EOF クランプのためだけの
+    /// QUERY_INFO は range ごとに 1 往復まるごと無駄になる。`knownSize:` でそれを
+    /// 省けることを **往復回数** (環境非依存の指標) で固定する。
+    func testRangedReadStreamSkipsQueryInfoWhenSizeIsKnown() async throws {
+        let payload = Array("abc".utf8)
+        let inbound = try framed([
+            // 1 本目: knownSize なし = CREATE + QUERY_INFO + READ + CLOSE の 4 往復。
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId),
+            try smb2QueryInfoResponse(size: 3, messageId: 1, treeId: treeId),
+            try smb2ReadResponse(payload, messageId: 2, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: treeId),
+            // 2 本目: knownSize あり = QUERY_INFO が消えて 3 往復。
+            try smb2CreateResponse(fileId: fileId, messageId: 4, treeId: treeId),
+            try smb2ReadResponse(payload, messageId: 5, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId)
+        ])
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = makeClientSession(transport: transport, initialCredits: negotiatedServerCredits)
+        let range = SMBReadRange(offset: 0, length: 3)
+
+        let unknownSink = CountingChunkSink()
+        try await session.withReadStream(path: "ranged.bin", range: range) { unknownSink.record($0) }
+        let unknownCounter = try SMBCommandCounter(outbound: transport.outbound)
+        unknownCounter.assertMetric("read_stream_ranged.commands.CREATE", command: SMB2Commands.create, expected: 1)
+        unknownCounter.assertMetric("read_stream_ranged.commands.QUERY_INFO", command: SMB2Commands.queryInfo, expected: 1)
+        unknownCounter.assertMetric("read_stream_ranged.commands.READ", command: SMB2Commands.read, expected: 1)
+        unknownCounter.assertMetric("read_stream_ranged.commands.CLOSE", command: SMB2Commands.close, expected: 1)
+        unknownSink.assertMetric("read_stream_ranged.bytes", actual: unknownSink.byteCount, expected: payload.count)
+
+        let knownStart = transport.outbound.count
+        let knownSink = CountingChunkSink()
+        try await session.withReadStream(path: "ranged.bin", range: range, knownSize: 3) { knownSink.record($0) }
+        let knownCounter = try SMBCommandCounter(outbound: Array(transport.outbound.dropFirst(knownStart)))
+        knownCounter.assertMetric("read_stream_known_size.commands.CREATE", command: SMB2Commands.create, expected: 1)
+        knownCounter.assertMetric("read_stream_known_size.commands.QUERY_INFO", command: SMB2Commands.queryInfo, expected: 0)
+        knownCounter.assertMetric("read_stream_known_size.commands.READ", command: SMB2Commands.read, expected: 1)
+        knownCounter.assertMetric("read_stream_known_size.commands.CLOSE", command: SMB2Commands.close, expected: 1)
+        knownSink.assertMetric("read_stream_known_size.bytes", actual: knownSink.byteCount, expected: payload.count)
+    }
+
     func testWriteStreamingUsesExpectedWriteCommandAndByteCounts() async throws {
         XCTAssertEqual(SMBClientSession.localWriteChunkLimit, 1024 * 1024)
         let fileSize = 64 * 1024 * 2 + 321

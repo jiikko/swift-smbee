@@ -7,9 +7,14 @@
 （CREATE1/QUERY_INFO0/READ1/CLOSE1 = 3、既存 read は QUERY_INFO1 込みで 4）+ Samba E2E
 （smoke 3 プロファイル green）で固定済み。**測定はコマンド数の固定のみで、実サーバの
 往復レイテンシ削減は未計測**（「測定を先にやる」の実測部分は未達のまま）。
+更新: 2026-08-05 — consumer 側の実機ログで **第 2 の profile（動画 range read）** を観測。
+window ごとに CREATE+QUERY_INFO+CLOSE を払っていることが裏付けられた（下記「追加観測」）。
+優先度の示唆: `knownSize:` による QUERY_INFO 省略が両 profile に効き、実装コストも B より低い。
 関連: `Sources/SMBee/SMBClient.swift`（`read` / `withReadStream` / `streamRead` / `readBounds`） /
 `Sources/SMBee/SMB2Header.swift`（`nextCommand` / `SMB2CreditWindow`） /
-consumer 側: obaket `macOS/issues/437-feat-smb-thumbnail-display.md`
+consumer 側: obaket `macOS/issues/437-feat-smb-thumbnail-display.md` /
+obaket `issues/done/460-architecture-large-exact-range-bypasses-window-split.md`（window 分割の設計） /
+obaket `issues/462-perf-video-range-window-prefetch.md`（C の consumer 側前提）
 
 ## 背景
 
@@ -39,6 +44,43 @@ consumer（obaket）は SMB 上の画像に対して **client-side サムネイ�
    READ をパイプライン化する下地はある。
 5. **同時 open handle 数の上限が無い**。consumer が N 並列でサムネ生成すると N 個の handle が
    同時に開く。サーバ側上限に当たったときの挙動は未検証。
+
+## 追加観測: 動画 range read という第 2 の consumer profile（2026-08-05、obaket 実機 SMB）
+
+起票時の profile は「多数のファイルの先頭 64 KiB を読む」だったが、**同じ往復コストが
+まったく違う形でもう 1 つの経路に効いている**ことが実測で分かった。
+
+obaket は動画のプレビュー / サムネイルで 1 ファイルを **4 MiB の window に割って順に読む**
+（window ごとに cancel 再確認と revision gate 再評価を行う設計）。この経路では
+`withReadStream` が **window ごと**に呼ばれるため、上記「現状の事実 1/2」の
+CREATE → QUERY_INFO → READ×N → CLOSE が **4 MiB ごとに 1 セット**発生する。
+
+実測ログ（344 MB / 4.8 GB の mp4、SMB）:
+
+- 連続再生中、4.2 MB の `[storage-request]` が完全に直列で 7 本連続（window ごとに 1 read）
+- AVPlayer の `observedBitrate` は 69.2 Mbps。4 MiB の転送は約 0.49 秒で、
+  そこに CREATE+QUERY_INFO+CLOSE の往復が毎回乗る
+
+この profile に対する含意:
+
+1. **`knownSize:`（A の代替案）は prefix read だけでなく ranged read にも効く**。
+   consumer は listing で size を持っている（obaket の動画経路は `ObjectMetadata.size` が
+   非 nil であることを生成の前提条件にしており、`totalBytes` として loader に渡している）。
+   `readBounds` の EOF クランプのためだけの QUERY_INFO は、window ごとに 1 往復ぶん無駄になる。
+   B（compound）より実装コストが低く、window 経路にも prefix 経路にも同時に効く。
+2. **B（CREATE+READ+CLOSE の compound 化）はこの profile でこそ効く**。1 ファイルに対し
+   数十〜数百 window を開くため、window あたり 3 往復の削減がそのまま積み上がる。
+3. **C（READ パイプライン化）は consumer 側の先読みと組で初めて効く**
+   （obaket `issues/462-perf-video-range-window-prefetch.md`）。ただし obaket 側は SMB を
+   `StorageServiceKind.maxConcurrentConnectionsHint = 1` で直列化しており、その理由は
+   「複数 outstanding requests の安全性を実機で確認するまで直列寄りにする」。C を活かすには
+   SMBee 側の多重 outstanding の安全性確認と、consumer 側の hint 見直しの**両方**が要る。
+4. **D（同時 open handle の上限）は現状この profile では顕在化していない**。obaket は動画
+   サムネイル生成を幅 1 の gate で直列化しているため、同時に開く handle は実質 1 本。
+
+なお consumer 側は「小さい尻尾のためだけに window を 1 つ増やさない」等の緩和を入れたが、
+それは往復回数そのものを減らすものではない（`obaket issues/done/460-...` の trade-off）。
+**往復を減らせるのは SMBee 側の A(knownSize) / B / C だけ**。
 
 ## 欲しいもの（候補・優先度順）
 

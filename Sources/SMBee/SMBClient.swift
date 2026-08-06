@@ -1120,7 +1120,7 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, path: path, directory: false)
         do {
             let size = try await resolvedSize(knownSize: knownSize, fileId: fileId)
-            let (start, requested) = try readBounds(size: size, range: range)
+            let (start, requested) = try readBounds(size: size, range: range, sizeIsCallerProvided: knownSize != nil)
             let data = try await SMBClient.readAll(session: session, treeId: treeId, fileId: fileId, offset: start, length: requested, onProgress: onProgress)
             guard UInt64(data.count) == requested else {
                 throw SMBCodecError.invalidValue("short SMB read: expected \(requested) bytes, got \(data.count)")
@@ -1150,7 +1150,7 @@ public actor SMBClientSession {
         let fileId = try await session.create(treeId: treeId, path: path, directory: false)
         do {
             let size = try await resolvedSize(knownSize: knownSize, fileId: fileId)
-            let (start, requested) = try readBounds(size: size, range: range)
+            let (start, requested) = try readBounds(size: size, range: range, sizeIsCallerProvided: knownSize != nil)
             try await SMBClient.streamRead(
                 session: session,
                 treeId: treeId,
@@ -1472,22 +1472,42 @@ public actor SMBClientSession {
         }
     }
 
-    private func readBounds(size: UInt64, range: SMBReadRange?) throws -> (offset: UInt64, length: UInt64) {
+    /// - Parameter sizeIsCallerProvided: `size` が `knownSize` 由来か。
+    ///
+    ///   QUERY_INFO 由来 (= サーバの現在値) なら、要求 range が末尾を超えていても
+    ///   **EOF クランプとして黙って短くしてよい** (従来どおりの正当な挙動)。
+    ///   一方 `knownSize` 由来のときに range がその size を超えるのは **caller 内部の
+    ///   矛盾**で、黙って短く返すと silent truncation になる。API doc が「silent
+    ///   truncation にはならない」と宣言している以上、ここで loud に落とす。
+    private func readBounds(
+        size: UInt64,
+        range: SMBReadRange?,
+        sizeIsCallerProvided: Bool
+    ) throws -> (offset: UInt64, length: UInt64) {
         let start = range?.offset ?? 0
         guard start <= size else {
             throw SMBCodecError.invalidValue("read range starts past end of file")
         }
         let available = size - start
-        return (start, range.map { min($0.length, available) } ?? available)
+        guard let range else { return (start, available) }
+        guard !sizeIsCallerProvided || range.length <= available else {
+            throw SMBCodecError.invalidValue(
+                "read range exceeds caller-provided knownSize (requested \(range.length), available \(available))"
+            )
+        }
+        return (start, min(range.length, available))
     }
 
     /// EOF クランプに使うファイルサイズを決める。`knownSize` が渡されていれば
     /// QUERY_INFO を **送らずに** それを使う (往復 1 回の削減)。
     ///
-    /// `knownSize` が実サイズより大きいと、要求長がファイル末尾を超えるため
-    /// READ が要求より少なく返り、呼び出し元の契約 (`read` は short read = error、
-    /// `withReadStream` は `streamRead` の short read 判定) で **loud に失敗**する。
-    /// silent な truncation にはならないが、正しさの責任は呼び出し側にある。
+    /// `knownSize` が **実サイズより大きい** と、要求長がファイル末尾を超えるため READ が
+    /// 要求より少なく返り、呼び出し元の契約 (`read` は short read = error、`withReadStream`
+    /// は `streamRead` の short read 判定) で **loud に失敗**する。
+    /// `knownSize` が **実サイズより小さい** 場合は、その size までしか読まない
+    /// (= caller が宣言した範囲を読む)。range を明示しつつ `knownSize` を超える長さを
+    /// 要求した場合は `readBounds` が loud に落とす。いずれも silent truncation にはしない。
+    /// 正しい size を渡す責任は呼び出し側にある。
     private func resolvedSize(knownSize: UInt64?, fileId: [UInt8]) async throws -> UInt64 {
         if let knownSize { return knownSize }
         return try await session.queryInfo(treeId: treeId, fileId: fileId).size

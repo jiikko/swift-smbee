@@ -115,6 +115,36 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         knownSink.assertMetric("read_stream_known_size.bytes", actual: knownSink.byteCount, expected: payload.count)
     }
 
+    /// `knownSize` を渡しつつ、その size を超える range を要求したら loud に落とす。
+    /// 黙って短く返すと silent truncation になり、API doc の宣言と食い違う。
+    /// (QUERY_INFO 由来の size なら従来どおり EOF クランプで短くしてよい。)
+    func testRangedReadStreamRejectsRangeBeyondKnownSize() async throws {
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 1, treeId: treeId)
+        ])
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = makeClientSession(transport: transport, initialCredits: negotiatedServerCredits)
+        let sink = CountingChunkSink()
+
+        do {
+            try await session.withReadStream(
+                path: "ranged.bin",
+                range: SMBReadRange(offset: 0, length: 10),
+                knownSize: 3
+            ) { sink.record($0) }
+            XCTFail("expected knownSize violation to throw")
+        } catch {
+            XCTAssertTrue("\(error)".contains("exceeds caller-provided knownSize"), "unexpected error: \(error)")
+        }
+
+        // READ は 1 本も出ない (CREATE と後始末の CLOSE のみ)。
+        let counter = try SMBCommandCounter(outbound: transport.outbound)
+        counter.assertMetric("read_stream_known_size_violation.commands.READ", command: SMB2Commands.read, expected: 0)
+        counter.assertMetric("read_stream_known_size_violation.commands.QUERY_INFO", command: SMB2Commands.queryInfo, expected: 0)
+        sink.assertMetric("read_stream_known_size_violation.bytes", actual: sink.byteCount, expected: 0)
+    }
+
     func testWriteStreamingUsesExpectedWriteCommandAndByteCounts() async throws {
         XCTAssertEqual(SMBClientSession.localWriteChunkLimit, 1024 * 1024)
         let fileSize = 64 * 1024 * 2 + 321

@@ -23,7 +23,7 @@ jobs:
   ci-script-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Test performance CI scripts
         run: bin/ci/test-performance-scripts
 
@@ -33,7 +33,7 @@ jobs:
     env:
       RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '20' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Restore SwiftPM performance build
@@ -137,7 +137,7 @@ jobs:
             --fail-on-regression >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload resource metrics artifact
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: resource-performance-${{ github.sha }}
           retention-days: 30
@@ -160,7 +160,7 @@ jobs:
       SMBEE_E2E_HOST: 127.0.0.1
       SMBEE_E2E_PORT: "445"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Start encrypted Samba
         run: bash test/e2e/start-samba-ci.sh
       - name: Measure real Samba latency and throughput
@@ -178,7 +178,7 @@ jobs:
         run: bin/ci/publish-network-performance-summary .build/network-performance.log >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload Samba network metrics artifact
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: network-performance-${{ github.sha }}
           retention-days: 30

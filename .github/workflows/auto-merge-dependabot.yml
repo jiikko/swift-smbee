@@ -9,6 +9,9 @@ name: Auto-merge dependabot PR
 # ⚠️ dependabot 発火の pull_request では Actions secrets を読めない
 #    (Dependabot secrets のみ)。よって GITHUB_TOKEN でマージする
 #    (permissions で明示的に write を付与している)。
+# ⚠️ statusCheckRollup の読み取りには checks/statuses: read が必要。
+#    permissions を書くと未指定スコープは none になるため、これが無いと
+#    "GraphQL: Resource not accessible by integration" で落ちる。
 # ⚠️ action の更新はほぼ major タグの差分 (v4→v5) なので major も対象にしている。
 #    壊れると困る action は dependabot.yml の ignore 側で除外する。
 
@@ -19,6 +22,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  checks: read
+  statuses: read
 
 jobs:
   automerge:

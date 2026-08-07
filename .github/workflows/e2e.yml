@@ -63,7 +63,7 @@ jobs:
       SMBEE_E2E_HOST: 127.0.0.1
       SMBEE_E2E_PORT: "445"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Samba runs via host Docker (binds host :445). Swift runs inside the official
       # swift image with --network host so it reaches Samba on 127.0.0.1:445. This
@@ -117,7 +117,7 @@ jobs:
       SMBEE_E2E_HOST: 127.0.0.1
       SMBEE_E2E_PORT: "445"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # See e2e-api: Samba via host Docker, Swift via the official image with
       # --network host (replaces the broken swift-actions/setup-swift@v3).
@@ -145,7 +145,7 @@ jobs:
 
       - name: Upload real-server smoke report
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: real-server-smoke-${{ github.sha }}
           retention-days: 30

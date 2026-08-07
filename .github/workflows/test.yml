@@ -18,7 +18,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify SwiftLint has no warnings
         # The command plugin uses the repository-pinned SwiftLint binary from
         # SwiftLintPlugins. --strict promotes every warning to an error.
@@ -30,7 +30,7 @@ jobs:
     # macOS runner は内蔵Swiftを使うため、.swift-version は厳密pinではなく最低要求versionとして検証する。
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify Swift version compatibility
         run: |
           required="$(tr -d '[:space:]' < .swift-version)"
@@ -109,7 +109,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify Swift version compatibility
         run: |
           required="$(tr -d '[:space:]' < .swift-version)"
@@ -150,7 +150,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Read Swift version
         id: swift-version
         run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
@@ -170,7 +170,7 @@ jobs:
     # unit/vector テストが Linux 上でも通ることを PR 時点で明示的に確認する。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Read Swift version
         id: swift-version
         run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
@@ -193,7 +193,7 @@ jobs:
     # 下限として使い、Linux SwiftPM/XCTest 上の登録漏れを早めに検出する。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Read Swift version
         id: swift-version
         run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
@@ -215,7 +215,7 @@ jobs:
     # 含む。facade/CLI を大きく増やすと比率が下がるので、その場合は glue を分母から除外する方針へ。
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Read Swift version
         id: swift-version
         run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
@@ -241,7 +241,7 @@ jobs:
           fi
       - name: Upload code coverage artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: swift-code-coverage
           retention-days: 14

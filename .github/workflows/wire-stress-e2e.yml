@@ -21,7 +21,7 @@ jobs:
       SMBEE_E2E_HOST: 127.0.0.1
       SMBEE_E2E_PORT: '445'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Start Samba
         run: bash test/e2e/start-samba-ci.sh

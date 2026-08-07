@@ -1,0 +1,78 @@
+name: Auto-merge dependabot PR
+
+# dependabot の GitHub Actions バージョン更新 PR を、他の CI が全部 green に
+# なってから squash merge する。
+#
+# ⚠️ `gh pr merge --auto` は使わない。"Allow auto-merge" が有効でも必須チェックが
+#    無いと CI を待たずに即マージされてしまうため、自前で待つ。
+# ⚠️ 自分自身の check run を待つと deadlock するので workflowName で除外する。
+# ⚠️ dependabot 発火の pull_request では Actions secrets を読めない
+#    (Dependabot secrets のみ)。よって GITHUB_TOKEN でマージする
+#    (permissions で明示的に write を付与している)。
+# ⚠️ action の更新はほぼ major タグの差分 (v4→v5) なので major も対象にしている。
+#    壊れると困る action は dependabot.yml の ignore 側で除外する。
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  automerge:
+    # dependabot 以外が作った PR では何もしない。
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Wait for CI, then squash merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SELF: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+
+          # PR 直後は check run がまだ登録されていない。ここで待たないと
+          # 「pending 0 件」と誤判定して CI 開始前にマージしてしまう。
+          sleep 60
+
+          for i in $(seq 1 80); do
+            state=$(gh pr view "$PR" --json state --jq .state)
+            if [ "$state" != "OPEN" ]; then
+              echo "PR #$PR is $state. Skipping."
+              exit 0
+            fi
+
+            checks=$(gh pr view "$PR" --json statusCheckRollup \
+              --jq "[.statusCheckRollup[] | select(.workflowName != \"$SELF\")]")
+
+            bad=$(printf '%s' "$checks" | jq '[.[]
+              | (.conclusion // .state)
+              | select(. == "FAILURE" or . == "ERROR" or . == "TIMED_OUT"
+                       or . == "CANCELLED" or . == "ACTION_REQUIRED"
+                       or . == "STARTUP_FAILURE")] | length')
+            if [ "$bad" -gt 0 ]; then
+              echo "CI is not green. Leaving PR #$PR open for manual review."
+              exit 1
+            fi
+
+            pending=$(printf '%s' "$checks" | jq '[.[]
+              | select((.__typename == "CheckRun" and .status != "COMPLETED")
+                       or (.__typename == "StatusContext" and .state == "PENDING"))]
+              | length')
+            if [ "$pending" -eq 0 ]; then
+              gh pr merge "$PR" --squash --delete-branch
+              echo "Merged PR #$PR."
+              exit 0
+            fi
+
+            echo "waiting for $pending check(s)... ($i)"
+            sleep 30
+          done
+
+          echo "Timed out waiting for checks."
+          exit 1

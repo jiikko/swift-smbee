@@ -1,0 +1,21 @@
+# Dependabot: GitHub Actions の action バージョンを自動更新する。
+# 対象は .github/workflows/ 配下の `uses:` (github-actions ecosystem。directory: / で
+# dependabot が workflows ディレクトリを自動探索する)。
+# PR のマージは .github/workflows/auto-merge-dependabot.yml が CI green を待って行う。
+---
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+      time: "07:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    # 複数 action の更新を 1 PR にまとめ、レビュー/マージ回数を減らす
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore(deps)

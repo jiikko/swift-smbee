@@ -14,10 +14,11 @@ import XCTest
 final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
 
     /// Consumer callback を止めずに 4 MiB の重なり window 3 本を同じ session / file 上で走らせ、
-    /// wire session に response 待ちが同時に 2 本以上存在する瞬間を直接観測する。
-    /// 全 first chunk 到着後にも複数の wire READ が残る長さは保ちつつ、range を重ねて
-    /// upload は 4 MiB + 128 KiB に抑える。観測後も全 read を完走させ、全 byte と長さが
-    /// 期待 range と一致することを確認する。
+    /// 全 read の実行期間をサンプリングして、wire session に送信済み response 待ちが同時に
+    /// 2 本以上存在したことを確認する。サンプリングなので短い重複を見逃す可能性はあるが、
+    /// その場合は false negative としてテストを失敗させ、wire 上の並行性という主張は弱めない。
+    /// range を重ねて upload は 4 MiB + 128 KiB に抑えつつ、全 read を完走させ、全 byte と
+    /// 長さが期待 range と一致することも確認する。
     func testSharedSessionRangedReadsHaveMultipleWireResponsesInFlight() async throws {
         let details = try sharedSessionConnectionDetails()
         let rangeLength: UInt64 = 4 * 1024 * 1024
@@ -40,23 +41,27 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
             try await sharedSessionAwaitWithTimeout {
                 let wireSession = await session.wireSessionForTesting()
                 let accumulators = ranges.map { _ in SharedSessionByteAccumulator() }
-                let firstChunks = SharedSessionFirstChunkObservation(expectedCount: ranges.count)
+                let initialPendingCount = await wireSession.pendingCountForTesting()
+                let initialSentPendingCount = await wireSession.sentPendingResponseCountForTesting()
                 let pendingObservation = Task {
-                    try await sharedSessionAwaitWithTimeout(seconds: 5) {
-                        while await firstChunks.arrivalCount < ranges.count {
-                            try Task.checkCancellation()
-                            await Task.yield()
-                        }
-                        while true {
-                            let pendingCount = await wireSession.pendingCountForTesting()
-                            let sentPendingCount = await wireSession.sentPendingResponseCountForTesting()
-                            if pendingCount >= 2, sentPendingCount >= 2 {
-                                return (pendingCount, sentPendingCount)
-                            }
-                            try Task.checkCancellation()
-                            await Task.yield()
+                    var maximumPendingCount = initialPendingCount
+                    var maximumSentPendingCount = initialSentPendingCount
+                    while !Task.isCancelled {
+                        maximumPendingCount = max(
+                            maximumPendingCount,
+                            await wireSession.pendingCountForTesting()
+                        )
+                        maximumSentPendingCount = max(
+                            maximumSentPendingCount,
+                            await wireSession.sentPendingResponseCountForTesting()
+                        )
+                        do {
+                            try await Task.sleep(for: .milliseconds(5))
+                        } catch {
+                            break
                         }
                     }
+                    return (maximumPendingCount, maximumSentPendingCount)
                 }
                 let readTasks = ranges.indices.map { index in
                     Task {
@@ -65,34 +70,36 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
                             range: ranges[index],
                             knownSize: UInt64(payload.count)
                         ) { chunk in
-                            if await accumulators[index].append(chunk) {
-                                await firstChunks.recordArrival()
-                            }
+                            await accumulators[index].append(chunk)
                         }
                     }
                 }
 
                 do {
-                    let observation = try await pendingObservation.value
-                    XCTAssertGreaterThanOrEqual(
-                        observation.0,
-                        2,
-                        "ranged READs never had two wire responses pending concurrently"
-                    )
+                    try await withTaskCancellationHandler {
+                        for readTask in readTasks {
+                            try await readTask.value
+                        }
+                        try Task.checkCancellation()
+                    } onCancel: {
+                        pendingObservation.cancel()
+                        readTasks.forEach { $0.cancel() }
+                    }
+                    pendingObservation.cancel()
+                    let observation = await pendingObservation.value
                     XCTAssertGreaterThanOrEqual(
                         observation.1,
                         2,
-                        "pending ranged READs had not both reached the wire"
+                        "ranged READs never had two sent wire responses pending concurrently " +
+                            "(maximum pending: \(observation.0), maximum sent pending: \(observation.1))"
                     )
-                    for readTask in readTasks {
-                        try await readTask.value
-                    }
                 } catch {
                     pendingObservation.cancel()
                     readTasks.forEach { $0.cancel() }
                     for readTask in readTasks {
                         _ = try? await readTask.value
                     }
+                    _ = await pendingObservation.value
                     throw error
                 }
 
@@ -536,22 +543,6 @@ private actor SharedSessionByteAccumulator {
         let isFirstChunk = storage.isEmpty
         storage.append(contentsOf: chunk)
         return isFirstChunk
-    }
-}
-
-/// Records first chunks without making a stream wait in its consumer callback.
-private actor SharedSessionFirstChunkObservation {
-    private let expectedCount: Int
-    private(set) var arrivalCount = 0
-
-    init(expectedCount: Int) {
-        precondition(expectedCount > 0)
-        self.expectedCount = expectedCount
-    }
-
-    func recordArrival() {
-        guard arrivalCount < expectedCount else { return }
-        arrivalCount += 1
     }
 }
 

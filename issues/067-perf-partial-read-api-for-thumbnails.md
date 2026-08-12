@@ -1,6 +1,7 @@
 # 067 perf: 小さい部分 READ を安く回すための API が足りない（サムネイル生成用途）
 
-状態: **open（A は実装済み。B / C / D と実サーバ計測が未着手）**
+状態: **open（A は実装済み。C の前提となる正常系の複数 outstanding は E2E 確認済みだが、
+B / C / D と実サーバ計測は未着手）**
 起票: 2026-07-27
 更新: 2026-07-27 — A: prefix read を実装（`9f20dbf` 実装 / `13acbdc` E2E / `4c36c12` 空ファイル unit）。
 `SMBClientSession.readPrefix` / `withPrefixReadStream` が使える。unit + perf regression
@@ -10,6 +11,10 @@
 更新: 2026-08-05 — consumer 側の実機ログで **第 2 の profile（動画 range read）** を観測。
 window ごとに CREATE+QUERY_INFO+CLOSE を払っていることが裏付けられた（下記「追加観測」）。
 優先度の示唆: `knownSize:` による QUERY_INFO 省略が両 profile に効き、実装コストも B より低い。
+更新: 2026-08-12 — obaket issue 462 で preview の次 window 1 本先読みを実装。SMBee
+`a2efb8b` / `d81c668` では同一セッション上の正常系の並行 ranged read を container Samba E2E で
+wire レベルまで確認した。ただし C の READ pipeline 自体は未実装で、issue 069 の異常系も未確認。
+あわせて、暗号化必須 Samba CI の WRITE 遅延と E2E suite の timeout 余裕不足を記録した。
 関連: `Sources/SMBee/SMBClient.swift`（`read` / `withReadStream` / `streamRead` / `readBounds`） /
 `Sources/SMBee/SMB2Header.swift`（`nextCommand` / `SMB2CreditWindow`） /
 consumer 側: obaket `macOS/issues/437-feat-smb-thumbnail-display.md` /
@@ -70,11 +75,14 @@ CREATE → QUERY_INFO → READ×N → CLOSE が **4 MiB ごとに 1 セット**�
    B（compound）より実装コストが低く、window 経路にも prefix 経路にも同時に効く。
 2. **B（CREATE+READ+CLOSE の compound 化）はこの profile でこそ効く**。1 ファイルに対し
    数十〜数百 window を開くため、window あたり 3 往復の削減がそのまま積み上がる。
-3. **C（READ パイプライン化）は consumer 側の先読みと組で初めて効く**
-   （obaket `issues/462-perf-video-range-window-prefetch.md`）。ただし obaket 側は SMB を
-   `StorageServiceKind.maxConcurrentConnectionsHint = 1` で直列化しており、その理由は
-   「複数 outstanding requests の安全性を実機で確認するまで直列寄りにする」。C を活かすには
-   SMBee 側の多重 outstanding の安全性確認と、consumer 側の hint 見直しの**両方**が要る。
+3. **C（READ パイプライン化）と組になる consumer 側の先読みは実装済み**
+   （obaket `issues/462-perf-video-range-window-prefetch.md`）。preview の大 range は、現 window の
+   最初の respond 成功後に次 window を request 単位 depth=1 で先行 open する。一方、obaket の
+   `StorageServiceKind.maxConcurrentConnectionsHint(.smb) = 1` は変更していない。この hint は
+   transfer engine の job 数と transfer wire budget を絞るもので、preview range read はその経路を
+   通らないと判明したため、先読みを有効にするための hint 見直しは前提ではなかった。
+   SMBee 側では正常系の複数 outstanding が成立することを今回 E2E で確認したが、C の
+   `streamRead` 内 READ pipeline 自体は未実装である。
 4. **D（同時 open handle の上限）は現状この profile では顕在化していない**。obaket は動画
    サムネイル生成を幅 1 の gate で直列化しているため、同時に開く handle は実質 1 本。
 
@@ -102,6 +110,39 @@ API を用意する。現状は EOF クランプのために QUERY_INFO を強�
 
 `streamRead` で credit の許す範囲だけ先行して READ を投げる。chunk 順序の保証と
 onChunk の逐次呼び出し契約を壊さないこと（consumer は progressive decode に順序を仮定している）。
+
+**2026-08-12 時点の検証状況（C は未完了）**:
+
+- `a2efb8b` / `d81c668` で
+  `Tests/SMBeeTests/SMBeeSharedSessionRangedReadE2ETests.swift` に container Samba E2E を追加した。
+  同一セッション・同一ファイル上で 3 本の ranged read を同時開始し、各 range の全 byte と長さが
+  完全一致することを確認した。
+- consumer callback を止めずに読み、test seam の
+  `SMBClientSession.wireSessionForTesting()` と
+  `SMBSession.sentPendingResponseCountForTesting()` を使って、送信済み pending response が同時に
+  2 本以上になる瞬間を観測した。messageId demux は既に実装済みであり、今回その経路で実際に
+  wire 上の複数 outstanding が成立することまで確認した。
+- 3 本中 1 本を cancel しても残り 2 本が完走し、同じセッション上の後続 read も成功した。
+  success / one-cancel の反復後にも probe read が成功し、テストの反復範囲では pending response / credit /
+  remote handle の枯渇を観測しなかった。初版が CI で失敗した直前の credit balance も 614 だった。
+- 変異検証では credit を 1 に制限して厳密な単一 in-flight にすると red になり、軽量化後も
+  wire-level multi-flight の検知力が残ることを確認した。
+
+これは**正常系の並行 ranged read を E2E で確認した**という範囲に限る。複数 outstanding 全般の
+安全性を実証したものではない。特に issue 069（CLOSE cleanup 失敗が shared session を巻き添えにする）
+の障害は注入していない。consumer の先読みは、seek 等で使われなかった window の CLOSE を増やし、
+069 の発生確率を上げる。異常系を含む安全性は未確認であり、C の READ pipeline 実装・順序保証・
+backpressure の検証も残っている。
+
+### CI E2E の新しい懸念（2026-08-12）
+
+暗号化必須の container Samba を使う CI では WRITE が約 50 KB/s と極端に遅く、1 MiB の WRITE に
+18〜27 秒かかった。`a2efb8b` 初版は各テストで 12 MiB を upload したため、3 テストが
+`connectionClosed` / timeout で red になった。`d81c668` で upload 合計を 48 MiB から
+8.125 MiB（83% 削減）へ落として解消したが、並行 READ 機構の問題ではないと診断できた範囲に
+留まる。既存の `RangedReadCancelStorm` も CI で 182 秒かかっており、E2E suite 全体が元々
+timeout 境界に近い。今後 E2E を追加・増量するときは、READ の検証時間だけでなく fixture upload の
+WRITE コストと suite 全体の時間余裕を考慮する必要がある。
 
 ### D. 同時 open handle の上限とバックプレッシャー
 
@@ -150,4 +191,6 @@ CREDIT_FIFO_HOL_READ_TIMING）で B の価値判断に使える実測が取れ�
 3. 実 NAS の RTT 実測（compatibility matrix 作業）が先。localhost の 1.5ms/件では
    30-60 件でも 50-90ms で、実害 gate（issue 068 と同じ基準）未達
 
-C / D は B より優先度が下がる（C は full fetch 経路で今回の用途外、D は A の運用実績待ち）。
+C / D は B より優先度が下がる。C は full fetch 経路の pipeline 自体は未実装だが、consumer 側では
+動画 preview の次 window 先読みが実装され、正常系の複数 outstanding が成立する前提までは E2E で
+確認できた。D は A の運用実績待ち。

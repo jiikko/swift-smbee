@@ -13,15 +13,19 @@ import XCTest
 /// `SMBEE_E2E=1` でない環境では skip。
 final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
 
-    /// Consumer callback を止めずに 4 MiB の重なり window 3 本を同じ session / file 上で走らせ、
+    /// Consumer callback を止めずに 1 MiB の重なり range 3 本を同じ session / file 上で走らせ、
     /// 全 read の実行期間をサンプリングして、wire session に送信済み response 待ちが同時に
     /// 2 本以上存在したことを確認する。サンプリングなので短い重複を見逃す可能性はあるが、
     /// その場合は false negative としてテストを失敗させ、wire 上の並行性という主張は弱めない。
-    /// range を重ねて upload は 4 MiB + 128 KiB に抑えつつ、全 read を完走させ、全 byte と
-    /// 長さが期待 range と一致することも確認する。
+    /// 1 MiB は SMBee の最大 READ chunk なので、各 range は credit charge 16 の multi-credit
+    /// READ になる。4 MiB window × 3 本の並行はローカル container では完走を確認済み
+    /// (2026-08-12)。CI の暗号化 Samba は遅すぎて 12 MiB read が deadline 内に完走しないため、
+    /// CI では 1 MiB range で wire multi-flight を検証する。range を重ねて upload は
+    /// 1 MiB + 128 KiB に抑えつつ、全 read を完走させ、全 byte と長さが期待 range と一致する
+    /// ことも確認する。
     func testSharedSessionRangedReadsHaveMultipleWireResponsesInFlight() async throws {
         let details = try sharedSessionConnectionDetails()
-        let rangeLength: UInt64 = 4 * 1024 * 1024
+        let rangeLength: UInt64 = 1 * 1024 * 1024
         let rangeStride: UInt64 = 64 * 1024
         let payload = Self.rangedReadPayload(
             byteCount: Int(rangeLength + 2 * rangeStride)

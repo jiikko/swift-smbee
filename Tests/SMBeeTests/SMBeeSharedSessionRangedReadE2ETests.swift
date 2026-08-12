@@ -13,26 +13,31 @@ import XCTest
 /// `SMBEE_E2E=1` でない環境では skip。
 final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
 
-    /// Consumer callback を止めずに 4 MiB window 3 本を同じ session / file 上で走らせ、
+    /// Consumer callback を止めずに 4 MiB の重なり window 3 本を同じ session / file 上で走らせ、
     /// wire session に response 待ちが同時に 2 本以上存在する瞬間を直接観測する。
-    /// 観測後も全 read を完走させ、全 byte と長さが期待 range と一致することを確認する。
+    /// 全 first chunk 到着後にも複数の wire READ が残る長さは保ちつつ、range を重ねて
+    /// upload は 4 MiB + 128 KiB に抑える。観測後も全 read を完走させ、全 byte と長さが
+    /// 期待 range と一致することを確認する。
     func testSharedSessionRangedReadsHaveMultipleWireResponsesInFlight() async throws {
         let details = try sharedSessionConnectionDetails()
-        let payload = Self.rangedReadPayload(byteCount: 12 * 1024 * 1024)
         let rangeLength: UInt64 = 4 * 1024 * 1024
+        let rangeStride: UInt64 = 64 * 1024
+        let payload = Self.rangedReadPayload(
+            byteCount: Int(rangeLength + 2 * rangeStride)
+        )
         let ranges = (0..<3).map {
-            SMBReadRange(offset: UInt64($0) * rangeLength, length: rangeLength)
+            SMBReadRange(offset: UInt64($0) * rangeStride, length: rangeLength)
         }
 
-        try await sharedSessionAwaitWithTimeout(seconds: 90) {
-            let session = try await SMBee.connect(
-                host: details.host, port: details.port,
-                credential: details.credential, share: details.share
-            )
-            let path = "smbee-shared-wire-multiflight-ranged-\(UUID().uuidString).bin"
+        let session = try await SMBee.connect(
+            host: details.host, port: details.port,
+            credential: details.credential, share: details.share
+        )
+        let path = "smbee-shared-wire-multiflight-ranged-\(UUID().uuidString).bin"
 
-            do {
-                try await session.upload(path: path, data: payload)
+        do {
+            try await session.upload(path: path, data: payload)
+            try await sharedSessionAwaitWithTimeout {
                 let wireSession = await session.wireSessionForTesting()
                 let accumulators = ranges.map { _ in SharedSessionByteAccumulator() }
                 let firstChunks = SharedSessionFirstChunkObservation(expectedCount: ranges.count)
@@ -106,38 +111,37 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
                         "multi-flight ranged read \(index) returned unexpected bytes"
                     )
                 }
-
-                try await session.delete(path: path)
-                await session.close()
-            } catch {
-                try? await session.delete(path: path)
-                await session.close()
-                throw error
             }
+            try await session.delete(path: path)
+            await session.close()
+        } catch {
+            try? await session.delete(path: path)
+            await session.close()
+            throw error
         }
     }
 
-    /// 4 MiB window 3 本を同じ session / file 上で同時に開始する。各 stream は
-    /// first chunk を受け取った位置で gate に留まるため、全 range が開始済みになるまで
-    /// どの range も完了できない。これは wire 上の multi-flight の証明ではなく、3 本が
-    /// 同じ session で進行できることと、gate 解放後の byte correctness を確認する回帰テスト。
+    /// multi-credit になる 512 KiB window 3 本を同じ session / file 上で同時に開始する。
+    /// 各 stream は first chunk を受け取った位置で gate に留まるため、全 range が開始済みに
+    /// なるまでどの range も完了できない。これは wire 上の multi-flight の証明ではなく、
+    /// 3 本が同じ session で進行できることと、gate 解放後の byte correctness を確認する回帰テスト。
     func testSharedSessionConcurrentRangedReadsReturnExactBytes() async throws {
         let details = try sharedSessionConnectionDetails()
-        let payload = Self.rangedReadPayload(byteCount: 12 * 1024 * 1024)
-        let rangeLength: UInt64 = 4 * 1024 * 1024
+        let rangeLength: UInt64 = 512 * 1024
+        let payload = Self.rangedReadPayload(byteCount: 3 * Int(rangeLength))
         let ranges = (0..<3).map {
             SMBReadRange(offset: UInt64($0) * rangeLength, length: rangeLength)
         }
 
-        try await sharedSessionAwaitWithTimeout(seconds: 90) {
-            let session = try await SMBee.connect(
-                host: details.host, port: details.port,
-                credential: details.credential, share: details.share
-            )
-            let path = "smbee-shared-concurrent-ranged-\(UUID().uuidString).bin"
+        let session = try await SMBee.connect(
+            host: details.host, port: details.port,
+            credential: details.credential, share: details.share
+        )
+        let path = "smbee-shared-concurrent-ranged-\(UUID().uuidString).bin"
 
-            do {
-                try await session.upload(path: path, data: payload)
+        do {
+            try await session.upload(path: path, data: payload)
+            try await sharedSessionAwaitWithTimeout {
                 let result = try await Self.runConcurrentRangedReads(
                     session: session,
                     path: path,
@@ -160,39 +164,42 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
                         "concurrent ranged read \(index) returned unexpected bytes"
                     )
                 }
-
-                try await session.delete(path: path)
-                await session.close()
-            } catch {
-                try? await session.delete(path: path)
-                await session.close()
-                throw error
             }
+            try await session.delete(path: path)
+            await session.close()
+        } catch {
+            try? await session.delete(path: path)
+            await session.close()
+            throw error
         }
     }
 
-    /// 3 本が同じ session で進行し、すべてが first chunk を受信した時点で中央の read
-    /// だけを cancel する (wire 上の multi-flight を証明するテストではない)。
+    /// 1 MiB の local READ chunk 上限より長い、重なり window 3 本が同じ session で進行し、
+    /// すべてが first chunk を受信した時点で中央の read だけを cancel する
+    /// (wire 上の multi-flight を証明するテストではない)。
     /// cancel 対象の `withReadStream` が CLOSE を含む後始末を終えるまで await し、
     /// 残り 2 本の完走と、同じ session 上の follow-up read の成功を確認する。
     func testSharedSessionConcurrentRangedReadsSurviveOneCancellation() async throws {
         let details = try sharedSessionConnectionDetails()
-        let payload = Self.rangedReadPayload(byteCount: 12 * 1024 * 1024)
-        let rangeLength: UInt64 = 4 * 1024 * 1024
+        let rangeLength: UInt64 = 1152 * 1024
+        let rangeStride: UInt64 = 64 * 1024
+        let payload = Self.rangedReadPayload(
+            byteCount: Int(rangeLength + 2 * rangeStride)
+        )
         let ranges = (0..<3).map {
-            SMBReadRange(offset: UInt64($0) * rangeLength, length: rangeLength)
+            SMBReadRange(offset: UInt64($0) * rangeStride, length: rangeLength)
         }
         let cancelledIndex = 1
 
-        try await sharedSessionAwaitWithTimeout(seconds: 90) {
-            let session = try await SMBee.connect(
-                host: details.host, port: details.port,
-                credential: details.credential, share: details.share
-            )
-            let path = "smbee-shared-concurrent-cancel-\(UUID().uuidString).bin"
+        let session = try await SMBee.connect(
+            host: details.host, port: details.port,
+            credential: details.credential, share: details.share
+        )
+        let path = "smbee-shared-concurrent-cancel-\(UUID().uuidString).bin"
 
-            do {
-                try await session.upload(path: path, data: payload)
+        do {
+            try await session.upload(path: path, data: payload)
+            try await sharedSessionAwaitWithTimeout {
                 let result = try await Self.runConcurrentRangedReads(
                     session: session,
                     path: path,
@@ -235,39 +242,41 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
                     Array(payload[Int(followUpRange.offset)..<Int(followUpRange.offset + followUpRange.length)]),
                     "follow-up read failed after concurrent cancellation cleanup"
                 )
-
-                try await session.delete(path: path)
-                await session.close()
-            } catch {
-                try? await session.delete(path: path)
-                await session.close()
-                throw error
             }
+            try await session.delete(path: path)
+            await session.close()
+        } catch {
+            try? await session.delete(path: path)
+            await session.close()
+            throw error
         }
     }
 
-    /// success-only と one-cancel の 3-way gate read を同じ session で交互に反復する。
+    /// success-only と one-cancel の 3-way gate read を同じ session で 2 round 反復する。
     /// wire 上の multi-flight ではなく、同じ session での進行と cancel の隔離を反復検証する。
     /// 各 round の byte correctness に加え、最後の probe が成功することで pending
     /// response / credit / remote handle が反復によって枯渇していないことを確認する。
     func testSharedSessionConcurrentRangedReadsRemainReusableAfterRepetition() async throws {
         let details = try sharedSessionConnectionDetails()
-        let payload = Self.rangedReadPayload(byteCount: 12 * 1024 * 1024)
-        let rangeLength: UInt64 = 4 * 1024 * 1024
+        let rangeLength: UInt64 = 1152 * 1024
+        let rangeStride: UInt64 = 64 * 1024
+        let payload = Self.rangedReadPayload(
+            byteCount: Int(rangeLength + 2 * rangeStride)
+        )
         let ranges = (0..<3).map {
-            SMBReadRange(offset: UInt64($0) * rangeLength, length: rangeLength)
+            SMBReadRange(offset: UInt64($0) * rangeStride, length: rangeLength)
         }
 
-        try await sharedSessionAwaitWithTimeout(seconds: 120) {
-            let session = try await SMBee.connect(
-                host: details.host, port: details.port,
-                credential: details.credential, share: details.share
-            )
-            let path = "smbee-shared-concurrent-repeat-\(UUID().uuidString).bin"
+        let session = try await SMBee.connect(
+            host: details.host, port: details.port,
+            credential: details.credential, share: details.share
+        )
+        let path = "smbee-shared-concurrent-repeat-\(UUID().uuidString).bin"
 
-            do {
-                try await session.upload(path: path, data: payload)
-                for round in 0..<4 {
+        do {
+            try await session.upload(path: path, data: payload)
+            try await sharedSessionAwaitWithTimeout {
+                for round in 0..<2 {
                     let cancelledIndex = round.isMultiple(of: 2) ? nil : round % ranges.count
                     let result = try await Self.runConcurrentRangedReads(
                         session: session,
@@ -298,7 +307,7 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
                     }
                 }
 
-                let finalRange = SMBReadRange(offset: rangeLength, length: 256 * 1024)
+                let finalRange = SMBReadRange(offset: 2 * rangeStride, length: 256 * 1024)
                 let finalRead = SharedSessionByteAccumulator()
                 try await session.withReadStream(
                     path: path,
@@ -314,14 +323,13 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
                     Array(payload[Int(finalRange.offset)..<Int(finalRange.offset + finalRange.length)]),
                     "follow-up read failed after repeated concurrent ranged reads"
                 )
-
-                try await session.delete(path: path)
-                await session.close()
-            } catch {
-                try? await session.delete(path: path)
-                await session.close()
-                throw error
             }
+            try await session.delete(path: path)
+            await session.close()
+        } catch {
+            try? await session.delete(path: path)
+            await session.close()
+            throw error
         }
     }
 

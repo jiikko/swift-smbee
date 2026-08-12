@@ -699,6 +699,10 @@ public actor SMBClientSession {
         await session.retainsAuthenticationCredentialForTesting()
     }
 
+    func wireSessionForTesting() -> SMBSession {
+        session
+    }
+
     func installSymbolicLinkReparsePointForTesting(path: String, target: String) async throws {
         try ensureOpen()
         let fileId = try await session.create(treeId: treeId, request: .setReparsePoint(path: path))
@@ -5355,6 +5359,10 @@ actor SMBSession {
 
     func pendingCountForTesting() -> Int {
         pendingResponses.count
+    }
+
+    func sentPendingResponseCountForTesting() -> Int {
+        sentResponseMessageIds.count
     }
 
     func requestTimeoutTaskCountForTesting() -> Int {

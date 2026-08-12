@@ -13,6 +13,318 @@ import XCTest
 /// `SMBEE_E2E=1` でない環境では skip。
 final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
 
+    /// Consumer callback を止めずに 4 MiB window 3 本を同じ session / file 上で走らせ、
+    /// wire session に response 待ちが同時に 2 本以上存在する瞬間を直接観測する。
+    /// 観測後も全 read を完走させ、全 byte と長さが期待 range と一致することを確認する。
+    func testSharedSessionRangedReadsHaveMultipleWireResponsesInFlight() async throws {
+        let details = try sharedSessionConnectionDetails()
+        let payload = Self.rangedReadPayload(byteCount: 12 * 1024 * 1024)
+        let rangeLength: UInt64 = 4 * 1024 * 1024
+        let ranges = (0..<3).map {
+            SMBReadRange(offset: UInt64($0) * rangeLength, length: rangeLength)
+        }
+
+        try await sharedSessionAwaitWithTimeout(seconds: 90) {
+            let session = try await SMBee.connect(
+                host: details.host, port: details.port,
+                credential: details.credential, share: details.share
+            )
+            let path = "smbee-shared-wire-multiflight-ranged-\(UUID().uuidString).bin"
+
+            do {
+                try await session.upload(path: path, data: payload)
+                let wireSession = await session.wireSessionForTesting()
+                let accumulators = ranges.map { _ in SharedSessionByteAccumulator() }
+                let firstChunks = SharedSessionFirstChunkObservation(expectedCount: ranges.count)
+                let pendingObservation = Task {
+                    try await sharedSessionAwaitWithTimeout(seconds: 5) {
+                        while await firstChunks.arrivalCount < ranges.count {
+                            try Task.checkCancellation()
+                            await Task.yield()
+                        }
+                        while true {
+                            let pendingCount = await wireSession.pendingCountForTesting()
+                            let sentPendingCount = await wireSession.sentPendingResponseCountForTesting()
+                            if pendingCount >= 2, sentPendingCount >= 2 {
+                                return (pendingCount, sentPendingCount)
+                            }
+                            try Task.checkCancellation()
+                            await Task.yield()
+                        }
+                    }
+                }
+                let readTasks = ranges.indices.map { index in
+                    Task {
+                        try await session.withReadStream(
+                            path: path,
+                            range: ranges[index],
+                            knownSize: UInt64(payload.count)
+                        ) { chunk in
+                            if await accumulators[index].append(chunk) {
+                                await firstChunks.recordArrival()
+                            }
+                        }
+                    }
+                }
+
+                do {
+                    let observation = try await pendingObservation.value
+                    XCTAssertGreaterThanOrEqual(
+                        observation.0,
+                        2,
+                        "ranged READs never had two wire responses pending concurrently"
+                    )
+                    XCTAssertGreaterThanOrEqual(
+                        observation.1,
+                        2,
+                        "pending ranged READs had not both reached the wire"
+                    )
+                    for readTask in readTasks {
+                        try await readTask.value
+                    }
+                } catch {
+                    pendingObservation.cancel()
+                    readTasks.forEach { $0.cancel() }
+                    for readTask in readTasks {
+                        _ = try? await readTask.value
+                    }
+                    throw error
+                }
+
+                for index in ranges.indices {
+                    let range = ranges[index]
+                    let bytes = await accumulators[index].bytes
+                    let expected = Array(payload[Int(range.offset)..<Int(range.offset + range.length)])
+                    XCTAssertEqual(
+                        bytes.count,
+                        Int(range.length),
+                        "multi-flight ranged read \(index) returned the wrong length"
+                    )
+                    XCTAssertEqual(
+                        bytes,
+                        expected,
+                        "multi-flight ranged read \(index) returned unexpected bytes"
+                    )
+                }
+
+                try await session.delete(path: path)
+                await session.close()
+            } catch {
+                try? await session.delete(path: path)
+                await session.close()
+                throw error
+            }
+        }
+    }
+
+    /// 4 MiB window 3 本を同じ session / file 上で同時に開始する。各 stream は
+    /// first chunk を受け取った位置で gate に留まるため、全 range が開始済みになるまで
+    /// どの range も完了できない。これは wire 上の multi-flight の証明ではなく、3 本が
+    /// 同じ session で進行できることと、gate 解放後の byte correctness を確認する回帰テスト。
+    func testSharedSessionConcurrentRangedReadsReturnExactBytes() async throws {
+        let details = try sharedSessionConnectionDetails()
+        let payload = Self.rangedReadPayload(byteCount: 12 * 1024 * 1024)
+        let rangeLength: UInt64 = 4 * 1024 * 1024
+        let ranges = (0..<3).map {
+            SMBReadRange(offset: UInt64($0) * rangeLength, length: rangeLength)
+        }
+
+        try await sharedSessionAwaitWithTimeout(seconds: 90) {
+            let session = try await SMBee.connect(
+                host: details.host, port: details.port,
+                credential: details.credential, share: details.share
+            )
+            let path = "smbee-shared-concurrent-ranged-\(UUID().uuidString).bin"
+
+            do {
+                try await session.upload(path: path, data: payload)
+                let result = try await Self.runConcurrentRangedReads(
+                    session: session,
+                    path: path,
+                    fileSize: UInt64(payload.count),
+                    ranges: ranges
+                )
+
+                XCTAssertFalse(result.cancelledReadObserved)
+                for index in ranges.indices {
+                    let range = ranges[index]
+                    let expected = Array(payload[Int(range.offset)..<Int(range.offset + range.length)])
+                    XCTAssertEqual(
+                        result.bytes[index].count,
+                        Int(range.length),
+                        "concurrent ranged read \(index) returned the wrong length"
+                    )
+                    XCTAssertEqual(
+                        result.bytes[index],
+                        expected,
+                        "concurrent ranged read \(index) returned unexpected bytes"
+                    )
+                }
+
+                try await session.delete(path: path)
+                await session.close()
+            } catch {
+                try? await session.delete(path: path)
+                await session.close()
+                throw error
+            }
+        }
+    }
+
+    /// 3 本が同じ session で進行し、すべてが first chunk を受信した時点で中央の read
+    /// だけを cancel する (wire 上の multi-flight を証明するテストではない)。
+    /// cancel 対象の `withReadStream` が CLOSE を含む後始末を終えるまで await し、
+    /// 残り 2 本の完走と、同じ session 上の follow-up read の成功を確認する。
+    func testSharedSessionConcurrentRangedReadsSurviveOneCancellation() async throws {
+        let details = try sharedSessionConnectionDetails()
+        let payload = Self.rangedReadPayload(byteCount: 12 * 1024 * 1024)
+        let rangeLength: UInt64 = 4 * 1024 * 1024
+        let ranges = (0..<3).map {
+            SMBReadRange(offset: UInt64($0) * rangeLength, length: rangeLength)
+        }
+        let cancelledIndex = 1
+
+        try await sharedSessionAwaitWithTimeout(seconds: 90) {
+            let session = try await SMBee.connect(
+                host: details.host, port: details.port,
+                credential: details.credential, share: details.share
+            )
+            let path = "smbee-shared-concurrent-cancel-\(UUID().uuidString).bin"
+
+            do {
+                try await session.upload(path: path, data: payload)
+                let result = try await Self.runConcurrentRangedReads(
+                    session: session,
+                    path: path,
+                    fileSize: UInt64(payload.count),
+                    ranges: ranges,
+                    cancelling: cancelledIndex
+                )
+
+                XCTAssertTrue(result.cancelledReadObserved)
+                XCTAssertGreaterThan(result.bytes[cancelledIndex].count, 0)
+                XCTAssertLessThan(
+                    result.bytes[cancelledIndex].count,
+                    Int(ranges[cancelledIndex].length),
+                    "cancelled ranged read unexpectedly completed before cancellation"
+                )
+                for index in ranges.indices where index != cancelledIndex {
+                    let range = ranges[index]
+                    let expected = Array(payload[Int(range.offset)..<Int(range.offset + range.length)])
+                    XCTAssertEqual(result.bytes[index].count, Int(range.length))
+                    XCTAssertEqual(
+                        result.bytes[index],
+                        expected,
+                        "surviving ranged read \(index) was damaged by another read's cancellation"
+                    )
+                }
+
+                let followUpRange = SMBReadRange(offset: rangeLength / 2, length: 256 * 1024)
+                let followUp = SharedSessionByteAccumulator()
+                try await session.withReadStream(
+                    path: path,
+                    range: followUpRange,
+                    knownSize: UInt64(payload.count)
+                ) { chunk in
+                    await followUp.append(chunk)
+                }
+                let followUpBytes = await followUp.bytes
+                XCTAssertEqual(followUpBytes.count, Int(followUpRange.length))
+                XCTAssertEqual(
+                    followUpBytes,
+                    Array(payload[Int(followUpRange.offset)..<Int(followUpRange.offset + followUpRange.length)]),
+                    "follow-up read failed after concurrent cancellation cleanup"
+                )
+
+                try await session.delete(path: path)
+                await session.close()
+            } catch {
+                try? await session.delete(path: path)
+                await session.close()
+                throw error
+            }
+        }
+    }
+
+    /// success-only と one-cancel の 3-way gate read を同じ session で交互に反復する。
+    /// wire 上の multi-flight ではなく、同じ session での進行と cancel の隔離を反復検証する。
+    /// 各 round の byte correctness に加え、最後の probe が成功することで pending
+    /// response / credit / remote handle が反復によって枯渇していないことを確認する。
+    func testSharedSessionConcurrentRangedReadsRemainReusableAfterRepetition() async throws {
+        let details = try sharedSessionConnectionDetails()
+        let payload = Self.rangedReadPayload(byteCount: 12 * 1024 * 1024)
+        let rangeLength: UInt64 = 4 * 1024 * 1024
+        let ranges = (0..<3).map {
+            SMBReadRange(offset: UInt64($0) * rangeLength, length: rangeLength)
+        }
+
+        try await sharedSessionAwaitWithTimeout(seconds: 120) {
+            let session = try await SMBee.connect(
+                host: details.host, port: details.port,
+                credential: details.credential, share: details.share
+            )
+            let path = "smbee-shared-concurrent-repeat-\(UUID().uuidString).bin"
+
+            do {
+                try await session.upload(path: path, data: payload)
+                for round in 0..<4 {
+                    let cancelledIndex = round.isMultiple(of: 2) ? nil : round % ranges.count
+                    let result = try await Self.runConcurrentRangedReads(
+                        session: session,
+                        path: path,
+                        fileSize: UInt64(payload.count),
+                        ranges: ranges,
+                        cancelling: cancelledIndex
+                    )
+
+                    XCTAssertEqual(
+                        result.cancelledReadObserved,
+                        cancelledIndex != nil,
+                        "round \(round) did not take the expected cancellation path"
+                    )
+                    for index in ranges.indices {
+                        let range = ranges[index]
+                        if index == cancelledIndex {
+                            XCTAssertGreaterThan(result.bytes[index].count, 0)
+                            XCTAssertLessThan(result.bytes[index].count, Int(range.length))
+                        } else {
+                            XCTAssertEqual(result.bytes[index].count, Int(range.length))
+                            XCTAssertEqual(
+                                result.bytes[index],
+                                Array(payload[Int(range.offset)..<Int(range.offset + range.length)]),
+                                "round \(round), ranged read \(index) returned unexpected bytes"
+                            )
+                        }
+                    }
+                }
+
+                let finalRange = SMBReadRange(offset: rangeLength, length: 256 * 1024)
+                let finalRead = SharedSessionByteAccumulator()
+                try await session.withReadStream(
+                    path: path,
+                    range: finalRange,
+                    knownSize: UInt64(payload.count)
+                ) { chunk in
+                    await finalRead.append(chunk)
+                }
+                let finalBytes = await finalRead.bytes
+                XCTAssertEqual(finalBytes.count, Int(finalRange.length))
+                XCTAssertEqual(
+                    finalBytes,
+                    Array(payload[Int(finalRange.offset)..<Int(finalRange.offset + finalRange.length)]),
+                    "follow-up read failed after repeated concurrent ranged reads"
+                )
+
+                try await session.delete(path: path)
+                await session.close()
+            } catch {
+                try? await session.delete(path: path)
+                await session.close()
+                throw error
+            }
+        }
+    }
+
     /// 通常再生の最小再現 (cancel なし): 保持した 1 session で異なる offset の
     /// range streaming read を逐次 10 回行い、全部が期待バイトを受信し
     /// connection-lost しないことを確認する。
@@ -86,22 +398,19 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
             // ではなく次の read 自体が次のスキップに相当する。
             for index in 0..<10 {
                 let offset = UInt64(index) * UInt64(4 * 1024 * 1024) // 0, 4, 8, ... MiB (< fileSize)
-                let firstChunk = SharedSessionFirstChunkArrival()
+                let firstChunk = SharedSessionFirstChunkGate(expectedCount: 1)
                 let readTask = Task {
                     try await session.withReadStream(
                         path: path,
                         range: SMBReadRange(offset: offset, length: UInt64(fileSize) - offset)
                     ) { chunk in
-                        await firstChunk.record()
+                        await firstChunk.arriveAndWaitForRelease()
                         _ = chunk
                     }
                 }
-                try await sharedSessionAwaitWithTimeout {
-                    while !(await firstChunk.hasArrived) {
-                        try await Task.sleep(for: .milliseconds(1))
-                    }
-                }
+                try await sharedSessionAwaitWithTimeout { await firstChunk.waitUntilAllArrived() }
                 readTask.cancel()
+                await firstChunk.releaseAll()
                 // cancel した read の後始末を待つ (session を再利用する前に)。
                 _ = try? await sharedSessionAwaitWithTimeout { try await readTask.value }
             }
@@ -133,19 +442,195 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
     private static func rangedReadPayload(byteCount: Int) -> [UInt8] {
         (0..<byteCount).map { UInt8($0 % 251) }
     }
+
+    /// Starts every public `withReadStream` before releasing any first chunk. Explicit
+    /// task handles are used so exactly one read can be cancelled while its siblings stay live.
+    private static func runConcurrentRangedReads(
+        session: SMBClientSession,
+        path: String,
+        fileSize: UInt64,
+        ranges: [SMBReadRange],
+        cancelling cancelledIndex: Int? = nil
+    ) async throws -> (bytes: [[UInt8]], cancelledReadObserved: Bool) {
+        precondition(!ranges.isEmpty)
+        if let cancelledIndex {
+            precondition(ranges.indices.contains(cancelledIndex))
+        }
+
+        let gate = SharedSessionFirstChunkGate(expectedCount: ranges.count)
+        let accumulators = ranges.map { _ in SharedSessionByteAccumulator() }
+        let readTasks = ranges.indices.map { index in
+            Task {
+                do {
+                    try await session.withReadStream(
+                        path: path,
+                        range: ranges[index],
+                        knownSize: fileSize
+                    ) { chunk in
+                        if await accumulators[index].append(chunk) {
+                            await gate.arriveAndWaitForRelease()
+                        }
+                    }
+                } catch {
+                    await gate.abort()
+                    throw error
+                }
+            }
+        }
+
+        var cancelledReadObserved = false
+        try await withTaskCancellationHandler {
+            do {
+                await gate.waitUntilAllArrived()
+                try Task.checkCancellation()
+                if let cancelledIndex {
+                    readTasks[cancelledIndex].cancel()
+                }
+                await gate.releaseAll()
+
+                for index in readTasks.indices {
+                    do {
+                        try await readTasks[index].value
+                    } catch is CancellationError {
+                        guard index == cancelledIndex else { throw CancellationError() }
+                        cancelledReadObserved = true
+                    }
+                }
+                try Task.checkCancellation()
+            } catch {
+                readTasks.forEach { $0.cancel() }
+                await gate.abort()
+                for readTask in readTasks {
+                    _ = try? await readTask.value
+                }
+                throw error
+            }
+        } onCancel: {
+            readTasks.forEach { $0.cancel() }
+            Task { await gate.abort() }
+        }
+
+        var bytes: [[UInt8]] = []
+        bytes.reserveCapacity(accumulators.count)
+        for accumulator in accumulators {
+            bytes.append(await accumulator.bytes)
+        }
+        return (bytes, cancelledReadObserved)
+    }
 }
 
 private actor SharedSessionByteAccumulator {
     private var storage: [UInt8] = []
     var bytes: [UInt8] { storage }
     var byteCount: Int { storage.count }
-    func append(_ chunk: [UInt8]) { storage.append(contentsOf: chunk) }
+    @discardableResult
+    func append(_ chunk: [UInt8]) -> Bool {
+        let isFirstChunk = storage.isEmpty
+        storage.append(contentsOf: chunk)
+        return isFirstChunk
+    }
 }
 
-private actor SharedSessionFirstChunkArrival {
-    private var arrived = false
-    var hasArrived: Bool { arrived }
-    func record() { arrived = true }
+/// Records first chunks without making a stream wait in its consumer callback.
+private actor SharedSessionFirstChunkObservation {
+    private let expectedCount: Int
+    private(set) var arrivalCount = 0
+
+    init(expectedCount: Int) {
+        precondition(expectedCount > 0)
+        self.expectedCount = expectedCount
+    }
+
+    func recordArrival() {
+        guard arrivalCount < expectedCount else { return }
+        arrivalCount += 1
+    }
+}
+
+/// A cancellation-aware first-chunk latch. Stream tasks stop in their public `onChunk`
+/// callback until the test has observed every arrival; timeout cancellation resumes all
+/// stored continuations so a failed E2E cannot leave its structured timeout waiting forever.
+private actor SharedSessionFirstChunkGate {
+    private let expectedCount: Int
+    private var arrivalCount = 0
+    private var released = false
+    private var allArrivedWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var releaseWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    init(expectedCount: Int) {
+        precondition(expectedCount > 0)
+        self.expectedCount = expectedCount
+    }
+
+    func arriveAndWaitForRelease() async {
+        guard !released else { return }
+        arrivalCount += 1
+        if arrivalCount >= expectedCount {
+            let waiters = Array(allArrivedWaiters.values)
+            allArrivedWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+
+        guard !released else { return }
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if released || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    releaseWaiters[waiterID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.resumeReleaseWaiter(waiterID) }
+        }
+    }
+
+    func waitUntilAllArrived() async {
+        guard arrivalCount < expectedCount, !released else { return }
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if arrivalCount >= expectedCount || released || Task.isCancelled {
+                    continuation.resume()
+                } else {
+                    allArrivedWaiters[waiterID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.resumeAllArrivedWaiter(waiterID) }
+        }
+    }
+
+    func releaseAll() {
+        guard !released else { return }
+        released = true
+        resumeAllWaiters()
+    }
+
+    func abort() {
+        released = true
+        resumeAllWaiters()
+    }
+
+    private func resumeAllWaiters() {
+        let waiters = Array(allArrivedWaiters.values) + Array(releaseWaiters.values)
+        allArrivedWaiters.removeAll()
+        releaseWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func resumeAllArrivedWaiter(_ waiterID: UUID) {
+        allArrivedWaiters.removeValue(forKey: waiterID)?.resume()
+    }
+
+    private func resumeReleaseWaiter(_ waiterID: UUID) {
+        releaseWaiters.removeValue(forKey: waiterID)?.resume()
+    }
 }
 
 private struct SharedSessionE2ETimeout: Error {}
@@ -160,9 +645,8 @@ private func sharedSessionAwaitWithTimeout<T: Sendable>(
             try await Task.sleep(for: .seconds(seconds))
             throw SharedSessionE2ETimeout()
         }
-        let result = try await group.next()!
-        group.cancelAll()
-        return result
+        defer { group.cancelAll() }
+        return try await group.next()!
     }
 }
 

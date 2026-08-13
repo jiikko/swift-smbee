@@ -81,3 +81,31 @@ full-speed 3 本並行の本テストとは条件が異なる。今回の CI 隔
 テストとする。残り 5 本の shared-session ranged-read E2E は従来どおり CI で実行し、調査用の再現条件と
 テスト本体は削除・弱体化しない。
 
+
+## インパクト評価 (2026-08-13)
+
+真因が未特定のため幅がある。優先度は **low-medium** (緊急でない) と判断し、当面は本 issue に
+書き留めるのみで調査は着手しない (ユーザー判断)。
+
+### 楽観側 (Samba / 環境要因なら): ほぼゼロ
+- 再現は CI (Linux runner の暗号化必須 Samba) のみ。ローカル Apple container (同一 config) では
+  未再現、consumer (obaket) の実機確認 (2026-08-13、SMB 上の 427 MB mp4 の先読み再生 + seek) でも
+  問題なし
+- CI テストの発火条件は攻撃的 (3 本 full-speed + 重なり range + 5 ms polling)。consumer の実経路は
+  どれもそれより穏やか: 動画先読みは 2 本 + AVFoundation ペース消費 / サムネイルは幅 1 gate で直列 /
+  transfer は concurrency hint=1 で直列
+
+### 悲観側 (client の送信 race なら): medium
+- 「future message id への応答 → 直後に切断」は送信 Task spawn と登録順序の race を示唆する。
+  不正 packet を wire に出す race なら、遅いネットワーク・遅い NAS で実機でも発火しうる
+- **実 NAS の多くも中身は Linux の Samba** なので「CI 限定」と言い切れる根拠はまだ無い
+
+### 発火した場合の実害の上限は低い
+- read only なのでデータ破壊は構造的に起きない
+- `SMBRetryableStreamRead` の connection-lost 単発透過リトライで隠れる可能性が高い
+- 最悪でも「読み込みエラー → 開き直せば直る」。ただし放置期間が長いと「SMB でたまに切れる」系の
+  再現困難なバグ報告の潜在原因になる
+
+### 着手する場合の最小の一歩
+調査手段 1 (CI で `SMBEE_TRACE_WIRE=1` + gate を立てて 1 run)。不正 packet が出ていれば
+client race 確定、出ていなければ環境側に倒せる。1 run で証拠が取れる見込みでコストは小さい。

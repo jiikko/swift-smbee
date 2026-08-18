@@ -5268,6 +5268,61 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[96..<98]), [0x2a, 0x00])
     }
 
+    func testQueryDirectoryRequestEncodesCustomSearchPattern() throws {
+        let fileId = (0..<16).map(UInt8.init)
+        let request = try SMB2QueryDirectory.encodeRequest(
+            messageId: 11,
+            sessionId: 0x1122_3344,
+            treeId: 0x5566_7788,
+            fileId: fileId,
+            searchPattern: "Report.txt"
+        )
+
+        // UTF-16LE で pattern を encode し、FileNameLength がバイト数と一致すること
+        let expected = "Report.txt".utf16.flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
+        XCTAssertEqual(readUInt16LE(request, at: 90), UInt16(expected.count))
+        XCTAssertEqual(Array(request[96..<(96 + expected.count)]), expected)
+        XCTAssertEqual(request.count, 96 + expected.count)
+    }
+
+    func testQueryDirectoryRequestRejectsEmptySearchPattern() {
+        let fileId = (0..<16).map(UInt8.init)
+        XCTAssertThrowsError(
+            try SMB2QueryDirectory.encodeRequest(
+                messageId: 11,
+                sessionId: 0x1122_3344,
+                treeId: 0x5566_7788,
+                fileId: fileId,
+                searchPattern: ""
+            )
+        )
+    }
+
+    func testDirectoryEntrySelectionPrefersExactThenCaseInsensitive() {
+        func entry(_ name: String) -> SMBDirectoryEntry {
+            SMBDirectoryEntry(name: name, fileSize: 0, isDirectory: false, attributes: 0)
+        }
+
+        // exact 一致が case-insensitive 一致より優先される
+        XCTAssertEqual(
+            SMBDirectoryEntrySelection.entry(
+                matching: "report.txt",
+                from: [entry("Report.txt"), entry("report.txt")]
+            )?.name,
+            "report.txt"
+        )
+        // exact が無ければ case-insensitive 一致 (= server の canonical 表記) を返す
+        XCTAssertEqual(
+            SMBDirectoryEntrySelection.entry(matching: "report.txt", from: [entry("Report.txt")])?.name,
+            "Report.txt"
+        )
+        // wildcard の over-match (別名ファイル) は弾く
+        XCTAssertNil(
+            SMBDirectoryEntrySelection.entry(matching: "repor?.txt", from: [entry("report.txt")])
+        )
+        XCTAssertNil(SMBDirectoryEntrySelection.entry(matching: "report.txt", from: []))
+    }
+
     func testQueryDirectoryContinuationRequestClearsRestartScanFlag() throws {
         let fileId = (0..<16).map(UInt8.init)
         let request = try SMB2QueryDirectory.encodeRequest(

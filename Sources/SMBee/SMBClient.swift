@@ -885,6 +885,43 @@ public actor SMBClientSession {
         return collector.entries
     }
 
+
+    /// Resolve the server-side directory entry for `path` by querying its parent
+    /// directory with the leaf name as the QUERY_DIRECTORY search pattern.
+    ///
+    /// On case-insensitive (case-preserving) shares — the Windows / macOS / Samba
+    /// default — the server matches the pattern case-insensitively and returns the
+    /// entry under its **canonical (case-preserved) name**. This is the cheap
+    /// (single round-trip, no full listing) way to recover the canonical name after
+    /// a write that was issued with a differently-cased path; `SMBFileStat` and the
+    /// SMB2 CREATE response do not carry it.
+    ///
+    /// Returns nil for the share root (no leaf to resolve) and when no entry
+    /// matches. Wildcard metacharacters in the leaf (`*` `?` `<` `>` `"`) are
+    /// interpreted by the server and may over-match; the result is post-filtered to
+    /// entries whose name equals the leaf exactly or case-insensitively, preferring
+    /// the exact match.
+    public func directoryEntry(matching path: String) async throws -> SMBDirectoryEntry? {
+        try ensureOpen()
+        let components = path.replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/")
+            .map(String.init)
+        guard let leaf = components.last else { return nil }
+        let parent = components.dropLast().joined(separator: "/")
+        let fileId = try await session.create(treeId: treeId, path: parent, directory: true)
+        do {
+            let collector = SMBDirectoryEntryCollector()
+            try await session.queryDirectory(treeId: treeId, fileId: fileId, searchPattern: leaf) { entry in
+                collector.append(entry)
+            }
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+            return SMBDirectoryEntrySelection.entry(matching: leaf, from: collector.entries)
+        } catch {
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     public func withDirectoryStream(
         path: String = "",
         onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
@@ -1515,6 +1552,18 @@ public actor SMBClientSession {
     private func resolvedSize(knownSize: UInt64?, fileId: [UInt8]) async throws -> UInt64 {
         if let knownSize { return knownSize }
         return try await session.queryInfo(treeId: treeId, fileId: fileId).size
+    }
+}
+
+/// `directoryEntry(matching:)` の結果選択 (pure)。server の pattern match が
+/// wildcard で over-match した場合に備え、leaf との一致 (exact 優先 →
+/// case-insensitive) で絞り込む。
+enum SMBDirectoryEntrySelection {
+    static func entry(matching leaf: String, from entries: [SMBDirectoryEntry]) -> SMBDirectoryEntry? {
+        if let exact = entries.first(where: { $0.name == leaf }) {
+            return exact
+        }
+        return entries.first { $0.name.compare(leaf, options: [.caseInsensitive]) == .orderedSame }
     }
 }
 
@@ -4234,12 +4283,18 @@ actor SMBSession {
     func queryDirectory(
         treeId: UInt32,
         fileId: [UInt8],
+        searchPattern: String = "*",
         onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
     ) async throws {
         var restartScan = true
         var pageFingerprints = Set<String>()
         while true {
-            let entries = try await queryDirectoryPage(treeId: treeId, fileId: fileId, restartScan: restartScan)
+            let entries = try await queryDirectoryPage(
+                treeId: treeId,
+                fileId: fileId,
+                restartScan: restartScan,
+                searchPattern: searchPattern
+            )
             restartScan = false
             guard let entries else { return }
             guard !entries.isEmpty else { return }
@@ -4254,7 +4309,12 @@ actor SMBSession {
         }
     }
 
-    private func queryDirectoryPage(treeId: UInt32, fileId: [UInt8], restartScan: Bool) async throws -> [SMBDirectoryEntry]? {
+    private func queryDirectoryPage(
+        treeId: UInt32,
+        fileId: [UInt8],
+        restartScan: Bool,
+        searchPattern: String = "*"
+    ) async throws -> [SMBDirectoryEntry]? {
         try Task.checkCancellation()
         // Cap the output buffer by the granted credit window: requesting 256KiB with only
         // 1 granted credit would either be rejected by the server (CreditCharge too low)
@@ -4266,7 +4326,8 @@ actor SMBSession {
             treeId: treeId,
             fileId: fileId,
             restartScan: restartScan,
-            outputBufferLength: outputBufferLength
+            outputBufferLength: outputBufferLength,
+            searchPattern: searchPattern
         )
         debugDump("QUERY_DIRECTORY request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_DIRECTORY response")

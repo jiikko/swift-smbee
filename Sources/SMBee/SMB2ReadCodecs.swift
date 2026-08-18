@@ -1372,9 +1372,14 @@ enum SMB2QueryDirectory {
         treeId: UInt32,
         fileId: [UInt8],
         restartScan: Bool = true,
-        outputBufferLength: UInt32 = outputBufferSize
+        outputBufferLength: UInt32 = outputBufferSize,
+        searchPattern: String = "*"
     ) throws -> [UInt8] {
         guard fileId.count == 16 else { throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes") }
+        guard !searchPattern.isEmpty else {
+            throw SMBCodecError.invalidValue("QUERY_DIRECTORY search pattern must not be empty")
+        }
+        let patternBytes = searchPattern.utf16.flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
         let creditCharge = SMB2Credit.charge(forPayloadLength: UInt64(outputBufferLength))
         let header = try SMB2Header(
             creditCharge: creditCharge,
@@ -1392,9 +1397,9 @@ enum SMB2QueryDirectory {
         writer.writeUInt32LE(0)
         writer.writeBytes(fileId)
         writer.writeUInt16LE(UInt16(fileNameOffset))
-        writer.writeUInt16LE(2)
+        try writer.writeUInt16LE(count: patternBytes.count, of: "QUERY_DIRECTORY search pattern")
         writer.writeUInt32LE(outputBufferLength)
-        writer.writeBytes([0x2a, 0x00])
+        writer.writeBytes(patternBytes)
         return writer.bytes
     }
 

@@ -906,6 +906,9 @@ public actor SMBClientSession {
             .split(separator: "/")
             .map(String.init)
         guard let leaf = components.last else { return nil }
+        guard !components.contains("."), !components.contains("..") else {
+            throw SMBCodecError.invalidValue("SMB path must not contain . or .. components")
+        }
         let parent = components.dropLast().joined(separator: "/")
         let fileId = try await session.create(treeId: treeId, path: parent, directory: true)
         do {
@@ -4331,7 +4334,9 @@ actor SMBSession {
         debugDump("QUERY_DIRECTORY request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "QUERY_DIRECTORY response")
         let header = try SMB2Header.decode(response)
-        if header.status == SMB2Status.noMoreFiles {
+        if header.status == SMB2Status.noMoreFiles || header.status == SMB2Status.noSuchFile {
+            // noSuchFile は search pattern が 1 件もマッチしなかったときの標準応答
+            // (Windows / Samba)。列挙としては「空」であってエラーではない。
             return nil
         }
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_DIRECTORY")
@@ -6285,6 +6290,7 @@ enum SMB2Status {
     static let notifyEnumDir: UInt32 = 0x0000_010c
     static let bufferOverflow: UInt32 = 0x8000_0005
     static let noMoreFiles: UInt32 = 0x8000_0006
+    static let noSuchFile: UInt32 = 0xc000_000f
     static let invalidParameter: UInt32 = 0xc000_000d
     static let invalidDeviceRequest: UInt32 = 0xc000_0010
     static let endOfFile: UInt32 = 0xc000_0011

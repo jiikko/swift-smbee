@@ -5353,6 +5353,37 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(entries, [])
     }
 
+    func testListPropagatesQueryDirectoryFailureStatus() async throws {
+        // noSuchFile / noMoreFiles を「空の列挙」に写像したことで、他の失敗ステータス
+        // まで空リストに倒れていないことを固定する (accessDenied が silent に空になると
+        // 「権限が無いディレクトリが空に見える」最悪の退行になる)。
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
+        let treeId: UInt32 = 0x3344
+        let transport = InMemoryTransport(inbound: try framed(
+            authenticatedTreeResponses(treeId: treeId) + [
+                try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.accessDenied, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId)
+            ]
+        ))
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: { transport }
+        )
+
+        do {
+            _ = try await session.list(path: "restricted")
+            XCTFail("expected QUERY_DIRECTORY accessDenied to propagate")
+        } catch let error as SMBError {
+            guard case .accessDenied = error else {
+                XCTFail("expected accessDenied, got \(error)")
+                return
+            }
+        }
+    }
+
     func testDirectoryEntryMatchingRejectsDotSegments() async throws {
         // public API 単体でも安全であること: ".." を含む path の親を CREATE に
         // 渡さない (wire に出る前に reject する)。
@@ -5374,8 +5405,11 @@ final class SMBeeTests: XCTestCase {
             do {
                 _ = try await session.directoryEntry(matching: path)
                 XCTFail("expected dot-segment rejection for \(path)")
-            } catch is SMBCodecError {
-                // 期待どおり
+            } catch let error as SMBCodecError {
+                XCTAssertTrue(
+                    "\(error)".contains("must not contain . or .."),
+                    "unexpected codec error for \(path): \(error)"
+                )
             }
         }
 

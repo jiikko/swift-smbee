@@ -210,24 +210,22 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
             makeTransport: { transport }
         )
 
-        _ = try await session.directoryEntry(matching: "docs/report.txt")
+        // 要求 leaf は大文字混じりにする: 送出前に case を変形する実装 (lowercased 等) は
+        // case-sensitive share でだけ壊れるため、小文字の leaf で照合すると検出できない。
+        _ = try await session.directoryEntry(matching: "docs/Report.TXT")
 
-        // leaf が UTF-16LE の search pattern として送られている ("*" の全列挙ではない)
-        let patternBytes = "report.txt".utf16.flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
+        // leaf が変形されずそのまま UTF-16LE の search pattern として送られている
+        // (変形も "*" への fallback もこの照合で落ちる)
+        let patternBytes = "Report.TXT".utf16.flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
         let outbound = transport.outbound
         XCTAssertTrue(
             outbound.indices.dropLast(patternBytes.count - 1).contains { idx in
                 Array(outbound[idx..<(idx + patternBytes.count)]) == patternBytes
             },
-            "QUERY_DIRECTORY request should carry the leaf as UTF-16LE search pattern"
+            "QUERY_DIRECTORY request should carry the leaf verbatim as UTF-16LE search pattern"
         )
-        let wildcard: [UInt8] = [0x2a, 0x00]
         let counter = try SMBCommandCounter(outbound: transport.outbound)
         counter.assertMetric("query_directory.commands.QUERY_DIRECTORY", command: SMB2Commands.queryDirectory, expected: 1)
-        XCTAssertFalse(
-            outbound.suffix(patternBytes.count + wildcard.count).starts(with: wildcard),
-            "the request must not fall back to the \"*\" wildcard"
-        )
     }
 
     func testPersistentSessionReusesNegotiationSessionSetupAndTreeConnect() async throws {

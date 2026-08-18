@@ -41,9 +41,10 @@ Windows, macOS, and Samba shares are case-insensitive but case-preserving: openi
 that echoes the requested path back to its callers ends up disagreeing with its own
 directory listings.
 
-``SMBClientSession/directoryEntry(matching:)`` recovers the stored spelling in a single
-round trip by querying the parent directory with the leaf as the QUERY_DIRECTORY search
-pattern — no full listing required.
+``SMBClientSession/directoryEntry(matching:)`` recovers the stored spelling with a single
+QUERY_DIRECTORY against the parent directory, using the leaf as the search pattern — no
+full listing required. (The call still opens and closes the parent handle, so it costs
+the same three commands as a plain `stat`.)
 
 ```swift
 // The share stores "Report.txt"; the caller only knows "report.txt".

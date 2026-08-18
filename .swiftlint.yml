@@ -15,6 +15,16 @@ disabled_rules:
   - large_tuple
   - file_length
 
+# 本体が空のテストメソッド (placeholder のまま commit された TODO テスト) を弾く。
+#
+# ⚠️ 本 rule が見るのは「本体が空か」だけで、assert の有無や強度は見ない
+# (probe で実測)。obaket issue 505 で踏んだ「assert はあるが変異で生き残る」
+# vacuous なテスト — wire 検証の要求値が小文字だけで case 変形を検出できない、
+# エラー写像のテストに失敗ステータスの fixture が無い等 — は lint では原理的に
+# 検出できず、変異検証 (mutation-verify-new-tests) でしか捕まらない。
+opt_in_rules:
+  - empty_xctest_method
+
 analyzer_rules: []
 
 custom_rules:

@@ -885,7 +885,6 @@ public actor SMBClientSession {
         return collector.entries
     }
 
-
     /// Resolve the server-side directory entry for `path` by querying its parent
     /// directory with the leaf name as the QUERY_DIRECTORY search pattern.
     ///

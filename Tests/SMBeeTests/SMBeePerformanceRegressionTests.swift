@@ -239,6 +239,63 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         )
     }
 
+    func testDirectoryEntryMatchingReturnsNilWhenServerReportsNoSuchFile() async throws {
+        // pattern が 1 件もマッチしないとき Windows / Samba は NO_MORE_FILES ではなく
+        // STATUS_NO_SUCH_FILE を返す。これを「空の列挙」として扱い nil を返すこと
+        // (エラーとして throw しないこと) を固定する。
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
+        let inbound = try framed([
+            try negotiateResponse(messageId: 0),
+            try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try smb2TreeConnectResponse(treeId: treeId),
+            try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.noSuchFile, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId)
+        ])
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: credential,
+            makeTransport: { transport }
+        )
+
+        let entry = try await session.directoryEntry(matching: "docs/missing.txt")
+        XCTAssertNil(entry)
+    }
+
+    func testDirectoryEntryMatchingRejectsDotSegments() async throws {
+        // public API 単体でも安全であること: ".." を含む path の親を CREATE に
+        // 渡さない (wire に出る前に reject する)。
+        let inbound = try framed([
+            try negotiateResponse(messageId: 0),
+            try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try smb2TreeConnectResponse(treeId: treeId)
+        ])
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: credential,
+            makeTransport: { transport }
+        )
+
+        for path in ["a/../b.txt", "./b.txt", "a/./b.txt"] {
+            do {
+                _ = try await session.directoryEntry(matching: path)
+                XCTFail("expected dot-segment rejection for \(path)")
+            } catch let error as SMBCodecError {
+                XCTAssertTrue("\(error)".contains("."), "unexpected codec error for \(path): \(error)")
+            }
+        }
+
+        // reject は wire に出る前なので CREATE は 1 度も送られていない
+        let counter = try SMBCommandCounter(outbound: transport.outbound)
+        counter.assertMetric("directory_entry.commands.CREATE", command: SMB2Commands.create, expected: 0)
+    }
+
     func testPersistentSessionReusesNegotiationSessionSetupAndTreeConnect() async throws {
         let statFileId = Array(UInt8(16)..<UInt8(32))
         let directoryFileId = Array(UInt8(32)..<UInt8(48))

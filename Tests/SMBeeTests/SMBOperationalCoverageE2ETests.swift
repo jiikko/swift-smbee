@@ -29,6 +29,60 @@ final class SMBOperationalCoverageE2ETests: XCTestCase {
         }
     }
 
+    /// issue 505 (obaket): case-insensitive (case-preserving) share で、要求 leaf の
+    /// case が実体と違っても server 側の canonical name を回収できることを実サーバで
+    /// 実証する。in-memory transport の wire テストは「自分が組んだ応答」しか見ないので、
+    /// server が本当に pattern を case-insensitive にマッチさせるかはここでしか分からない。
+    func testDirectoryEntryMatchingRecoversCanonicalCaseOnRealServer() async throws {
+        let details = try connectionDetails()
+        if ProcessInfo.processInfo.environment["SMBEE_E2E_PROFILE"] == "guest" {
+            throw XCTSkip("canonical-name coverage requires a writable authenticated Samba profile")
+        }
+        let canonicalName = "Report-\(UUID().uuidString).TXT"
+        let requestedName = canonicalName.lowercased()
+        let payload = Array("canonical".utf8)
+
+        try await SMBee.upload(
+            host: details.host, port: details.port, credential: details.credential,
+            share: details.share, path: canonicalName, data: payload
+        )
+        defer {
+            let host = details.host
+            let port = details.port
+            let credential = details.credential
+            let share = details.share
+            Task {
+                try? await SMBee.delete(
+                    host: host, port: port, credential: credential, share: share, path: canonicalName
+                )
+            }
+        }
+
+        let session = try await SMBee.connect(
+            host: details.host, port: details.port, credential: details.credential, share: details.share
+        )
+        defer { Task { await session.close() } }
+
+        // 実体と違う case で引いても canonical (case-preserved) name が返る
+        let entry = try await session.directoryEntry(matching: requestedName)
+        XCTAssertEqual(entry?.name, canonicalName)
+        XCTAssertEqual(entry?.fileSize, UInt64(payload.count))
+        XCTAssertFalse(entry?.isDirectory ?? true)
+
+        // listing の表記と一致する (= write/stat 経路が listing と同じ identity を返せる)
+        let entries = try await SMBee.list(
+            host: details.host, port: details.port, credential: details.credential, share: details.share
+        )
+        XCTAssertTrue(
+            entries.contains { $0.name == canonicalName },
+            "listing should expose the canonical name that directoryEntry(matching:) returned"
+        )
+
+        // 存在しない leaf は throw ではなく nil (pattern 無マッチ = 空の列挙)
+        let missing = try await session.directoryEntry(matching: "missing-\(UUID().uuidString).txt")
+        XCTAssertNil(missing)
+    }
+
     private struct ConnectionDetails {
         let host: String
         let port: UInt16

@@ -186,6 +186,59 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         counter.assertMetric("write_stream.bytes", actual: try counter.totalWritePayloadBytes(), expected: fileSize)
     }
 
+    /// decode 可能な FileIdBothDirectoryInformation 形 (104 bytes + name) の entry を組む。
+    /// 本 file の `makeDirectoryEntry` は command counter 用の簡略形で decoder が読めない。
+    private static func fullDirectoryEntry(name: String, isDirectory: Bool, fileSize: UInt64) -> [UInt8] {
+        let nameBytes = NTLM.utf16le(name)
+        var bytes = Array(repeating: UInt8(0), count: 104 + nameBytes.count)
+        writeUInt64LE(fileSize, to: &bytes, at: 40)
+        writeUInt32LE(isDirectory ? 0x10 : 0x80, to: &bytes, at: 56)
+        writeUInt32LE(UInt32(nameBytes.count), to: &bytes, at: 60)
+        bytes.replaceSubrange(104..<104 + nameBytes.count, with: nameBytes)
+        return bytes
+    }
+
+    func testDirectoryEntryMatchingUsesLeafPatternAndReturnsCanonicalName() async throws {
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
+        let inbound = try framed([
+            try negotiateResponse(messageId: 0),
+            try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try smb2TreeConnectResponse(treeId: treeId),
+            try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
+            try smb2QueryDirectoryResponse(
+                entries: [Self.fullDirectoryEntry(name: "Report.txt", isDirectory: false, fileSize: 3)],
+                messageId: 5,
+                treeId: treeId
+            ),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: treeId)
+        ])
+        let transport = PerformanceInMemoryTransport(inbound: inbound)
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: credential,
+            makeTransport: { transport }
+        )
+
+        // case 違いの要求 leaf に対し、server 応答の canonical (case-preserved) name が返る
+        let entry = try await session.directoryEntry(matching: "docs/report.txt")
+        XCTAssertEqual(entry?.name, "Report.txt")
+        XCTAssertEqual(entry?.fileSize, 3)
+
+        // outbound の QUERY_DIRECTORY request が leaf を search pattern として運んでいる
+        // ("*" の全列挙ではない)
+        let patternBytes = "report.txt".utf16.flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
+        let outbound = transport.outbound
+        XCTAssertTrue(
+            outbound.indices.dropLast(patternBytes.count - 1).contains { idx in
+                Array(outbound[idx..<(idx + patternBytes.count)]) == patternBytes
+            },
+            "QUERY_DIRECTORY request should carry the leaf as UTF-16LE search pattern"
+        )
+    }
+
     func testPersistentSessionReusesNegotiationSessionSetupAndTreeConnect() async throws {
         let statFileId = Array(UInt8(16)..<UInt8(32))
         let directoryFileId = Array(UInt8(32)..<UInt8(48))

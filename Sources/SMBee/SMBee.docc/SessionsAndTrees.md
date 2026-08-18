@@ -32,3 +32,29 @@ not answer `CLOSE`, `TREE_DISCONNECT`, or `LOGOFF`, SMBee closes the transport a
 invalidates the session rather than retaining an indeterminate server-side resource.
 After such a cleanup failure, create a new ``SMBClientSession`` instead of reusing the
 old one.
+
+## Resolving canonical names on case-insensitive shares
+
+Windows, macOS, and Samba shares are case-insensitive but case-preserving: opening
+`report.txt` succeeds even when the stored entry is `Report.txt`. Neither
+``SMBFileStat`` nor the SMB2 CREATE response carries the stored spelling, so a client
+that echoes the requested path back to its callers ends up disagreeing with its own
+directory listings.
+
+``SMBClientSession/directoryEntry(matching:)`` recovers the stored spelling in a single
+round trip by querying the parent directory with the leaf as the QUERY_DIRECTORY search
+pattern — no full listing required.
+
+```swift
+// The share stores "Report.txt"; the caller only knows "report.txt".
+let entry = try await session.directoryEntry(matching: "docs/report.txt")
+entry?.name // "Report.txt"
+
+// A pattern that matches nothing returns nil rather than throwing.
+let missing = try await session.directoryEntry(matching: "docs/absent.txt")
+missing // nil
+```
+
+Wildcard metacharacters in the leaf (`*`, `?`) are interpreted by the server, so the
+result is filtered down to entries whose name matches the leaf exactly or
+case-insensitively. Paths containing `.` or `..` components are rejected.

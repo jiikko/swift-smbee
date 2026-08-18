@@ -5268,6 +5268,121 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(Array(request[96..<98]), [0x2a, 0x00])
     }
 
+    // MARK: - directoryEntry(matching:) — canonical name 解決 (obaket issue 505)
+
+    func testDirectoryEntryMatchingUsesLeafPatternAndReturnsCanonicalName() async throws {
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
+        let treeId: UInt32 = 0x3344
+        let transport = InMemoryTransport(inbound: try framed(
+            authenticatedTreeResponses(treeId: treeId) + [
+                try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
+                try smb2QueryDirectoryResponse(
+                    entries: [makeDirectoryEntry(name: "Report.txt", isDirectory: false, fileSize: 3, nextOffset: 0)],
+                    messageId: 5,
+                    treeId: treeId
+                ),
+                try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: treeId)
+            ]
+        ))
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: { transport }
+        )
+
+        // case 違いの要求 leaf に対し、server 応答の canonical (case-preserved) name が返る
+        let entry = try await session.directoryEntry(matching: "docs/report.txt")
+        XCTAssertEqual(entry?.name, "Report.txt")
+        XCTAssertEqual(entry?.fileSize, 3)
+
+        // outbound の QUERY_DIRECTORY request が leaf を search pattern として運んでいる
+        // ("*" の全列挙ではない)
+        // 注: 本ファイルの wire fixture は SMB 3.x 暗号化を有効にするため outbound が
+        // 平文にならない。「pattern が実際に wire へ出る」ことの検証は平文 transport
+        // fixture を持つ SMBeePerformanceRegressionTests 側に置いている
+        // (testQueryDirectoryRequestCarriesLeafPatternOnTheWire)。
+    }
+
+    func testDirectoryEntryMatchingReturnsNilWhenServerReportsNoSuchFile() async throws {
+        // pattern が 1 件もマッチしないとき Windows / Samba は NO_MORE_FILES ではなく
+        // STATUS_NO_SUCH_FILE を返す。これを「空の列挙」として扱い nil を返すこと
+        // (エラーとして throw しないこと) を固定する。
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
+        let treeId: UInt32 = 0x3344
+        let transport = InMemoryTransport(inbound: try framed(
+            authenticatedTreeResponses(treeId: treeId) + [
+                try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.noSuchFile, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId)
+            ]
+        ))
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: { transport }
+        )
+
+        let entry = try await session.directoryEntry(matching: "docs/missing.txt")
+        XCTAssertNil(entry)
+    }
+
+    func testListReturnsEmptyWhenServerReportsNoSuchFile() async throws {
+        // noSuchFile の写像は queryDirectoryPage (共有 low-level) に入れたので、
+        // 既定の "*" を使う list(path:) にも効く。空 directory に NO_SUCH_FILE を
+        // 返す server 実装で throw せず空配列になることを固定する。
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
+        let treeId: UInt32 = 0x3344
+        let transport = InMemoryTransport(inbound: try framed(
+            authenticatedTreeResponses(treeId: treeId) + [
+                try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.noSuchFile, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId)
+            ]
+        ))
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: { transport }
+        )
+
+        let entries = try await session.list(path: "empty")
+        XCTAssertEqual(entries, [])
+    }
+
+    func testDirectoryEntryMatchingRejectsDotSegments() async throws {
+        // public API 単体でも安全であること: ".." を含む path の親を CREATE に
+        // 渡さない (wire に出る前に reject する)。
+        let treeId: UInt32 = 0x3344
+        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses(treeId: treeId)))
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: { transport }
+        )
+        let outboundBeforeReject = transport.outbound.count
+
+        // leaf 自体が "." / ".." のケースを必ず含める: これらは親 path から dot が
+        // 消えるため、directoryEntry 側の guard が無いと CREATE(parent) が成功して
+        // pattern="." で wire に出てしまう (親に dot がある形は CREATE 時の SMBPath
+        // 検証でも弾かれるので、guard の有無を区別できない)。
+        for path in ["a/..", ".", "a/../b.txt", "./b.txt", "a/./b.txt"] {
+            do {
+                _ = try await session.directoryEntry(matching: path)
+                XCTFail("expected dot-segment rejection for \(path)")
+            } catch is SMBCodecError {
+                // 期待どおり
+            }
+        }
+
+        // reject は wire に出る前なので追加のリクエストは 1 byte も送られていない
+        XCTAssertEqual(transport.outbound.count, outboundBeforeReject)
+    }
+
     func testQueryDirectoryRequestEncodesCustomSearchPattern() throws {
         let fileId = (0..<16).map(UInt8.init)
         let request = try SMB2QueryDirectory.encodeRequest(

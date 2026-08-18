@@ -895,6 +895,12 @@ public actor SMBClientSession {
     /// a write that was issued with a differently-cased path; `SMBFileStat` and the
     /// SMB2 CREATE response do not carry it.
     ///
+    /// Only `SMBClientSession` provides this: the caller that needs canonical names
+    /// (obaket's SMB adapter, issue 505) drives every write through a persistent
+    /// session, and `SMBClientTreeSession` exists for scoped one-off trees (IPC$
+    /// share enumeration, DFS referral) that never write. Add the tree-session
+    /// counterpart when a consumer actually writes through a scoped tree.
+    ///
     /// Returns nil for the share root (no leaf to resolve) and when no entry
     /// matches. Wildcard metacharacters in the leaf (`*` `?` `<` `>` `"`) are
     /// interpreted by the server and may over-match; the result is post-filtered to
@@ -4337,6 +4343,11 @@ actor SMBSession {
         if header.status == SMB2Status.noMoreFiles || header.status == SMB2Status.noSuchFile {
             // noSuchFile は search pattern が 1 件もマッチしなかったときの標準応答
             // (Windows / Samba)。列挙としては「空」であってエラーではない。
+            //
+            // ⚠️ 本関数は pattern 指定の有無に関わらず全 QUERY_DIRECTORY 経路が共有する。
+            // つまり既定の "*" を使う `list(path:)` / `withDirectoryStream` にも効き、
+            // 空 directory に noSuchFile を返す server 実装では throw でなく空配列になる
+            // (テスト: testListReturnsEmptyWhenServerReportsNoSuchFile)。
             return nil
         }
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "QUERY_DIRECTORY")

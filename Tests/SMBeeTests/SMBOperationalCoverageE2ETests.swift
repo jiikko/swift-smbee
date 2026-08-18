@@ -39,48 +39,49 @@ final class SMBOperationalCoverageE2ETests: XCTestCase {
             throw XCTSkip("canonical-name coverage requires a writable authenticated Samba profile")
         }
         let canonicalName = "Report-\(UUID().uuidString).TXT"
-        let requestedName = canonicalName.lowercased()
         let payload = Array("canonical".utf8)
 
         try await SMBee.upload(
             host: details.host, port: details.port, credential: details.credential,
             share: details.share, path: canonicalName, data: payload
         )
-        defer {
-            let host = details.host
-            let port = details.port
-            let credential = details.credential
-            let share = details.share
-            Task {
-                try? await SMBee.delete(
-                    host: host, port: port, credential: credential, share: share, path: canonicalName
-                )
-            }
+
+        do {
+            let session = try await SMBee.connect(
+                host: details.host, port: details.port, credential: details.credential, share: details.share
+            )
+
+            // 実体と違う case で引いても canonical (case-preserved) name が返る
+            let entry = try await session.directoryEntry(matching: canonicalName.lowercased())
+            // 存在しない leaf は throw ではなく nil (pattern 無マッチ = 空の列挙)
+            let missing = try await session.directoryEntry(matching: "missing-\(UUID().uuidString).txt")
+            await session.close()
+
+            XCTAssertEqual(entry?.name, canonicalName)
+            XCTAssertEqual(entry?.fileSize, UInt64(payload.count))
+            XCTAssertFalse(entry?.isDirectory ?? true)
+            XCTAssertNil(missing)
+
+            // listing の表記と一致する (= write/stat 経路が listing と同じ identity を返せる)
+            let entries = try await SMBee.list(
+                host: details.host, port: details.port, credential: details.credential, share: details.share
+            )
+            XCTAssertTrue(
+                entries.contains { $0.name == canonicalName },
+                "listing should expose the canonical name that directoryEntry(matching:) returned"
+            )
+
+            try await SMBee.delete(
+                host: details.host, port: details.port, credential: details.credential,
+                share: details.share, path: canonicalName
+            )
+        } catch {
+            try? await SMBee.delete(
+                host: details.host, port: details.port, credential: details.credential,
+                share: details.share, path: canonicalName
+            )
+            throw error
         }
-
-        let session = try await SMBee.connect(
-            host: details.host, port: details.port, credential: details.credential, share: details.share
-        )
-        defer { Task { await session.close() } }
-
-        // 実体と違う case で引いても canonical (case-preserved) name が返る
-        let entry = try await session.directoryEntry(matching: requestedName)
-        XCTAssertEqual(entry?.name, canonicalName)
-        XCTAssertEqual(entry?.fileSize, UInt64(payload.count))
-        XCTAssertFalse(entry?.isDirectory ?? true)
-
-        // listing の表記と一致する (= write/stat 経路が listing と同じ identity を返せる)
-        let entries = try await SMBee.list(
-            host: details.host, port: details.port, credential: details.credential, share: details.share
-        )
-        XCTAssertTrue(
-            entries.contains { $0.name == canonicalName },
-            "listing should expose the canonical name that directoryEntry(matching:) returned"
-        )
-
-        // 存在しない leaf は throw ではなく nil (pattern 無マッチ = 空の列挙)
-        let missing = try await session.directoryEntry(matching: "missing-\(UUID().uuidString).txt")
-        XCTAssertNil(missing)
     }
 
     private struct ConnectionDetails {

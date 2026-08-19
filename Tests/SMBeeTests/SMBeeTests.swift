@@ -5329,31 +5329,25 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(entries, [])
     }
 
-    func testDirectoryEntryMatchingFallsBackToFullScanWhenPatternIsCaseSensitive() async throws {
-        // macOS の SMB 共有は QUERY_DIRECTORY の search pattern を case-sensitive に
-        // マッチさせる (2026-08-19 実測、obaket issue 505)。1 段目の pattern query が
-        // 空振りしたら親を全列挙して case-insensitive に照合し直すことを固定する。
-        let firstFileId = Array(UInt8(32)..<UInt8(48))
-        let secondFileId = Array(UInt8(48)..<UInt8(64))
+    func testDirectoryEntryMatchingRecoversCanonicalNameFromEnumeration() async throws {
+        // 親を全列挙し、client 側で case-insensitive に照合して canonical name を返す
+        // (obaket issue 505)。server の pattern マッチには頼らない — macOS 共有は
+        // pattern に要求表記をそのまま返し、canonical を隠してしまう (2026-08-19 実測)。
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
         let treeId: UInt32 = 0x3344
         let transport = InMemoryTransport(inbound: try framed(
             authenticatedTreeResponses(treeId: treeId) + [
-                // 1 段目: leaf pattern "report.txt" → server は 0 件 (case-sensitive)
-                try smb2CreateResponse(fileId: firstFileId, messageId: 4, treeId: treeId),
-                try smb2StatusResponse(status: SMB2Status.noSuchFile, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
-                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId),
-                // 2 段目: "*" の全列挙 → canonical な Report.TXT が含まれる
-                try smb2CreateResponse(fileId: secondFileId, messageId: 7, treeId: treeId),
+                try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
                 try smb2QueryDirectoryResponse(
                     entries: [
                         makeDirectoryEntry(name: "other.bin", isDirectory: false, fileSize: 1, nextOffset: 122),
                         makeDirectoryEntry(name: "Report.TXT", isDirectory: false, fileSize: 3, nextOffset: 0)
                     ],
-                    messageId: 8,
+                    messageId: 5,
                     treeId: treeId
                 ),
-                try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 9, treeId: treeId),
-                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 10, treeId: treeId)
+                try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: treeId)
             ]
         ))
         let session = try await SMBClient.connect(
@@ -5364,29 +5358,24 @@ final class SMBeeTests: XCTestCase {
         )
 
         let entry = try await session.directoryEntry(matching: "docs/report.txt")
-        XCTAssertEqual(entry?.name, "Report.TXT", "fallback should recover the canonical name")
+        XCTAssertEqual(entry?.name, "Report.TXT", "enumeration should recover the canonical name")
         XCTAssertEqual(entry?.fileSize, 3)
     }
 
-    func testDirectoryEntryMatchingReturnsNilWhenAbsentFromBothStages() async throws {
-        // 実在しない leaf は 2 段とも空振りして nil (fallback が false positive を
-        // 作らないこと)。
-        let firstFileId = Array(UInt8(32)..<UInt8(48))
-        let secondFileId = Array(UInt8(48)..<UInt8(64))
+    func testDirectoryEntryMatchingReturnsNilWhenAbsentFromEnumeration() async throws {
+        // 列挙に無い leaf は nil (照合が false positive を作らないこと)。
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
         let treeId: UInt32 = 0x3344
         let transport = InMemoryTransport(inbound: try framed(
             authenticatedTreeResponses(treeId: treeId) + [
-                try smb2CreateResponse(fileId: firstFileId, messageId: 4, treeId: treeId),
-                try smb2StatusResponse(status: SMB2Status.noSuchFile, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
-                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId),
-                try smb2CreateResponse(fileId: secondFileId, messageId: 7, treeId: treeId),
+                try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
                 try smb2QueryDirectoryResponse(
                     entries: [makeDirectoryEntry(name: "unrelated.bin", isDirectory: false, fileSize: 1, nextOffset: 0)],
-                    messageId: 8,
+                    messageId: 5,
                     treeId: treeId
                 ),
-                try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 9, treeId: treeId),
-                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 10, treeId: treeId)
+                try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: treeId)
             ]
         ))
         let session = try await SMBClient.connect(

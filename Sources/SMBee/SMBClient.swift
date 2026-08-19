@@ -901,20 +901,17 @@ public actor SMBClientSession {
     /// share enumeration, DFS referral) that never write. Add the tree-session
     /// counterpart when a consumer actually writes through a scoped tree.
     ///
-    /// **Two-stage lookup.** The search pattern is matched by the *server*, and
-    /// MS-SMB2 does not specify whether that match is case-insensitive: Samba
-    /// resolves `report.txt` to a stored `Report.TXT`, while macOS shares return no
-    /// match (measured 2026-08-19). When the pattern finds nothing, this falls back
-    /// to enumerating the parent directory and matching case-insensitively, so the
-    /// canonical name is recovered on both kinds of server. The fallback costs a
-    /// full parent listing and only runs on servers whose pattern match is
-    /// case-sensitive (or when the leaf genuinely does not exist).
+    /// **The parent is enumerated in full and matched client-side.** Using the leaf
+    /// as a QUERY_DIRECTORY search pattern would be cheaper, but the match is
+    /// performed by the *server* and MS-SMB2 does not specify its semantics: macOS
+    /// shares answer a `report.txt` pattern with an entry whose FileName is the
+    /// requested spelling rather than the stored `Report.TXT` (measured 2026-08-19
+    /// against a real share), which silently defeats the entire purpose of this
+    /// call. Only a client-side comparison against the enumerated names is
+    /// trustworthy across servers.
     ///
     /// Returns nil for the share root (no leaf to resolve) and when no entry
-    /// matches either stage. Wildcard metacharacters in the leaf (`*` `?` `<` `>`
-    /// `"`) are interpreted by the server and may over-match; results are
-    /// post-filtered to entries whose name equals the leaf exactly or
-    /// case-insensitively, preferring the exact match.
+    /// matches. Names are compared exactly first, then case-insensitively.
     public func directoryEntry(matching path: String) async throws -> SMBDirectoryEntry? {
         try ensureOpen()
         let components = path.replacingOccurrences(of: "\\", with: "/")
@@ -925,23 +922,14 @@ public actor SMBClientSession {
             throw SMBCodecError.invalidValue("SMB path must not contain . or .. components")
         }
         let parent = components.dropLast().joined(separator: "/")
-        if let matched = try await directoryEntry(inParent: parent, leaf: leaf, searchPattern: leaf) {
-            return matched
-        }
-        // Pattern found nothing. Either the leaf does not exist, or the server
-        // matches patterns case-sensitively — enumerate and compare ourselves.
-        return try await directoryEntry(inParent: parent, leaf: leaf, searchPattern: "*")
+        return try await directoryEntry(inParent: parent, leaf: leaf)
     }
 
-    private func directoryEntry(
-        inParent parent: String,
-        leaf: String,
-        searchPattern: String
-    ) async throws -> SMBDirectoryEntry? {
+    private func directoryEntry(inParent parent: String, leaf: String) async throws -> SMBDirectoryEntry? {
         let fileId = try await session.create(treeId: treeId, path: parent, directory: true)
         do {
             let collector = SMBDirectoryEntryCollector()
-            try await session.queryDirectory(treeId: treeId, fileId: fileId, searchPattern: searchPattern) { entry in
+            try await session.queryDirectory(treeId: treeId, fileId: fileId) { entry in
                 collector.append(entry)
             }
             await session.bestEffortClose(treeId: treeId, fileId: fileId)
@@ -4310,6 +4298,11 @@ actor SMBSession {
         return collector.entries
     }
 
+    /// - Note: `searchPattern` は MS-SMB2 の正式な機能だが、**SMBee 内部に利用者はいない**
+    ///   (既定の `"*"` のみ)。canonical name 解決 (`directoryEntry(matching:)`) は当初
+    ///   leaf を pattern に渡していたが、macOS 共有が要求表記をそのまま返して canonical を
+    ///   隠すため、全列挙 + client 側照合へ切り替えた (obaket issue 505、2026-08-19 実測)。
+    ///   server の pattern マッチ意味論に依存する新しい呼び出しを足す前に、その実測を思い出すこと。
     func queryDirectory(
         treeId: UInt32,
         fileId: [UInt8],

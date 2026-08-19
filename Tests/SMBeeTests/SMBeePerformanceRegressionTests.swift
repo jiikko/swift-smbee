@@ -186,55 +186,6 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         counter.assertMetric("write_stream.bytes", actual: try counter.totalWritePayloadBytes(), expected: fileSize)
     }
 
-    /// QUERY_DIRECTORY の search pattern が実際に wire へ出ることを固定する
-    /// (obaket issue 505)。振る舞いの検証 (canonical name / 無マッチ / dot segment) は
-    /// SMBeeTests 側にあるが、そちらの fixture は SMB 3.x 暗号化を有効にするため
-    /// outbound を平文で読めない。平文 transport fixture が本ファイルにしかないので、
-    /// wire レベルの assert だけここに置く。
-    func testQueryDirectoryRequestCarriesLeafPatternOnTheWire() async throws {
-        let directoryFileId = Array(UInt8(32)..<UInt8(48))
-        let inbound = try framed([
-            try negotiateResponse(messageId: 0),
-            try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
-            try smb2TreeConnectResponse(treeId: treeId),
-            // 1 段目: leaf pattern。case-sensitive server を模して 0 件を返す
-            try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
-            try smb2StatusResponse(status: SMB2Status.noSuchFile, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId),
-            // 2 段目: "*" の全列挙 fallback (本テストは wire の pattern だけを見るので中身は空でよい)
-            try smb2CreateResponse(fileId: directoryFileId, messageId: 7, treeId: treeId),
-            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 8, treeId: treeId),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 9, treeId: treeId)
-        ])
-        let transport = PerformanceInMemoryTransport(inbound: inbound)
-        let session = try await SMBClient.connect(
-            host: "server",
-            share: "share",
-            credential: credential,
-            makeTransport: { transport }
-        )
-
-        // 要求 leaf は大文字混じりにする: 送出前に case を変形する実装 (lowercased 等) は
-        // case-sensitive share でだけ壊れるため、小文字の leaf で照合すると検出できない。
-        _ = try await session.directoryEntry(matching: "docs/Report.TXT")
-
-        // leaf が変形されずそのまま UTF-16LE の search pattern として送られている
-        // (変形も "*" への fallback もこの照合で落ちる)
-        let patternBytes = "Report.TXT".utf16.flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] }
-        let outbound = transport.outbound
-        XCTAssertTrue(
-            outbound.indices.dropLast(patternBytes.count - 1).contains { idx in
-                Array(outbound[idx..<(idx + patternBytes.count)]) == patternBytes
-            },
-            "QUERY_DIRECTORY request should carry the leaf verbatim as UTF-16LE search pattern"
-        )
-        // pattern 空振り時は "*" で全列挙し直すため QUERY_DIRECTORY は 2 回出る
-        // (case-sensitive server 対応の two-stage lookup、obaket issue 505)
-        let counter = try SMBCommandCounter(outbound: transport.outbound)
-        counter.assertMetric("query_directory.commands.QUERY_DIRECTORY", command: SMB2Commands.queryDirectory, expected: 2)
-    }
-
     func testPersistentSessionReusesNegotiationSessionSetupAndTreeConnect() async throws {
         let statFileId = Array(UInt8(16)..<UInt8(32))
         let directoryFileId = Array(UInt8(32)..<UInt8(48))

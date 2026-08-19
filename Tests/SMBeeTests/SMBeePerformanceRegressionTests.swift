@@ -198,9 +198,14 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
             try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
             try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
             try smb2TreeConnectResponse(treeId: treeId),
+            // 1 段目: leaf pattern。case-sensitive server を模して 0 件を返す
             try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
             try smb2StatusResponse(status: SMB2Status.noSuchFile, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId)
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: treeId),
+            // 2 段目: "*" の全列挙 fallback (本テストは wire の pattern だけを見るので中身は空でよい)
+            try smb2CreateResponse(fileId: directoryFileId, messageId: 7, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 8, treeId: treeId),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 9, treeId: treeId)
         ])
         let transport = PerformanceInMemoryTransport(inbound: inbound)
         let session = try await SMBClient.connect(
@@ -224,8 +229,10 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
             },
             "QUERY_DIRECTORY request should carry the leaf verbatim as UTF-16LE search pattern"
         )
+        // pattern 空振り時は "*" で全列挙し直すため QUERY_DIRECTORY は 2 回出る
+        // (case-sensitive server 対応の two-stage lookup、obaket issue 505)
         let counter = try SMBCommandCounter(outbound: transport.outbound)
-        counter.assertMetric("query_directory.commands.QUERY_DIRECTORY", command: SMB2Commands.queryDirectory, expected: 1)
+        counter.assertMetric("query_directory.commands.QUERY_DIRECTORY", command: SMB2Commands.queryDirectory, expected: 2)
     }
 
     func testPersistentSessionReusesNegotiationSessionSetupAndTreeConnect() async throws {

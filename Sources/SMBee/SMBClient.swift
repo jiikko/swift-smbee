@@ -901,11 +901,20 @@ public actor SMBClientSession {
     /// share enumeration, DFS referral) that never write. Add the tree-session
     /// counterpart when a consumer actually writes through a scoped tree.
     ///
+    /// **Two-stage lookup.** The search pattern is matched by the *server*, and
+    /// MS-SMB2 does not specify whether that match is case-insensitive: Samba
+    /// resolves `report.txt` to a stored `Report.TXT`, while macOS shares return no
+    /// match (measured 2026-08-19). When the pattern finds nothing, this falls back
+    /// to enumerating the parent directory and matching case-insensitively, so the
+    /// canonical name is recovered on both kinds of server. The fallback costs a
+    /// full parent listing and only runs on servers whose pattern match is
+    /// case-sensitive (or when the leaf genuinely does not exist).
+    ///
     /// Returns nil for the share root (no leaf to resolve) and when no entry
-    /// matches. Wildcard metacharacters in the leaf (`*` `?` `<` `>` `"`) are
-    /// interpreted by the server and may over-match; the result is post-filtered to
-    /// entries whose name equals the leaf exactly or case-insensitively, preferring
-    /// the exact match.
+    /// matches either stage. Wildcard metacharacters in the leaf (`*` `?` `<` `>`
+    /// `"`) are interpreted by the server and may over-match; results are
+    /// post-filtered to entries whose name equals the leaf exactly or
+    /// case-insensitively, preferring the exact match.
     public func directoryEntry(matching path: String) async throws -> SMBDirectoryEntry? {
         try ensureOpen()
         let components = path.replacingOccurrences(of: "\\", with: "/")
@@ -916,10 +925,23 @@ public actor SMBClientSession {
             throw SMBCodecError.invalidValue("SMB path must not contain . or .. components")
         }
         let parent = components.dropLast().joined(separator: "/")
+        if let matched = try await directoryEntry(inParent: parent, leaf: leaf, searchPattern: leaf) {
+            return matched
+        }
+        // Pattern found nothing. Either the leaf does not exist, or the server
+        // matches patterns case-sensitively — enumerate and compare ourselves.
+        return try await directoryEntry(inParent: parent, leaf: leaf, searchPattern: "*")
+    }
+
+    private func directoryEntry(
+        inParent parent: String,
+        leaf: String,
+        searchPattern: String
+    ) async throws -> SMBDirectoryEntry? {
         let fileId = try await session.create(treeId: treeId, path: parent, directory: true)
         do {
             let collector = SMBDirectoryEntryCollector()
-            try await session.queryDirectory(treeId: treeId, fileId: fileId, searchPattern: leaf) { entry in
+            try await session.queryDirectory(treeId: treeId, fileId: fileId, searchPattern: searchPattern) { entry in
                 collector.append(entry)
             }
             await session.bestEffortClose(treeId: treeId, fileId: fileId)

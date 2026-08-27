@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# SwiftLint の analyzer rules (unused_declaration / unused_import) を回す。
+#
+# analyzer rules は build tool plugin が実行する `swiftlint lint` では評価されず、
+# コンパイラログを渡す `swiftlint analyze` でしか走らない (issues/083)。
+# .swiftlint.yml の analyzer_rules がここ以外から評価される経路は無い。
+#
+# 入口: `make lint-analyze` / CI の `swiftlint-analyze` job (test.yml)。
+#
+# 使い捨ての scratch path でクリーン build するのは、増分 build の verbose ログには
+# 再コンパイルされた module の swiftc 引数しか出ないため。引数の無いファイルは analyze が
+# 黙って skip して 0 件 (= 偽の緑) になる。下の module 名チェックはその「走っていない緑」を
+# 落とすための検査で、対象 target を増やしたらここにも足す。
+#
+# 出力に `no such module 'Glibc'` / `cannot find 'signingCMACContext'` のような診断が混ざるのは、
+# SourceKit が非活性の `#if os(Linux)` / `#if canImport(CryptoExtras)` ブランチも読みにいくため
+# (実測 2026-08-27、macOS 上で 50 行)。判定には影響しない (exit code と末尾の
+# `Done analyzing! Found N violations` 行で読む)。裏返しに、Linux 専用ブランチからしか参照されない
+# 宣言は macOS では「未使用」と誤検出されうる。そのときは理由付きの
+# `// swiftlint:disable:next unused_declaration` で逃がす (今は該当 0 件)。
+set -euo pipefail
+unset CDPATH
+cd "$(dirname "$0")/../.."
+
+scratch="${SMBEE_LINT_ANALYZE_SCRATCH:-./tmp/lint-analyze}"
+rm -rf "$scratch"
+mkdir -p "$scratch"
+log="$scratch/compile.log"
+
+echo "lint-analyze: clean verbose build -> $log"
+swift build -v --build-tests --scratch-path "$scratch/build" > "$log" 2> "$scratch/compile.err"
+
+for module in SMBee smbcli SMBeeTests; do
+  if ! grep -q -- "-module-name $module " "$log"; then
+    echo "lint-analyze: no swiftc invocation for module '$module' in $log; refusing to report a vacuous pass" >&2
+    exit 1
+  fi
+done
+
+echo "lint-analyze: swiftlint analyze --strict"
+swift package plugin --allow-writing-to-package-directory swiftlint -- \
+  analyze --strict --compiler-log-path "$log" "$@"

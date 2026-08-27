@@ -24,6 +24,18 @@ jobs:
         # SwiftLintPlugins. --strict promotes every warning to an error.
         run: swift package plugin --allow-writing-to-package-directory swiftlint -- lint --strict --no-cache
 
+  swiftlint-analyze:
+    name: SwiftLint analyzer rules (unused_declaration / unused_import)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Analyze against a clean verbose build
+        # analyzer rules は上の `lint` (build tool plugin と同じ経路) では評価されない。
+        # bin/ci/lint-analyze がクリーン build のコンパイラログを作って analyze --strict を回す
+        # (issues/083)。
+        run: bin/ci/lint-analyze
+
   build-test:
     # public repo なので macOS runner は無料 (.claude/rules gha-runner)。
     # Network.framework / CryptoKit-backed swift-crypto に依存するため macOS で回す。

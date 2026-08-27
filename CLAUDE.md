@@ -40,6 +40,10 @@ swift build && swift test          # 1. まず unit（サーバ不要・必須�
 bin/e2e/container-samba.sh          # 2. production を触ったら container Samba E2E smoke
 ```
 
+関数・型・import を置き換えたり消したりしたら `make lint-analyze` も回す（unused_declaration /
+unused_import。`swift build` の lint plugin では走らない analyzer rules で、CI の `swiftlint-analyze`
+job と同じもの。手元で build 30s + analyze 2 分強）。
+
 SMB 3.0.2 encrypted、SMB 3.1.1 signing、Samba 4.22 reparseの3プロファイルをまとめて検証し、
 push 前ゲート用マーカーを作るには `bin/e2e/smoke-all`（または
 `make smoke`）を実行する。初回だけ `make setup-hooks` でリポジトリ管理の pre-push フックを有効化する。

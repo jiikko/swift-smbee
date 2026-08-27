@@ -25,7 +25,21 @@ disabled_rules:
 opt_in_rules:
   - empty_xctest_method
 
-analyzer_rules: []
+# analyzer rules は build tool plugin の `swiftlint lint` では評価されず、コンパイラログを渡す
+# `swiftlint analyze` でしか走らない。入口は bin/ci/lint-analyze (= make lint-analyze、CI の
+# swiftlint-analyze job) だけ。issues/083 で導入 (呼び出し元を失った関数が 6 週間残った再発防止)。
+analyzer_rules:
+  - unused_declaration
+  - unused_import
+
+unused_import:
+  # `import Crypto` (swift-crypto) は Apple platform では CryptoKit を re-export するだけなので、
+  # SourceKit は SHA256 等を CryptoKit 由来と解決し、macOS 上の analyze は Crypto を「未使用」と
+  # 誤検出する (実測 2026-08-27: SHA256 を使う SMBCrypto.swift / SMBTransferVerification.swift /
+  # SMBeeTests.swift の `import Crypto` を 3 件とも未使用と報告した)。Linux では swift-crypto が
+  # 実体なので Crypto 無しでは解決できない。常に残す。
+  always_keep_imports:
+    - Crypto
 
 custom_rules:
   no_trapping_uint16_length_cast:

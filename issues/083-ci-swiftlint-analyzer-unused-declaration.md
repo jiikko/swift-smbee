@@ -66,3 +66,23 @@ SwiftLint 自体には対応するルールが**存在する** (バイナリ
 - 2026-08-26: codex 敵対的レビューは **未実施** (codex usage limit、reset 22:46)。
   ルールの実在・`analyzer: yes`・`analyzer_rules: []` は main agent が実バイナリと
   設定ファイルで裏取り済み。**費用対効果の見積もりは未検証**
+
+## 実測と決定 (2026-08-27)
+
+- **所要時間 (手元 Apple silicon)**: クリーン `swift build -v --build-tests` 34s + `swiftlint analyze` 135s。
+  採用する (CI は独立 job `swiftlint-analyze`、macos-26、timeout 30 min)
+- **検出力**: 082 の関数を含む unused_declaration 10 件・unused_import 17 件を報告。内訳:
+  - 未使用宣言 7 件は本物 (082 の関数 / `withSession(credentialProvider:)` overload /
+    `write(treeId:fileId:nextChunk:)` overload / `SMBByteReader.remaining` / `SMB2Read.bufferOffset` /
+    `remoteRecursiveBatchGlobEntries(endpoint:)` / テスト側 2 件) → 削除
+  - 偽陽性 2 件 (`@main` の `SMBCLIMain.main()`、`Encodable` の `BatchSummaryOutput.ok` = JSON 契約)
+    → 理由付き `swiftlint:disable:next`
+  - unused_import: `import Foundation` 13 件 + `Darwin`/`Glibc` ブロック 1 件は本物 (削除後に Linux
+    swift:6.2 container で `swift build --build-tests` green)。`import Crypto` 3 件は macOS で
+    CryptoKit に解決されるだけの偽陽性 → `always_keep_imports: [Crypto]`
+- **配線**: `bin/ci/lint-analyze` (クリーン scratch build → module 名ガード → `analyze --strict`)、
+  `make lint-analyze`、`test.yml` の `swiftlint-analyze` job、CLAUDE.md に入口を追記
+- **安全機構の異常系**: 空ログでガードが exit 1 / no-op 増分ビルドは swiftc 行 0 件 (= クリーン
+  build 必須の根拠) / 変異 (082 の関数 + `import Foundation` を戻す) で 2 violations, rc=1
+- **残課題**: CI 上で「082 の削除を revert すると `swiftlint-analyze` job が赤くなる」の実証
+  (受け入れ条件 2 つ目)。手元の red 確認は済み

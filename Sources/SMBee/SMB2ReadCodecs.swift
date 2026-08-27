@@ -691,9 +691,6 @@ enum SMB2QueryInfo {
 }
 
 enum SMB2Read {
-    private static let fixedPartSize = 48
-    private static let bufferOffset = SMB2Header.encodedSize + fixedPartSize
-
     static func encodeRequest(
         messageId: UInt64,
         sessionId: UInt64,

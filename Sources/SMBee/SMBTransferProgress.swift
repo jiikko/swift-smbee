@@ -1,5 +1,3 @@
-import Foundation
-
 public struct SMBTransferProgress: Sendable {
     public let bytesTransferred: UInt64
     public let totalBytes: UInt64?

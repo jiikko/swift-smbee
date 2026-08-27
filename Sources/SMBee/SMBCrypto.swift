@@ -1,5 +1,4 @@
 import Crypto
-import Foundation
 
 public enum SMBCrypto {
     static let smb3SigningLabel = Array("SMB2AESCMAC".utf8) + [0]

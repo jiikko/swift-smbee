@@ -1,5 +1,3 @@
-import Foundation
-
 enum DirectTCPFraming {
     // Keep direct-TCP framing in the SMB layer so transports remain plain byte streams.
     // This preserves the architecture rule that SMB logic depends only on SMBTransport.

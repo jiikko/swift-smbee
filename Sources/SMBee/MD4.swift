@@ -1,5 +1,3 @@
-import Foundation
-
 public enum MD4 {
     public static func hash(_ bytes: [UInt8]) -> [UInt8] {
         var message = bytes

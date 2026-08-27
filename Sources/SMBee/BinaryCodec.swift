@@ -1,5 +1,3 @@
-import Foundation
-
 /// A validation or wire-format error detected before an SMB operation can complete.
 ///
 /// Public APIs use `invalidValue` for invalid arguments and inconsistent local or
@@ -62,8 +60,6 @@ struct SMBByteWriter {
 struct SMBByteReader {
     let bytes: [UInt8]
     private(set) var offset: Int = 0
-
-    var remaining: Int { bytes.count - offset }
 
     mutating func readUInt8() throws -> UInt8 {
         guard offset < bytes.count else { throw SMBCodecError.truncated }

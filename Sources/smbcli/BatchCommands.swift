@@ -365,26 +365,6 @@ func localRecursiveBatchGlobEntries(directory: String, include pattern: String, 
 }
 
 private func remoteRecursiveBatchGlobEntries(
-    endpoint: SMBURLParser.ReadURL,
-    credential: SMBCredential,
-    include pattern: String,
-    exclude: [String],
-    timeout: Duration?
-) async throws -> [RemoteBatchFile] {
-    var files: [RemoteBatchFile] = []
-    try await appendRemoteRecursiveBatchGlobEntries(
-        endpoint: endpoint,
-        credential: credential,
-        relativeDirectory: "",
-        include: pattern,
-        exclude: exclude,
-        timeout: timeout,
-        files: &files
-    )
-    return files.sorted { $0.relativePath < $1.relativePath }
-}
-
-private func remoteRecursiveBatchGlobEntries(
     session: SMBClientSession,
     rootPath: String,
     include pattern: String,
@@ -513,6 +493,9 @@ private struct BatchSummaryOutput: Encodable {
     let count: Int
     let skipped: Int
     let dryRun: Bool
+    // JSON 契約のフィールド (SMBCLIBatchTests が "ok": true を assert する)。Swift 側から名前で
+    // 読まれないため、unused_declaration は synthesized encode(to:) の参照を数えず誤検出する。
+    // swiftlint:disable:next unused_declaration
     let ok = true
 }
 

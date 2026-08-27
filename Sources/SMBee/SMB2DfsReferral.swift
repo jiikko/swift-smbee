@@ -1,5 +1,3 @@
-import Foundation
-
 public struct SMBDfsReferralResult: Sendable {
     public let pathConsumed: Int
     public let headerFlags: UInt32

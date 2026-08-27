@@ -1,5 +1,3 @@
-import Foundation
-
 struct SMB3TransformHeader: Equatable {
     static let encodedSize = 52
     static let protocolId: [UInt8] = [0xfd, 0x53, 0x4d, 0x42]

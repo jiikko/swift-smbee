@@ -1,5 +1,3 @@
-import Foundation
-
 public struct SMB2Header: Equatable, Sendable {
     public static let encodedSize = 64
 

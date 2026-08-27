@@ -555,7 +555,6 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
 private actor SharedSessionByteAccumulator {
     private var storage: [UInt8] = []
     var bytes: [UInt8] { storage }
-    var byteCount: Int { storage.count }
     @discardableResult
     func append(_ chunk: [UInt8]) -> Bool {
         let isFirstChunk = storage.isEmpty

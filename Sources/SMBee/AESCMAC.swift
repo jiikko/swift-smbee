@@ -1,4 +1,3 @@
-import Foundation
 #if canImport(CommonCrypto)
 import CommonCrypto
 #elseif canImport(CryptoExtras)

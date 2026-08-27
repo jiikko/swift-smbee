@@ -10755,16 +10755,6 @@ final class SMBeeTests: XCTestCase {
         XCTFail("timed out waiting for \(expectedCount) outbound SMB frames")
     }
 
-    private func waitForOutboundFrameCount(_ expectedCount: Int, transport: InMemoryTransport) async throws {
-        for _ in 0..<100 {
-            if try unframed(transport.outbound).count >= expectedCount {
-                return
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("timed out waiting for \(expectedCount) outbound SMB frames")
-    }
-
     // 無制限に await するテスト内 Task (例: session.readChunk の Task.value) を、
     // 明示タイムアウトで包む安全網。順序前提の破れ等で continuation が resume されない
     // と CI job 全体が 10 分 hang する (issue 007) ので、テスト側で bound して即 fail させる。

@@ -1,6 +1,6 @@
 # 082 refactor: `DCERPC.responseHasLastFragment` が呼び出し元を失ったまま残っている (issue 032 で塞いだ弱い判定の再導入口)
 
-状態: **open**
+状態: **done** (2026-08-27)
 起票: 2026-08-26
 種別: `refactor` (P3。現時点で呼ばれていないため実害は無いが、放置すると 032 の退行口になる)
 起源: /audit の dead-code / dependency 監査
@@ -88,3 +88,12 @@ compile error にも lint error にもならない。
   (reset 22:46) に達して 4 セッションとも最終回答前に停止したため。
   ⚠️ 本 issue の主張 (grep 1 件・commit `0fb16dc` の差し替え・両実装の防御機構の差) は
   main agent が実コマンド出力で裏取り済みだが、**反証レビューは通していない**
+
+## 完了記録 (2026-08-27)
+
+- `DCERPC.responseHasLastFragment(_:)` を削除。`swift build --build-tests` (macOS / Linux swift:6.2
+  container) と `swift test --skip SMBeeE2ETests` (441 tests, 0 failures) が green
+- 継続検出は issue 083 の `bin/ci/lint-analyze` (`swiftlint analyze` の `unused_declaration`) が担う。
+  同ルールで本関数のほかに未使用宣言 6 件・未使用 import 13 件が同時に見つかり、同じ commit で掃除した
+- 変異検証: 本関数を戻して `bin/ci/lint-analyze` と同じ analyze を回すと
+  `DCERPC.swift:90:17: error: Unused Declaration Violation` で rc=1 (red) になることを確認

@@ -1,5 +1,3 @@
-import Foundation
-
 public enum SMBError: Error, Equatable, Sendable {
     case notFound(status: UInt32, operation: String)
     case accessDenied(status: UInt32, operation: String)

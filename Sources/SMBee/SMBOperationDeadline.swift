@@ -1,5 +1,3 @@
-import Foundation
-
 /// Runs an operation with a cooperative client-side deadline.
 ///
 /// A timeout requests cancellation of the operation task and reports

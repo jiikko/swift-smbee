@@ -2,11 +2,6 @@ import ArgumentParser
 import Dispatch
 import Foundation
 import SMBee
-#if os(Linux)
-import Glibc
-#else
-import Darwin
-#endif
 struct SMBCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "smbcli",
@@ -22,6 +17,8 @@ struct SMBCLI: AsyncParsableCommand {
 
 @main
 enum SMBCLIMain {
+    // @main の entry point。呼び出し元はランタイムなので unused_declaration は誤検出する。
+    // swiftlint:disable:next unused_declaration
     static func main() async {
         do {
             var command = try await SMBCLI.asyncParseAsRoot()

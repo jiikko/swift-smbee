@@ -1819,29 +1819,6 @@ public enum SMBClient {
         }
     }
 
-    private static func withSession<T>(
-        host: String,
-        port: UInt16,
-        share: String,
-        credentialProvider: SMBCredentialProvider,
-        makeTransport: (@Sendable () -> SMBTransport)? = nil,
-        idempotent: Bool,
-        operationName: String,
-        operation: (SMBSession, UInt32) async throws -> T
-    ) async throws -> T {
-        let credential = try await credentialProvider()
-        return try await withSession(
-            host: host,
-            port: port,
-            share: share,
-            credential: credential,
-            makeTransport: makeTransport,
-            idempotent: idempotent,
-            operationName: operationName,
-            operation: operation
-        )
-    }
-
     /// 既定の per-request response timeout (issue 010 §修正方針 3 の原設計値 60s)。
     ///
     /// 「server が応答を返さない / RST 無しの half-dead TCP (スリープ復帰後の典型)」は
@@ -4608,10 +4585,6 @@ actor SMBSession {
             chunkSize = await creditAwareWriteChunkSize()
         }
         await progress.finish()
-    }
-
-    func write(treeId: UInt32, fileId: [UInt8], nextChunk: (Int) throws -> [UInt8]) async throws {
-        try await write(treeId: treeId, fileId: fileId, offset: 0, nextChunk: nextChunk)
     }
 
     func write(treeId: UInt32, fileId: [UInt8], offset startOffset: UInt64, nextChunk: (Int) throws -> [UInt8]) async throws {

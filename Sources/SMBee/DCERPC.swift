@@ -87,6 +87,20 @@ enum DCERPC {
         }
     }
 
+    static func responseHasLastFragment(_ bytes: [UInt8]) throws -> Bool {
+        guard !bytes.isEmpty else { throw SMBCodecError.truncated }
+        var cursor = 0
+        while true {
+            guard cursor < bytes.count else { return false }
+            let header = try decodeHeader(Array(bytes[cursor...]))
+            guard header.fragLength >= 16 else { throw SMBCodecError.truncated }
+            if (header.flags & pfcLastFrag) != 0 {
+                return true
+            }
+            cursor += Int(header.fragLength)
+        }
+    }
+
     static func validateResponseFragments(_ bytes: [UInt8], expectedCallId: UInt32? = nil, maxBytes: Int = 16 * 1024 * 1024) throws -> Bool {
         guard !bytes.isEmpty, bytes.count <= maxBytes else { throw SMBCodecError.invalidValue("DCE/RPC response exceeds size limit") }
         var cursor = 0

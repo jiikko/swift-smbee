@@ -1,6 +1,6 @@
 # 083 ci: 未使用 declaration / import の継続検出が無い (`swiftlint analyze` の analyzer rules 未配線)
 
-状態: **open**
+状態: **done** (2026-08-27)
 起票: 2026-08-26
 種別: `ci` (P3。今回見つかった取り残しは 1 件で実害も無いため、費用対効果を測ってから判断する)
 起源: /audit の dead-code / dependency 監査。issue 082 の 3 番から分離
@@ -49,8 +49,8 @@ SwiftLint 自体には対応するルールが**存在する** (バイナリ
 
 ## 受け入れ条件
 
-- [ ] `swiftlint analyze` の所要時間が実測されている
-- [ ] 採用する場合: CI で実行され、issue 082 の削除を revert すると **CI が赤くなる**ことを確認済み
+- [x] `swiftlint analyze` の所要時間が実測されている (手元 build 34s + analyze 135s。CI job も同構成で緑)
+- [x] 採用する場合: CI で実行され、issue 082 の削除を revert すると **CI が赤くなる**ことを確認済み (下記)
 - [ ] 不採用の場合: 理由が `.swiftlint.yml` にコメントとして残っている
 
 ## 関連
@@ -86,3 +86,16 @@ SwiftLint 自体には対応するルールが**存在する** (バイナリ
   build 必須の根拠) / 変異 (082 の関数 + `import Foundation` を戻す) で 2 violations, rc=1
 - **残課題**: CI 上で「082 の削除を revert すると `swiftlint-analyze` job が赤くなる」の実証
   (受け入れ条件 2 つ目)。手元の red 確認は済み
+
+## CI red 実証 (2026-08-27)
+
+- 緑: cf1bf3c の Test run https://github.com/jiikko/swift-smbee/actions/runs/33033819996 —
+  `swiftlint-analyze` job success、ログ `Done analyzing! Found 0 violations, 0 serious in 55 files`
+  (手元と同じ 55 files = 走った証拠)
+- 赤: 082 の削除を一時 revert した 0cfccc9 の Test run
+  https://github.com/jiikko/swift-smbee/actions/runs/33054105993 —
+  **`swiftlint-analyze` だけ failure、他 7 job (lint strict / build-test / linux-build-test /
+  linux-asan / macos-tsan / coverage 2 種) は success**。失敗行:
+  `Sources/SMBee/DCERPC.swift:90:17: error: Unused Declaration Violation (unused_declaration)`
+- fe51658 で再削除して復旧 (subtree は cf1bf3c と同一)
+- 不採用理由のコメントは不要 (採用したため)。残課題なし

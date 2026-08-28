@@ -49,6 +49,15 @@ fi
 if [ -n "${DOCKER_STUB_MARKER:-}" ]; then
   touch "${DOCKER_STUB_MARKER}"
 fi
+if [ -n "${DOCKER_STUB_ENV_LOG:-}" ]; then
+  printf '%s\n' \
+    "RESOURCE_BASELINE_RUNS=${RESOURCE_BASELINE_RUNS:-}" \
+    "RESOURCE_SKIP_BUILD=${RESOURCE_SKIP_BUILD:-}" \
+    "RESOURCE_APPEND_LOG=${RESOURCE_APPEND_LOG:-}" \
+    "RESOURCE_BASELINE_RUN_OFFSET=${RESOURCE_BASELINE_RUN_OFFSET:-}" \
+    "RESOURCE_BASELINE_RUN_TOTAL=${RESOURCE_BASELINE_RUN_TOTAL:-}" \
+    > "${DOCKER_STUB_ENV_LOG}"
+fi
 if [ -n "${DOCKER_STUB_LOG:-}" ]; then
   invocation_count_file="${DOCKER_STUB_LOG}.count"
   invocation_count=0
@@ -58,6 +67,13 @@ if [ -n "${DOCKER_STUB_LOG:-}" ]; then
   invocation_count=$((invocation_count + 1))
   printf '%s\n' "${invocation_count}" > "${invocation_count_file}"
   printf '%s\n' "$@" > "${DOCKER_STUB_LOG}.${invocation_count}"
+fi
+if [ -n "${DOCKER_STUB_DOWNLOAD_LOG:-}" ]; then
+  printf '%s\n' 'Downloading binary artifact (stub)' >> "${DOCKER_STUB_DOWNLOAD_LOG}"
+fi
+if [ -n "${DOCKER_STUB_TOUCH_FILE:-}" ]; then
+  mkdir -p "$(dirname "${DOCKER_STUB_TOUCH_FILE}")"
+  : >> "${DOCKER_STUB_TOUCH_FILE}"
 fi
 EOF
   chmod +x "${scenario_dir}/docker"
@@ -69,7 +85,32 @@ run_resource_performance_without_docker() {
   PATH="${scenario_dir}:${PATH}" \
   SWIFT_IMAGE=swift:test \
   DOCKER_STUB_MARKER="${scenario_dir}/docker-stub-called" \
+  DOCKER_STUB_TOUCH_FILE="${REPO_ROOT}/.build/resource-performance.log" \
     "$@"
+}
+
+expect_resource_performance_docker_argv() {
+  local argv_file="$1"
+  local repo_root="$2"
+  local cache_dir="$3"
+  local expected_file="${argv_file}.expected"
+  printf '%s\n' \
+    run \
+    --rm \
+    -e RESOURCE_BASELINE_RUNS \
+    -e RESOURCE_SKIP_BUILD \
+    -e RESOURCE_APPEND_LOG \
+    -e RESOURCE_BASELINE_RUN_OFFSET \
+    -e RESOURCE_BASELINE_RUN_TOTAL \
+    -e XDG_CACHE_HOME=/root/.cache \
+    -v "${repo_root}:/workspace" \
+    -v "${cache_dir}:/root/.cache/org.swift.swiftpm" \
+    -w /workspace \
+    swift:test \
+    bash \
+    -c \
+    > "${expected_file}"
+  head -n 23 "${argv_file}" | diff -u "${expected_file}" -
 }
 
 write_canonical_log() {
@@ -81,18 +122,19 @@ PERF_ENV cpu_model Genuine Intel(R) CPU
 PERF_ENV cpu_count 4
 PERF_BUILD_CACHE exact_hit=false
 EOF
-  for baseline_run in 1 2; do
-    cat >> "${log_file}" <<EOF
+  {
+    for baseline_run in 1 2; do
+      cat <<EOF
 PERF_BASELINE_RUN run=${baseline_run} total=2
 $(if [ "${baseline_run}" -eq 1 ]; then echo 'PERF_METRIC deterministic_command_count actual=12 expected=12'; fi)
 PERF_FORMAT version=1
 EOF
-    for sample_run in 1 2 3 4 5; do
-      cat >> "${log_file}" <<EOF
+      for sample_run in 1 2 3 4 5; do
+        cat <<EOF
 PERF_RESOURCE_SAMPLE operation=read_stream run=${sample_run} elapsed_ms=245.000 throughput_mib_s=653.061 user_cpu_ms=200.000 system_cpu_ms=4.000 max_rss_kb=286048 total_size_mib=160 iterations=20
 EOF
-    done
-    cat >> "${log_file}" <<'EOF'
+      done
+      cat <<'EOF'
 PERF_RESOURCE read_stream.throughput_mib_s value=737.364 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release
 PERF_RESOURCE read_stream.user_cpu_ms value=200.000 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release
 PERF_RESOURCE read_stream.system_cpu_ms value=4.000 size_mib=160 runs=5 iterations=20 throughput_floor_mib_s=400 config=release
@@ -101,12 +143,12 @@ PERF_RESOURCE read_stream.max_rss_kb value=286048 size_mib=160 runs=5 iterations
 PERF_RUN_COMPLETE operation=read_stream
 PERF_FORMAT version=1
 EOF
-    for sample_run in 1 2 3 4 5; do
-      cat >> "${log_file}" <<EOF
+      for sample_run in 1 2 3 4 5; do
+        cat <<EOF
 PERF_RESOURCE_SAMPLE operation=write_stream run=${sample_run} elapsed_ms=1096.000 throughput_mib_s=7.298 user_cpu_ms=1102.000 system_cpu_ms=0.000 max_rss_kb=286048 total_size_mib=8 iterations=1
 EOF
-    done
-    cat >> "${log_file}" <<'EOF'
+      done
+      cat <<'EOF'
 PERF_RESOURCE write_stream.throughput_mib_s value=7.298 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
 PERF_RESOURCE write_stream.user_cpu_ms value=1102.000 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
 PERF_RESOURCE write_stream.system_cpu_ms value=0.000 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
@@ -114,7 +156,7 @@ PERF_RESOURCE write_stream.sample_elapsed_ms value=1096.000 size_mib=8 runs=5 it
 PERF_RESOURCE write_stream.max_rss_kb value=286048 size_mib=8 runs=5 iterations=1 throughput_floor_mib_s=5 config=release
 PERF_RUN_COMPLETE operation=write_stream
 EOF
-    cat >> "${log_file}" <<'EOF'
+      cat <<'EOF'
 PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=1 elapsed_ms=222.000 throughput_mib_s=2306.306 user_cpu_ms=221.000 current_rss_before_kb=27000 current_rss_after_kb=27016 max_rss_kb=27016
 PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=2 elapsed_ms=224.000 throughput_mib_s=2285.714 user_cpu_ms=223.000 current_rss_before_kb=27016 current_rss_after_kb=27016 max_rss_kb=27016
 PERF_CMAC_SCALING_SAMPLE size_mib=4 chunks=64 iterations=128 run=3 elapsed_ms=223.000 throughput_mib_s=2295.964 user_cpu_ms=222.000 current_rss_before_kb=27016 current_rss_after_kb=27016 max_rss_kb=27016
@@ -127,9 +169,10 @@ PERF_WRITE_PROFILE stage=pure_swift_signing_only median_ms=1280.738 throughput_m
 PERF_WRITE_PROFILE stage=session_no_outbound_retention median_ms=658.768 throughput_mib_s=12.153 size_mib=8 runs=5 chunks=128
 PERF_WRITE_PROFILE stage=full_synthetic median_ms=659.644 throughput_mib_s=12.128 size_mib=8 runs=5 chunks=128
 EOF
-    printf '\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:42.50\n' >> "${log_file}"
-    printf '\tMaximum resident set size (kbytes): 682080\n' >> "${log_file}"
-  done
+      printf '\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:42.50\n'
+      printf '\tMaximum resident set size (kbytes): 682080\n'
+    done
+  } >> "${log_file}"
 }
 
 expect_parser_failure() {
@@ -270,6 +313,7 @@ test_run_resource_performance_log_path() {
   SWIFT_IMAGE=swift:test \
   DOCKER_STUB_MARKER="${docker_stub_marker}" \
   DOCKER_STUB_LOG="${resource_docker_log}" \
+  DOCKER_STUB_TOUCH_FILE="${REPO_ROOT}/.build/resource-performance.log" \
   RESOURCE_SKIP_BUILD=true \
     "${SCRIPT_DIR}/run-resource-performance" \
     >"${scenario_dir}/resource-run.out" 2>"${scenario_dir}/resource-run.err"
@@ -312,6 +356,175 @@ test_run_resource_performance_log_path() {
     'RESOURCE_PERFORMANCE_LOG must be the default path' \
     'custom paths are not supported'
   test ! -e "${docker_stub_marker}"
+}
+
+test_run_resource_performance_default_cache_mount() {
+  local scenario_dir scenario_repo docker_log cache_dir
+  scenario_dir="$(new_scenario_dir)"
+  scenario_repo="${scenario_dir}/scenario-repo"
+  docker_log="${scenario_dir}/docker-call"
+  cache_dir="${scenario_repo}/.build/swiftpm-cache"
+  mkdir -p "${scenario_repo}"
+  write_docker_stub "${scenario_dir}"
+
+  env -u RESOURCE_PERFORMANCE_LOG -u RESOURCE_SWIFTPM_CACHE_DIR \
+    PATH="${scenario_dir}:${PATH}" \
+    SWIFT_IMAGE=swift:test \
+    DOCKER_STUB_MARKER="${scenario_dir}/docker-stub-called" \
+    DOCKER_STUB_LOG="${docker_log}" \
+    DOCKER_STUB_TOUCH_FILE="${scenario_repo}/.build/resource-performance.log" \
+    RESOURCE_REPO_ROOT="${scenario_repo}" \
+    RESOURCE_BASELINE_RUNS=1 \
+    RESOURCE_SKIP_BUILD=false \
+    RESOURCE_APPEND_LOG=false \
+    RESOURCE_BASELINE_RUN_OFFSET=0 \
+    RESOURCE_BASELINE_RUN_TOTAL=1 \
+      "${SCRIPT_DIR}/run-resource-performance" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"
+
+  test -e "${scenario_dir}/docker-stub-called"
+  test -d "${cache_dir}"
+  test "$(cat "${docker_log}.count")" -eq 1
+  expect_resource_performance_docker_argv "${docker_log}.1" "${scenario_repo}" "${cache_dir}"
+}
+
+test_run_resource_performance_override_cache_mount() {
+  local scenario_dir scenario_repo docker_log docker_env cache_dir
+  scenario_dir="$(new_scenario_dir)"
+  scenario_repo="${scenario_dir}/scenario-repo"
+  docker_log="${scenario_dir}/docker-call"
+  docker_env="${scenario_dir}/docker-env"
+  cache_dir="${scenario_dir}/override-cache"
+  mkdir -p "${scenario_repo}"
+  write_docker_stub "${scenario_dir}"
+
+  env -u RESOURCE_PERFORMANCE_LOG \
+    PATH="${scenario_dir}:${PATH}" \
+    SWIFT_IMAGE=swift:test \
+    DOCKER_STUB_MARKER="${scenario_dir}/docker-stub-called" \
+    DOCKER_STUB_LOG="${docker_log}" \
+    DOCKER_STUB_ENV_LOG="${docker_env}" \
+    DOCKER_STUB_TOUCH_FILE="${scenario_repo}/.build/resource-performance.log" \
+    RESOURCE_REPO_ROOT="${scenario_repo}" \
+    RESOURCE_SWIFTPM_CACHE_DIR="${cache_dir}" \
+    RESOURCE_BASELINE_RUNS=2 \
+    RESOURCE_SKIP_BUILD=true \
+    RESOURCE_APPEND_LOG=true \
+    RESOURCE_BASELINE_RUN_OFFSET=0 \
+    RESOURCE_BASELINE_RUN_TOTAL=2 \
+      "${SCRIPT_DIR}/run-resource-performance" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"
+
+  test -e "${scenario_dir}/docker-stub-called"
+  test -d "${cache_dir}"
+  test ! -e "${scenario_repo}/.build/swiftpm-cache"
+  test "$(cat "${docker_log}.count")" -eq 1
+  expect_resource_performance_docker_argv "${docker_log}.1" "${scenario_repo}" "${cache_dir}"
+  printf '%s\n' \
+    RESOURCE_BASELINE_RUNS=2 \
+    RESOURCE_SKIP_BUILD=true \
+    RESOURCE_APPEND_LOG=true \
+    RESOURCE_BASELINE_RUN_OFFSET=0 \
+    RESOURCE_BASELINE_RUN_TOTAL=2 \
+    | diff -u - "${docker_env}"
+}
+
+test_run_resource_performance_invalid_cache_path() {
+  local scenario_dir scenario_repo invalid_cache
+  scenario_dir="$(new_scenario_dir)"
+  scenario_repo="${scenario_dir}/scenario-repo"
+  mkdir -p "${scenario_repo}"
+  write_docker_stub "${scenario_dir}"
+
+  for invalid_cache in \
+    relative/swiftpm-cache \
+    "${scenario_dir}/cache:with-colon"; do
+    rm -f "${scenario_dir}/docker-stub-called"
+    if env -u RESOURCE_PERFORMANCE_LOG \
+      PATH="${scenario_dir}:${PATH}" \
+      SWIFT_IMAGE=swift:test \
+      DOCKER_STUB_MARKER="${scenario_dir}/docker-stub-called" \
+      RESOURCE_REPO_ROOT="${scenario_repo}" \
+      RESOURCE_SWIFTPM_CACHE_DIR="${invalid_cache}" \
+      RESOURCE_BASELINE_RUNS=1 \
+      RESOURCE_SKIP_BUILD=true \
+      RESOURCE_APPEND_LOG=false \
+      RESOURCE_BASELINE_RUN_OFFSET=0 \
+      RESOURCE_BASELINE_RUN_TOTAL=1 \
+        "${SCRIPT_DIR}/run-resource-performance" \
+        >"${scenario_dir}/invalid.out" 2>"${scenario_dir}/invalid.err"; then
+      echo "run-resource-performance unexpectedly accepted ${invalid_cache}" >&2
+      return 1
+    fi
+    expect_contains "${scenario_dir}/invalid.err" \
+      "RESOURCE_SWIFTPM_CACHE_DIR must be an absolute path without ':'"
+    test ! -e "${scenario_dir}/docker-stub-called"
+  done
+}
+
+test_run_resource_performance_rejects_download_log() {
+  local scenario_dir scenario_repo docker_log cache_dir resource_log
+  scenario_dir="$(new_scenario_dir)"
+  scenario_repo="${scenario_dir}/scenario-repo"
+  docker_log="${scenario_dir}/docker-call"
+  cache_dir="${scenario_repo}/.build/swiftpm-cache"
+  resource_log="${scenario_repo}/.build/resource-performance.log"
+  mkdir -p "${scenario_repo}"
+  write_docker_stub "${scenario_dir}"
+
+  if env -u RESOURCE_PERFORMANCE_LOG -u RESOURCE_SWIFTPM_CACHE_DIR \
+    PATH="${scenario_dir}:${PATH}" \
+    SWIFT_IMAGE=swift:test \
+    DOCKER_STUB_MARKER="${scenario_dir}/docker-stub-called" \
+    DOCKER_STUB_LOG="${docker_log}" \
+    DOCKER_STUB_DOWNLOAD_LOG="${resource_log}" \
+    RESOURCE_REPO_ROOT="${scenario_repo}" \
+    RESOURCE_BASELINE_RUNS=1 \
+    RESOURCE_SKIP_BUILD=true \
+    RESOURCE_APPEND_LOG=false \
+    RESOURCE_BASELINE_RUN_OFFSET=0 \
+    RESOURCE_BASELINE_RUN_TOTAL=1 \
+      "${SCRIPT_DIR}/run-resource-performance" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"; then
+    echo 'run-resource-performance unexpectedly accepted a binary artifact download in the log' >&2
+    return 1
+  fi
+
+  test -e "${scenario_dir}/docker-stub-called"
+  test -f "${resource_log}"
+  expect_resource_performance_docker_argv "${docker_log}.1" "${scenario_repo}" "${cache_dir}"
+  expect_contains "${resource_log}" 'Downloading binary artifact'
+  expect_contains "${scenario_dir}/run.err" \
+    'resource-performance measurement downloaded a binary artifact; SwiftPM cache invariant failed'
+}
+
+test_run_resource_performance_rejects_missing_log() {
+  local scenario_dir scenario_repo
+  scenario_dir="$(new_scenario_dir)"
+  scenario_repo="${scenario_dir}/scenario-repo"
+  mkdir -p "${scenario_repo}"
+  write_docker_stub "${scenario_dir}"
+
+  # The stub records argv but never writes the measurement log; the invariant check must not read that as "no download".
+  if env -u RESOURCE_PERFORMANCE_LOG -u RESOURCE_SWIFTPM_CACHE_DIR \
+    PATH="${scenario_dir}:${PATH}" \
+    SWIFT_IMAGE=swift:test \
+    DOCKER_STUB_MARKER="${scenario_dir}/docker-stub-called" \
+    RESOURCE_REPO_ROOT="${scenario_repo}" \
+    RESOURCE_BASELINE_RUNS=1 \
+    RESOURCE_SKIP_BUILD=true \
+    RESOURCE_APPEND_LOG=false \
+    RESOURCE_BASELINE_RUN_OFFSET=0 \
+    RESOURCE_BASELINE_RUN_TOTAL=1 \
+      "${SCRIPT_DIR}/run-resource-performance" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"; then
+    echo 'run-resource-performance unexpectedly passed without a measurement log' >&2
+    return 1
+  fi
+
+  test -e "${scenario_dir}/docker-stub-called"
+  test ! -e "${scenario_repo}/.build/resource-performance.log"
+  expect_contains "${scenario_dir}/run.err" 'is missing or unreadable; cannot verify the SwiftPM cache invariant'
 }
 
 test_run_performance_regression() {
@@ -792,6 +1005,11 @@ run_scenario test_agent_verifiers
 run_scenario test_network_performance_summary
 run_scenario test_swift_image
 run_scenario test_run_resource_performance_log_path
+run_scenario test_run_resource_performance_default_cache_mount
+run_scenario test_run_resource_performance_override_cache_mount
+run_scenario test_run_resource_performance_invalid_cache_path
+run_scenario test_run_resource_performance_rejects_download_log
+run_scenario test_run_resource_performance_rejects_missing_log
 run_scenario test_run_performance_regression
 run_scenario test_summary_happy_path
 run_scenario test_artifact_jsonl

@@ -32,6 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '20' }}
+      RESOURCE_SWIFTPM_CACHE_DIR: ${{ github.workspace }}/.build/swiftpm-cache
     steps:
       - uses: actions/checkout@v7
         with:

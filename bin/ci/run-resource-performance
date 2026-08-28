@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${RESOURCE_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 SWIFT_IMAGE="${SWIFT_IMAGE:-$("${SCRIPT_DIR}/swift-image")}"
 LOG_FILE="${RESOURCE_PERFORMANCE_LOG:-${REPO_ROOT}/.build/resource-performance.log}"
+RESOURCE_SWIFTPM_CACHE_DIR="${RESOURCE_SWIFTPM_CACHE_DIR:-${REPO_ROOT}/.build/swiftpm-cache}"
 RESOURCE_BASELINE_RUNS="${RESOURCE_BASELINE_RUNS:-1}"
 RESOURCE_SKIP_BUILD="${RESOURCE_SKIP_BUILD:-false}"
 RESOURCE_APPEND_LOG="${RESOURCE_APPEND_LOG:-false}"
@@ -18,6 +19,12 @@ DEFAULT_LOG_FILE="${REPO_ROOT}/.build/resource-performance.log"
 if [ "${LOG_FILE}" != "${DEFAULT_LOG_FILE}" ]; then
   # The container is fixed to /workspace/.build, and later scripts read that path.
   echo "RESOURCE_PERFORMANCE_LOG must be the default path (${DEFAULT_LOG_FILE}); custom paths are not supported because the container writes to /workspace/.build/resource-performance.log" >&2
+  exit 2
+fi
+
+if [[ "${RESOURCE_SWIFTPM_CACHE_DIR}" != /* ||
+    "${RESOURCE_SWIFTPM_CACHE_DIR}" == *:* ]]; then
+  echo "RESOURCE_SWIFTPM_CACHE_DIR must be an absolute path without ':'" >&2
   exit 2
 fi
 
@@ -44,14 +51,20 @@ fi
 
 cd "${REPO_ROOT}"
 mkdir -p "$(dirname "${LOG_FILE}")"
+mkdir -p "${RESOURCE_SWIFTPM_CACHE_DIR}"
 
+# SwiftPM resolves its cache root from XDG_CACHE_HOME first, so pinning it keeps the cache on the
+# mount below even if the image's user/HOME drifts. The mount target still assumes a root image
+# (a non-root user could not write under /root).
 docker run --rm \
   -e RESOURCE_BASELINE_RUNS \
   -e RESOURCE_SKIP_BUILD \
   -e RESOURCE_APPEND_LOG \
   -e RESOURCE_BASELINE_RUN_OFFSET \
   -e RESOURCE_BASELINE_RUN_TOTAL \
+  -e XDG_CACHE_HOME=/root/.cache \
   -v "${REPO_ROOT}:/workspace" \
+  -v "${RESOURCE_SWIFTPM_CACHE_DIR}:/root/.cache/org.swift.swiftpm" \
   -w /workspace \
   "${SWIFT_IMAGE}" \
   bash -c '
@@ -66,6 +79,21 @@ docker run --rm \
     mkdir -p .build
     if [ "${RESOURCE_APPEND_LOG}" != true ]; then
       : > .build/resource-performance.log
+    fi
+    if [ "${RESOURCE_SKIP_BUILD}" != true ]; then
+      resolve_attempt=1
+      while [ "${resolve_attempt}" -le 3 ]; do
+        if swift package resolve; then
+          break
+        fi
+        # SwiftPM does not evict an invalid archive left in this cache.
+        rm -rf /root/.cache/org.swift.swiftpm/artifacts
+        resolve_attempt=$((resolve_attempt + 1))
+      done
+      if [ "${resolve_attempt}" -gt 3 ]; then
+        echo "swift package resolve failed after 3 attempts" >&2
+        exit 1
+      fi
     fi
     test_arguments=(-c release)
     if [ "${RESOURCE_SKIP_BUILD}" = true ]; then
@@ -99,4 +127,15 @@ docker run --rm \
       done
     } 2>&1 | tee -a .build/resource-performance.log
     chmod -R a+rX .build
+    chmod -R a+rX /root/.cache/org.swift.swiftpm
   '
+
+# A missing/unreadable log must not pass as "no download": grep would exit 2 and `if` would swallow it.
+if [ ! -r "${LOG_FILE}" ]; then
+  echo "resource-performance log ${LOG_FILE} is missing or unreadable; cannot verify the SwiftPM cache invariant" >&2
+  exit 1
+fi
+if grep -Fq 'Downloading binary artifact' "${LOG_FILE}"; then
+  echo 'resource-performance measurement downloaded a binary artifact; SwiftPM cache invariant failed' >&2
+  exit 1
+fi

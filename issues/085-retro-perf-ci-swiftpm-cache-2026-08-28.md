@@ -36,6 +36,6 @@
 
 ## 残課題
 
-- [ ] 次の master push の Performance run で `Downloading binary artifact` が 0 件 (warm cache) であることの確認
-      (本 retro の push で走る run 33149122254 の次)
+- [x] 次の master push の Performance run で `Downloading binary artifact` が 0 件 (warm cache) であることの確認
+      → run 33150668326 (29782ab) で確認: download 0 件、reference の prewarm は `Fetching binary artifact ... from cache`
 - [ ] 上記 1 / 4 の切り出し要否の判断 (ユーザー)

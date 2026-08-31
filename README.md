@@ -26,6 +26,7 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 
 - `SMBee` — ライブラリ本体
 - `smbcli` — CLI（`smbcli probe smb://host` で交渉結果を表示、など）
+- `SMBClientSession.upload(path:overwrite:totalBytes:nextChunk:onProgress:)` — credit-aware async chunk supplier upload
 
 ## ドキュメント
 

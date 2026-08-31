@@ -1326,6 +1326,38 @@ public actor SMBClientSession {
         }
     }
 
+    /// Upload bytes supplied asynchronously. The supplier receives the current credit-aware
+    /// maximum chunk size for each request. Returning an empty chunk completes the byte stream.
+    /// Progress is emitted after the supplier returns a non-empty chunk and before its WRITE is sent.
+    public func upload(
+        path: String,
+        overwrite: Bool = true,
+        totalBytes: UInt64,
+        nextChunk: @escaping @Sendable (Int) async throws -> [UInt8],
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try ensureOpen()
+        let fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
+        let progress = SMBTransferProgressEmitter(totalBytes: totalBytes, onProgress: onProgress)
+        do {
+            try await session.write(
+                treeId: treeId,
+                fileId: fileId,
+                offset: 0,
+                nextChunk: nextChunk,
+                onProgress: { bytesTransferred in
+                    progress.emit(bytesTransferred: bytesTransferred)
+                }
+            )
+            await progress.finish()
+            try await session.flush(treeId: treeId, fileId: fileId)
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+        } catch {
+            await session.bestEffortClose(treeId: treeId, fileId: fileId)
+            throw error
+        }
+    }
+
     /// Download a file using this already-connected session.
     public func download(path: String, localFile: URL, overwrite: Bool = true,
                          onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil) async throws {
@@ -4599,6 +4631,29 @@ actor SMBSession {
             guard !nextOffset.overflow else {
                 throw SMBCodecError.invalidValue("SMB write offset overflow")
             }
+            offset = nextOffset.partialValue
+        }
+    }
+
+    func write(
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset startOffset: UInt64,
+        nextChunk: @Sendable (Int) async throws -> [UInt8],
+        onProgress: (@Sendable (UInt64) -> Void)? = nil
+    ) async throws {
+        var offset = startOffset
+        while true {
+            try Task.checkCancellation()
+            let chunkSize = await creditAwareWriteChunkSize()
+            let chunk = try await nextChunk(chunkSize)
+            if chunk.isEmpty { break }
+            let nextOffset = offset.addingReportingOverflow(UInt64(chunk.count))
+            guard !nextOffset.overflow else {
+                throw SMBCodecError.invalidValue("SMB write offset overflow")
+            }
+            onProgress?(nextOffset.partialValue)
+            try await writeChunk(treeId: treeId, fileId: fileId, offset: offset, data: chunk)
             offset = nextOffset.partialValue
         }
     }

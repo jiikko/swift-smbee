@@ -53,6 +53,41 @@ private final class TransferProgressCollector: @unchecked Sendable {
     }
 }
 
+private final class AsyncChunkSupplierRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let chunks: [[UInt8]]
+    private var nextChunkIndex = 0
+    private var requestedSizesStorage: [Int] = []
+
+    init(chunks: [[UInt8]]) {
+        self.chunks = chunks
+    }
+
+    var requestedSizes: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestedSizesStorage
+    }
+
+    @discardableResult
+    func recordRequest(maxLength: Int) -> Int {
+        lock.lock()
+        requestedSizesStorage.append(maxLength)
+        let callNumber = requestedSizesStorage.count
+        lock.unlock()
+        return callNumber
+    }
+
+    func nextChunk(maxLength: Int) -> [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+        requestedSizesStorage.append(maxLength)
+        guard nextChunkIndex < chunks.count else { return [] }
+        defer { nextChunkIndex += 1 }
+        return chunks[nextChunkIndex]
+    }
+}
+
 private final class PrefixChunkCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [[UInt8]] = []
@@ -6604,6 +6639,161 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(progress.snapshots.map(\.bytesTransferred), [65_537])
         XCTAssertEqual(progress.snapshots.map(\.totalBytes), [65_537])
         XCTAssertTrue(progress.snapshots.allSatisfy { $0.bytesPerSecond >= 0 })
+    }
+
+    func testClientSessionAsyncSupplierUploadUsesCreditAwareSizesAndWritesSupplierBytes() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let firstChunk = [UInt8(1), 2, 3]
+        let secondChunk = [UInt8(4), 5]
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2WriteResponse(count: firstChunk.count, messageId: 1, treeId: 0x3344, credits: 3),
+            try smb2WriteResponse(count: secondChunk.count, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 3, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 4, treeId: 0x3344)
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            initialCredits: 1
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let supplier = AsyncChunkSupplierRecorder(chunks: [firstChunk, secondChunk])
+        let progress = TransferProgressCollector()
+
+        try await clientSession.upload(
+            path: "file.bin",
+            totalBytes: UInt64(firstChunk.count + secondChunk.count),
+            nextChunk: { maxLength in
+                supplier.nextChunk(maxLength: maxLength)
+            },
+            onProgress: progress.append
+        )
+
+        XCTAssertEqual(supplier.requestedSizes, [65_536, 196_608, 196_608])
+        let writes = try unframed(transport.outbound).filter {
+            try SMB2Header.decode($0).command == SMB2Commands.write
+        }
+        XCTAssertEqual(try writes.flatMap { try writePayload(from: $0) }, firstChunk + secondChunk)
+        XCTAssertEqual(progress.snapshots.last?.bytesTransferred, UInt64(firstChunk.count + secondChunk.count))
+        XCTAssertEqual(progress.snapshots.last?.totalBytes, UInt64(firstChunk.count + secondChunk.count))
+    }
+
+    func testClientSessionAsyncSupplierUploadStopsOnEmptyChunkAndFlushesAndCloses() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+        ]))
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let supplier = AsyncChunkSupplierRecorder(chunks: [])
+
+        try await clientSession.upload(
+            path: "empty.bin",
+            totalBytes: 0,
+            nextChunk: { maxLength in
+                supplier.nextChunk(maxLength: maxLength)
+            }
+        )
+
+        XCTAssertEqual(supplier.requestedSizes, [65_536])
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.flush,
+            SMB2Commands.close
+        ])
+    }
+
+    func testClientSessionAsyncSupplierUploadPropagatesSupplierFailureAndCloses() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 1, treeId: 0x3344)
+        ]))
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        do {
+            try await clientSession.upload(
+                path: "failed.bin",
+                totalBytes: 1,
+                nextChunk: { _ in
+                    throw SMBCodecError.invalidValue("supplier failed")
+                }
+            )
+            XCTFail("expected supplier failure")
+        } catch let error as SMBCodecError {
+            XCTAssertEqual(error, .invalidValue("supplier failed"))
+        }
+
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.close
+        ])
+    }
+
+    func testClientSessionAsyncSupplierUploadCancellationClosesAfterPartialWrite() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2WriteResponse(count: 1, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+        ]))
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let supplier = AsyncChunkSupplierRecorder(chunks: [])
+        let uploadTask = Task {
+            try await clientSession.upload(
+                path: "cancelled.bin",
+                totalBytes: 2,
+                nextChunk: { maxLength in
+                    let callNumber = supplier.recordRequest(maxLength: maxLength)
+                    if callNumber == 1 { return [0x41] }
+                    try await Task.sleep(for: .seconds(3_600))
+                    return []
+                }
+            )
+        }
+
+        try await awaitWithTimeout("async supplier second request") {
+            while supplier.requestedSizes.count < 2 {
+                try await Task.sleep(for: .milliseconds(1))
+            }
+        }
+        uploadTask.cancel()
+
+        do {
+            try await uploadTask.value
+            XCTFail("expected upload cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create,
+            SMB2Commands.write,
+            SMB2Commands.close
+        ])
     }
 
     func testClientSessionStreamingUploadWritesTempFileInChunks() async throws {

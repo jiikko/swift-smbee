@@ -60,6 +60,14 @@ run 31588752225 の GHA タイムスタンプの gap 上位: 26.5s / 25.6s / 20.
 **内訳 (復号なのか I/O なのか) は未計測**だが、issue 075 が実測した
 「ubuntu-latest の debug ビルドで約 0.3 MiB/s」と整合する。E2E は `swift test` (debug) で走る。
 
+**同じ CI の Performance workflow との対比 (2026-09-08 実測、run 34183254157)**:
+同じ SMB 3.0.2 signing/encryption required・1 MiB payload で
+**read 4.226 MiB/s / p50 236 ms、write 5.102 MiB/s / p50 196 ms**。
+E2E (debug) の 18〜26 秒/MiB とは **約 100 倍**の差がある。
+→ 「build configuration が支配的」という読みを支持する
+(Performance job は専用ハーネスなので測定条件は完全には同一でない)。
+これは下記「当面の扱い」の gate 解除条件 3 (release build で E2E を回す) の根拠にもなる。
+
 ### `closeTransport` は session 全体を落とす
 
 `closeTransport` → `failWire` → `failAllPendingResponses` が

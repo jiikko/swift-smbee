@@ -139,4 +139,7 @@ codex の敵対レビュー 2 lens (挙動を壊す / false green) と設計レ�
 
 - [x] fixture スクリプト 2 本の sentinel / サイズ生成が 1 箇所から導出される
 - [x] `bin/e2e/container-samba.sh` で `testReadRangesAround4GiBBoundary` が green
-- [ ] CI E2E で green — **push 後に確認する**
+- [x] CI E2E で green — commit `035909b` の E2E run 34183254161 で **7 job すべて success**、
+      `testReadRangesAround4GiBBoundary` は **skip ではなく passed** (docker/Linux 側でも
+      共有 init が fixture を作れている)。`bin/ci/verify-agent-push 035909b...` は rc=0
+      (Test / E2E / Performance すべて success、regression gate PASS)。

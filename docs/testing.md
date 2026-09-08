@@ -211,6 +211,21 @@ summaryに理由を表示する。この場合、performance-sensitiveな修正�
 扱わない。まとまった修正やtransport / codec / crypto / read-write pathの変更では、push後にworkflowの完了、
 job summary、20ペアの中央値、effect size、95% CI、spreadを確認し、run URLとbefore/afterを作業結果へ記録する。
 
+## Test workflow の手動起動（red の実証）
+
+`Test` workflow は `workflow_dispatch` を持つので、テストが本当に赤くなることを実証したいときに
+**意図的に赤い commit を master へ push する必要はない**。
+
+```sh
+gh workflow run test.yml --ref <ref>
+gh run list --workflow test.yml --event workflow_dispatch --limit 5 \
+  --json url,headBranch,status,conclusion
+```
+
+`concurrency` group は `test-${{ github.ref }}` なので、**master へ dispatch すると進行中の
+push run を cancel する**。push 直後に `bin/ci/verify-agent-push` で検証している最中は master へ
+dispatch しない。
+
 ## まとめ
 
 | Tier | 対象 | CI | 役割 |

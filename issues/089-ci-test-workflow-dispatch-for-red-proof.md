@@ -45,3 +45,47 @@ CI を赤にして見せる必要がある (グローバルルール `verify-exe
 
 - 他の workflow (`e2e.yml` / `performance.yml`) への `workflow_dispatch` 追加。
   必要になった時点で同じ形を足す。
+
+## 対応 (2026-09-08) — 実装済み / dispatch の実測待ち
+
+### 変更
+
+| ファイル | 変更 |
+|---|---|
+| `.github/workflows/test.yml` | `on:` に `workflow_dispatch:` を追加 (`concurrency` は変更なし) |
+| `docs/testing.md` | 「Test workflow の手動起動（red の実証）」節を追加 |
+
+### 実測 (変更前・2026-09-08)
+
+```
+$ gh workflow run test.yml --ref master
+rc=1
+stderr: could not create workflow dispatch event: HTTP 422:
+        Workflow does not have 'workflow_dispatch' trigger
+```
+
+この 422 が「変更前は trigger が live でない」ことの証拠。push 後に同じコマンドが通ることを
+確認して、両側で挟む。
+
+### 完了条件の変更 (スコープの縮小・明示)
+
+起票時の完了条件は「**master 以外の ref** を指定して起動できることを 1 回実際に確認」だったが、
+これは**一時ブランチの新規作成**を要求する。ブランチ作成はユーザーの領分
+(グローバルルール `no-unauthorized-branch-switch.md`) なので、次の形に縮める:
+
+- master への dispatch が起動できることを実測する (run URL を残す)。
+- **既存の** remote branch (`agent/issues-018-029` / `claude/kerberos-finder-auth-5pjrgn` /
+  `copilot/update-node-version` / `feature/smbclient-backlog`) を `--ref` に指定して、
+  非 master ref への dispatch の可否を実測して記録する。ブランチは作らない。
+- 実際の「赤の実証」でブランチが要るときは、その時点でユーザーに確認する。
+
+### 設計判断: `concurrency` は触らない
+
+master へ dispatch すると `concurrency: test-${{ github.ref }}` により進行中の push run を
+cancel する。しかし red-proof の想定利用は**非 master ref への dispatch** なので、この衝突は
+通常発火しない。`group` に `github.event_name` を足す変更は入れず、caveat を doc に 1 行書くに留めた。
+
+### 残タスク
+
+- [ ] push 後に `gh workflow run test.yml --ref master` の rc/stdout/stderr を分けて実測し run URL を記録
+- [ ] 既存 remote branch への dispatch 可否を実測し、制約が判明したら `docs/testing.md` に追記

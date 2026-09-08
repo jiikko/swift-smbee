@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 # issues/ の運用規約を機械で守る。規約の正本は issues/README.md。
 #
-# 何を検出しないか (脅威モデル): 本文の正しさ・重要度・記述の妥当性は見ない。見るのは
-# 「番号が一意か」「命名が規約どおりか」「人が読む期限が書いてあるか」「相対リンクが解決するか」
-# のような、機械で判定できて放置すると静かに壊れるものだけ。
+# 脅威モデル: 「うっかり壊す」を止める。番号の重複・命名の崩れ・human の期限漏れ・
+# retro の日付漏れ・done/ へ移したときの相対リンク切れ — どれも放置すると静かに腐る。
+#
+# 検出しないと決めたもの (意図的):
+#   - 本文の正しさ・重要度・カテゴリ語彙の妥当性 (人とレビューの責務)
+#   - human / retro の判定はファイル名の prefix でのみ行う。名前が実態と違うものは見ない
+#   - この検査自身を同じ変更で無力化する経路 (それは review の責務)
+#   - 番号が「最大 + 1」かどうか (欠番は許す。再利用だけを重複として弾く)
+#
+# bash 3.2 (macOS の /bin/bash) でも動くこと。mapfile / readarray は使わない
+# (2026-09-08: 初版が mapfile を使い /bin/bash で rc=127 になった)。
 set -euo pipefail
 unset CDPATH
 
@@ -17,7 +25,7 @@ fail() {
   failures=$((failures + 1))
 }
 
-# 規約導入前から在るファイル。命名検査の対象外にする (改名すると番号での参照が切れるため)。
+# 規約導入前から在るファイル。命名・番号検査の対象外 (改名すると番号での参照が切れる)。
 is_grandfathered() {
   case "$1" in
     issues/README.md|issues/done/todo.md) return 0 ;;
@@ -25,92 +33,105 @@ is_grandfathered() {
   esac
 }
 
-mapfile -t all_md < <(find issues -type f -name '*.md' | sort)
-if [ "${#all_md[@]}" -eq 0 ]; then
-  fail "issues/ に md が 1 つも無い (検査対象の抽出が壊れている可能性)"
+# 収集は NUL 区切りで行う (改行を含むファイル名で対象から外れるのを防ぐ)。
+# symlink も対象にする (-type f だけだと symlink の issue が全検査から消える)。
+list_file="$(mktemp)"
+trap 'rm -f "${list_file}"' EXIT
+if ! find issues \( -type f -o -type l \) -name '*.md' -print0 > "${list_file}"; then
+  fail "find が失敗した (検査対象を列挙できていない)"
   exit 1
 fi
-printf 'issue ファイル %s 件を検査する\n' "${#all_md[@]}"
 
-# 1. 命名規約: NNN-<category>-<slug>.md
+total=0
+while IFS= read -r -d '' f; do
+  total=$((total + 1))
+done < "${list_file}"
+
+# canary: 抽出が空 / 極端に少ないなら「違反 0 件」ではなく検査の破損として落とす。
+if [ "${total}" -lt 50 ]; then
+  fail "収集したファイルが ${total} 件しかない (この repo では 90 件超が正常。抽出が壊れている)"
+  exit 1
+fi
+printf 'issue ファイル %s 件を検査する\n' "${total}"
+
+# 1. 命名規約 + 2. 番号の一意性
+numbers_file="$(mktemp)"
 named=0
-for f in "${all_md[@]}"; do
+while IFS= read -r -d '' f; do
   base="${f##*/}"
-  if is_grandfathered "$f"; then continue; fi
-  if [[ ! "${base}" =~ ^[0-9][0-9][0-9]-[a-z]+-[a-z0-9.-]+\.md$ ]]; then
-    fail "命名が規約外: ${f} (期待: NNN-<category>-<slug>.md)"
-  else
-    named=$((named + 1))
-  fi
-done
+  is_grandfathered "$f" && continue
+  case "${base}" in
+    [0123456789][0123456789][0123456789]-*-*.md)
+      named=$((named + 1))
+      printf '%s\n' "${base%%-*}" >> "${numbers_file}"
+      ;;
+    *)
+      fail "命名が規約外: ${f} (期待: NNN-<category>-<slug>.md)"
+      ;;
+  esac
+done < "${list_file}"
 printf '  命名 OK: %s 件\n' "${named}"
 
-# 2. 番号の一意性 (issues/ 配下を深さを切らずに掘る)
-duplicates="$(
-  for f in "${all_md[@]}"; do
-    base="${f##*/}"
-    is_grandfathered "$f" && continue
-    printf '%s\n' "${base%%-*}"
-  done | sort | uniq -d
-)"
-if [ -n "${duplicates}" ]; then
-  while IFS= read -r n; do
-    [ -n "$n" ] || continue
-    fail "番号 ${n} が重複している:"
-    find issues -type f -name "${n}-*.md" | sed 's|^|    |' >&2
-  done <<< "${duplicates}"
-fi
+while IFS= read -r n; do
+  [ -n "$n" ] || continue
+  fail "番号 ${n} が重複している:"
+  find issues \( -type f -o -type l \) -name "${n}-*.md" | sed 's|^|    |' >&2
+done < <(sort "${numbers_file}" | uniq -d)
+rm -f "${numbers_file}"
 
-# 3. human は「期限:」必須 (人間待ちは放置すると価値が腐る)
+# 3. human は「期限:」必須
 human_count=0
-for f in "${all_md[@]}"; do
-  base="${f##*/}"
-  case "${base}" in
-    *-human-*) ;;
-    *) continue ;;
-  esac
+while IFS= read -r -d '' f; do
+  case "${f##*/}" in *-human-*) ;; *) continue ;; esac
   human_count=$((human_count + 1))
-  if ! grep -qE '^期限: [0-9]{4}-[0-9]{2}-[0-9]{2}$' "$f"; then
-    fail "human issue に '期限: YYYY-MM-DD' が無い (半角コロン・行頭): ${f}"
+  if ! grep -qE '^期限: [0123456789]{4}-[0123456789]{2}-[0123456789]{2}$' "$f"; then
+    fail "human issue に '期限: YYYY-MM-DD' が無い (行頭・半角コロン): ${f}"
   fi
-done
+done < "${list_file}"
 printf '  human issue: %s 件\n' "${human_count}"
 
-# 4. retro はファイル名末尾に -YYYY-MM-DD (経過日数をファイル名から取るため)
+# 4. retro はファイル名末尾に -YYYY-MM-DD
 retro_count=0
-for f in "${all_md[@]}"; do
+while IFS= read -r -d '' f; do
   base="${f##*/}"
-  case "${base}" in
-    *-retro-*) ;;
-    *) continue ;;
-  esac
+  case "${base}" in *-retro-*) ;; *) continue ;; esac
   retro_count=$((retro_count + 1))
-  if [[ ! "${base}" =~ -[0-9]{4}-[0-9]{2}-[0-9]{2}\.md$ ]]; then
-    fail "retro のファイル名に -YYYY-MM-DD が無い: ${f}"
-  fi
-done
+  case "${base}" in
+    *-[0123456789][0123456789][0123456789][0123456789]-[0123456789][0123456789]-[0123456789][0123456789].md) ;;
+    *) fail "retro のファイル名に -YYYY-MM-DD が無い: ${f}" ;;
+  esac
+done < "${list_file}"
 printf '  retro: %s 件\n' "${retro_count}"
 
 # 5. 相対リンクが解決すること。
-#    done/ へ移すと ../NNN 形式が切れる事故を 2026-09-08 に 2 回踏んだので機械で止める。
+#    inline `](target)` と参照定義 `[label]: target` の両方を見る。コードブロック内は除く
+#    (2026-09-08 の敵対レビュー: 参照リンクとコードブロックの decoy で素通りできた)。
 link_count=0
-while IFS= read -r line; do
-  file="${line%%:*}"
-  target="${line#*:}"
-  case "${target}" in
-    http://*|https://*|'#'*) continue ;;
-  esac
-  target="${target%%#*}"
-  [ -n "${target}" ] || continue
-  link_count=$((link_count + 1))
-  if [ ! -e "$(dirname "${file}")/${target}" ]; then
-    fail "相対リンクが解決しない: ${file} -> ${target}"
-  fi
-done < <(
-  for f in "${all_md[@]}"; do
-    grep -oE '\]\([^)]+\)' "$f" | sed -E "s|^\]\((.*)\)$|${f}:\1|" || true
-  done
-)
+while IFS= read -r -d '' f; do
+  while IFS= read -r target; do
+    [ -n "${target}" ] || continue
+    case "${target}" in http://*|https://*|'#'*|mailto:*) continue ;; esac
+    target="${target%%#*}"
+    [ -n "${target}" ] || continue
+    link_count=$((link_count + 1))
+    if [ ! -e "$(dirname "$f")/${target}" ]; then
+      fail "相対リンクが解決しない: ${f} -> ${target}"
+    fi
+  done < <(
+    awk '
+      /^[[:space:]]*```/ { in_fence = !in_fence; next }
+      in_fence { next }
+      { print }
+    ' "$f" |
+    { grep -oE '\]\([^)]+\)|^\[[^]]+\]:[[:space:]]*[^[:space:]]+' || true; } |
+    sed -E -e 's/^\]\((.*)\)$/\1/' -e 's/^\[[^]]+\]:[[:space:]]*//' -e 's/[[:space:]]+".*"$//'
+  )
+done < "${list_file}"
+
+# canary: リンク抽出が壊れて 0 件になったら「違反なし」ではなく破損として落とす。
+if [ "${link_count}" -lt 20 ]; then
+  fail "抽出した相対リンクが ${link_count} 件しかない (この repo では 30 件超が正常。抽出が壊れている)"
+fi
 printf '  相対リンク: %s 件を解決確認\n' "${link_count}"
 
 if [ "${failures}" -ne 0 ]; then

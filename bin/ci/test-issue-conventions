@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# issues/ の運用規約を機械で守る。規約の正本は issues/README.md。
+#
+# 何を検出しないか (脅威モデル): 本文の正しさ・重要度・記述の妥当性は見ない。見るのは
+# 「番号が一意か」「命名が規約どおりか」「人が読む期限が書いてあるか」「相対リンクが解決するか」
+# のような、機械で判定できて放置すると静かに壊れるものだけ。
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+cd "${REPO_ROOT}"
+
+failures=0
+fail() {
+  printf 'ISSUE-CONVENTIONS: %s\n' "$*" >&2
+  failures=$((failures + 1))
+}
+
+# 規約導入前から在るファイル。命名検査の対象外にする (改名すると番号での参照が切れるため)。
+is_grandfathered() {
+  case "$1" in
+    issues/README.md|issues/done/todo.md) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+mapfile -t all_md < <(find issues -type f -name '*.md' | sort)
+if [ "${#all_md[@]}" -eq 0 ]; then
+  fail "issues/ に md が 1 つも無い (検査対象の抽出が壊れている可能性)"
+  exit 1
+fi
+printf 'issue ファイル %s 件を検査する\n' "${#all_md[@]}"
+
+# 1. 命名規約: NNN-<category>-<slug>.md
+named=0
+for f in "${all_md[@]}"; do
+  base="${f##*/}"
+  if is_grandfathered "$f"; then continue; fi
+  if [[ ! "${base}" =~ ^[0-9][0-9][0-9]-[a-z]+-[a-z0-9.-]+\.md$ ]]; then
+    fail "命名が規約外: ${f} (期待: NNN-<category>-<slug>.md)"
+  else
+    named=$((named + 1))
+  fi
+done
+printf '  命名 OK: %s 件\n' "${named}"
+
+# 2. 番号の一意性 (issues/ 配下を深さを切らずに掘る)
+duplicates="$(
+  for f in "${all_md[@]}"; do
+    base="${f##*/}"
+    is_grandfathered "$f" && continue
+    printf '%s\n' "${base%%-*}"
+  done | sort | uniq -d
+)"
+if [ -n "${duplicates}" ]; then
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    fail "番号 ${n} が重複している:"
+    find issues -type f -name "${n}-*.md" | sed 's|^|    |' >&2
+  done <<< "${duplicates}"
+fi
+
+# 3. human は「期限:」必須 (人間待ちは放置すると価値が腐る)
+human_count=0
+for f in "${all_md[@]}"; do
+  base="${f##*/}"
+  case "${base}" in
+    *-human-*) ;;
+    *) continue ;;
+  esac
+  human_count=$((human_count + 1))
+  if ! grep -qE '^期限: [0-9]{4}-[0-9]{2}-[0-9]{2}$' "$f"; then
+    fail "human issue に '期限: YYYY-MM-DD' が無い (半角コロン・行頭): ${f}"
+  fi
+done
+printf '  human issue: %s 件\n' "${human_count}"
+
+# 4. retro はファイル名末尾に -YYYY-MM-DD (経過日数をファイル名から取るため)
+retro_count=0
+for f in "${all_md[@]}"; do
+  base="${f##*/}"
+  case "${base}" in
+    *-retro-*) ;;
+    *) continue ;;
+  esac
+  retro_count=$((retro_count + 1))
+  if [[ ! "${base}" =~ -[0-9]{4}-[0-9]{2}-[0-9]{2}\.md$ ]]; then
+    fail "retro のファイル名に -YYYY-MM-DD が無い: ${f}"
+  fi
+done
+printf '  retro: %s 件\n' "${retro_count}"
+
+# 5. 相対リンクが解決すること。
+#    done/ へ移すと ../NNN 形式が切れる事故を 2026-09-08 に 2 回踏んだので機械で止める。
+link_count=0
+while IFS= read -r line; do
+  file="${line%%:*}"
+  target="${line#*:}"
+  case "${target}" in
+    http://*|https://*|'#'*) continue ;;
+  esac
+  target="${target%%#*}"
+  [ -n "${target}" ] || continue
+  link_count=$((link_count + 1))
+  if [ ! -e "$(dirname "${file}")/${target}" ]; then
+    fail "相対リンクが解決しない: ${file} -> ${target}"
+  fi
+done < <(
+  for f in "${all_md[@]}"; do
+    grep -oE '\]\([^)]+\)' "$f" | sed -E "s|^\]\((.*)\)$|${f}:\1|" || true
+  done
+)
+printf '  相対リンク: %s 件を解決確認\n' "${link_count}"
+
+if [ "${failures}" -ne 0 ]; then
+  printf 'ISSUE-CONVENTIONS: %s 件の違反\n' "${failures}" >&2
+  exit 1
+fi
+echo 'issue conventions OK'

@@ -1,6 +1,6 @@
 # 085 retro: resource-performance job の live download 依存を codex-drive で直した (2026-08-28)
 
-状態: **open**
+状態: **決着済み (2026-09-08)**
 起票: 2026-08-28
 種別: `retro`
 
@@ -38,4 +38,18 @@
 
 - [x] 次の master push の Performance run で `Downloading binary artifact` が 0 件 (warm cache) であることの確認
       → run 33150668326 (29782ab) で確認: download 0 件、reference の prewarm は `Fetching binary artifact ... from cache`
-- [ ] 上記 1 / 4 の切り出し要否の判断 (ユーザー)
+- [x] 上記 1 / 4 の切り出し要否の判断 (2026-09-08 ユーザー判断で実行)
+
+## 切り出しの結果 (2026-09-08)
+
+| 項目 | 切り出し先 | 状態 |
+|---|---|---|
+| 1. WebFetch の要約を外部事実として書いた | `_claude/rules/measure-external-cli-streams-separately.md` に追記 | ✅ 実行 (「外部ソースの要約は仮説。設計の前提にする前に手元実験を 1 本通す」) |
+| 2. 赤い baseline 上で変異を読んだ | — | ❌ 却下 (`mutation-verify-new-tests.md` 手順 0 どおり。次の往復で自分で気づいた) |
+| 3. 敵対レビューが `LOG_FILE` 不在の素通りを拾った | — | ❌ 却下 (`adversarial-review-own-safeguards.md` が既にあり、仕組みが機能した例) |
+| 4. prewarm の retry/purge がテストされていない | 新規 issue [`090`](../090-test-resource-performance-inner-script-testable.md) | ✅ 起票 (頻度を見てからの trigger 待ち) |
+| 5. cold cache の初回露出 | — | 観測ポイントとして残す (再発してから issue 化) |
+
+## 残課題
+
+なし。

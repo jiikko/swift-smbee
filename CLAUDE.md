@@ -28,6 +28,11 @@ AB/BA順序、regression gate、raw artifact、統計再計算も検証する。
 `bin/ci/verify-agent-performance`。canonical policyは
 [docs/agent-performance-verification.md](docs/agent-performance-verification.md)。
 
+🚨 **連続してpushするなら、verifyは最後のtipに対して1回だけ実行する。** workflowは
+`cancel-in-progress`で前のrunを取り消すため、中間commitに対してverifyを走らせると
+**検証対象のrunが後続pushに消される**（docsだけのcommitでも起きる）。commitを積む予定が
+あるなら、積み終わってからverifyする。
+
 ## 実装を変更したら smoke E2E を回す（最重要）
 
 **production の wire 挙動（`Sources/SMBee/` の codec / crypto / session / transport など）を変更したら、

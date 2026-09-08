@@ -6,7 +6,7 @@
 - 関連: `Tests/SMBeeTests/SMBeeSharedSessionRangedReadE2ETests.swift`
   (`testSharedSessionRangedReadsHaveMultipleWireResponsesInFlight`) / `Sources/SMBee/SMBClient.swift` /
   [`075`](../075-perf-linux-aes-ccm-pure-swift-throughput.md) /
-  [`086`](../086-design-cleanup-deadline-tears-down-shared-session.md) /
+  [`069`](../069-bug-cleanup-failure-kills-shared-session.md) /
   [`done/062`](062-design-cancel-tears-down-shared-session.md) /
   [`done/065`](065-leak-cleanup-wire-operations-have-no-deadline.md) / obaket issue 462
 
@@ -144,8 +144,10 @@ keepalive failure (`814-830`) / send・setup failure (`5631`, `5674` 他)。
 - テストの skip メッセージと doc コメントが「タイミング依存で接続断する」という誤った理由を
   述べていたので、本 issue の結論に合わせて更新した。
 - cleanup deadline 超過が共有セッション全体を落とす件は、issue 065 で**意図的に入れた
-  session invalidation policy** であり、遅い実 NAS でも起こりうる。その再検討を
-  [`086`](../086-design-cleanup-deadline-tears-down-shared-session.md) として切り出した。
+  session invalidation policy** であり、遅い実 NAS でも起こりうる。この問題は
+  [`069`](../069-bug-cleanup-failure-kills-shared-session.md) が 2026-07-27 から扱っているので、
+  **新規 issue は立てず 069 の本文へ観測を追記した** (069 の「未再現・レビュー由来の構造指摘」が
+  CI で実際に発火していたことの証拠になる)。
 
 ## 進捗
 
@@ -156,9 +158,9 @@ keepalive failure (`814-830`) / send・setup failure (`5631`, `5674` 他)。
 - [x] codex による静的全数列挙 (transport terminal 経路 / `pendingResponses` 削除経路 / 登録されない messageId)
 - [x] codex による本 issue の反証レビュー (P1 3 件 + P2 5 件 + P3 2 件をすべて採用して断定を弱めた)
 - [x] テストの skip メッセージ / doc コメントの訂正
-- [x] 製品側の懸念を issue 086 へ切り出し
+- [x] 製品側の懸念を既存 issue 069 へ追記 (重複 issue を新設しかけたが 069 に統合した)
 
 ## 残タスク (スコープ外)
 
-- `SMBEE_PERF=1` の CI run 1 回で 12.4s の `close_transport cause=` を確定させる → issue 086 の着手時
+- `SMBEE_PERF=1` の CI run 1 回で 12.4s の `close_transport cause=` を確定させる → issue 069 の着手時
 - multi-flight の主張を決定論的テストへ移す (上記 gate 解除条件 1) → 未起票

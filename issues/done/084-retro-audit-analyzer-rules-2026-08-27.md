@@ -1,6 +1,6 @@
 # 084 retro: /audit 全滅 → dead-code 1 件から analyzer rules 導入まで (2026-08-26〜27)
 
-状態: **open**
+状態: **決着済み (2026-09-08)**
 起票: 2026-08-27
 種別: `retro`
 
@@ -36,6 +36,16 @@
    test.yml に足しておけばブランチも赤 commit も不要になる。
    → 切り出し先: 新規 issue 候補「test.yml に workflow_dispatch (ref 指定) を足す」。要否はユーザー判断
 
+## 切り出しの結果 (2026-09-08 ユーザー判断で実行)
+
+| 項目 | 切り出し先 | 状態 |
+|---|---|---|
+| 1. 監査の投げ方が予算を踏み抜いた | `~/.claude/skills/audit/SKILL.md` に追記 | ✅ 実行。既存の「並行起動しないこと」は **file 書き込み競合**が理由だったので、重複しない角度 (**予算**: 1 波 2〜3 体・波が完走してから次) で足した |
+| 2. grep の「未使用ゼロ」が overload を見落とした | `_claude/rules/subagent-model-tiering.md`「検閲の観点」に追記 | ✅ 実行 |
+| 3. 未検証の断定を 2 回書いた | — | ❌ 却下 (既存「主張は証拠ではない」で足りる。commit 前に自分で捕まえた) |
+| 4. 連続 push で verify 対象の run が消える | swift-smbee `CLAUDE.md`「push後のCI確認」に追記 | ✅ 実行 (`cancel-in-progress` の説明つき) |
+| 5. red 実証に master の意図的な赤 commit を使った | 新規 issue [`089`](../089-ci-test-workflow-dispatch-for-red-proof.md) | ✅ 起票 |
+
 ## 残課題
 
-- [ ] 上記 1 / 2 / 4 / 5 の切り出し要否の判断 (ユーザー)
+なし。

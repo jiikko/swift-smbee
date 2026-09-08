@@ -132,3 +132,41 @@ diff が意図どおりであることを見てから read した。
       (現状 stub は docker の引数を記録するだけなので、`RESOURCE_SKIP_BUILD=true` の
       cache-hit 経路で prewarm が誤って走る退行を検知できない)。**変更前から同じ状態**で、
       今回の変更が悪化させたものではない。
+
+### 追記 (2026-09-08): 最初の CI run で落ちた — D3 が指摘した盲点がそのまま発火した
+
+push 直後の Performance workflow が **exit 127** で失敗した
+([run 34193223370](https://github.com/jiikko/swift-smbee/actions/runs/34193223370))。
+
+```
+bash: bin/ci/prewarm-swiftpm-artifacts: No such file or directory
+```
+
+原因: Performance は current と reference を交互に測るため、reference 側は
+`.github/workflows/performance.yml:96,120` が `RESOURCE_REPO_ROOT="${PERFORMANCE_REFERENCE_DIR}"` を
+渡して **古い worktree を `/workspace` にマウントしたまま、current の
+`run-resource-performance` を実行する**。その worktree には新設 script が存在しない。
+
+**これは D3 敵対レビューの P2-7「caller の分岐は docker stub が payload を実行しないので未検査」が
+指した盲点そのもの**。私はそれを「変更前から未検査なので今回の退行ではない」と判断して
+静的 pin だけに留めたが、その盲点の中で**新しい退行を作っていた**。「変更前から穴だった」ことは
+「その穴に新しいものを落とさない」ことを意味しない。
+
+修正: script を `/workspace` から読むのではなく、**`SCRIPT_DIR` から in-repo と同じパスへ
+single-file mount する**。
+
+```
+-v "${SCRIPT_DIR}/prewarm-swiftpm-artifacts:/workspace/bin/ci/prewarm-swiftpm-artifacts:ro"
+```
+
+マウント先を in-repo と同じパスにしているのは、script 自身が `BASH_SOURCE` から計算する
+`REPO_ROOT` を `/workspace` のまま保つため (ガードの「repo 配下を消さない」規則の意味を
+変えないため)。
+
+この退行は**既存の harness で捕まえられた**: `expect_resource_performance_docker_argv` は
+docker の argv を**完全一致**で pin しており、payload 本文も argv に含まれる。私の配線 pin が
+argv ではなく**ファイルを grep していた**ため素通りした。argv の期待値に mount を足し、
+mount を消す変異 (M10) が `test_run_resource_performance_default_cache_mount` を red にすることを確認した。
+
+**未検証の範囲**: argv pin が証明するのは「docker コマンドに mount が含まれること」までで、
+container 内で実際に解決できることは CI でしか確かめられない。

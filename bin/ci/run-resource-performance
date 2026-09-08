@@ -56,6 +56,11 @@ mkdir -p "${RESOURCE_SWIFTPM_CACHE_DIR}"
 # SwiftPM resolves its cache root from XDG_CACHE_HOME first, so pinning it keeps the cache on the
 # mount below even if the image's user/HOME drifts. The mount target still assumes a root image
 # (a non-root user could not write under /root).
+#
+# prewarm-swiftpm-artifacts is mounted from SCRIPT_DIR, not read out of /workspace: the paired
+# performance run measures a reference commit by pointing RESOURCE_REPO_ROOT at an older worktree
+# (.github/workflows/performance.yml), and that worktree does not contain scripts added since.
+# Mounting it at its in-repo path keeps the script's own REPO_ROOT equal to /workspace.
 docker run --rm \
   -e RESOURCE_BASELINE_RUNS \
   -e RESOURCE_SKIP_BUILD \
@@ -65,6 +70,7 @@ docker run --rm \
   -e XDG_CACHE_HOME=/root/.cache \
   -v "${REPO_ROOT}:/workspace" \
   -v "${RESOURCE_SWIFTPM_CACHE_DIR}:/root/.cache/org.swift.swiftpm" \
+  -v "${SCRIPT_DIR}/prewarm-swiftpm-artifacts:/workspace/bin/ci/prewarm-swiftpm-artifacts:ro" \
   -w /workspace \
   "${SWIFT_IMAGE}" \
   bash -c '

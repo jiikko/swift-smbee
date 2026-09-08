@@ -136,12 +136,13 @@ expect_resource_performance_docker_argv() {
     -e XDG_CACHE_HOME=/root/.cache \
     -v "${repo_root}:/workspace" \
     -v "${cache_dir}:/root/.cache/org.swift.swiftpm" \
+    -v "${SCRIPT_DIR}/prewarm-swiftpm-artifacts:/workspace/bin/ci/prewarm-swiftpm-artifacts:ro" \
     -w /workspace \
     swift:test \
     bash \
     -c \
     > "${expected_file}"
-  head -n 23 "${argv_file}" | diff -u "${expected_file}" -
+  head -n 25 "${argv_file}" | diff -u "${expected_file}" -
 }
 
 write_canonical_log() {

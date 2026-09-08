@@ -21,6 +21,10 @@ scenario_failed() {
 run_scenario() {
   current_scenario="$1"
   scenario_count=$((scenario_count + 1))
+  # Printed on success too, so a CI log shows which scenarios actually ran. Scenarios
+  # that assert the absence of something emit nothing of their own, and without this
+  # line their execution can only be inferred from the count pin below.
+  printf 'scenario: %s\n' "${current_scenario}"
   trap scenario_failed ERR
   "${current_scenario}"
   trap - ERR
@@ -1284,6 +1288,7 @@ run_scenario test_prewarm_handles_path_with_space
 run_scenario test_run_resource_performance_prewarm_wiring
 
 expected_scenario_count=24
+printf 'ran %s scenarios\n' "${scenario_count}"
 if [ "${scenario_count}" -ne "${expected_scenario_count}" ]; then
   printf 'expected %s scenarios, ran %s\n' \
     "${expected_scenario_count}" "${scenario_count}" >&2

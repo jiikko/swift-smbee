@@ -22,9 +22,14 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
     /// (2026-08-12)。range を重ねて upload は 1 MiB + 128 KiB に抑えつつ、全 read を完走させ、
     /// 全 byte と長さが期待 range と一致することも確認する。
     ///
-    /// issue 080 の調査が終わるまで local 専用。local では green (0.23s) だが、CI では
-    /// タイミング依存で接続断する (詳細は issue 080)。既存の `SMBEE_E2E=1` に加えて
-    /// `SMBEE_E2E_WIRE_MULTIFLIGHT=1` で有効化する。Apple container でこの 1 本だけ走らせる例:
+    /// local 専用。理由は wire の race ではなく **CI の暗号 throughput に対して転送量が大きすぎる**
+    /// ことにある (issue 080 の調査で確定)。Linux CI の debug build は pure-Swift AES-CCM が遅く
+    /// (issue 075)、1 MiB の暗号化 response の前後に 18〜26 秒かかるため、単一の wire 操作が
+    /// SMBee の固定 deadline (60 秒の request timeout / 5 秒級の cleanup deadline) を超え、
+    /// その deadline が設計どおり transport 全体を閉じる。local では green (0.23s)。
+    /// gate を外す条件は issue 080 の「当面の扱い」を参照 (issue 075 の解決を待つ必要はない)。
+    /// 既存の `SMBEE_E2E=1` に加えて `SMBEE_E2E_WIRE_MULTIFLIGHT=1` で有効化する。
+    /// Apple container でこの 1 本だけ走らせる例:
     /// ```sh
     /// SMBEE_E2E_WIRE_MULTIFLIGHT=1 \
     /// SMBEE_E2E_TEST_FILTER=SMBeeSharedSessionRangedReadE2ETests.testSharedSessionRangedReadsHaveMultipleWireResponsesInFlight \
@@ -36,7 +41,8 @@ final class SMBeeSharedSessionRangedReadE2ETests: XCTestCase {
         guard ProcessInfo.processInfo.environment["SMBEE_E2E_WIRE_MULTIFLIGHT"] == "1" else {
             throw XCTSkip(
                 "Set SMBEE_E2E_WIRE_MULTIFLIGHT=1 to run this local-only test; " +
-                    "local is green (0.23s), but CI has timing-dependent connection closures (issue 080)"
+                    "local is green (0.23s), but on CI a single 1 MiB encrypted response takes " +
+                    "18-26s (issue 075), so SMBee's fixed deadlines close the transport (issue 080)"
             )
         }
         let rangeLength: UInt64 = 1 * 1024 * 1024

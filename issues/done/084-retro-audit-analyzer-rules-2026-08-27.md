@@ -44,7 +44,7 @@
 | 2. grep の「未使用ゼロ」が overload を見落とした | `_claude/rules/subagent-model-tiering.md`「検閲の観点」に追記 | ✅ 実行 |
 | 3. 未検証の断定を 2 回書いた | — | ❌ 却下 (既存「主張は証拠ではない」で足りる。commit 前に自分で捕まえた) |
 | 4. 連続 push で verify 対象の run が消える | swift-smbee `CLAUDE.md`「push後のCI確認」に追記 | ✅ 実行 (`cancel-in-progress` の説明つき) |
-| 5. red 実証に master の意図的な赤 commit を使った | 新規 issue [`089`](../089-ci-test-workflow-dispatch-for-red-proof.md) | ✅ 起票 |
+| 5. red 実証に master の意図的な赤 commit を使った | 新規 issue [`089`](089-ci-test-workflow-dispatch-for-red-proof.md) | ✅ 起票 |
 
 ## 残課題
 

@@ -47,7 +47,7 @@
 | 1. WebFetch の要約を外部事実として書いた | `_claude/rules/measure-external-cli-streams-separately.md` に追記 | ✅ 実行 (「外部ソースの要約は仮説。設計の前提にする前に手元実験を 1 本通す」) |
 | 2. 赤い baseline 上で変異を読んだ | — | ❌ 却下 (`mutation-verify-new-tests.md` 手順 0 どおり。次の往復で自分で気づいた) |
 | 3. 敵対レビューが `LOG_FILE` 不在の素通りを拾った | — | ❌ 却下 (`adversarial-review-own-safeguards.md` が既にあり、仕組みが機能した例) |
-| 4. prewarm の retry/purge がテストされていない | 新規 issue [`090`](../090-test-resource-performance-inner-script-testable.md) | ✅ 起票 (頻度を見てからの trigger 待ち) |
+| 4. prewarm の retry/purge がテストされていない | 新規 issue [`090`](090-test-resource-performance-inner-script-testable.md) | ✅ 起票 (頻度を見てからの trigger 待ち) |
 | 5. cold cache の初回露出 | — | 観測ポイントとして残す (再発してから issue 化) |
 
 ## 残課題

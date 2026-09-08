@@ -222,6 +222,11 @@ gh run list --workflow test.yml --event workflow_dispatch --limit 5 \
   --json url,headBranch,status,conclusion
 ```
 
+`--ref` に指定する **ref 側の `test.yml` にも `workflow_dispatch` が要る**。実測 2026-09-08:
+`workflow_dispatch` を持たない既存 branch を指定すると
+`HTTP 422: Workflow does not have 'workflow_dispatch' trigger` で拒否された。赤の実証用の
+ブランチは `workflow_dispatch` を持つ master から切ること。
+
 `concurrency` group は `test-${{ github.ref }}` なので、**master へ dispatch すると進行中の
 push run を cancel する**。push 直後に `bin/ci/verify-agent-push` で検証している最中は master へ
 dispatch しない。

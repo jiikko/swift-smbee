@@ -170,3 +170,11 @@ mount を消す変異 (M10) が `test_run_resource_performance_default_cache_mou
 
 **未検証の範囲**: argv pin が証明するのは「docker コマンドに mount が含まれること」までで、
 container 内で実際に解決できることは CI でしか確かめられない。
+
+### 残タスクの切り出し
+
+上記の「payload を実際に評価する caller scenario」は [`091`](../091-test-resource-performance-payload-execution.md) として起票した。
+本 issue の完了条件 (3 経路が shell test で回り workflow へ配線されている / 各経路に変異を当てて red) は
+すべて満たしたので **done** とする。
+
+状態: **done**

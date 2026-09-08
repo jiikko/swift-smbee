@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+# This is separate because the retry/purge policy used to be embedded in the
+# docker-run bash payload, which made the policy itself hard to test (issue 090).
+# The guard protects against empty or unset values, typos, and symlink changes
+# that could otherwise delete an unintended directory; in particular, it keeps
+# a scenario configuration mistake from deleting the working tree.
+# It does not protect an intentional repo-external absolute path named
+# "artifacts" with at least three path elements; that caller could run rm -rf directly.
+#
+# Keep this file free of array expansions. bash 3.2 (macOS /bin/bash) raises
+# "unbound variable" for "${arr[@]}" on an empty array under set -u, which turns a
+# clean refusal into a crash with a misleading message. Measured 2026-09-08:
+# SWIFTPM_ARTIFACTS_DIR=/ gave rc=1 under 3.2 and rc=2 under 5.3.
+# bin/ci/test-performance-scripts pins the absence of array expansions here.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+
+max_attempts="${SWIFTPM_PREWARM_MAX_ATTEMPTS:-3}"
+case "${max_attempts}" in
+  ''|*[!0123456789]*)
+    printf 'prewarm: SWIFTPM_PREWARM_MAX_ATTEMPTS must be an integer from 1 through 10\n' >&2
+    exit 2
+    ;;
+esac
+if [ "${#max_attempts}" -gt 2 ] ||
+    [ "${max_attempts}" -lt 1 ] ||
+    [ "${max_attempts}" -gt 10 ]; then
+  printf 'prewarm: SWIFTPM_PREWARM_MAX_ATTEMPTS must be an integer from 1 through 10\n' >&2
+  exit 2
+fi
+
+if [[ ${SWIFTPM_ARTIFACTS_DIR+x} ]]; then
+  artifacts_dir="${SWIFTPM_ARTIFACTS_DIR}"
+else
+  artifacts_dir="${XDG_CACHE_HOME:-/root/.cache}/org.swift.swiftpm/artifacts"
+fi
+
+component_count=0
+has_dotdot=0
+
+# Walks the "/"-separated components of $1, setting component_count and has_dotdot.
+scan_path_components() {
+  local rest="${1#/}"
+  local component
+
+  component_count=0
+  has_dotdot=0
+  while [ -n "${rest}" ]; do
+    component="${rest%%/*}"
+    if [ "${component}" = "${rest}" ]; then
+      rest=''
+    else
+      rest="${rest#*/}"
+    fi
+    if [ "${component}" = '..' ]; then
+      has_dotdot=1
+    fi
+    if [ -n "${component}" ]; then
+      component_count=$((component_count + 1))
+    fi
+  done
+}
+
+refuse_purge() {
+  printf 'prewarm: refusing to purge %s\n' "${artifacts_dir}" >&2
+  return 2
+}
+
+validate_purge_target() {
+  local artifacts_basename
+  local parent_dir
+  local canonical_parent
+  local canonical_artifacts_dir
+
+  if [ -z "${artifacts_dir}" ]; then
+    refuse_purge
+    return 2
+  fi
+  if [[ "${artifacts_dir}" != /* ]]; then
+    refuse_purge
+    return 2
+  fi
+
+  # Reject traversal components before canonicalization so the input itself is
+  # never accepted merely because pwd -P happens to normalize it away.
+  scan_path_components "${artifacts_dir}"
+  if [ "${has_dotdot}" -eq 1 ]; then
+    refuse_purge
+    return 2
+  fi
+  if [ "${component_count}" -lt 3 ]; then
+    refuse_purge
+    return 2
+  fi
+
+  artifacts_basename="$(basename "${artifacts_dir}")"
+  if [ "${artifacts_basename}" != artifacts ]; then
+    refuse_purge
+    return 2
+  fi
+
+  parent_dir="$(dirname "${artifacts_dir}")"
+  if ! canonical_parent="$(cd "${parent_dir}" 2>/dev/null && pwd -P)"; then
+    refuse_purge
+    return 2
+  fi
+  if [ "${canonical_parent}" = / ]; then
+    canonical_artifacts_dir="/${artifacts_basename}"
+  else
+    canonical_artifacts_dir="${canonical_parent}/${artifacts_basename}"
+  fi
+
+  scan_path_components "${canonical_artifacts_dir}"
+  if [ "${component_count}" -lt 3 ]; then
+    refuse_purge
+    return 2
+  fi
+
+  if [ "${canonical_artifacts_dir}" = "${REPO_ROOT}" ] ||
+      [[ "${canonical_artifacts_dir}" == "${REPO_ROOT}"/* ]] ||
+      [[ "${REPO_ROOT}" == "${canonical_artifacts_dir}"/* ]]; then
+    refuse_purge
+    return 2
+  fi
+}
+
+purge_artifacts() {
+  # Re-evaluate the guard immediately before the destructive operation.
+  if ! validate_purge_target; then
+    return 2
+  fi
+  rm -rf "${artifacts_dir}"
+  # Emitted after the removal, not before it: bin/ci/test-performance-scripts counts
+  # these lines to assert how many purges actually happened, and a message printed
+  # ahead of the rm would count intent instead.
+  printf 'prewarm: swift package resolve failed (attempt %s/%s); purged %s\n' \
+    "${attempt}" "${max_attempts}" "${artifacts_dir}" >&2
+}
+
+if ! validate_purge_target; then
+  exit 2
+fi
+
+attempt=1
+while [ "${attempt}" -le "${max_attempts}" ]; do
+  if swift package resolve; then
+    exit 0
+  fi
+  if ! purge_artifacts; then
+    exit 2
+  fi
+  attempt=$((attempt + 1))
+done
+
+printf 'swift package resolve failed after %s attempts\n' "${max_attempts}" >&2
+exit 1

@@ -10,6 +10,7 @@ temporary="$(mktemp -d)"
 trap 'rm -rf "${temporary}"' EXIT
 
 current_scenario=''
+scenario_count=0
 
 scenario_failed() {
   trap - ERR
@@ -19,6 +20,7 @@ scenario_failed() {
 
 run_scenario() {
   current_scenario="$1"
+  scenario_count=$((scenario_count + 1))
   trap scenario_failed ERR
   "${current_scenario}"
   trap - ERR
@@ -35,6 +37,35 @@ expect_contains() {
   for expected in "$@"; do
     grep -F -- "${expected}" "${file}"
   done
+}
+
+write_prewarm_fake_swift() {
+  local scenario_dir="$1"
+  mkdir -p "${scenario_dir}/bin"
+  cat > "${scenario_dir}/bin/swift" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This fake never execs the real swift, so the PATH shim cannot recurse into itself.
+if [ "${1:-} ${2:-}" != 'package resolve' ]; then
+  exit 99
+fi
+
+call_log="${FAKE_SWIFT_CALL_LOG:?}"
+call_count=0
+if [ -f "${call_log}" ]; then
+  call_count="$(wc -l < "${call_log}")"
+fi
+call_count=$((call_count + 1))
+printf '%q ' "$@" >> "${call_log}"
+printf '\n' >> "${call_log}"
+printf '%s\n' 'fake-swift-stdout'
+printf '%s\n' 'fake-swift-stderr' >&2
+if [ "${call_count}" -le "${FAKE_SWIFT_FAIL_UNTIL:-0}" ]; then
+  exit 1
+fi
+EOF
+  chmod +x "${scenario_dir}/bin/swift"
 }
 
 write_docker_stub() {
@@ -193,6 +224,7 @@ test_syntax_checks() {
     "${SCRIPT_DIR}/swift-image" \
     "${SCRIPT_DIR}/run-performance-regression" \
     "${SCRIPT_DIR}/run-resource-performance" \
+    "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
     "${SCRIPT_DIR}/resource-performance-metadata" \
     "${SCRIPT_DIR}/parse-resource-performance" \
     "${SCRIPT_DIR}/publish-network-performance-summary" \
@@ -224,6 +256,231 @@ import sys
 
 ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 PY
+}
+
+test_prewarm_retry_then_success() {
+  local scenario_dir artifacts_dir sentinel call_log purge_count
+  scenario_dir="$(new_scenario_dir)"
+  artifacts_dir="${scenario_dir}/cache/org.swift.swiftpm/artifacts"
+  sentinel="${artifacts_dir}/sentinel"
+  call_log="${scenario_dir}/swift-calls.log"
+  mkdir -p "${artifacts_dir}"
+  printf '%s\n' sentinel > "${sentinel}"
+  write_prewarm_fake_swift "${scenario_dir}"
+  test -e "${sentinel}"
+
+  if ! PATH="${scenario_dir}/bin:${PATH}" \
+    FAKE_SWIFT_FAIL_UNTIL=1 \
+    FAKE_SWIFT_CALL_LOG="${call_log}" \
+    SWIFTPM_ARTIFACTS_DIR="${artifacts_dir}" \
+      "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"; then
+    echo 'prewarm unexpectedly failed after retrying to success' >&2
+    return 1
+  fi
+
+  test "$(wc -l < "${call_log}")" -eq 2
+  purge_count="$(grep -F -c '; purged ' "${scenario_dir}/run.err" || true)"
+  test "${purge_count}" -eq 1
+  test ! -e "${sentinel}"
+  expect_contains "${scenario_dir}/run.out" 'fake-swift-stdout'
+  expect_contains "${scenario_dir}/run.err" \
+    'fake-swift-stderr' \
+    'prewarm: swift package resolve failed (attempt 1/3); purged '
+}
+
+test_prewarm_exhausts_attempts() {
+  local scenario_dir artifacts_dir sentinel call_log purge_count
+  scenario_dir="$(new_scenario_dir)"
+  artifacts_dir="${scenario_dir}/cache/org.swift.swiftpm/artifacts"
+  sentinel="${artifacts_dir}/sentinel"
+  call_log="${scenario_dir}/swift-calls.log"
+  mkdir -p "${artifacts_dir}"
+  printf '%s\n' sentinel > "${sentinel}"
+  write_prewarm_fake_swift "${scenario_dir}"
+  test -e "${sentinel}"
+
+  if PATH="${scenario_dir}/bin:${PATH}" \
+    FAKE_SWIFT_FAIL_UNTIL=99 \
+    FAKE_SWIFT_CALL_LOG="${call_log}" \
+    SWIFTPM_ARTIFACTS_DIR="${artifacts_dir}" \
+      "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"; then
+    echo 'prewarm unexpectedly succeeded after exhausting attempts' >&2
+    return 1
+  fi
+
+  test "$(wc -l < "${call_log}")" -eq 3
+  purge_count="$(grep -F -c '; purged ' "${scenario_dir}/run.err" || true)"
+  test "${purge_count}" -eq 3
+  test ! -e "${sentinel}"
+  expect_contains "${scenario_dir}/run.err" \
+    'swift package resolve failed after 3 attempts'
+}
+
+test_prewarm_success_does_not_purge() {
+  local scenario_dir artifacts_dir sentinel call_log purge_count
+  scenario_dir="$(new_scenario_dir)"
+  artifacts_dir="${scenario_dir}/cache/org.swift.swiftpm/artifacts"
+  sentinel="${artifacts_dir}/sentinel"
+  call_log="${scenario_dir}/swift-calls.log"
+  mkdir -p "${artifacts_dir}"
+  printf '%s\n' sentinel > "${sentinel}"
+  write_prewarm_fake_swift "${scenario_dir}"
+  test -e "${sentinel}"
+
+  if ! PATH="${scenario_dir}/bin:${PATH}" \
+    FAKE_SWIFT_FAIL_UNTIL=0 \
+    FAKE_SWIFT_CALL_LOG="${call_log}" \
+    SWIFTPM_ARTIFACTS_DIR="${artifacts_dir}" \
+      "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"; then
+    echo 'prewarm unexpectedly failed on the first successful resolve' >&2
+    return 1
+  fi
+
+  test "$(wc -l < "${call_log}")" -eq 1
+  purge_count="$(grep -F -c '; purged ' "${scenario_dir}/run.err" || true)"
+  test "${purge_count}" -eq 0
+  test -e "${sentinel}"
+}
+
+test_prewarm_refuses_unsafe_targets() {
+  local scenario_dir sandbox_dir sentinel call_log invalid_target
+  local invalid_targets
+  scenario_dir="$(new_scenario_dir)"
+  sandbox_dir="${scenario_dir}/sandbox"
+  sentinel="${scenario_dir}/outside-sentinel"
+  call_log="${scenario_dir}/swift-calls.log"
+  mkdir -p "${sandbox_dir}/cache/org.swift.swiftpm/artifacts"
+  printf '%s\n' outside-sentinel > "${sentinel}"
+  write_prewarm_fake_swift "${scenario_dir}"
+  test -e "${sentinel}"
+
+  invalid_targets=(
+    ''
+    relative/artifacts
+    /
+    /artifacts
+    /tmp/artifacts
+    "${sandbox_dir}/cache/org.swift.swiftpm/artifacts/../.."
+    "${sandbox_dir}/cache/org.swift.swiftpm/x"
+    # Rejected only by the ".." rule: basename, depth and parent are all fine, and
+    # canonicalization would resolve it to a legitimate directory.
+    "${sandbox_dir}/cache/org.swift.swiftpm/../org.swift.swiftpm/artifacts"
+    # Rejected only by the "parent must exist" rule.
+    "${sandbox_dir}/no-such-parent/deep/artifacts"
+    # Rejected only by the "not inside the repository" rule: bin/ci exists in every
+    # checkout, so depth, basename and parent all pass.
+    "${REPO_ROOT}/bin/ci/artifacts"
+    "${REPO_ROOT}/"
+    "//${REPO_ROOT#/}"
+  )
+  for invalid_target in "${invalid_targets[@]}"; do
+    : > "${call_log}"
+    if PATH="${scenario_dir}/bin:${PATH}" \
+      FAKE_SWIFT_FAIL_UNTIL=0 \
+      FAKE_SWIFT_CALL_LOG="${call_log}" \
+      SWIFTPM_ARTIFACTS_DIR="${invalid_target}" \
+        "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+        >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"; then
+      echo "prewarm unexpectedly accepted unsafe target ${invalid_target}" >&2
+      return 1
+    fi
+    expect_contains "${scenario_dir}/run.err" 'prewarm: refusing to purge'
+    test "$(wc -l < "${call_log}")" -eq 0
+    test -e "${sentinel}"
+  done
+
+  # Rejected only by the "must be absolute" rule: run from a directory where the
+  # relative path has a real parent and would canonicalize outside the repository.
+  mkdir -p "${sandbox_dir}/a/b"
+  : > "${call_log}"
+  if (cd "${sandbox_dir}" &&
+      PATH="${scenario_dir}/bin:${PATH}" \
+      FAKE_SWIFT_FAIL_UNTIL=0 \
+      FAKE_SWIFT_CALL_LOG="${call_log}" \
+      SWIFTPM_ARTIFACTS_DIR=a/b/artifacts \
+        "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+        >"${scenario_dir}/relative.out" 2>"${scenario_dir}/relative.err"); then
+    echo 'prewarm unexpectedly accepted a relative target' >&2
+    return 1
+  fi
+  expect_contains "${scenario_dir}/relative.err" 'prewarm: refusing to purge'
+  test "$(wc -l < "${call_log}")" -eq 0
+  test -e "${sentinel}"
+
+  : > "${call_log}"
+  if env -u SWIFTPM_ARTIFACTS_DIR \
+    PATH="${scenario_dir}/bin:${PATH}" \
+    XDG_CACHE_HOME="${REPO_ROOT}" \
+    FAKE_SWIFT_FAIL_UNTIL=0 \
+    FAKE_SWIFT_CALL_LOG="${call_log}" \
+      "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+      >"${scenario_dir}/xdg-root.out" 2>"${scenario_dir}/xdg-root.err"; then
+    echo 'prewarm unexpectedly accepted an XDG cache below the repository root' >&2
+    return 1
+  fi
+  expect_contains "${scenario_dir}/xdg-root.err" 'prewarm: refusing to purge'
+  test "$(wc -l < "${call_log}")" -eq 0
+  test -e "${sentinel}"
+  test "$(<"${sentinel}")" = outside-sentinel
+}
+
+test_prewarm_handles_path_with_space() {
+  local scenario_dir artifacts_dir sentinel call_log purge_count
+  scenario_dir="$(new_scenario_dir)"
+  artifacts_dir="${scenario_dir}/space cache/org.swift.swiftpm/artifacts"
+  sentinel="${artifacts_dir}/sentinel"
+  call_log="${scenario_dir}/swift-calls.log"
+  mkdir -p "${artifacts_dir}"
+  printf '%s\n' sentinel > "${sentinel}"
+  write_prewarm_fake_swift "${scenario_dir}"
+  test -e "${sentinel}"
+
+  if PATH="${scenario_dir}/bin:${PATH}" \
+    FAKE_SWIFT_FAIL_UNTIL=99 \
+    FAKE_SWIFT_CALL_LOG="${call_log}" \
+    SWIFTPM_ARTIFACTS_DIR="${artifacts_dir}" \
+      "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"; then
+    echo 'prewarm unexpectedly succeeded for the all-failure spaced-path scenario' >&2
+    return 1
+  fi
+
+  test "$(wc -l < "${call_log}")" -eq 3
+  purge_count="$(grep -F -c '; purged ' "${scenario_dir}/run.err" || true)"
+  test "${purge_count}" -eq 3
+  test ! -e "${sentinel}"
+  expect_contains "${scenario_dir}/run.err" "${artifacts_dir}"
+}
+
+test_run_resource_performance_prewarm_wiring() {
+  local scenario_dir wiring_excerpt
+  scenario_dir="$(new_scenario_dir)"
+  wiring_excerpt="${scenario_dir}/wiring-excerpt"
+  # This is a wiring pin, not a behavior test.
+  if ! grep -F -A2 -- '    if [ "${RESOURCE_SKIP_BUILD}" != true ]; then' \
+    "${SCRIPT_DIR}/run-resource-performance" >"${wiring_excerpt}"; then
+    echo 'run-resource-performance is missing the prewarm guard' >&2
+    return 1
+  fi
+  expect_contains "${wiring_excerpt}" \
+    'if [ "${RESOURCE_SKIP_BUILD}" != true ]; then' \
+    'bash bin/ci/prewarm-swiftpm-artifacts'
+
+  # Also a lexical pin: bash 3.2 (macOS /bin/bash) raises "unbound variable" for an
+  # empty array expansion under set -u, which would turn the purge guard's clean
+  # refusal into a crash. CI runs bash 5 on Linux, so no behavior test here can see
+  # that regression. This catches an accidental reintroduction of "${name[@]}" in
+  # prewarm-swiftpm-artifacts only; it does not detect other bash-4-only constructs.
+  # Comments are stripped first: this file's own explanation of the hazard contains
+  # the very literal being searched for.
+  if sed '/^[[:space:]]*#/d' "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" |
+      grep -F -- '[@]}'; then
+    echo 'prewarm-swiftpm-artifacts must stay free of array expansions (bash 3.2)' >&2
+    return 1
+  fi
 }
 
 test_network_performance_summary() {
@@ -1018,5 +1275,18 @@ run_scenario test_parser_rejects_malformed
 run_scenario test_summary_edge_cases
 run_scenario test_artifact_and_summary_parse_failure
 run_scenario test_missing_log_metadata
+run_scenario test_prewarm_retry_then_success
+run_scenario test_prewarm_exhausts_attempts
+run_scenario test_prewarm_success_does_not_purge
+run_scenario test_prewarm_refuses_unsafe_targets
+run_scenario test_prewarm_handles_path_with_space
+run_scenario test_run_resource_performance_prewarm_wiring
+
+expected_scenario_count=24
+if [ "${scenario_count}" -ne "${expected_scenario_count}" ]; then
+  printf 'expected %s scenarios, ran %s\n' \
+    "${expected_scenario_count}" "${scenario_count}" >&2
+  exit 1
+fi
 
 echo 'Performance CI script tests passed.'

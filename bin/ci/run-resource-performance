@@ -81,19 +81,7 @@ docker run --rm \
       : > .build/resource-performance.log
     fi
     if [ "${RESOURCE_SKIP_BUILD}" != true ]; then
-      resolve_attempt=1
-      while [ "${resolve_attempt}" -le 3 ]; do
-        if swift package resolve; then
-          break
-        fi
-        # SwiftPM does not evict an invalid archive left in this cache.
-        rm -rf /root/.cache/org.swift.swiftpm/artifacts
-        resolve_attempt=$((resolve_attempt + 1))
-      done
-      if [ "${resolve_attempt}" -gt 3 ]; then
-        echo "swift package resolve failed after 3 attempts" >&2
-        exit 1
-      fi
+      bash bin/ci/prewarm-swiftpm-artifacts
     fi
     test_arguments=(-c release)
     if [ "${RESOURCE_SKIP_BUILD}" = true ]; then

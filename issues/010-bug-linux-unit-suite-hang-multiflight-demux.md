@@ -310,3 +310,77 @@ handler が無い。最終応答を注入しないテストを書くと receive 
 3. どちらでも `sentResponseMessageIds` の 4 つの役割を先に分離すること（これを飛ばすと
    CANCEL と遅着 response が壊れる）。
 4. wire 中核なので `bin/e2e/container-samba.sh` の smoke は必須。
+
+## 進捗チェックポイント — M1 完了 (2026-09-08)
+
+ユーザーが選択肢 **A（§修正方針 1 = session 所有の単一 long-lived reader）** を選択。codex-drive で
+D1（独立 4 案）→ D2（統合）→ D3（敵対 + 発見型）→ 承認ゲート → M1 実装、と進めた。
+
+### 採用設計の要点（承認済み）
+
+- `SMBSession` が単一の `readerTask` を所有。**最初の 1 本の send 完了までは起動しない**
+  （orphan 上限 64 に対し perf fixture が 130 frame 超を preload するため。ユーザー決定 ①(a)）。
+  それ以降は **individual な send の完了に依存せず**、cancel か transport error まで生存する。
+- reader は framing だけを担当し、`transport` と `weak self` だけを捕捉（deinit cycle 回避）。
+  復号・credit grant・demux は session actor 側で、**現行の順序を維持**する。
+- `sentResponseMessageIds` を**撤去**し、`SMBPendingResponse.sendPhase` に畳む
+  （D1 の 4 案のうち、台帳を増やさない案を採用。**却下**: 4 コレクションへの分割 /
+  `SMBRequestLedger` 型の新設 / 集合を tombstone として残す案）。
+- **response 受理を `sendPhase == .sent` で gate する**（既存の穴の同時修正。下記）。
+
+### D3 で判明した重要事項
+
+- **「未送信 request への応答配送」は既存の穴**。`pendingResponses` の登録は
+  `withCheckedThrowingContinuation` の内側 (`:5638`)、`markRequestSent` は send 完了後 (`:5661`)。
+  long-lived reader は窓を広げるだけで、原因ではない。
+- **当初の回帰テスト案 (A4) は無効だった**。`initialCredits=1` + `charge=2` で park させるだけでは
+  旧構造も新構造も grant が来ずに停止し、変異で red にならない。
+  → **「queue 済みの grant を reader が消費する」刺激**に変える（M4）。
+- **複雑性の主張を訂正**: 参照数は `sentResponseMessageIds` 11 ≒ `sendPhase` 11 で読む複雑性は
+  減らない。減るのは「**同期すべきデータ構造が 2 → 1**」だけ。CANCEL 判定は O(1) → 2 段参照、
+  count 観測は O(1) → O(n) に悪化する。
+
+D3 が出した改訂 13 件は `[D2 v2]` として設計に反映済み（設計ファイルは `tmp/` なので、
+実装時に効く項目は各マイルストーンの本文へ移す）。
+
+### M1: characterization（完了・production 変更なし）
+
+`Tests/SMBeeTests/SMBeeWireCharacterizationTests.swift`（新規 657 行）。
+**assert は protocol 観測可能な値だけ**（decode した outbound ヘッダと continuation の結末）。
+内部 count は M2 で意味が変わるため使わない。
+
+| # | 固定した意味論 | 変異 | 結果 |
+|---|---|---|---|
+| 1 | send 完了前の cancel は wire に CANCEL を出さない | `guard wasSent` を外す | **red** |
+| 2 | sync CANCEL は TreeId 0・MessageId 一致 | TreeId を非 0 に | **red** |
+| 3 | interim 後の cancel は AsyncId 付き async CANCEL | 常に sync 形式に | **red** |
+| 4 | cancel 後の遅着 final で二重 resume しない | 遅着分岐を殺す | **GREEN（観測不能）** |
+| 5 | interim では resume せず final で一度だけ | interim を final 扱いに | **red** |
+| 6 | **send 完了前に届いた future response が replay される** | orphan への投入を消す | **red** |
+
+- baseline green / 各変異後 red / 復元後 green / `Sources/` 差分ゼロ を **Claude が素の環境で実測**
+  （codex は `--disable-sandbox` でしか回せないため、その報告は主張として扱い再実行した）。
+- **#6 は最初 GREEN だった**。orphan queue は `markRequestSent` (`:6013`) で**消費される**
+  （send 完了時にその messageId 宛の先着 frame を replay する）のに、テストが
+  「二度と使われない未知の messageId」を使っていて的が外れていた。書き直して red になった。
+- **#4 は protocol 観測不能**と確定。遅着分岐を殺しても frame が orphan に入るだけで、
+  replay もされず resume もされない。**残るのはメモリ衛生の差だけ**で wire にも呼び出し側にも出ない。
+  観測 API は存在せず、追加は production への test seam になるので採らない。
+  → 受け入れ条件を「6/6 red」から「**5/6 red + 1 件は観測不能と記録**」へ修正した。
+  tombstone のメモリ衛生は M3/M4（reader lifecycle で orphan 圧力が観測可能になる段）で扱う。
+
+### 次のマイルストーン
+
+| # | 内容 | 状態 |
+|---|---|---|
+| M1 | characterization | **完了** |
+| M2 | `sendPhase` 導入・`sentResponseMessageIds` 撤去（reader は現行のまま） | 未着手 |
+| M3 | long-lived reader 導入（生存条件の切断・weak 捕捉・generation・close/deinit） | 未着手 |
+| M4 | transport 契約 + fixture 移行 + credit 循環の回帰テスト | 未着手 |
+| M5 | 全体検証（macOS / Linux / E2E smoke / verify-agent-push） | 未着手 |
+
+M2 で最初に触るべき箇所（D3 + Claude の実測）: `pendingResponses` に tombstone を混在させると
+意味が変わる **5 箇所** — `:5471` `:5480` `:5488` `:5515`（count ベースの待機・観測）と
+**`:6117`（`failAllPendingResponses` の走査元。tombstone を resume すると二重 resume）**。
+加えて `:6117` は tombstone の `sendTask` を cancel する必要がある（`continue` で skip すると
+blocked send が残る）。

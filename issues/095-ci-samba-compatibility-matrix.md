@@ -1,5 +1,7 @@
 # 004 ci: Samba compatibility matrix を導入する
 
+> **旧番号 004**: 本 issue は元は `004-ci-samba-compatibility-matrix.md` だった。`004` が 3 ファイルで衝突していたため 095 へ寄せた (2026-09-08)。過去のメモで「issue 004」が Samba 互換性マトリクスの話ならこの issue。
+
 状態: **実装済み。初回 CI 実行結果待ち**
 起票: 2026-06-30
 関連: `.github/workflows/e2e.yml` / `test/e2e/smb.conf` / `Tests/SMBeeTests/SMBeeE2ETests.swift`

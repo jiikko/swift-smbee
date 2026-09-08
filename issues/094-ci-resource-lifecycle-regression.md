@@ -1,5 +1,7 @@
 # 004 ci: リソースライフサイクル退行を静的lintと実行時contractで検出する
 
+> **旧番号 004**: 本 issue は元は `004-ci-resource-lifecycle-regression.md` だった。`004` が 3 ファイルで衝突していたため 094 へ寄せた (2026-09-08)。過去のメモで「issue 004」が resource lifecycle の話ならこの issue。
+
 状態: **open**
 起票: 2026-06-30
 関連: `.github/workflows/ci.yml` / `Tests/SMBeeTests` / `Sources/SMBee/POSIXSocketTransport.swift` / `Sources/SMBee/SMBClient.swift`

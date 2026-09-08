@@ -1,5 +1,7 @@
 # smbcli `--json` × recursive 出力の汚染・欠落
 
+> **旧番号 010**: 本 issue は元は `010-cli-json-recursive-output.md` だった。`010` が Linux ユニット hang の issue と衝突していたため、参照の少ない本 issue を 093 へ寄せた (2026-09-08)。過去のメモで「issue 010」が CLI の JSON 出力の話ならこの issue。
+
 - 種別: bug (CLI machine-readable output)
 - 発見: 2026-07-03 サブエージェントレビュー → main agent で code 裏取り済み。codex レビューは usage limit のため未実施 (要: 後日 codex-review)
 

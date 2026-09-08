@@ -674,10 +674,13 @@ final class SMBeeE2ETests: XCTestCase {
         let username = environment["SMBEE_E2E_USERNAME"] ?? "smbee"
         let password = environment["SMBEE_E2E_PASSWORD"] ?? "smbee"
         let share = environment["SMBEE_E2E_SHARE"] ?? "public"
-        let path = environment["SMBEE_E2E_LARGE_PATH"] ?? "large-4gib-plus.bin"
+        let defaultLargePath = "large-4gib-plus.bin"
+        let path = environment["SMBEE_E2E_LARGE_PATH"] ?? defaultLargePath
         let credential = SMBCredential(username: username, password: password)
         let boundary = UInt64(UInt32.max)
-        // Keep these sentinel offsets and bytes in sync with the fixture scripts.
+        // Keep these sentinel offsets and bytes in sync with test/e2e/container-init.sh.
+        // Keep these Swift-side literals handwritten and independent from the producer so
+        // the test retains an independent oracle; do not derive them from that script.
         // Both fixture sentinels share the same 4,096-byte length.
         // Fixture contract: the file must be all-zero sparse EXCEPT the two sentinel
         // windows below. A fixture supplied via SMBEE_E2E_LARGE_PATH must satisfy the
@@ -699,6 +702,18 @@ final class SMBeeE2ETests: XCTestCase {
         let stat = try await SMBee.stat(
             host: host, port: port, credential: credential, share: share, path: path
         )
+        // Exact size is only contractual for the fixture created by
+        // test/e2e/container-init.sh; a caller-supplied fixture only has to satisfy
+        // the sparse/sentinel contract documented above. Keyed on the resolved path,
+        // not on SMBEE_E2E_LARGE_PATH being unset: passing the default name through
+        // that variable must not opt out of the size check.
+        if path == defaultLargePath {
+            XCTAssertEqual(
+                stat.size,
+                4_296_998_912,
+                "default fixture size drifted from test/e2e/container-init.sh (truncate -s)"
+            )
+        }
         XCTAssertGreaterThanOrEqual(stat.size, boundary + 1)
         for range in ranges {
             let data = try await SMBee.read(

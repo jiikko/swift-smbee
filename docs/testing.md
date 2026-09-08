@@ -89,6 +89,7 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 
 macOS で CI の E2E に近い条件を再現する場合は Apple の `container` CLI を使う。
 この repo では `bin/e2e/container-samba.sh` が次をまとめて実行する。
+コンテナ内の init 本文の正本は `test/e2e/container-init.sh` で、CI (`test/e2e/start-samba-ci.sh`) とローカルの両方がこれを読み込む。
 
 1. `ubuntu:24.04` コンテナを起動し、`apt-get install samba` で CI と同じ distro Samba を入れる。
 2. `test/e2e/smb/smb302-encrypted-required.conf` を `/etc/samba/smb.conf` に配置する。

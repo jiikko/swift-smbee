@@ -1,5 +1,16 @@
 #!/usr/bin/env bash
+unset CDPATH
 set -euxo pipefail
+
+# Resolve paths from the script location, not from ${PWD}: the container init body
+# and the Samba config both live in the repo, and every caller used to have to be
+# standing in the repo root. BASH_SOURCE is not symlink-resolved, so invoking this
+# script through a symlink or process substitution derives the wrong REPO_ROOT — that
+# fails loudly on the config/init existence checks below rather than starting a wrong
+# container, so it is left unsupported instead of carrying symlink-resolution code.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${REPO_ROOT}"
 
 SAMBA_CONTAINER="${SAMBA_CONTAINER:-smbee-samba}"
 SAMBA_BASE_IMAGE="${SAMBA_BASE_IMAGE:-ubuntu:24.04}"
@@ -12,41 +23,41 @@ if [[ ! -f "${SAMBA_CONFIG}" ]]; then
   exit 1
 fi
 
+# An absolute SAMBA_CONFIG must not get REPO_ROOT prefixed onto it.
+case "${SAMBA_CONFIG}" in
+  /*) SAMBA_CONFIG_PATH="${SAMBA_CONFIG}" ;;
+  *)  SAMBA_CONFIG_PATH="${REPO_ROOT}/${SAMBA_CONFIG}" ;;
+esac
+
+CONTAINER_INIT_PATH="${REPO_ROOT}/test/e2e/container-init.sh"
+if [[ ! -f "${CONTAINER_INIT_PATH}" || ! -r "${CONTAINER_INIT_PATH}" ]]; then
+  printf 'Container init payload is missing or unreadable: %s\n' "${CONTAINER_INIT_PATH}" >&2
+  exit 1
+fi
+if ! CONTAINER_INIT="$(<"${CONTAINER_INIT_PATH}")"; then
+  printf 'Failed to read container init payload: %s\n' "${CONTAINER_INIT_PATH}" >&2
+  exit 1
+fi
+if [[ -z "${CONTAINER_INIT}" ]]; then
+  printf 'Container init payload is empty: %s\n' "${CONTAINER_INIT_PATH}" >&2
+  exit 1
+fi
+# Threat model: catch an empty / truncated / stale fragment (a container that starts
+# and exits silently is the expensive failure). This does NOT defend against a
+# deliberately crafted payload — anyone who can edit the file can run anything.
+if ! grep -qE '^[[:space:]]*exec smbd' "${CONTAINER_INIT_PATH}"; then
+  printf 'Container init payload must end in an "exec smbd" command: %s\n' "${CONTAINER_INIT_PATH}" >&2
+  exit 1
+fi
+
 # Make reruns on the same runner idempotent. GitHub-hosted runners are normally
 # fresh, but local reproduction and self-hosted runners benefit from cleanup.
 docker rm -f "${SAMBA_CONTAINER}" >/dev/null 2>&1 || true
 
 docker run -d --name "${SAMBA_CONTAINER}" -p "${SMBEE_E2E_PORT}:445" \
-  -v "${PWD}/${SAMBA_CONFIG}:/tmp/smbee-smb.conf:ro" \
+  -v "${SAMBA_CONFIG_PATH}:/tmp/smbee-smb.conf:ro" \
   "${SAMBA_BASE_IMAGE}" \
-  bash -lc '
-    set -euxo pipefail
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends samba
-    # smb.conf を /etc/samba にbind-mountすると samba-common の postinst が
-    # read-only ファイルに書けず失敗するため、install 後に書き込み可能な場所へ cp する。
-    cp /tmp/smbee-smb.conf /etc/samba/smb.conf
-    mkdir -p /srv/smbee/public
-    mkdir -p /srv/smbee/dfsroot
-    useradd -M -s /usr/sbin/nologin smbee
-    printf "smbee\nsmbee\n" | smbpasswd -a -s smbee
-    printf "hello from SMBee E2E\n" > /srv/smbee/public/known.txt
-    # Samba msdfs links are symlinks whose target uses the msdfs: prefix.
-    ln -s "msdfs:127.0.0.1\\public" /srv/smbee/dfsroot/public-link
-    ln -s "msdfs:127.0.0.1\\dfsroot\\public-link" /srv/smbee/dfsroot/chain-link
-    ln -s "msdfs:127.0.0.1\\dfsroot\\loop-b" /srv/smbee/dfsroot/loop-a
-    ln -s "msdfs:127.0.0.1\\dfsroot\\loop-a" /srv/smbee/dfsroot/loop-b
-    # Sparse size = (UInt32.max - 64KiB) + 2MiB + 1 byte of end headroom.
-    truncate -s 4296998912 /srv/smbee/public/large-4gib-plus.bin
-    # Non-zero sentinel after 4GiB detects READ offset wrap to UInt32.
-    dd if=/dev/zero bs=4096 count=1 iflag=fullblock status=none | LC_ALL=C tr "\\0" "\\245" | dd of=/srv/smbee/public/large-4gib-plus.bin bs=4096 seek=1048588 count=1 conv=notrunc iflag=fullblock status=none
-    # 2 個目以降の READ offset の wrap 検出用（第 1 sentinel は最初の chunk 内に収まるため）。
-    dd if=/dev/zero bs=4096 count=1 iflag=fullblock status=none | LC_ALL=C tr "\\0" "\\132" | dd of=/srv/smbee/public/large-4gib-plus.bin bs=4096 seek=1048817 count=1 conv=notrunc iflag=fullblock status=none
-    chown -R smbee:smbee /srv/smbee
-    smbd --version
-    testparm -s
-    exec smbd --foreground --no-process-group --debug-stdout --debuglevel=3
-  '
+  bash -lc "${CONTAINER_INIT}"
 
 for _ in $(seq 1 120); do
   if (exec 3<>"/dev/tcp/${SMBEE_E2E_HOST}/${SMBEE_E2E_PORT}") 2>/dev/null; then

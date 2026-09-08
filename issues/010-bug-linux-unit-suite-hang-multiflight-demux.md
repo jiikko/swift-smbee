@@ -232,3 +232,81 @@ credit waiter / 登録済み未送信 pending という別クラスの待ち手�
   doc + 可能なら custom lint で明示。
 - 「continuation を登録する箇所は、全終端経路で resume されることを保証する」不変条件を
   `SMBClient` / `SMB2CreditWindow` の該当箇所にコメントで残す (実装で強制できない設計契約)。
+
+## 現況監査 (2026-09-08) — 本文の 3 点を訂正する
+
+codex 3 観点 (read-only) + Claude の裏取りによる監査。**本 issue の記述に誤りが 3 点あった**。
+
+### 訂正 1: 主仮説 A は、観測された hang を説明していない
+
+本文は `testConcurrentReadChunksDemuxOutOfOrderResponses` を「有力な主因」としていたが、
+CI アーカイブログの全数勘定（[`013`](waiting/013-linux-ci-intermittent-hang.md) の「全数勘定」節）では:
+
+- hang した 8 job のうち、そのテストに**到達した job は 0 件**（実行はアルファベット順で
+  `ChangeNotify…` < `ConcurrentRead…`）。
+- 同じ run (28601793534) の **macOS job では当該テストが pass している**。
+
+A は「論理は妥当だが Linux 実機で未確認」と本文自身が但し書きしていたとおり、**未確認のまま**で、
+かつ**観測はこれを支持しない**。テスト側の修正 (2026-07-03) 自体は正しい修正なので取り消さないが、
+**hang の原因として扱わない**。
+
+### 訂正 2: §B の「credit waiter が resume されない」は既に解消済み
+
+本文 §B は `SMB2CreditWindow.reserve` が `CheckedContinuation<UInt32, Never>` で
+「fail 不能・teardown で leak」と書いているが、現コードでは:
+
+- `reserve` は throwing + cancellation 対応済み（`SMB2Header.swift:249`）
+- `failAllWaiters` が在り、`failAllPendingResponses` / `closeTransport` から drain される
+  （`SMB2Header.swift:303` / `SMBClient.swift:6116`）
+- request timeout も既定 60s で入っている
+
+「対応状況 (2026-07-03)」節が ✅ を付けているとおりで、**§B の本文だけが古いまま残っていた**。
+現行コードに対する runtime の発火条件は無い。
+
+### 訂正 3: §修正方針 1 の見積もりが小さすぎる（60-80 LOC → 250-350 LOC）
+
+§1 が未着手であること自体は事実（`receiveTask` は存在せず、`connect()` は reader を所有せず、
+`closeTransport()` は reader を cancel せず、`deinit` も無い。`receiveLoopRunning` /
+`startReceiveLoopIfNeeded` / `while !sentResponseMessageIds.isEmpty` は現存する）。
+しかし規模の見積もりが実態と合っていない。
+
+- **`sentResponseMessageIds` は単なる loop の生存フラグではない**（`SMBClient.swift:4051` /
+  `:5990`）。cancel 済み request の遅着 response 判定・CANCEL の可否判定・tombstone・
+  テストの計測にも使われている。**「自己終了ループの撤去」で素朴に消すと CANCEL と
+  遅着 response の意味論が壊れる**。ここが本文の最大の見落とし。
+- reader task の所有・close / cancel・transport の receive 中断・`Task { await self.receiveLoop() }`
+  の self 強捕捉と cycle 回避まで含めると **全体で ~250-350 LOC**。
+- **既存テストへの影響が広い**: `InMemoryTransport` を「空なら close まで block」に一律変更すると、
+  drain 後の EOF / `connectionClosed` を期待する **4 テスト**が壊れる。`ControlledReceiveTransport`
+  の利用 26 件、performance suite 7 件 / 9 sites も影響範囲。opt-in flag か明示 close が要る。
+
+### 代替 A の再評価: 「非推奨」を撤回して短期の選択肢に戻す
+
+本文は代替 A（自己終了ループを残し、生存条件を pending / credit waiter へ拡張）を
+「cross-actor predicate で racy・非推奨」としていた。監査の結論は**短期策としては実用的**:
+
+- **pending は send の前に登録される**ので、「pending 登録直後に reader を起動し、pending が
+  ある間 reader を生存させる」だけで、credit 待ちの sendTask が grant を受けられるようになる。
+  §B の循環待ち（send → receive → credit → send）はこれで切れる。
+- 残る未解決は reader task の所有・close・任意 transport の cancellation 契約で、これは §1 と共通。
+
+つまり **§1 は「正しい構造」だが、循環待ちを切るだけなら代替 A で足りる**。どちらを採るかは
+「今 hang を止めたいのか / 構造を直したいのか」で決める。
+
+### この監査で新たに見つかったもの
+
+`ControlledReceiveTransport.receive(maxLength:)`（`SMBeeTests.swift:1068`）に cancellation
+handler が無い。最終応答を注入しないテストを書くと receive continuation が永久 pending になる。
+現行テストは応答を注入しているので発火しない。詳細は [`013`](waiting/013-linux-ci-intermittent-hang.md)。
+
+### 着手手順の更新
+
+本文の「着手手順 1（まず A を Linux 実機で確定）」は**不要になった**。A は観測で否定された。
+代わりに:
+
+1. **hang の再現を待つか、待たずに構造を直すかを決める**（[`013`](waiting/013-linux-ci-intermittent-hang.md) は
+   `waiting/` へ移した。真因は未確定）。
+2. 構造を直すなら **§1 か 代替 A のどちらかを選ぶ**（上の再評価を根拠に）。
+3. どちらでも `sentResponseMessageIds` の 4 つの役割を先に分離すること（これを飛ばすと
+   CANCEL と遅着 response が壊れる）。
+4. wire 中核なので `bin/e2e/container-samba.sh` の smoke は必須。

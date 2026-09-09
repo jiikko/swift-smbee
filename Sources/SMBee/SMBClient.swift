@@ -3974,6 +3974,12 @@ private enum SMBRequestTimeoutPolicy: Sendable {
     }
 }
 
+private enum SMBPendingResponseSendPhase {
+    case registered
+    case sending
+    case sent
+}
+
 private struct SMBPendingResponse {
     let label: String
     let longPoll: Bool
@@ -3988,7 +3994,7 @@ private struct SMBPendingResponse {
     let continuation: CheckedContinuation<SMBReceivedFrame, Error>
     var sendTask: Task<Void, Never>?
     var timeoutTask: Task<Void, Never>?
-    var sendStarted = false
+    var sendPhase: SMBPendingResponseSendPhase
     var cancellationRequested = false
     var continuationResumed = false
 }
@@ -4048,7 +4054,6 @@ actor SMBSession {
     private let initialCredits: UInt32
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
     private var pendingCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
-    private var sentResponseMessageIds: Set<UInt64> = []
     private var orphanResponses: [UInt64: SMBReceivedFrame] = [:]
     private static let maxOrphanResponses = 64
     private var receiveLoopRunning = false
@@ -5446,7 +5451,7 @@ actor SMBSession {
                 continuation: continuation,
                 sendTask: nil,
                 timeoutTask: nil,
-                sendStarted: false,
+                sendPhase: .registered,
                 cancellationRequested: false,
                 continuationResumed: false
             )
@@ -5468,7 +5473,7 @@ actor SMBSession {
 
     func waitForPendingCountForTesting(atLeast count: Int) async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            if pendingResponses.count >= count {
+            if pendingResponses.values.filter({ !$0.continuationResumed }).count >= count {
                 continuation.resume()
             } else {
                 pendingCountWaiters.append((count, continuation))
@@ -5477,15 +5482,19 @@ actor SMBSession {
     }
 
     func pendingCountForTesting() -> Int {
-        pendingResponses.count
+        pendingResponses.values.filter { !$0.continuationResumed }.count
     }
 
     func sentPendingResponseCountForTesting() -> Int {
-        sentResponseMessageIds.count
+        pendingResponses.values.filter {
+            !$0.continuationResumed && $0.sendPhase == .sent
+        }.count
     }
 
     func requestTimeoutTaskCountForTesting() -> Int {
-        pendingResponses.values.filter { $0.timeoutTask != nil }.count
+        pendingResponses.values.filter {
+            !$0.continuationResumed && $0.timeoutTask != nil
+        }.count
     }
 
     func requestSentCountForTesting() -> Int {
@@ -5512,7 +5521,7 @@ actor SMBSession {
         var ready: [CheckedContinuation<Void, Never>] = []
         var pending: [(Int, CheckedContinuation<Void, Never>)] = []
         for (target, continuation) in pendingCountWaiters {
-            if pendingResponses.count >= target {
+            if pendingResponses.values.filter({ !$0.continuationResumed }).count >= target {
                 ready.append(continuation)
             } else {
                 pending.append((target, continuation))
@@ -5645,7 +5654,7 @@ actor SMBSession {
                 continuation: continuation,
                 sendTask: nil,
                 timeoutTask: nil,
-                sendStarted: false,
+                sendPhase: .registered,
                 cancellationRequested: false,
                 continuationResumed: false
             )
@@ -5854,7 +5863,7 @@ actor SMBSession {
     }
 
     private func receiveLoop() async {
-        while !sentResponseMessageIds.isEmpty {
+        while pendingResponses.values.contains(where: { $0.sendPhase == .sent }) {
             do {
                 try Task.checkCancellation()
                 let frame = try await receiveDecryptedFrame(label: "SMB response")
@@ -5882,16 +5891,6 @@ actor SMBSession {
             return
         }
         guard var pending = pendingResponses[header.messageId] else {
-            if sentResponseMessageIds.contains(header.messageId) {
-                // A cancelled request still owns its wire response until the final frame.
-                if try SMB2AsyncInterim.isInterim(header) {
-                    debugLine("ignoring interim response for cancelled message id \(header.messageId)")
-                    return
-                }
-                sentResponseMessageIds.remove(header.messageId)
-                debugLine("completed cancelled SMB response message id \(header.messageId)")
-                return
-            }
             // Bound the orphan queue: spurious/duplicate server responses whose messageId is
             // never claimed by markRequestSent would otherwise accumulate for the whole
             // session lifetime (issues/012). Dropping the oldest is safe — a legitimate
@@ -5969,7 +5968,6 @@ actor SMBSession {
             }
         }
         pendingResponses.removeValue(forKey: header.messageId)
-        sentResponseMessageIds.remove(header.messageId)
         pending.timeoutTask?.cancel()
         if !pending.continuationResumed {
             pending.continuationResumed = true
@@ -5981,7 +5979,7 @@ actor SMBSession {
         guard var pending = pendingResponses[messageId] else {
             return false
         }
-        pending.sendStarted = true
+        pending.sendPhase = .sending
         pendingResponses[messageId] = pending
         return true
     }
@@ -5992,11 +5990,10 @@ actor SMBSession {
             return nil
         }
         requestSentCountForTestingStorage += 1
-        sentResponseMessageIds.insert(messageId)
+        pending.sendPhase = .sent
         if pending.cancellationRequested {
             // Keep the cancellation tombstone: a later interim must still be able to
             // store its AsyncId so the final response can be correlated (issues/078).
-            pendingResponses[messageId] = pending
         } else if pending.requestTimeoutPolicy.isEligible, let requestTimeout {
             let command = pending.expectedCommand
             pending.timeoutTask = Task { [weak self] in
@@ -6008,8 +6005,8 @@ actor SMBSession {
                     return
                 }
             }
-            pendingResponses[messageId] = pending
         }
+        pendingResponses[messageId] = pending
         if let orphan = orphanResponses.removeValue(forKey: messageId) {
             do {
                 try dispatchReceivedPacket(orphan)
@@ -6021,7 +6018,8 @@ actor SMBSession {
         startReceiveLoopIfNeeded()
         // An orphan can be the final response. In that case dispatchReceivedPacket
         // already consumed it, so there is no wire request left to cancel.
-        guard pending.cancellationRequested, sentResponseMessageIds.contains(messageId) else {
+        guard pending.cancellationRequested,
+              pendingResponses[messageId]?.sendPhase == .sent else {
             return nil
         }
         if let asyncId = pendingResponses[messageId]?.asyncId {
@@ -6040,7 +6038,7 @@ actor SMBSession {
         pending.continuationResumed = true
         SMBPerfLog.line(
             "[wire] request_timeout session=\(diagnosticSessionId) message_id=\(messageId) " +
-                "command=\(command) send_started=\(pending.sendStarted ? 1 : 0)"
+                "command=\(command) send_started=\(pending.sendPhase == .registered ? 0 : 1)"
         )
         pending.continuation.resume(throwing: SMBTransportError.timedOut)
         // A timed-out sent MessageId cannot be abandoned while the connection remains usable:
@@ -6060,7 +6058,6 @@ actor SMBSession {
         pending.timeoutTask?.cancel()
         pending.timeoutTask = nil
         pendingResponses.removeValue(forKey: messageId)
-        sentResponseMessageIds.remove(messageId)
         if pending.continuationResumed {
             debugLine("drained cancelled request after async correlation violation: \(reason)")
             return
@@ -6073,7 +6070,7 @@ actor SMBSession {
         guard var pending = pendingResponses[messageId] else { return }
         pending.timeoutTask?.cancel()
         pending.timeoutTask = nil
-        if pending.sendStarted {
+        if pending.sendPhase != .registered {
             if error is CancellationError {
                 pending.cancellationRequested = true
                 pendingResponses[messageId] = pending
@@ -6084,12 +6081,12 @@ actor SMBSession {
             pendingResponses.removeValue(forKey: messageId)
             pending.sendTask?.cancel()
         }
-        // Cancel releases pending state, but the wire response is unfinished — retain
-        // sentResponseMessageIds until its final response so credit grants remain observable.
+        // Cancellation releases the caller but the wire response is unfinished — retain the
+        // same record until its final response so it can keep correlating late frames.
         if !pending.continuationResumed {
             pending.continuationResumed = true
             pending.continuation.resume(throwing: error)
-            if pending.sendStarted, pending.cancellationRequested {
+            if pending.sendPhase != .registered, pending.cancellationRequested {
                 pendingResponses[messageId] = pending
             }
         }
@@ -6103,7 +6100,7 @@ actor SMBSession {
     /// make an already-decided sync CANCEL stale on the wire. That is harmless: servers
     /// fall back to MessageId lookup for sync CANCEL (MS-SMB2 §3.3.5.16).
     private func cancelInFlightRequest(messageId: UInt64) -> SMB2Cancel.Target? {
-        let wasSent = sentResponseMessageIds.contains(messageId)
+        let wasSent = pendingResponses[messageId]?.sendPhase == .sent
         let asyncId = pendingResponses[messageId]?.asyncId
         failPendingResponse(messageId: messageId, error: CancellationError())
         guard wasSent else { return nil }
@@ -6115,21 +6112,26 @@ actor SMBSession {
 
     private func failAllPendingResponses(error: Error) {
         let pending = pendingResponses
+        let livePending = pending.filter { !$0.value.continuationResumed }
         if SMBPerfLog.effectiveIsEnabled {
-            let resumed = pending.values.filter(\.continuationResumed).count
-            let details = pending.sorted { $0.key < $1.key }.prefix(16).map {
+            let details = livePending.sorted { $0.key < $1.key }.prefix(16).map {
                 "\($0.key):\($0.value.expectedCommand):\($0.value.continuationResumed ? 1 : 0)"
             }
-            let remaining = pending.count - details.count
+            let remaining = livePending.count - details.count
             let detail = details.joined(separator: ",") + (remaining > 0 ? ",(+\(remaining) more)" : "")
-            SMBPerfLog.line("[wire] victim session=\(diagnosticSessionId) count=\(pending.count) resumed=\(resumed) pending=\(pending.count - resumed) detail=\(detail)")
+            // `resumed` counts cancellation tombstones (already-resumed records kept for
+            // late-frame correlation). Losing that number makes a post-mortem unable to tell
+            // "no victims" from "all victims were already cancelled".
+            let resumed = pending.count - livePending.count
+            SMBPerfLog.line("[wire] victim session=\(diagnosticSessionId) count=\(pending.count) resumed=\(resumed) pending=\(livePending.count) detail=\(detail)")
         }
         pendingResponses.removeAll()
-        sentResponseMessageIds.removeAll()
         orphanResponses.removeAll()
         for var waiter in pending.values {
             waiter.timeoutTask?.cancel()
-            waiter.timeoutTask = nil
+            // A cancelled tombstone may still own a blocked send task. It must be cancelled
+            // even though its continuation has already been resumed.
+            waiter.sendTask?.cancel()
             // A cancellation tombstone may have already resumed its continuation;
             // wire failure must not resume it a second time.
             if waiter.continuationResumed { continue }
@@ -6138,7 +6140,6 @@ actor SMBSession {
             // declared the shared wire dead. Cancelling a send that already started
             // is therefore safe: the transport/socket is being torn down as a unit,
             // and it prevents a blocked send task from surviving session failure.
-            waiter.sendTask?.cancel()
             waiter.continuation.resume(throwing: error)
         }
         // Credit waiters are only ever resumed by grants from received responses; once the

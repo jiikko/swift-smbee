@@ -384,3 +384,52 @@ M2 で最初に触るべき箇所（D3 + Claude の実測）: `pendingResponses`
 **`:6117`（`failAllPendingResponses` の走査元。tombstone を resume すると二重 resume）**。
 加えて `:6117` は tombstone の `sendTask` を cancel する必要がある（`continue` で skip すると
 blocked send が残る）。
+
+### M2: `sendPhase` 導入・`sentResponseMessageIds` 撤去（完了・2026-09-09）
+
+**挙動を変えない純粋なリファクタに限定した。** D2 v2 の改訂 1（response 受理を `sendPhase == .sent` で
+gate する = 既存バグの修正）は **M2b へ分離**した（挙動変更を混ぜると、テストが落ちたときに
+「リファクタの誤り」か「意図した挙動変更」かの帰属が付かなくなるため）。
+
+production の diff は **41 追加 / 40 削除**（`SMBClient.swift` のみ）。台帳が減ったので純減に近い。
+
+| 旧 `sentResponseMessageIds` の参照 | 移行先 |
+|---|---|
+| 生存条件 `:5857` | `pendingResponses.values.contains { $0.sendPhase == .sent }`（**M3 でここを外す**） |
+| 遅着判定 `:5885` `:5891` | tombstone が `pendingResponses` に残るので通常経路で処理 |
+| CANCEL 可否 `:6024` `:6106` | `sendPhase == .sent` |
+| 計測 `:5484` | `.sent && !continuationResumed` の projection |
+| teardown `:6128` | 撤去 |
+
+**tombstone 混在で意味が変わる 5 箇所を live-only に直した**（`:5471` `:5480` `:5488` `:5515` `:6117`）。
+特に `:6117` は `sendTask?.cancel()` を `continue` の**前**へ移し、D3 敵対レビューが指摘した
+「cancel 済み tombstone の blocked な sendTask が close 後も残る」を塞いだ。
+
+`sendStarted` は**置換**（残して二重管理にしていない）。
+
+#### 検証（すべて Claude が素の環境で実測）
+
+- `swift build` rc=0 / `swift test` rc=0 — **468 tests / 37 skipped / 0 failures**
+- **M1 のテストファイルは 1 行も変更していない**（移行前後で不変であるべき contract。
+  触っていたら移行が挙動を変えた証拠になる）
+- 変異検証 3 本すべて red → 復元後 green:
+
+| 変異 | 結果 |
+|---|---|
+| MutA `failAllPendingResponses` の二重 resume ガードを外す | **red**（`testClosingAfterSentCancellationDoesNotResumeTombstoneTwice` が `SWIFT TASK CONTINUATION MISUSE` で trap。予測と一致） |
+| MutB tombstone の `sendTask` を cancel しない | **red** |
+| MutC 生存条件を `.sent` 以外も数える形に壊す（Claude が追加） | **red** |
+
+🚨 **codex は「全体で 7 failures、既存の network 系」と報告したが、素の環境では 0 failures**
+だった。sandbox（`--disable-sandbox` + loopback bind 失敗）由来の偽赤で、報告を鵜呑みにせず
+回し直す規律がそのまま効いた事例。
+
+#### diff 精読で見つけた、報告に無い挙動差 2 件
+
+1. **遅着 frame の行き先が変わる**。`pendingResponses` から除去済みだが旧 Set には残っていた
+   messageId（timeout / send 失敗の経路）宛の遅着 frame は、旧実装では**捨てられ**ていたが、
+   新実装では `orphanResponses` へ積まれる。上限 64 + eviction で bounded なので受容する。
+   Mut4 と同じ「protocol 観測不能なメモリ衛生」の類で、M1 では原理的に捕まらない。
+2. **診断ログの後退（修正済み）**。`[wire] victim` 行が `resumed=0` 固定になり tombstone 件数が
+   見えなくなっていた。「victim なし」と「victim は全部 cancel 済みだった」を事後解析で
+   区別できなくなるので、`resumed` を復元した。

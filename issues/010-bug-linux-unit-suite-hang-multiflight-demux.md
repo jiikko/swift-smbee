@@ -433,3 +433,98 @@ production の diff は **41 追加 / 40 削除**（`SMBClient.swift` のみ）�
 2. **診断ログの後退（修正済み）**。`[wire] victim` 行が `resumed=0` 固定になり tombstone 件数が
    見えなくなっていた。「victim なし」と「victim は全部 cancel 済みだった」を事後解析で
    区別できなくなるので、`resumed` を復元した。
+
+## 🔁 引き継ぎ（2026-09-09 時点。再起動・別セッション・別マシン向け）
+
+### いまの状態
+
+| 項目 | 状態 |
+|---|---|
+| ローカル commit | `7923d76`（M1）/ `178229f`（M2）。**どちらも未 push** |
+| working tree | clean |
+| 親 repo (`my-products`) の submodule 参照 | **未 bump**（submodule を push してからでないと bump してはいけない） |
+| pre-push フック | 有効化済み（`git config core.hooksPath bin/hooks`）。M2 が wire を触ったので **push には smoke が要る** |
+| Apple `container` | 初回セットアップ済み・running（`bin/e2e/container-samba.sh` が回せる） |
+
+### 再開手順
+
+```sh
+cd lib/swift-smbee
+git log --oneline -3          # 7923d76 (M1) / 178229f (M2) があるか
+swift build && swift test     # 468 tests / 37 skipped / 0 failures が baseline
+make smoke                    # wire を触ったので push 前に必須
+git push origin master
+bin/ci/verify-agent-push <full-sha>
+# submodule を push してから親の参照を bump する
+```
+
+**設計ファイル `tmp/d010/codex-drive-design.md` は gitignore なので git には無い。**
+残りのマイルストーンに要る判断は以下に全部写してあるので、無くても再開できる。
+
+### 残りのマイルストーン（D2 v2 の改訂 13 件を割り付け済み）
+
+#### M2b — response 受理を `sendPhase == .sent` で gate する（既存バグの修正）
+
+`SMBClient.swift:5884` の `guard var pending = pendingResponses[header.messageId]` は
+**record の存在だけで応答を受理する**。pending の登録は `withCheckedThrowingContinuation` の
+内側 (`:5638`)、`markRequestSent` は send 完了後 (`:5661`) なので、**wire に出ていない request へ
+応答が配送されうる**。これは**既存の穴**（long-lived reader が作るものではなく、窓を広げるだけ）。
+
+- 受理条件に `sendPhase == .sent` を足し、未送信 id 宛の frame は `orphanResponses` へ回す
+  （`markRequestSent` が replay するので失われない。M1 のテスト 6 がその経路を固定済み）
+- 変異: gate を外す → 新テストが red になること
+
+#### M3 — long-lived reader の導入（**生存条件の切断が本題**）
+
+- `readerTask: Task<Void, Never>?` と `readerGeneration` を session が所有する
+- **起動**: 最初の 1 本の send 完了まで待つ（ユーザー決定 ①(a)。perf fixture が 130 frame 超を
+  preload するのに対し `orphanResponses` の上限が 64 のため）。以降は **individual な send の
+  完了に依存せず** cancel か transport error まで生存
+- `receiveLoop` の `while pendingResponses.values.contains { $0.sendPhase == .sent }`（M2 で
+  派生述語にした箇所）を**外す**
+- **cycle 回避**: reader closure は `transport` と `weak self` だけを捕捉。raw frame の読み取りは
+  nonisolated helper に分け、1 frame ごとに session actor へ戻す。`Task { await self.receiveLoop() }`
+  の形にしない
+- **generation を frame / credit grant / error / CANCEL task / orphan key に通す**（完了通知だけの
+  照合では不十分。D3 敵対 I5）
+- **`readerState` を単一の真実にする**（cancel 済みで非 nil の handle を running と誤認しない）
+- **`disconnect` の graceful cleanup 中は reader を生かす**（TREE_DISCONNECT / LOGOFF 完了後に停止。
+  `SMBClient.swift:5399` は `Task.detached`）
+- **`failWire` と `closeTransport` の責務を分ける**（reader の transport error が `failWire` だけを
+  呼ぶと「reader は死んだが transport は生きている」状態になる。`:5420` / `:6151`）
+- **close 由来の `CancellationError` を wire failure として記録しない**
+- **`recordCreditGrant` → `dispatchReceivedPacket` の順序を維持**（`:5840`。別 Task へ投げない）
+- 🚨 **移行で確実に壊れるテスト 2 箇所**: `SMBeeTests.swift:8293` と `:8596` が
+  `while await session.receiveLoopRunningForTesting() { ... }` で **reader の停止を待っている**。
+  long-lived reader では止まらないので**無限ループになる**。transport close 基準へ直す
+
+#### M4 — transport 契約 + fixture 移行 + credit 循環の回帰テスト
+
+- 「`close()` は待機中の `receive()` を起こす」を `SMBTransport` の doc に明記する。
+  **必須メソッドは追加しない**（public API 非破壊）。外部 conformer には強制できないので残リスク
+- `InMemoryTransport` に `.waitUntilClosed` を **opt-in** で追加（既定は現状の `.eofWhenDrained`）。
+  drain 後は `throw` せず**空配列を返す**実装 (`SMBTransport.swift:40`) が前提
+- `ControlledReceiveTransport`（テスト側）に **cancellation handler を追加**
+- 🚨 **credit 循環の回帰テストの刺激**: `initialCredits=1` + `charge=2` で park させるだけでは
+  **旧構造も新構造も grant が来ずに停止し、変異で red にならない**（D3 敵対が反証）。
+  「**queue 済みの credit grant を reader が消費する**」形にすること
+- 変異: reader の起動を `markRequestSent` に戻す → red
+
+#### M5 — 全体検証
+
+macOS / Linux unit / `bin/e2e/container-samba.sh` / `bin/ci/verify-agent-push` rc=0。
+
+### 残リスク（設計では閉じない。実測か受容が必要）
+
+- 外部 `SMBTransport` が `close()` で blocked `receive()` を解除する保証は**強制できない**
+- Swift 6.2 の actor `deinit` から reader cancel / transport close ができるか（**未検証**）
+- idle な long-lived reader の CPU / メモリ影響（**未測定**）
+- CANCEL 後に server が final を返さない場合、tombstone が無期限に残る（回収方針が未定）
+- **hang の真因は依然未確定**。本タスクは構造改修であって hang の修正ではない
+  （[`013`](waiting/013-linux-ci-intermittent-hang.md) は `waiting/` で再現待ち）
+
+### 却下済み（再提案を防ぐため記録）
+
+- `sentResponseMessageIds` を 4 コレクションに分割する案 / `SMBRequestLedger` 型を新設する案 /
+  集合を tombstone として残す案 — いずれも**同期すべき台帳が増える**ので却下（D1 の 4 案から選定）
+- 当初の回帰テスト案（`initialCredits=1` + `charge=2` の park だけ）— 変異で red にならない

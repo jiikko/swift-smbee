@@ -88,3 +88,9 @@ Tests/SMBeeTests/AESCCMBenchmarkTests.swift = SMBEE_BENCH_CCM=1 gate で再現�
    着手 trigger（数値）: 実 Linux 利用で CCM read が 25 MiB/s 未満かつ CPU 律速、または
    10 GiB 級転送が 5 分超。次の候補は monomorphic な word 単位 AES 実装の見直しで、
    T-table 採用時は side-channel threat model の明文化を必須とする。
+
+## 関連の追記 (2026-09-25)
+
+実 Samba 転送 (CI の `samba-network-performance`、SMB 3.0.2 暗号化 = CCM) の律速の分解は [097](097-perf-samba-real-transfer-measurement.md) で行う。
+097 で CCM が全体の 10% 以上と出たら、その数字をこの issue に書き足す (061 の決定)。
+

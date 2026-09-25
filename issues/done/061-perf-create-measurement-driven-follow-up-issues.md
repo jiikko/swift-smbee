@@ -1,6 +1,6 @@
 # 061 perf: 次の性能改善候補を測定駆動の個別issueとして起票する
 
-状態: **open**
+状態: **done (2026-09-25)**
 起票: 2026-07-12
 関連: `issues/done/060-perf-profile-and-reduce-aes-cmac-write-cost.md` / `docs/performance-resource-baseline.md` / `.github/workflows/performance.yml` / `bin/e2e/smoke-all`
 
@@ -105,11 +105,43 @@ large-file concurrency/credit windowだが、根拠を取得する前に実装ta
 
 ## 完了条件
 
-- [ ] issue 060の測定結果と最新Performance/Samba E2E artifactから未測定gapを一覧化する。
-- [ ] 「実ネットワーク/Samba上での転送性能測定」を独立した個別issueとして起票する。
-- [ ] そのissueにserver起動からraw artifact保存までの測定開始protocolを明記する。
-- [ ] そのissueに採用・棄却を含む定量的な完了条件を明記する。
-- [ ] その他の候補は10%以上の寄与を検証可能な根拠があるものだけ個別issue化する。
-- [ ] 起票した全issueにbefore/after比較方法、noise判定、correctness/security検証を記載する。
-- [ ] 効果なしでも結果を記録して閉じられる終了条件を全issueに設ける。
-- [ ] 親子issueの関連リンクと推奨実行順をこのissueへ追記する。
+- [x] issue 060の測定結果と最新Performance/Samba E2E artifactから未測定gapを一覧化する。
+- [x] 「実ネットワーク/Samba上での転送性能測定」を独立した個別issueとして起票する。
+- [x] そのissueにserver起動からraw artifact保存までの測定開始protocolを明記する。
+- [x] そのissueに採用・棄却を含む定量的な完了条件を明記する。
+- [x] その他の候補は10%以上の寄与を検証可能な根拠があるものだけ個別issue化する。
+- [x] 起票した全issueにbefore/after比較方法、noise判定、correctness/security検証を記載する。
+- [x] 効果なしでも結果を記録して閉じられる終了条件を全issueに設ける。
+- [x] 親子issueの関連リンクと推奨実行順をこのissueへ追記する。
+
+## 結果 (2026-09-25)
+
+### 未測定 gap の一覧
+
+最新値は commit b143e72 の Performance run [36089942046](https://github.com/jiikko/swift-smbee/actions/runs/36089942046)。
+
+| # | gap | 根拠 |
+|---|---|---|
+| 1 | **060 の AES-CMAC 改善が実転送に効いたかを測る経路が無い**。synthetic は in-memory・署名 (CMAC)、`samba-network-performance` job は SMB 3.0.2 暗号化 (CCM) で、別の経路を見ている | `SMBeePerformanceRegressionTests` / `performance.yml` の `samba-network-performance` |
+| 2 | **CMAC を実 Samba で通す profile が無い**。SMB 3.1.1 の署名は client が GMAC だけを提示するので CMAC にならない | `test/e2e/smb/` / `SMBNegotiate.swift` の `encodeSigningData` |
+| 3 | **実転送の 1 MiB あたり約 200〜240 ms の大半が説明できない**。暗号 (Linux release CCM 34.5 MiB/s、075) で説明できるのは約 30 ms。手元の macOS では同じ測定が 15〜19 ms で、CI の Linux だけ約 10 倍遅い | read 4.116 MiB/s (p50 242.959 ms) / write 4.950 MiB/s (p50 201.930 ms)。097 の予備測定 |
+| 4 | 実転送の計測が 1 MiB・1 profile・1 invocation だけで、size の段階・client/server の CPU / RSS・byte / command 数・hash 照合・A/B が無い | `SMBeeNetworkPerformanceE2ETests` |
+
+### 起票した個別 issue
+
+- **[097](../097-perf-samba-real-transfer-measurement.md)** perf: 実 Samba 転送で、synthetic の署名改善がどれだけ効いているかと律速箇所を測る
+  (gap 1〜4 をまとめて扱う。061 の「必ず起票する個別 issue」)。反証レビュー (read-only サブエージェント) を 1 周通し、
+  P1 1 件 (実転送の経路から切り替えられない「pure-Swift backend の代替 A/B」を削除) と P2/P3 4 件を反映した。
+
+### 起票しなかった候補と理由
+
+- **Linux の AES-CCM fallback** → 新規起票せず、既存の [075](../075-perf-linux-aes-ccm-pure-swift-throughput.md) を受け皿にする。
+  097 の分解測定で CCM が 10% 以上と出たら、その数字を 075 に書き足す。
+- **TCP_NODELAY 未設定** → 手元の A/B (097 の予備測定) ではノイズの範囲で、10% 以上の根拠が無い。Linux での A/B を 097 の分解測定に入れた。
+- packet normalization copy / write packet assembly / large-file concurrency・credit window → 097 の分解結果が出るまで根拠が無いので起票しない
+  (061 の「根拠を取得する前に実装 task として確定しない」)。
+
+### 推奨実行順
+
+1. 097 (実転送の測定と分解)。
+2. 097 の結果で 10% 以上の候補が出たときだけ、その実装 issue (CCM なら 075)。

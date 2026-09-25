@@ -34,7 +34,9 @@ issue 087 で launcher 2 本の同一実装を `test/e2e/launcher-common.sh` に
   文言しか手段が無いなら `LC_ALL=C` を固定したうえで、その理由をコメントに残す。
   切り出し先: `~/.claude/rules/mutation-verify-new-tests.md` の「観測の設計」節へ追記。
 
-実行 (rule への追記) はユーザーの判断を待つ。
+**決着 (2026-09-25)**: ユーザー指示で A・B とも `~/dotfiles/_claude/rules/mutation-verify-new-tests.md` に追記した
+(A は「assert と期待値」節、B は「観測の設計」節。由来は `_claude/rules-rationale/mutation-verify-new-tests.md`)。
+dotfiles の commit「rules(mutation-verify): 条件文脈の中の assert とエラー文言の grep を「守っていないテスト」に足す」。
 
 ## 却下
 
@@ -43,4 +45,4 @@ issue 087 で launcher 2 本の同一実装を `test/e2e/launcher-common.sh` に
 
 ## 残課題
 
-- [ ] 提案 A・B を rule に追記するか (ユーザー判断)
+- [x] 提案 A・B を rule に追記する — 追記済み (上記)。残課題なし

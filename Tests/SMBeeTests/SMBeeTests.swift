@@ -1335,6 +1335,15 @@ private final class ChangeNotifyCollector: @unchecked Sendable {
     }
 }
 
+private func awaitResult(_ operation: @Sendable () async throws -> Void) async -> Result<Void, Error> {
+    do {
+        try await operation()
+        return .success(())
+    } catch {
+        return .failure(error)
+    }
+}
+
 private final class LockedCounter: @unchecked Sendable {
     private let lock = NSLock()
     private var storage = 0
@@ -6815,6 +6824,56 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
             SMB2Commands.create, SMB2Commands.read, SMB2Commands.close
         ])
+    }
+
+    /// issues/070: the doc promises that cancellation is observed after each chunk. With one
+    /// credit every READ is capped at 64 KiB, so a 128 KiB prefix needs two READs; cancelling
+    /// inside the first onChunk must stop before the second READ and still close the handle.
+    /// The uncancelled control proves the fixture really would issue that second READ.
+    func testClientSessionPrefixStreamCancellationAfterChunkStopsBeforeNextRead() async throws {
+        let chunk = [UInt8](repeating: 0x42, count: 64 * 1024)
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+
+        func run(cancelInFirstChunk: Bool) async throws -> (outcome: Result<Void, Error>, commands: [UInt16], chunks: Int) {
+            let transport = InMemoryTransport(inbound: try framed([
+                try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+                try smb2ReadResponse(chunk, messageId: 1, treeId: 0x3344),
+                cancelInFirstChunk
+                    ? try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+                    : try smb2ReadResponse(chunk, messageId: 2, treeId: 0x3344),
+                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 3, treeId: 0x3344)
+            ]))
+            let session = SMBSession(
+                host: "server", port: 445,
+                credential: SMBCredential(username: "user", password: "pass"),
+                transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+            )
+            let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+            let chunks = LockedCounter()
+            let task = Task {
+                try await clientSession.withPrefixReadStream(path: "stream.bin", maxLength: 128 * 1024) { _ in
+                    chunks.increment()
+                    if cancelInFirstChunk {
+                        withUnsafeCurrentTask { $0?.cancel() }
+                    }
+                }
+            }
+            let outcome = await awaitResult { try await task.value }
+            let commands = try unframed(transport.outbound).map { try SMB2Header.decode($0).command }
+            return (outcome, commands, chunks.value)
+        }
+
+        let control = try await run(cancelInFirstChunk: false)
+        XCTAssertNoThrow(try control.outcome.get())
+        XCTAssertEqual(control.chunks, 2)
+        XCTAssertEqual(control.commands, [SMB2Commands.create, SMB2Commands.read, SMB2Commands.read, SMB2Commands.close])
+
+        let cancelled = try await run(cancelInFirstChunk: true)
+        XCTAssertThrowsError(try cancelled.outcome.get()) { error in
+            XCTAssertTrue(error is CancellationError, "expected CancellationError, got \(error)")
+        }
+        XCTAssertEqual(cancelled.chunks, 1)
+        XCTAssertEqual(cancelled.commands, [SMB2Commands.create, SMB2Commands.read, SMB2Commands.close])
     }
 
     func testClientSessionPrefixStreamNormalizesConnectionLossAfterYield() async throws {

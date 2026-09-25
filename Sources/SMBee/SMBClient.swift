@@ -668,10 +668,10 @@ public actor SMBClientSession {
     static let localWriteChunkLimit = 1024 * 1024
 
     // Both prefix APIs share this bound. readPrefix needs it because it retains the complete
-    // result; withPrefixReadStream needs it because the length bounds how long the open handle,
-    // the session task and the onChunk capture live (issues/070). Prefix reads are for small
-    // heads (the obaket thumbnail consumer reads at most 4 MiB); larger reads belong to
-    // withReadStream(range:).
+    // result. For withPrefixReadStream it keeps the prefix API from being used as an unbounded
+    // download (issues/070): prefix reads are for small heads (the obaket thumbnail consumer reads
+    // at most 4 MiB), and larger reads belong to withReadStream(range:). It does not bound how
+    // long the handle stays open — a slow onChunk or server does; only a caller deadline does.
     static let maxPrefixReadLength: UInt64 = 64 * 1024 * 1024
 
     /// Everything needed to rebuild a dropped connection for opt-in watch resubscribe.
@@ -1273,15 +1273,18 @@ public actor SMBClientSession {
     /// Stream a best-effort prefix from offset zero without issuing QUERY_INFO.
     ///
     /// A short success is not proof of the file size and ends the operation immediately.
-    /// `maxLength` shares `readPrefix`'s limit even though nothing is accumulated: it bounds how
-    /// long the handle stays open. Use `withReadStream(range:)` for larger reads. A connection
+    /// `maxLength` shares `readPrefix`'s limit even though nothing is accumulated, so this API is
+    /// not used as an unbounded download; use `withReadStream(range:)` for larger reads. A connection
     /// loss after a chunk was yielded is normalized to `SMBError.connectionLost(operation: "READ")`.
     ///
-    /// There is no built-in operation timeout. Each chunk is followed by a cancellation check,
-    /// so a caller that needs a deadline wraps this call in `SMBOperationDeadline.run(timeout:)`;
-    /// the cancellation it raises closes the handle. A timeout parameter here could not do more:
-    /// `SMBOperationDeadline` waits for the operation task, so an `onChunk` that ignores
-    /// cancellation would still keep this call (and the handle) alive.
+    /// There is no built-in operation timeout (the same holds for `withReadStream`). A caller that
+    /// needs a deadline wraps this call in `SMBOperationDeadline.run(timeout:)`: the cancellation it
+    /// raises is observed after each chunk and by an in-flight READ, and the handle is then closed
+    /// best-effort. If that CLOSE gets no response either, the session tears down the whole
+    /// transport after its cleanup timeout, so the call can return up to that much later than the
+    /// deadline and other operations on the same session fail too. A timeout parameter here could
+    /// not do more: `SMBOperationDeadline` waits for the operation task, so an `onChunk` that ignores
+    /// cancellation still keeps this call (and the handle) alive.
     ///
     /// - Throws: If `maxLength` exceeds the prefix read limit, before any request is sent.
     public func withPrefixReadStream(

@@ -2,7 +2,7 @@
 
 - 起票: 2026-07-23
 - 種別: `ci`
-- 状態: open
+- 状態: **done (2026-09-25)**
 
 ## 背景 / 問題
 
@@ -58,3 +58,15 @@ blanket_disable をコード側で安全修正し、現時点で `swift build` �
 - my-products `.claude/rules/gha-runner.md` (lint は Linux runner)
 - my-products `.claude/rules/swiftlint-plugin.md` (plugin が正本 / brew 禁止 / shared-workflows は補完)
 - obaket 側 issue 429 (consumer に warning が流入していた件の対処)
+
+## 決着 (2026-09-25 issue-sync)
+
+受け入れ条件 4 つを確認して done へ移した。
+- 違反で FAIL: `.github/workflows/test.yml` の `SwiftLint (strict)` job と同じコマンド
+  (`swift package plugin --allow-writing-to-package-directory swiftlint -- lint --strict --no-cache`) を、
+  trailing whitespace と trailing comma を含む一時ファイルへ当てると rc=1 (warning が error に昇格)。違反の無いファイルでは rc=0。
+- master で PASS: 最新の test.yml run で `SwiftLint (strict)` が success。
+- push / PR の両方: test.yml は `push: master` と `pull_request` で走る。
+- バージョン一致: CI も plugin 経由で実行するので、ローカルの `swift build` と同じ SwiftLint バイナリを使う。
+実装は案 1 (Linux の専用 lint job) ではなく、macOS runner 上の plugin 実行になった (commit「ci: fail strict SwiftLint warnings」)。
+目的 (lint-clean の維持) は満たしているので、runner の違いは理由にしない。

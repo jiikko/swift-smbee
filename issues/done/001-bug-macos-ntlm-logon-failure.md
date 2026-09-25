@@ -1,6 +1,6 @@
 # 001 bug: 実 macOS SMBX サーバへ NTLMv2 接続すると STATUS_LOGON_FAILURE
 
-状態: **解決済み (2026-06-30)。実 macOS SMBX へ NTLMv2 認証成功・ls 再現性あり**
+状態: **done (2026-09-25)**
 
 ## 解決サマリ (サーバ側 smbd/digest-service ログを oracle にして確定)
 
@@ -30,7 +30,7 @@ probe / ls / stat / cat (content round-trip 一致) / mkdir / put / mv / rm(--di
 unit tests green (NTLM/blob/mechListMIC ベクタは独立計算で裏取り、循環テストでない)。
 注: rm でディレクトリ削除時 macOS は NON_DIRECTORY_FILE open を拒否 (Samba は許容) → 別途
 非 recursive delete に STATUS_FILE_IS_A_DIRECTORY 自動フォールバックを実装
-（[完了済み旧 TODO](done/todo.md) 参照）。
+（[完了済み旧 TODO](todo.md) 参照）。
 
 ---
 
@@ -149,4 +149,9 @@ negTokenResp 構造**を wire 比較した:
 - `Sources/SMBee/SMBClient.swift` (SESSION_SETUP 経路, `serverName` 受け渡し)
 - git 履歴: NTLM-MIC fix の連続 revert (`d8ae7aa`/`f724f1c`/`dba5c79`/`1b4c89e`) は本 issue と同根の
   「サーバ側 Kerberos-only が真因と気づかず client を blind fix」した痕跡。
-- [完了済み旧 TODO](done/todo.md)「実 macOS (3.0.2) 手動 smoke」の具体的失敗ケース。
+- [完了済み旧 TODO](todo.md)「実 macOS (3.0.2) 手動 smoke」の具体的失敗ケース。
+
+## 決着 (2026-09-25 issue-sync)
+
+状態行のとおり 2026-06-30 に解決済み (commit「fix(ntlm): 実 macOS SMBX への NTLMv2 認証を通す (blob header / Z(4) / mechListMIC RC4)」)。
+`NTLM.swift` に mechListMIC の付与と MIC 互換の target info が入っていることを確認し、done へ移した。

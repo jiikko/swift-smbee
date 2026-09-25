@@ -1,9 +1,9 @@
 # 009 test: DFS referral を実 msdfs サーバで E2E 検証する
 
-状態: **open** (backlog)
+状態: **done (2026-09-25)**
 起票: 2026-07-01
 関連: `Sources/SMBee/SMB2DfsReferral.swift` / `Sources/SMBee/SMBClient.swift` (`dfsReferral`) /
-`bin/e2e/container-samba.sh` / `test/e2e/smb/` / [todo2.md](../todo2.md) 「symlink / reparse point / DFS referral」
+`bin/e2e/container-samba.sh` / `test/e2e/smb/` / [todo2.md](../../todo2.md) 「symlink / reparse point / DFS referral」
 
 ## 背景
 
@@ -44,3 +44,13 @@ codex-drive の既知弱点「循環テスト green でも実サーバが拒否�
 - DFS は管理系 / エンタープライズ機能で、browse/GUI (obaket) の MVP には不要。
 - ただし「実 wire 未検証」は本ライブラリで DFS だけの状態なので、Samba を触る機会に msdfs profile を
   足して E2E を通し、他項目と同水準 (実サーバ検証済み) に揃えるのが望ましい。
+
+## 決着 (2026-09-25 issue-sync)
+
+「やること」1〜3 は実装済みだった (状態行が open のまま更新されていなかった)。
+- profile: `test/e2e/smb/msdfs.conf` (container init が msdfs link を作る。`test/e2e/container-init.sh`)
+- E2E: `Tests/SMBeeTests/SMBDfsReferralE2ETests.swift` (commit「test(e2e): cover samba msdfs referral」)
+- CI: `.github/workflows/e2e.yml` の matrix `profile: msdfs` / `scope: dfs-referral`。commit b143e72 の E2E run で
+  `SMBDfsReferralE2ETests.testDfsReferralDecodesSambaMsdfsLink` が passed (skip ではない) ことを確認した。
+「補足」の 2 項目は本 issue の目的外として残す: symlink target の取得は reparse の実サーバ検証 (`smb422-reparse` profile) 側、
+NameListReferral (DC referral) は DC referral を返す構成が必要になったときに別 issue にする。

@@ -30,6 +30,9 @@ jobs:
             profile: smb302-encrypted-required
             scope: full
             test_filter: SMBeeE2ETests
+            # The 4 GiB fixture is built by test/e2e/container-init.sh via the launcher;
+            # require the case that reads it to have actually run (issues/087).
+            required_test: SMBeeE2ETests.testReadRangesAround4GiBBoundary
           # Keep full 3.1.1 coverage in samba-compat.yml, but gate PR/push on an
           # authenticated read/write smoke for both 3.1.1 signing-only and
           # encrypted profiles. This catches GMAC/GCM regressions without making
@@ -79,7 +82,12 @@ jobs:
           SMBEE_DEBUG: "1"
           TEST_FILTER: ${{ matrix.test_filter }}
           DOCKER_RUN_ENV: SMBEE_E2E SMBEE_DEBUG TEST_FILTER
+          REQUIRED_TEST: ${{ matrix.required_test || '' }}
+          SCOPE: ${{ matrix.scope }}
+        # `swift test` exits 0 when E2E cases XCTSkip or the filter matches nothing, so the
+        # exit status alone cannot prove the fixture-backed case ran (issues/087).
         run: |
+          set +e
           bash test/e2e/run-swift-in-container.sh '
             swift run smbcli probe "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}"
             swift test --filter "${TEST_FILTER}"
@@ -92,7 +100,19 @@ jobs:
               swift run smbcli ls "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public"
               swift run smbcli cat "smb://${SMBEE_E2E_HOST}:${SMBEE_E2E_PORT}/public/known.txt" --guest
             fi
-          '
+          ' 2>&1 | tee e2e-api.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if [ "${SCOPE}" = full ] && [ -z "${REQUIRED_TEST}" ]; then
+            echo 'matrix.required_test must be set for the full scope (issues/087)' >&2
+            exit 1
+          fi
+          if [ -n "${REQUIRED_TEST}" ]; then
+            bin/ci/require-xctest-passed e2e-api.log "${REQUIRED_TEST}"
+          fi
 
       - name: Samba logs and teardown
         if: always()

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# usage: require-xctest-passed <log> <Class.testMethod>
+# Fails unless <log> shows the XCTest case passed exactly once and was never skipped.
+# A green `swift test` is not enough: E2E cases XCTSkip without SMBEE_E2E=1 and a
+# --filter that matches nothing also exits 0, so both look like success (issue 087).
+# Matches the Linux swift-corelibs-xctest line format used by the CI E2E jobs
+# ("Test Case 'Class.method' passed (…)"). macOS prints "-[Module.Class method]"
+# instead, so this gate is not meant for local Apple container logs.
+# Tested by bin/ci/test-e2e-launchers.
+set -euo pipefail
+unset CDPATH
+
+if [[ $# -ne 2 ]]; then
+  echo "usage: $0 <log> <Class.testMethod>" >&2
+  exit 2
+fi
+log="$1"
+test_case="$2"
+if [[ ! -f "${log}" ]]; then
+  echo "log not found: ${log}" >&2
+  exit 2
+fi
+
+prefix="Test Case '${test_case}' "
+passed="$(grep -cF -- "${prefix}passed (" "${log}" || true)"
+skipped="$(grep -cF -- "${prefix}skipped (" "${log}" || true)"
+if [[ "${passed}" != 1 || "${skipped}" != 0 ]]; then
+  echo "${test_case}: expected exactly 1 passed and 0 skipped, got passed=${passed} skipped=${skipped}" >&2
+  exit 1
+fi
+echo "${test_case}: passed once"

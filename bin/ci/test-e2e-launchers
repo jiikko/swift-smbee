@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# Regression tests for the Samba launchers and their shared helpers (issue 087):
+#   test/e2e/launcher-common.sh, test/e2e/start-samba-ci.sh, bin/e2e/container-samba.sh,
+#   and the E2E "really ran" gate bin/ci/require-xctest-passed.
+# Runs without a container runtime: docker / container / nc / sleep / swift are fakes
+# on PATH that only record their argv (none of them execs a real binary, so the PATH
+# shims cannot recurse). The launchers are copied into a scratch repo tree so the
+# container-init guards can be exercised without touching the real files.
+# Wired into CI by .github/workflows/test.yml (job e2e-launchers).
+# Scenario helpers (predicates, fake sleep) are invoked indirectly by name.
+# shellcheck disable=SC2329
+set -euo pipefail
+set -E
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+temporary="$(mktemp -d)"
+trap 'rm -rf "${temporary}"' EXIT
+
+current_scenario=''
+scenario_count=0
+
+scenario_failed() {
+  trap - ERR
+  printf 'FAILED in scenario %s\n' "${current_scenario}" >&2
+  exit 1
+}
+
+run_scenario() {
+  current_scenario="$1"
+  scenario_count=$((scenario_count + 1))
+  printf 'scenario: %s\n' "${current_scenario}"
+  trap scenario_failed ERR
+  "${current_scenario}"
+  trap - ERR
+}
+
+fail() {
+  printf '%s\n' "$*" >&2
+  return 1
+}
+
+expect_eq() {
+  [[ "$1" == "$2" ]] || fail "expected [$2] but got [$1] ($3)"
+}
+
+# Scratch repo tree holding copies of the launchers and a container init body.
+# $1 = init body to write ("" writes an empty file, "-" writes no file at all).
+new_repo() {
+  local init_body="$1"
+  local root
+  root="$(mktemp -d "${temporary}/repo.XXXXXX")"
+  mkdir -p "${root}/bin/e2e" "${root}/test/e2e/smb" "${root}/fakebin" "${root}/log"
+  cp "${REPO_ROOT}/bin/e2e/container-samba.sh" "${root}/bin/e2e/"
+  cp "${REPO_ROOT}/test/e2e/start-samba-ci.sh" "${REPO_ROOT}/test/e2e/launcher-common.sh" "${root}/test/e2e/"
+  printf '[global]\n' > "${root}/test/e2e/smb/fixture.conf"
+  if [[ "${init_body}" != "-" ]]; then
+    printf '%s' "${init_body}" > "${root}/test/e2e/container-init.sh"
+  fi
+  write_fakes "${root}"
+  printf '%s\n' "${root}"
+}
+
+write_fakes() {
+  local root="$1"
+  local name
+  # Every fake appends "<name> <argv...>" (one line) to log/calls.
+  for name in docker container nc sleep swift; do
+    cat > "${root}/fakebin/${name}" <<EOF
+#!/usr/bin/env bash
+printf '%s' "${name}" >> "${root}/log/calls"
+for arg in "\$@"; do printf ' [%s]' "\${arg//\$'\\n'/\\\\n}" >> "${root}/log/calls"; done
+printf '\n' >> "${root}/log/calls"
+case "${name} \${1:-}" in
+  'nc '*) exit "\${FAKE_NC_STATUS:-1}" ;;
+  'container logs') printf '%s\n' "\${FAKE_CONTAINER_LOGS:-}" ;;
+esac
+exit 0
+EOF
+    chmod +x "${root}/fakebin/${name}"
+  done
+}
+
+valid_init=$'set -eux\nexec smbd --foreground\n'
+
+# A local TCP port that refuses connections, for the CI launcher's /dev/tcp predicate.
+closed_port() {
+  local port
+  for port in 1 7 9 13 19 37; do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+      printf '%s\n' "${port}"
+      return 0
+    fi
+  done
+  fail 'no closed local port found for the readiness test'
+}
+
+run_ci_launcher() {
+  local root="$1" config="$2"
+  PATH="${root}/fakebin:${PATH}" SAMBA_CONFIG="${config}" SAMBA_CONTAINER=fake-samba \
+    SMBEE_E2E_HOST=127.0.0.1 SMBEE_E2E_PORT="$(closed_port)" \
+    bash "${root}/test/e2e/start-samba-ci.sh" >"${root}/log/out" 2>"${root}/log/err"
+}
+
+run_local_launcher() {
+  local root="$1" config="$2"
+  PATH="${root}/fakebin:${PATH}" SAMBA_CONFIG="${config}" SMBEE_E2E_CONTAINER_NAME=fake-samba \
+    SMBEE_E2E_SKIP_EXTRA_API_TESTS=1 SMBEE_E2E_SKIP_CLI_SMOKE=1 \
+    FAKE_NC_STATUS=0 FAKE_CONTAINER_LOGS='smbd: waiting for connections' \
+    bash "${root}/bin/e2e/container-samba.sh" >"${root}/log/out" 2>"${root}/log/err"
+}
+
+run_line() {
+  if [[ -f "$2/log/calls" ]]; then
+    grep -E "^$1 \[run\]" "$2/log/calls" || true
+  fi
+}
+
+# expect_run_arg <runtime> <repo> <substring of the recorded `run` argv>
+expect_run_arg() {
+  local line
+  line="$(run_line "$1" "$2")"
+  [[ "${line}" == *"$3"* ]] || fail "$1 run argv lacks [$3]: ${line}"
+}
+
+# --- launcher-common.sh unit scenarios -------------------------------------------
+
+test_resolve_absolute_config() {
+  local root
+  root="$(new_repo "${valid_init}")"
+  (
+    # shellcheck source=test/e2e/launcher-common.sh
+    source "${root}/test/e2e/launcher-common.sh"
+    cd "${temporary}"
+    smbee_e2e_resolve_samba_config /repo-root-must-not-be-prefixed "${root}/test/e2e/smb/fixture.conf"
+    expect_eq "${SAMBA_CONFIG_PATH}" "${root}/test/e2e/smb/fixture.conf" 'absolute config kept as is'
+  )
+}
+
+test_resolve_relative_config() {
+  local root
+  root="$(new_repo "${valid_init}")"
+  (
+    # shellcheck source=test/e2e/launcher-common.sh
+    source "${root}/test/e2e/launcher-common.sh"
+    cd "${root}"
+    smbee_e2e_resolve_samba_config "${root}" test/e2e/smb/fixture.conf
+    expect_eq "${SAMBA_CONFIG_PATH}" "${root}/test/e2e/smb/fixture.conf" 'relative config prefixed with repo root'
+  )
+}
+
+test_resolve_missing_config() {
+  local root status=0
+  root="$(new_repo "${valid_init}")"
+  (
+    # shellcheck source=test/e2e/launcher-common.sh
+    source "${root}/test/e2e/launcher-common.sh"
+    cd "${root}"
+    smbee_e2e_resolve_samba_config "${root}" test/e2e/smb/absent.conf
+  ) 2>"${root}/log/err" || status=$?
+  expect_eq "${status}" 1 'missing config is rejected'
+  grep -qF 'Missing Samba config: test/e2e/smb/absent.conf' "${root}/log/err"
+}
+
+expect_init_rejected() {
+  local init_body="$1" message="$2"
+  local root status=0
+  root="$(new_repo "${init_body}")"
+  (
+    # shellcheck source=test/e2e/launcher-common.sh
+    source "${root}/test/e2e/launcher-common.sh"
+    smbee_e2e_load_container_init "${root}"
+  ) 2>"${root}/log/err" || status=$?
+  expect_eq "${status}" 1 "init rejected: ${message}"
+  grep -qF "${message}: ${root}/test/e2e/container-init.sh" "${root}/log/err"
+}
+
+test_init_missing() { expect_init_rejected - 'Container init payload is missing or unreadable'; }
+test_init_empty() { expect_init_rejected '' 'Container init payload is empty'; }
+test_init_without_exec_smbd() {
+  expect_init_rejected $'set -eux\nsmbd --foreground\n' 'Container init payload must end in an "exec smbd" command'
+}
+
+test_init_loaded() {
+  local root
+  root="$(new_repo "${valid_init}")"
+  (
+    # shellcheck source=test/e2e/launcher-common.sh
+    source "${root}/test/e2e/launcher-common.sh"
+    smbee_e2e_load_container_init "${root}"
+    # $(<file) drops the trailing newline.
+    expect_eq "${CONTAINER_INIT}" $'set -eux\nexec smbd --foreground' 'init body loaded'
+  )
+}
+
+test_wait_ready_on_third_attempt() {
+  (
+    # shellcheck source=test/e2e/launcher-common.sh
+    source "${REPO_ROOT}/test/e2e/launcher-common.sh"
+    calls=0 ticks=0 sleeps=0
+    sleep() { sleeps=$((sleeps + 1)); }
+    predicate() { calls=$((calls + 1)); [[ "${calls}" -ge 3 ]]; }
+    tick() { ticks=$((ticks + 1)); }
+    smbee_e2e_wait_until_ready predicate tick
+    expect_eq "${calls}/${ticks}/${sleeps}" 3/2/2 'predicate/tick/sleep counts when ready on attempt 3'
+  )
+}
+
+test_wait_times_out() {
+  (
+    # shellcheck source=test/e2e/launcher-common.sh
+    source "${REPO_ROOT}/test/e2e/launcher-common.sh"
+    calls=0 sleeps=0 status=0 intervals=''
+    # Record, don't assert, inside: this runs under `||`, where errexit/ERR are off.
+    sleep() { sleeps=$((sleeps + 1)); intervals+="$1,"; }
+    predicate() { calls=$((calls + 1)); return 1; }
+    smbee_e2e_wait_until_ready predicate || status=$?
+    expect_eq "${status}/${calls}/${sleeps}" 1/121/120 'timeout after 120 retries plus a final check'
+    expect_eq "${intervals//1,/}" '' "every retry interval is 1 second: ${intervals:0:40}"
+  )
+}
+
+# --- launcher wiring scenarios -----------------------------------------------------
+
+test_ci_launcher_absolute_config() {
+  local root outside status=0
+  root="$(new_repo "${valid_init}")"
+  outside="$(mktemp -d "${temporary}/outside.XXXXXX")"
+  printf '[global]\n' > "${outside}/abs.conf"
+  run_ci_launcher "${root}" "${outside}/abs.conf" || status=$?
+  expect_eq "${status}" 1 'closed port times out'
+  grep -qF 'Samba did not become ready on 127.0.0.1:' "${root}/log/err"
+  expect_run_arg docker "${root}" " [-v] [${outside}/abs.conf:/tmp/smbee-smb.conf:ro] "
+  expect_run_arg docker "${root}" ' [bash] [-lc] [set -eux\nexec smbd --foreground]'
+  grep -qFx 'docker [logs] [fake-samba]' "${root}/log/calls"
+  expect_eq "$(grep -c '^sleep ' "${root}/log/calls")" 120 'CI launcher uses the shared retry envelope'
+}
+
+test_ci_launcher_relative_config() {
+  local root
+  root="$(new_repo "${valid_init}")"
+  run_ci_launcher "${root}" test/e2e/smb/fixture.conf || true
+  expect_run_arg docker "${root}" " [-v] [${root}/test/e2e/smb/fixture.conf:/tmp/smbee-smb.conf:ro] "
+}
+
+test_ci_launcher_rejects_bad_init() {
+  local root status=0
+  root="$(new_repo $'smbd --foreground\n')"
+  run_ci_launcher "${root}" test/e2e/smb/fixture.conf || status=$?
+  expect_eq "${status}" 1 'bad init aborts the CI launcher'
+  grep -qF 'must end in an "exec smbd" command' "${root}/log/err"
+  [[ -z "$(run_line docker "${root}")" ]] || fail 'container must not start with a bad init'
+}
+
+test_ci_launcher_rejects_missing_config() {
+  local root status=0
+  root="$(new_repo "${valid_init}")"
+  run_ci_launcher "${root}" test/e2e/smb/absent.conf || status=$?
+  expect_eq "${status}" 1 'missing config aborts the CI launcher'
+  grep -qF 'Missing Samba config: test/e2e/smb/absent.conf' "${root}/log/err"
+  # Stopped by the guard itself: the runtime is never called. Without `|| exit 1` the
+  # launcher still dies later on the unset SAMBA_CONFIG_PATH (set -u), but only after
+  # its next docker call, so "no container started" alone cannot tell the two apart.
+  if [[ -f "${root}/log/calls" ]] && grep -q '^docker ' "${root}/log/calls"; then
+    fail 'launcher ignored the config guard and called docker'
+  fi
+}
+
+test_local_launcher_absolute_config() {
+  local root outside
+  root="$(new_repo "${valid_init}")"
+  outside="$(mktemp -d "${temporary}/outside.XXXXXX")"
+  printf '[global]\n' > "${outside}/abs.conf"
+  run_local_launcher "${root}" "${outside}/abs.conf"
+  grep -qF 'Samba is ready.' "${root}/log/out"
+  grep -qF 'Local container E2E completed successfully.' "${root}/log/out"
+  expect_run_arg container "${root}" " [-v] [${outside}/abs.conf:/tmp/smbee-smb.conf:ro] "
+  expect_run_arg container "${root}" ' [bash] [-lc] [set -eux\nexec smbd --foreground]'
+  # EXIT trap teardown ran (the pre-start cleanup is the first rm -f).
+  expect_eq "$(grep -c '^container \[rm\] \[-f\] \[fake-samba\]$' "${root}/log/calls")" 2 'pre-start and EXIT teardown'
+}
+
+test_local_launcher_relative_config() {
+  local root
+  root="$(new_repo "${valid_init}")"
+  run_local_launcher "${root}" test/e2e/smb/fixture.conf
+  expect_run_arg container "${root}" " [-v] [${root}/test/e2e/smb/fixture.conf:/tmp/smbee-smb.conf:ro] "
+}
+
+test_local_launcher_not_ready() {
+  local root status=0
+  root="$(new_repo "${valid_init}")"
+  PATH="${root}/fakebin:${PATH}" SAMBA_CONFIG=test/e2e/smb/fixture.conf SMBEE_E2E_CONTAINER_NAME=fake-samba \
+    SMBEE_E2E_SKIP_EXTRA_API_TESTS=1 SMBEE_E2E_SKIP_CLI_SMOKE=1 FAKE_NC_STATUS=0 FAKE_CONTAINER_LOGS='still starting' \
+    bash "${root}/bin/e2e/container-samba.sh" >"${root}/log/out" 2>"${root}/log/err" || status=$?
+  expect_eq "${status}" 1 'port open without the smbd log line is not ready'
+  grep -qF 'Samba did not become ready. Recent logs:' "${root}/log/err"
+  expect_eq "$(grep -c '^sleep ' "${root}/log/calls")" 120 'local launcher uses the shared retry envelope'
+  if grep -q '^swift ' "${root}/log/calls"; then fail 'tests must not run when Samba is not ready'; fi
+}
+
+test_local_launcher_rejects_bad_init() {
+  local root status=0
+  root="$(new_repo $'smbd --foreground\n')"
+  run_local_launcher "${root}" test/e2e/smb/fixture.conf || status=$?
+  expect_eq "${status}" 1 'bad init aborts the local launcher'
+  grep -qF 'must end in an "exec smbd" command' "${root}/log/err"
+  [[ -z "$(run_line container "${root}")" ]] || fail 'container must not start with a bad init'
+}
+
+test_local_launcher_rejects_missing_config() {
+  local root status=0
+  root="$(new_repo "${valid_init}")"
+  run_local_launcher "${root}" test/e2e/smb/absent.conf || status=$?
+  expect_eq "${status}" 1 'missing config aborts the local launcher'
+  grep -qF 'Missing Samba config: test/e2e/smb/absent.conf' "${root}/log/err"
+  # Stopped by the guard itself: the runtime is never called. Without `|| exit 1` the
+  # launcher still dies later on the unset SAMBA_CONFIG_PATH (set -u), but only after
+  # its next container call, so "no container started" alone cannot tell the two apart.
+  if [[ -f "${root}/log/calls" ]] && grep -q '^container ' "${root}/log/calls"; then
+    fail 'launcher ignored the config guard and called container'
+  fi
+}
+
+test_local_launcher_rejects_missing_init() {
+  local root status=0
+  root="$(new_repo -)"
+  run_local_launcher "${root}" test/e2e/smb/fixture.conf || status=$?
+  expect_eq "${status}" 1 'missing init aborts the local launcher'
+  grep -qF 'Container init payload is missing or unreadable' "${root}/log/err"
+  [[ -z "$(run_line container "${root}")" ]] || fail 'container must not start without an init'
+}
+
+# --- require-xctest-passed scenarios -------------------------------------------------
+
+expect_xctest_gate() {
+  local expected_status="$1" body="$2"
+  local dir status=0
+  dir="$(mktemp -d "${temporary}/xctest.XXXXXX")"
+  printf '%b' "${body}" > "${dir}/log"
+  "${SCRIPT_DIR}/require-xctest-passed" "${dir}/log" SMBeeE2ETests.testBoundary \
+    >"${dir}/out" 2>"${dir}/err" || status=$?
+  expect_eq "${status}" "${expected_status}" "gate status for: ${body}"
+}
+
+started="Test Case 'SMBeeE2ETests.testBoundary' started at 2026-09-08 14:39:17.574\\n"
+test_xctest_passed_once() {
+  expect_xctest_gate 0 "${started}Test Case 'SMBeeE2ETests.testBoundary' passed (7.489 seconds)\\n"
+}
+test_xctest_skipped() {
+  expect_xctest_gate 1 "${started}Test Case 'SMBeeE2ETests.testBoundary' skipped (0.001 seconds)\\n"
+}
+# Passed in one `swift test` run but skipped in another (e.g. a run without SMBEE_E2E=1).
+test_xctest_passed_and_skipped() {
+  expect_xctest_gate 1 "Test Case 'SMBeeE2ETests.testBoundary' passed (1.000 seconds)\\nTest Case 'SMBeeE2ETests.testBoundary' skipped (0.001 seconds)\\n"
+}
+test_xctest_not_run() {
+  expect_xctest_gate 1 "Test Case 'SMBeeE2ETests.testBoundaryOther' passed (1.000 seconds)\\nExecuted 0 tests\\n"
+}
+test_xctest_passed_twice() {
+  expect_xctest_gate 1 "Test Case 'SMBeeE2ETests.testBoundary' passed (1.000 seconds)\\nTest Case 'SMBeeE2ETests.testBoundary' passed (1.000 seconds)\\n"
+}
+
+run_scenario test_resolve_absolute_config
+run_scenario test_resolve_relative_config
+run_scenario test_resolve_missing_config
+run_scenario test_init_missing
+run_scenario test_init_empty
+run_scenario test_init_without_exec_smbd
+run_scenario test_init_loaded
+run_scenario test_wait_ready_on_third_attempt
+run_scenario test_wait_times_out
+run_scenario test_ci_launcher_absolute_config
+run_scenario test_ci_launcher_relative_config
+run_scenario test_ci_launcher_rejects_bad_init
+run_scenario test_ci_launcher_rejects_missing_config
+run_scenario test_local_launcher_absolute_config
+run_scenario test_local_launcher_relative_config
+run_scenario test_local_launcher_not_ready
+run_scenario test_local_launcher_rejects_bad_init
+run_scenario test_local_launcher_rejects_missing_config
+run_scenario test_local_launcher_rejects_missing_init
+run_scenario test_xctest_passed_once
+run_scenario test_xctest_skipped
+run_scenario test_xctest_passed_and_skipped
+run_scenario test_xctest_not_run
+run_scenario test_xctest_passed_twice
+
+# Pin the count so a scenario deleted from the list above cannot pass silently.
+expected_scenarios=24
+if [[ "${scenario_count}" -ne "${expected_scenarios}" ]]; then
+  printf 'expected %s scenarios, ran %s\n' "${expected_scenarios}" "${scenario_count}" >&2
+  exit 1
+fi
+printf 'e2e launcher tests passed (%s scenarios)\n' "${scenario_count}"

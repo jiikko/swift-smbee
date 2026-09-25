@@ -35,37 +35,10 @@ if ! [[ "${SMBEE_E2E_PORT}" =~ ^[0-9]+$ ]] || [ "${SMBEE_E2E_PORT}" -lt 1 ] || [
   exit 1
 fi
 
-if [ ! -f "${SAMBA_CONFIG}" ]; then
-  printf 'Missing Samba config: %s\n' "${SAMBA_CONFIG}" >&2
-  exit 1
-fi
-
-# An absolute SAMBA_CONFIG must not get REPO_ROOT prefixed onto it.
-case "${SAMBA_CONFIG}" in
-  /*) SAMBA_CONFIG_PATH="${SAMBA_CONFIG}" ;;
-  *)  SAMBA_CONFIG_PATH="${REPO_ROOT}/${SAMBA_CONFIG}" ;;
-esac
-
-CONTAINER_INIT_PATH="${REPO_ROOT}/test/e2e/container-init.sh"
-if [[ ! -f "${CONTAINER_INIT_PATH}" || ! -r "${CONTAINER_INIT_PATH}" ]]; then
-  printf 'Container init payload is missing or unreadable: %s\n' "${CONTAINER_INIT_PATH}" >&2
-  exit 1
-fi
-if ! CONTAINER_INIT="$(<"${CONTAINER_INIT_PATH}")"; then
-  printf 'Failed to read container init payload: %s\n' "${CONTAINER_INIT_PATH}" >&2
-  exit 1
-fi
-if [[ -z "${CONTAINER_INIT}" ]]; then
-  printf 'Container init payload is empty: %s\n' "${CONTAINER_INIT_PATH}" >&2
-  exit 1
-fi
-# Threat model: catch an empty / truncated / stale fragment (a container that starts
-# and exits silently is the expensive failure). This does NOT defend against a
-# deliberately crafted payload — anyone who can edit the file can run anything.
-if ! grep -qE '^[[:space:]]*exec smbd' "${CONTAINER_INIT_PATH}"; then
-  printf 'Container init payload must end in an "exec smbd" command: %s\n' "${CONTAINER_INIT_PATH}" >&2
-  exit 1
-fi
+# shellcheck source=test/e2e/launcher-common.sh
+source "${REPO_ROOT}/test/e2e/launcher-common.sh"
+smbee_e2e_resolve_samba_config "${REPO_ROOT}" "${SAMBA_CONFIG}" || exit 1
+smbee_e2e_load_container_init "${REPO_ROOT}" || exit 1
 
 if ! container system status >/dev/null 2>&1; then
   printf 'Starting Apple container system service...\n'
@@ -92,23 +65,22 @@ container run -d --name "${CONTAINER_NAME}" -p "${SMBEE_E2E_HOST}:${SMBEE_E2E_PO
   "${SAMBA_BASE_IMAGE}" \
   bash -lc "${CONTAINER_INIT}" >/dev/null
 
-printf 'Waiting for SMB port %s:%s' "${SMBEE_E2E_HOST}" "${SMBEE_E2E_PORT}"
-for _ in $(seq 1 120); do
-  if nc -z "${SMBEE_E2E_HOST}" "${SMBEE_E2E_PORT}" >/dev/null 2>&1 &&
-      container logs "${CONTAINER_NAME}" 2>/dev/null | grep -q 'waiting for connections'; then
-    printf '\nSamba is ready.\n'
-    break
-  fi
-  printf '.'
-  sleep 1
-done
+# Readiness predicate is runtime specific: the port alone opens before smbd has
+# finished loading shares under Apple container, so also require the smbd log line.
+# shellcheck disable=SC2329  # invoked indirectly by smbee_e2e_wait_until_ready.
+samba_ready() {
+  nc -z "${SMBEE_E2E_HOST}" "${SMBEE_E2E_PORT}" >/dev/null 2>&1 &&
+    container logs "${CONTAINER_NAME}" 2>/dev/null | grep -q 'waiting for connections'
+}
+print_progress_dot() { printf '.'; }
 
-if ! nc -z "${SMBEE_E2E_HOST}" "${SMBEE_E2E_PORT}" >/dev/null 2>&1 ||
-    ! container logs "${CONTAINER_NAME}" 2>/dev/null | grep -q 'waiting for connections'; then
+printf 'Waiting for SMB port %s:%s' "${SMBEE_E2E_HOST}" "${SMBEE_E2E_PORT}"
+if ! smbee_e2e_wait_until_ready samba_ready print_progress_dot; then
   printf '\nSamba did not become ready. Recent logs:\n' >&2
   container logs "${CONTAINER_NAME}" 2>/dev/null | tail -n 120 >&2 || true
   exit 1
 fi
+printf '\nSamba is ready.\n'
 
 export SMBEE_E2E=1
 export SMBEE_E2E_HOST

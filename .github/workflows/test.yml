@@ -210,6 +210,18 @@ jobs:
         timeout-minutes: 5
         run: bin/ci/test-issue-conventions
 
+  e2e-launchers:
+    name: E2E launcher scripts
+    # Samba launcher 2 本 (bin/e2e/container-samba.sh / test/e2e/start-samba-ci.sh) と共通 helper
+    # (test/e2e/launcher-common.sh)、E2E の「実行された」判定 (bin/ci/require-xctest-passed) を
+    # fake runtime で検査する (issues/087)。container runtime は使わない。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test E2E launchers
+        timeout-minutes: 5
+        run: bin/ci/test-e2e-launchers
+
   test-registration-coverage:
     name: test-registration-coverage / .swift-version
     # `swift test --list-tests` が新規 XCTest ファイル / class / method を拾えているかを確認する。

@@ -109,3 +109,43 @@ issue 076 で **container 内で実行される init 本文**は 1 箇所 (`test
 - E2E ハーネス全体の「filter / skip で fixture 検証を飛ばせる」性質 — 076 で
   却下理由つきで記録済み (`issues/done/076-...` の「却下した指摘とその理由」)。
   ただし完了条件の 1 つ目はこの性質を前提に「実行されたことの機械判定」を要求する。
+
+## 進捗 (2026-09-25)
+
+ユーザー指示で trigger 待ちを解除して着手した。完了条件の 1 つ目 (共通化) を採った。
+
+- **共通化**: `test/e2e/launcher-common.sh` を新設し、両 launcher が source する。
+  寄せたのは `smbee_e2e_resolve_samba_config` (config 存在検査 + 絶対/相対 path 解決)、
+  `smbee_e2e_load_container_init` (init 読み込み + 4 段の guard)、`smbee_e2e_wait_until_ready`
+  (120 回 / 1 秒の retry envelope + 最後に 1 回判定。predicate と進捗表示は callback)。
+  predicate・teardown・起動コマンド・Apple container の前処理は各 launcher に残した。
+- **挙動差** (意図したもの): CI launcher の config 不在メッセージが `Samba config not found:` →
+  `Missing Samba config:` (旧文言への依存は grep で 0 件)。CI launcher の readiness 判定が
+  最後の 1 回ぶん増えて最大 121 回 (ローカルは元から 121 回)。
+- **回帰テスト**: `bin/ci/test-e2e-launchers` (24 シナリオ。docker / container / nc / sleep / swift を
+  fake に置き、launcher をスクラッチの repo tree へコピーして走らせる)。検査項目: 絶対 / 相対
+  `SAMBA_CONFIG`、config 不在、init 不在 / 空 / `exec smbd` 欠落、retry の回数と間隔、両 launcher の
+  `run` の argv、ローカルの EXIT trap teardown、ローカルの readiness がログ行を要求すること。
+  **配線**: `.github/workflows/test.yml` の job `e2e-launchers` (paths filter 無し)。
+- **CI の「実行された」判定**: `bin/ci/require-xctest-passed` を新設し、`e2e.yml` の full scope
+  (matrix `required_test`) で `SMBeeE2ETests.testReadRangesAround4GiBBoundary` が passed 1 回・
+  skipped 0 回であることを判定する。full scope で `required_test` が空なら step を失敗させる
+  (matrix の typo で gate が黙って外れるのを防ぐ)。書式は Linux XCTest (`Test Case 'Class.method' passed (…)`)
+  で、run 34239055805 の実ログで確認した。
+- **変異検証**: 21 変異すべてが狙った scenario で red (path 前置の復活 / 各 guard の除去 / retry 60 回 /
+  間隔 2 秒 / 最終判定の除去 / tick の除去 / 両 launcher の `-v` を旧式へ / `|| exit 1` → `|| true` /
+  ローカル readiness を port のみに / EXIT trap 除去 / gate の 1 回以上化・skip 検査除去・status 無視)。
+  途中で見つけた偽の緑: (1) `||` の中で呼ばれる fake `sleep` 内の assert は errexit も ERR trap も効かず
+  拾われなかった → 記録して外で比較する形へ。(2) config 不在の `|| exit 1` を外しても `set -u` が
+  後で落として同じ rc になる → guard の後に runtime (docker / container) が 1 回も呼ばれていないことを
+  assert する形にした。最初は stderr の `unbound variable` を grep したが、この Mac の bash は日本語で出すため
+  偽の緑になった (観測で確認)。文言に依存しない形へ置き換えた (2 周目の P3-1)。
+- **Apple container 側の証跡** (CI gate ではない): 2026-09-25 に `bin/e2e/container-samba.sh` を既定 profile で
+  実行し rc=0。`testReadRangesAround4GiBBoundary` は passed (macOS 書式
+  `-[SMBeeTests.SMBeeE2ETests testReadRangesAround4GiBBoundary]`)。
+- **敵対レビュー**: 1 周目は P1 なし / P2 1 件 (間隔 assert が効かない) / P3 3 件。
+  P2・P3-1 (ローカル側の bad init と両側の config 不在のシナリオ不足)・P3-2 (gate が黙って外れる) は対応した。
+  P3-3 は上記「挙動差」で、害なしとして記録のみ。
+  2 周目は P1/P2 なし。P3-1 (上記の文言依存) は対応した。P3-2「e2e.yml の SCOPE 判定は機械検査されていない」は、
+  YAML 内の判定で実害は `scope: full` を改名したときだけなので受容した (検出できるかは未確認。改名時に見直す)。
+  最後の修正は新しい判定を足しておらず、変異 (`LANG=ja_JP.UTF-8` 下で 21/21 red) で直接確かめたので周回を閉じた。

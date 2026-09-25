@@ -90,6 +90,11 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 macOS で CI の E2E に近い条件を再現する場合は Apple の `container` CLI を使う。
 この repo では `bin/e2e/container-samba.sh` が次をまとめて実行する。
 コンテナ内の init 本文の正本は `test/e2e/container-init.sh` で、CI (`test/e2e/start-samba-ci.sh`) とローカルの両方がこれを読み込む。
+2 本の launcher が同じに実装していた host 側の処理 (config path の解決、init の読み込みと guard、readiness の retry envelope) は
+`test/e2e/launcher-common.sh` にあり、両方が source する。readiness の判定条件・teardown・起動コマンドは runtime ごとに違うので各 launcher に残す。
+launcher を変えたら `bin/ci/test-e2e-launchers` (fake runtime の回帰テスト。CI では `test.yml` の `e2e-launchers` job) を回す。
+CI の full scope は `bin/ci/require-xctest-passed` で `testReadRangesAround4GiBBoundary` が 1 回 passed したことまで確かめる
+(`swift test` は XCTSkip や filter の空振りでも exit 0 になるため)。
 
 1. `ubuntu:24.04` コンテナを起動し、`apt-get install samba` で CI と同じ distro Samba を入れる。
 2. `test/e2e/smb/smb302-encrypted-required.conf` を `/etc/samba/smb.conf` に配置する。

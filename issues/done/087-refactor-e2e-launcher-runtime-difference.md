@@ -2,8 +2,8 @@
 
 - 種別: refactor (予防的。現時点で failing なものは無い)
 - 起票: 2026-09-08
-- 状態: **open / trigger 待ち**
-- 関連: [`done/076`](done/076-refactor-e2e-sentinel-constants-single-source.md) (container init の単一ソース化。本 issue の発端であり、
+- 状態: **done** (2026-09-25。ユーザー指示で trigger 待ちを解除して着手)
+- 関連: [`done/076`](076-refactor-e2e-sentinel-constants-single-source.md) (container init の単一ソース化。本 issue の発端であり、
   「host/container 境界を跨ぐ共通化の難しさ」の整理もここにある) /
   `bin/e2e/container-samba.sh` (Apple container / macOS) / `test/e2e/start-samba-ci.sh` (docker / CI) /
   `test/e2e/container-init.sh` (076 で作った共通 init) / `bin/ci/test-performance-scripts` (shell test の先例)

@@ -132,25 +132,33 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     private let syscalls: POSIXSocketSyscalls
     private let sendQueue = DispatchQueue(label: "dev.smbee.posix.send")
 
+    /// The real syscalls behind the default writer / reader / lifecycle hooks. Internal so
+    /// tests can wrap the live behaviour (e.g. observe a send blocked in the kernel) instead
+    /// of re-implementing the per-platform flags.
+    static let liveWriter: POSIXSocketWriter = { descriptor, bytes, offset in
+        bytes.withUnsafeBytes { buffer in
+            DarwinOrGlibc.send(
+                descriptor,
+                buffer.baseAddress!.advanced(by: offset),
+                bytes.count - offset,
+                DarwinOrGlibc.sendFlagsSuppressingSIGPIPE
+            )
+        }
+    }
+    static let liveReader: POSIXSocketReader = { descriptor, buffer, maxLength in
+        DarwinOrGlibc.recv(descriptor, buffer, maxLength, 0)
+    }
+    static let liveShutdown: POSIXSocketLifecycleHook = { descriptor in DarwinOrGlibc.shutdown(descriptor) }
+    static let liveClose: POSIXSocketLifecycleHook = { descriptor in DarwinOrGlibc.close(descriptor) }
+
     // POSIX is used instead of SwiftNIO for Phase 0 to keep the transport dependency-free
     // while still providing the Linux path required by the E2E plan.
     public init(timeout: Duration? = nil) {
         self.timeout = timeout
-        self.writer = { descriptor, bytes, offset in
-            bytes.withUnsafeBytes { buffer in
-                DarwinOrGlibc.send(
-                    descriptor,
-                    buffer.baseAddress!.advanced(by: offset),
-                    bytes.count - offset,
-                    DarwinOrGlibc.sendFlagsSuppressingSIGPIPE
-                )
-            }
-        }
-        self.reader = { descriptor, buffer, maxLength in
-            DarwinOrGlibc.recv(descriptor, buffer, maxLength, 0)
-        }
-        self.shutdownDescriptor = { descriptor in DarwinOrGlibc.shutdown(descriptor) }
-        self.closeDescriptor = { descriptor in DarwinOrGlibc.close(descriptor) }
+        self.writer = Self.liveWriter
+        self.reader = Self.liveReader
+        self.shutdownDescriptor = Self.liveShutdown
+        self.closeDescriptor = Self.liveClose
         self.sendEnqueueHook = {}
         self.syscalls = .live
     }
@@ -158,19 +166,8 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     internal init(
         timeout: Duration?,
         syscalls: POSIXSocketSyscalls,
-        writer: @escaping POSIXSocketWriter = { descriptor, bytes, offset in
-            bytes.withUnsafeBytes { buffer in
-                DarwinOrGlibc.send(
-                    descriptor,
-                    buffer.baseAddress!.advanced(by: offset),
-                    bytes.count - offset,
-                    DarwinOrGlibc.sendFlagsSuppressingSIGPIPE
-                )
-            }
-        },
-        reader: @escaping POSIXSocketReader = { descriptor, buffer, maxLength in
-            DarwinOrGlibc.recv(descriptor, buffer, maxLength, 0)
-        },
+        writer: @escaping POSIXSocketWriter = POSIXSocketTransport.liveWriter,
+        reader: @escaping POSIXSocketReader = POSIXSocketTransport.liveReader,
         shutdown: @escaping POSIXSocketLifecycleHook,
         close: @escaping POSIXSocketLifecycleHook
     ) {
@@ -186,9 +183,7 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     internal init(
         socketFileDescriptor: Int32 = 1,
         writer: @escaping POSIXSocketWriter,
-        reader: @escaping POSIXSocketReader = { descriptor, buffer, maxLength in
-            DarwinOrGlibc.recv(descriptor, buffer, maxLength, 0)
-        },
+        reader: @escaping POSIXSocketReader = POSIXSocketTransport.liveReader,
         shutdown: @escaping POSIXSocketLifecycleHook = { _ in },
         close: @escaping POSIXSocketLifecycleHook = { _ in },
         sendEnqueued: @escaping POSIXSocketSendEnqueueHook = {}

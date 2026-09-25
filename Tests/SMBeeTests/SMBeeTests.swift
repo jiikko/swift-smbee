@@ -589,6 +589,47 @@ private final class BlockingPOSIXReader: @unchecked Sendable {
     }
 }
 
+/// Wraps the live send / recv / shutdown / close so a test can put a real syscall into a
+/// kernel-blocked state and see what the transport did around it (issues/073): whether the
+/// shutdown reached a syscall that was still inside the kernel, and whether the physical close
+/// waited until that syscall had returned.
+private final class LivePOSIXSyscallProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enteredStorage = 0
+    private var returnedStorage = 0
+    private var insideAtShutdownStorage: [Bool] = []
+    private var insideAtCloseStorage: [Bool] = []
+
+    /// (calls entered, whether one is still inside the syscall)
+    var snapshot: (entered: Int, inside: Bool) {
+        lock.withLock { (enteredStorage, enteredStorage > returnedStorage) }
+    }
+    var insideAtShutdown: [Bool] { lock.withLock { insideAtShutdownStorage } }
+    var insideAtClose: [Bool] { lock.withLock { insideAtCloseStorage } }
+
+    func write(_ descriptor: Int32, _ bytes: [UInt8], _ offset: Int) throws -> Int {
+        lock.withLock { enteredStorage += 1 }
+        defer { lock.withLock { returnedStorage += 1 } }
+        return try POSIXSocketTransport.liveWriter(descriptor, bytes, offset)
+    }
+
+    func read(_ descriptor: Int32, _ buffer: UnsafeMutableRawPointer?, _ maxLength: Int) -> Int {
+        lock.withLock { enteredStorage += 1 }
+        defer { lock.withLock { returnedStorage += 1 } }
+        return POSIXSocketTransport.liveReader(descriptor, buffer, maxLength)
+    }
+
+    func shutdown(_ descriptor: Int32) {
+        lock.withLock { insideAtShutdownStorage.append(enteredStorage > returnedStorage) }
+        POSIXSocketTransport.liveShutdown(descriptor)
+    }
+
+    func close(_ descriptor: Int32) {
+        lock.withLock { insideAtCloseStorage.append(enteredStorage > returnedStorage) }
+        POSIXSocketTransport.liveClose(descriptor)
+    }
+}
+
 private final class POSIXSendEnqueueRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private let counter = POSIXAsyncCounter()
@@ -2195,6 +2236,103 @@ final class SMBeeTests: XCTestCase {
         transport.close()
         XCTAssertEqual(lifecycle.shutdownCount, 1)
         XCTAssertEqual(lifecycle.closeCount, 1)
+    }
+
+    /// A send that is really blocked in the kernel (the peer never reads and the payload is far
+    /// larger than the loopback socket buffers) must be woken by `close()`'s shutdown, and the
+    /// physical close must wait until it has returned. Unlike the fake-writer tests above, this
+    /// measures the OS contract the lease design relies on (issues/073: "shutdown wakes blocked
+    /// send/recv"), on whichever platform runs it.
+    func testPOSIXSocketTransportCloseWakesLiveKernelBlockedSend() async throws {
+        let server = try POSIXLoopbackServer(mode: .acceptAndHold)
+        server.start()
+        defer { server.close() }
+        let probe = LivePOSIXSyscallProbe()
+        let transport = POSIXSocketTransport(
+            timeout: nil,
+            syscalls: .live,
+            writer: probe.write,
+            reader: probe.read,
+            shutdown: probe.shutdown,
+            close: probe.close
+        )
+        defer { transport.close() }
+        try await awaitWithTimeout("connect POSIXSocketTransport to non-reading server") {
+            try await transport.connect(host: "127.0.0.1", port: server.port)
+        }
+
+        let payload = [UInt8](repeating: 0x5A, count: 32 * 1024 * 1024)
+        let sendTask = Task { try await transport.send(payload) }
+        try await waitUntilBlockedInLiveSyscall(probe, "live send blocked on a full socket buffer")
+        transport.close()
+
+        do {
+            try await awaitWithTimeout(seconds: 5, "kernel-blocked live send woken by close") {
+                try await sendTask.value
+            }
+            XCTFail("send of a payload the peer never reads unexpectedly succeeded")
+        } catch SMBTransportError.connectionClosed {
+        }
+        XCTAssertEqual(probe.insideAtShutdown, [true], "shutdown must reach the send blocked in the kernel")
+        XCTAssertEqual(probe.insideAtClose, [false], "physical close must wait for the blocked send to return")
+    }
+
+    /// The receive counterpart: a recv blocked on a silent peer is woken by `close()`'s shutdown
+    /// and only then physically closed (issues/073).
+    func testPOSIXSocketTransportCloseWakesLiveKernelBlockedReceive() async throws {
+        let server = try POSIXLoopbackServer(mode: .acceptAndHold)
+        server.start()
+        defer { server.close() }
+        let probe = LivePOSIXSyscallProbe()
+        let transport = POSIXSocketTransport(
+            timeout: nil,
+            syscalls: .live,
+            writer: probe.write,
+            reader: probe.read,
+            shutdown: probe.shutdown,
+            close: probe.close
+        )
+        defer { transport.close() }
+        try await awaitWithTimeout("connect POSIXSocketTransport to silent server") {
+            try await transport.connect(host: "127.0.0.1", port: server.port)
+        }
+
+        let receiveTask = Task { try await transport.receive(maxLength: 1) }
+        try await waitUntilBlockedInLiveSyscall(probe, "live recv blocked on a silent peer")
+        transport.close()
+
+        do {
+            _ = try await awaitWithTimeout(seconds: 5, "kernel-blocked live recv woken by close") {
+                try await receiveTask.value
+            }
+            XCTFail("receive from a silent peer unexpectedly succeeded")
+        } catch SMBTransportError.connectionClosed {
+        }
+        XCTAssertEqual(probe.insideAtShutdown, [true], "shutdown must reach the recv blocked in the kernel")
+        XCTAssertEqual(probe.insideAtClose, [false], "physical close must wait for the blocked recv to return")
+    }
+
+    /// Waits until the probe has been inside the same syscall for 10 consecutive 20 ms polls.
+    /// A send that is still filling the socket buffer returns quickly and re-enters, which
+    /// resets the count; only a call that stays in the kernel gets through.
+    private func waitUntilBlockedInLiveSyscall(
+        _ probe: LivePOSIXSyscallProbe,
+        _ label: String
+    ) async throws {
+        var lastEntered = -1
+        var stablePolls = 0
+        for _ in 0..<500 {
+            let snapshot = probe.snapshot
+            if snapshot.inside, snapshot.entered == lastEntered {
+                stablePolls += 1
+                if stablePolls >= 10 { return }
+            } else {
+                stablePolls = 0
+            }
+            lastEntered = snapshot.entered
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        throw SMBTestTimeoutError(label: label, seconds: 10)
     }
 
     func testPOSIXSocketTransportReceiveTimeout() async throws {

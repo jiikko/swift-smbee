@@ -667,8 +667,11 @@ public actor SMBClientSession {
     // Keep writes comparable to reads; credit/negotiated limits still clamp this.
     static let localWriteChunkLimit = 1024 * 1024
 
-    // Prefix reads are intentionally bounded because readPrefix retains the complete result.
-    // The stream API has no equivalent limit because it does not accumulate data.
+    // Both prefix APIs share this bound. readPrefix needs it because it retains the complete
+    // result; withPrefixReadStream needs it because the length bounds how long the open handle,
+    // the session task and the onChunk capture live (issues/070). Prefix reads are for small
+    // heads (the obaket thumbnail consumer reads at most 4 MiB); larger reads belong to
+    // withReadStream(range:).
     static let maxPrefixReadLength: UInt64 = 64 * 1024 * 1024
 
     /// Everything needed to rebuild a dropped connection for opt-in watch resubscribe.
@@ -1270,8 +1273,17 @@ public actor SMBClientSession {
     /// Stream a best-effort prefix from offset zero without issuing QUERY_INFO.
     ///
     /// A short success is not proof of the file size and ends the operation immediately.
-    /// Unlike `readPrefix`, this method does not impose an accumulation limit. A connection
+    /// `maxLength` shares `readPrefix`'s limit even though nothing is accumulated: it bounds how
+    /// long the handle stays open. Use `withReadStream(range:)` for larger reads. A connection
     /// loss after a chunk was yielded is normalized to `SMBError.connectionLost(operation: "READ")`.
+    ///
+    /// There is no built-in operation timeout. Each chunk is followed by a cancellation check,
+    /// so a caller that needs a deadline wraps this call in `SMBOperationDeadline.run(timeout:)`;
+    /// the cancellation it raises closes the handle. A timeout parameter here could not do more:
+    /// `SMBOperationDeadline` waits for the operation task, so an `onChunk` that ignores
+    /// cancellation would still keep this call (and the handle) alive.
+    ///
+    /// - Throws: If `maxLength` exceeds the prefix read limit, before any request is sent.
     public func withPrefixReadStream(
         path: String,
         maxLength: UInt64,
@@ -1280,6 +1292,9 @@ public actor SMBClientSession {
         try ensureOpen()
         // Same as readPrefix: reject a pre-cancelled task before the zero-length early return.
         try Task.checkCancellation()
+        guard maxLength <= Self.maxPrefixReadLength else {
+            throw SMBCodecError.invalidValue("prefix stream exceeds the prefix read limit; use withReadStream(range:)")
+        }
         guard maxLength > 0 else { return }
 
         let progress = SMBReadStreamProgress()

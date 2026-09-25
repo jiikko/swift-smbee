@@ -6728,6 +6728,95 @@ final class SMBeeTests: XCTestCase {
         ])
     }
 
+    /// issues/070: the stream variant shares readPrefix's limit because the length bounds how
+    /// long the handle stays open, and it is rejected before any request is sent.
+    func testClientSessionPrefixStreamRejectsPrefixLimitBeforeCreate() async throws {
+        let transport = InMemoryTransport()
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let chunks = LockedCounter()
+
+        do {
+            try await clientSession.withPrefixReadStream(
+                path: "large.bin",
+                maxLength: SMBClientSession.maxPrefixReadLength + 1
+            ) { _ in chunks.increment() }
+            XCTFail("expected the prefix read limit to reject the stream")
+        } catch SMBCodecError.invalidValue {
+            // Expected.
+        }
+        XCTAssertTrue(transport.outbound.isEmpty)
+        XCTAssertEqual(chunks.value, 0)
+    }
+
+    /// The limit is inclusive: exactly `maxPrefixReadLength` still opens the file.
+    func testClientSessionPrefixStreamAcceptsExactlyThePrefixLimit() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2ReadResponse(Array("data".utf8), messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+        ]))
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let received = PrefixChunkCollector()
+
+        try await clientSession.withPrefixReadStream(
+            path: "stream.bin",
+            maxLength: SMBClientSession.maxPrefixReadLength
+        ) { chunk in received.append(chunk) }
+
+        XCTAssertEqual(received.chunks, [Array("data".utf8)])
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create, SMB2Commands.read, SMB2Commands.close
+        ])
+    }
+
+    /// issues/070: there is no built-in operation timeout; the documented way to bound a stalled
+    /// (cooperative) onChunk is to wrap the call in SMBOperationDeadline. That must end the call
+    /// with `timedOut` and still close the handle.
+    func testClientSessionPrefixStreamDeadlineCancelsStalledChunkAndClosesHandle() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let transport = InMemoryTransport(inbound: try framed([
+            try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: 0x3344),
+            try smb2ReadResponse(Array("data".utf8), messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344)
+        ]))
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+        let chunkEntered = LockedCounter()
+
+        do {
+            try await awaitWithTimeout("prefix stream bounded by SMBOperationDeadline") {
+                try await SMBOperationDeadline.run(timeout: .milliseconds(100)) {
+                    try await clientSession.withPrefixReadStream(path: "stream.bin", maxLength: 4) { _ in
+                        chunkEntered.increment()
+                        try await Task.sleep(for: .seconds(60))
+                    }
+                }
+            }
+            XCTFail("expected the deadline to end the stalled prefix stream")
+        } catch SMBTransportError.timedOut {
+            // Expected.
+        }
+        XCTAssertEqual(chunkEntered.value, 1, "the stall must happen inside onChunk, not before the first chunk")
+        XCTAssertEqual(try unframed(transport.outbound).map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.create, SMB2Commands.read, SMB2Commands.close
+        ])
+    }
+
     func testClientSessionPrefixStreamNormalizesConnectionLossAfterYield() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let transport = InMemoryTransport(inbound: try framed([

@@ -122,6 +122,11 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
     private let connectionLock = NSLock()
     private var connectionState: ConnectionState = .idle
     private var connectingDescriptor: Int32 = -1
+    // Keyed by the raw fd value (issues/073). That is sound only while connect tries its
+    // candidates one at a time: a failed candidate is closed and its record removed on the
+    // connect thread before the next socket() can hand out the same number, and
+    // closeClaimedDescriptorIfNeeded only removes a record that is still the closed one.
+    // If candidates are ever connected in parallel, key this by a (generation, fd) identity.
     private var descriptorLeaseRecords: [Int32: DescriptorLeaseRecord] = [:]
     private let timeout: Duration?
     private let writer: POSIXSocketWriter

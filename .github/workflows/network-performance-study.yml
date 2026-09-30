@@ -9,16 +9,21 @@ name: Network performance study
 #   cmac-ab     issue 060 before/after (e91809a^ / e91809a, both with the issue 098 backport) on
 #               smb302-signing-required, the profile whose signing is AES-CMAC
 #   nodelay-ab  HEAD with and without TCP_NODELAY on smb302-encrypted-required and smb302-signing-required
+#   fix-ab      baseline_ref (the commit before a fix) vs HEAD on all four profiles
 
 on:
   workflow_dispatch:
     inputs:
       experiment:
-        description: profiles | cmac-ab | nodelay-ab
+        description: profiles | cmac-ab | nodelay-ab | fix-ab
         required: true
         default: profiles
         type: choice
-        options: [profiles, cmac-ab, nodelay-ab]
+        options: [profiles, cmac-ab, nodelay-ab, fix-ab]
+      baseline_ref:
+        description: fix-ab only — commit to compare HEAD against (the commit before the fix)
+        required: false
+        default: ""
       sizes_mib:
         description: Comma-separated payload sizes in MiB
         required: false
@@ -72,6 +77,12 @@ jobs:
               matrix='{"include":[
                 {"profile":"smb302-encrypted-required","arms":"current nodelay"},
                 {"profile":"smb302-signing-required","arms":"current nodelay"}]}' ;;
+            fix-ab)
+              matrix='{"include":[
+                {"profile":"smb302-encrypted-required","arms":"baseline current"},
+                {"profile":"smb302-signing-required","arms":"baseline current"},
+                {"profile":"smb311-signing-required","arms":"baseline current"},
+                {"profile":"smb311-encrypted-required","arms":"baseline current"}]}' ;;
             *) echo "unknown experiment ${EXPERIMENT}" >&2; exit 2 ;;
           esac
           if [ -n "${PROFILES}" ]; then
@@ -104,6 +115,7 @@ jobs:
       STUDY_SAMPLES: ${{ inputs.samples }}
       STUDY_WARMUP: ${{ inputs.warmup }}
       STUDY_OUTPUT_DIR: ${{ github.workspace }}/.build/network-study
+      STUDY_BASELINE_REF: ${{ inputs.baseline_ref }}
     steps:
       - uses: actions/checkout@v7
         with:

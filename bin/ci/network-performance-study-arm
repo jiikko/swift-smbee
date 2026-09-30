@@ -12,6 +12,8 @@ unset CDPATH
 #   nodelay      HEAD + TCP_NODELAY right after connect (issue 097 step 6)
 #   cmac-before  e91809a^ (before "perf: accelerate AES-CMAC signing", issue 060)
 #   cmac-after   e91809a
+#   baseline     STUDY_BASELINE_REF (required) with HEAD's harness — compares a fix against the commit
+#                before it on the same runner (e.g. issue 099)
 #
 # The cmac arms are older than issue 098. Those commits encrypt every SMB 3.0.x request even when the
 # server does not support encryption, so AES-CMAC signing never reaches the wire and a signing-only
@@ -32,7 +34,7 @@ BACKPORT_FROM=56a9b3a^
 BACKPORT_TO=958bb62
 
 if [ "$#" -ne 2 ]; then
-  echo "usage: $0 <current|nodelay|cmac-before|cmac-after> <output-dir>" >&2
+  echo "usage: $0 <current|nodelay|cmac-before|cmac-after|baseline> <output-dir>" >&2
   exit 2
 fi
 arm="$1"
@@ -109,6 +111,12 @@ case "${arm}" in
     apply_098_backport "${directory}"
     cp "${REPO_ROOT}/${HARNESS}" "${directory}/${HARNESS}"
     swift_flags='-Xswiftc -DSMBEE_LEGACY_TRANSPORT_API'
+    ;;
+  baseline)
+    : "${STUDY_BASELINE_REF:?STUDY_BASELINE_REF is required for the baseline arm}"
+    base_commit="$(git -C "${REPO_ROOT}" rev-parse --verify "${STUDY_BASELINE_REF}^{commit}")"
+    directory="$(new_worktree "${base_commit}")"
+    cp "${REPO_ROOT}/${HARNESS}" "${directory}/${HARNESS}"
     ;;
   *)
     echo "unknown arm: ${arm}" >&2

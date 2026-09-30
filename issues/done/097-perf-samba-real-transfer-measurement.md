@@ -1,9 +1,9 @@
 # 097 perf: 実 Samba 転送で、synthetic の署名改善がどれだけ効いているかと律速箇所を測る
 
 起票日: 2026-09-25
-親: [done/061](done/061-perf-create-measurement-driven-follow-up-issues.md) (測定駆動の個別 issue を起こすメタ issue)
-関連: [done/060](done/060-perf-profile-and-reduce-aes-cmac-write-cost.md) (AES-CMAC 改善) /
-[075](075-perf-linux-aes-ccm-pure-swift-throughput.md) (Linux AES-CCM fallback) /
+親: [done/061](061-perf-create-measurement-driven-follow-up-issues.md) (測定駆動の個別 issue を起こすメタ issue)
+関連: [done/060](060-perf-profile-and-reduce-aes-cmac-write-cost.md) (AES-CMAC 改善) /
+[075](../075-perf-linux-aes-ccm-pure-swift-throughput.md) (Linux AES-CCM fallback) /
 `Tests/SMBeeTests/SMBeeNetworkPerformanceE2ETests.swift` / `.github/workflows/performance.yml` の `samba-network-performance` job /
 `docs/performance-resource-baseline.md`
 
@@ -125,16 +125,16 @@ Sources に `TCP_NODELAY` の設定は 1 件も無い)。手元の Apple contain
 
 ## 完了条件
 
-- [ ] 4 profile × 3 size (入らないものは見積もりを記録) について、10 invocation の raw sample と metadata が JSONL と run URL で残っている。
-- [ ] 060 の A/B (または手順 5 の代替 A/B) の表があり、「synthetic の改善のうち実転送の throughput / client CPU に反映された割合」を数字で書いている。
-- [ ] 分解測定が最低 1 つあり、各 profile で「律速は client の暗号 / client のその他 / network・server」のどれかを判定している。
-- [ ] 全 sample で size が一致し、SHA-256 の照合が通っている。署名・暗号の交渉結果が期待どおりである。
-- [ ] `swift test` (unit 全体)、`make smoke` (container Samba E2E) が green。harness の変更で CI の `samba-network-performance` job が
+- [x] 4 profile × 3 size (入らないものは見積もりを記録) について、10 invocation の raw sample と metadata が JSONL と run URL で残っている。（run A・B。smb302-encrypted-required の 1 GiB は約 45 分の見積もりで除外）
+- [x] 060 の A/B (または手順 5 の代替 A/B) の表があり、「synthetic の改善のうち実転送の throughput / client CPU に反映された割合」を数字で書いている。（代替 A/B、run C。client CPU・wall とも約 102%）
+- [x] 分解測定が最低 1 つあり、各 profile で「律速は client の暗号 / client のその他 / network・server」のどれかを判定している。
+- [x] 全 sample で size が一致し、SHA-256 の照合が通っている。署名・暗号の交渉結果が期待どおりである。
+- [x] `swift test` (unit 全体)、`make smoke` (container Samba E2E) が green。harness の変更で CI の `samba-network-performance` job が
   壊れていない (job の summary に新しい表が出る)。
-- [ ] 結果を `docs/performance-resource-baseline.md` に「Issue 097: real Samba transfer」節として書き戻した。
-- [ ] **次の実装 issue は、client 側の単一の候補が全体の wall time の 10% 以上を占めるときだけ起票する**。
+- [x] 結果を `docs/performance-resource-baseline.md` に「Issue 097: real Samba transfer」節として書き戻した。
+- [x] **次の実装 issue は、client 側の単一の候補が全体の wall time の 10% 以上を占めるときだけ起票する**。（[099](../099-perf-direct-tcp-header-split-send-nagle-stall.md) を起票。CCM は 075 に書き足した）
   CCM が支配的と出た場合は新しい issue を作らず、075 に数字を書き足す (075 がその候補の受け皿)。
-- [ ] **10% 以上の候補が無ければ、「現条件では network / server 律速」と結果を書き、実装変更なしで done にしてよい**。
+- [x] （該当せず: 10% 以上の候補があった）**10% 以上の候補が無ければ、「現条件では network / server 律速」と結果を書き、実装変更なしで done にしてよい**。
   shaping が使えなかった・1 GiB が時間に入らなかった・古い commit で harness がコンパイルできなかった、はいずれも理由を書けば完了を妨げない。
 
 ## スコープ外
@@ -190,9 +190,32 @@ Sources に `TCP_NODELAY` の設定は 1 件も無い)。手元の Apple contain
 
 - run [36680560657](https://github.com/jiikko/swift-smbee/actions/runs/36680560657): 4 job とも arm の build で失敗
   （`swift build -c release --build-tests` は testability を有効にしないので `@testable import` が通らない）→ 上の fix
-- run [36681110725](https://github.com/jiikko/swift-smbee/actions/runs/36681110725): 再試走（profiles、1・64 MiB、invocation 1）。結果待ち
+- run [36681110725](https://github.com/jiikko/swift-smbee/actions/runs/36681110725): 再試走（profiles、1・64 MiB、invocation 1）。4 job とも成功し、所要時間から本番の組み方を決めた
 
-### 残タスク
+## 決着（2026-09-30）
 
-- 試走の 64 MiB の所要時間から 1 GiB と 10 invocation の組み方を決める（手順 8）
-- profiles / cmac-ab / nodelay-ab を 10 invocation で回し、表を作って `docs/performance-resource-baseline.md` と 075 に書き戻す
+表と run URL は `docs/performance-resource-baseline.md` の「Issue 097: real Samba transfer」→「結果」が正本。要点:
+
+- **060 の CMAC 改善は、実転送にほぼ全量反映された**（代替 A/B、run C）。64 MiB write の client CPU は 89.64 → 7.45 ms/MiB、
+  wall は 95.04 → 12.30 ms/MiB で、synthetic の削減 80.77 ms/MiB に対して約 102%。throughput は 10.5 → 81.3 MiB/s
+- **律速は 4 profile とも「往復ごとの待ち」**（client CPU ÷ wall 0.02〜0.2、server も 0.06 以下）。TCP_NODELAY の A/B（run D）で
+  smb302-signing-required の 1 MiB read が 168.1 → 5.8 ms（-96.6%）、64 MiB read が 21.6 → 259.5 MiB/s。原因は frame header を
+  別 send() で送ること（`0709833`）と考えられ、[099](../099-perf-direct-tcp-header-split-send-nagle-stall.md) を起票した。smb311 の 2 profile は
+  同じ形の固定遅延からの推定（A/B は未実施）
+- **CCM（smb302-encrypted-required）の 64 MiB write は client の暗号で律速**（CPU ÷ wall 0.81〜0.93）。待ちを消すと read も
+  CPU 律速（0.96、約 14 MiB/s）になる。数字は 075 に書き足した（075 の着手 trigger を 099 の修正後の条件で満たす）
+- 全 2,060 sample で size 一致・SHA-256 照合が通り、交渉結果も期待どおり
+
+### issue 本文の想定から外れた点
+
+- 手順 5 の 060 A/B は、098 より前の SMBee が 3.0.x で常に暗号化していたため（CMAC が wire に乗らない）、両 arm に 098 の最小 backport を
+  載せた代替 A/B にした
+- 手順 6 の分解は `perf record` ではなく client CPU ÷ wall と server の cgroup CPU で行った（runner の docker 内の perf を前提にしなかった）
+- 完了条件の「CI の `samba-network-performance` job の summary に新しい表が出る」は採らなかった。常設 job の出力契約
+  （PERF_NETWORK 2 行・sample 各 100 行。`publish-network-performance-summary` と `verify-agent-performance` が読む）を変えないため、
+  新しい表は手動の `network-performance-study.yml` の summary に出す。常設 job は `2ecb48a` / `c7458a3` の CI で従来どおり通った
+  （`bin/ci/verify-agent-push` rc=0）
+- 時間の上限（1 job 30 分）は run B（32〜35 分）・C（40 分）・D の CCM job（45 分）で超えた。smb302-encrypted-required の 1 GiB は
+  約 45 分の見積もりで測っていない
+- `make smoke` は `Sources/SMBee` が 098 の最後の commit（tree `7ece416`）から変わっていないので、そのとき通したものがこの issue の
+  状態にも当たる（097 は test / CI / docs だけを変えた）

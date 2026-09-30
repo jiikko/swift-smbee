@@ -129,7 +129,7 @@ large-file concurrency/credit windowだが、根拠を取得する前に実装ta
 
 ### 起票した個別 issue
 
-- **[097](../097-perf-samba-real-transfer-measurement.md)** perf: 実 Samba 転送で、synthetic の署名改善がどれだけ効いているかと律速箇所を測る
+- **[097](097-perf-samba-real-transfer-measurement.md)** perf: 実 Samba 転送で、synthetic の署名改善がどれだけ効いているかと律速箇所を測る
   (gap 1〜4 をまとめて扱う。061 の「必ず起票する個別 issue」)。反証レビュー (read-only サブエージェント) を 1 周通し、
   P1 1 件 (実転送の経路から切り替えられない「pure-Swift backend の代替 A/B」を削除) と P2/P3 4 件を反映した。
 

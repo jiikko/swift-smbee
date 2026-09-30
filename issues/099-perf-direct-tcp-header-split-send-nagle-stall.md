@@ -1,7 +1,7 @@
 # 099 perf: direct TCP の frame header を別の send() で送るため、往復ごとに Nagle と遅延 ACK で約 40 ms 待つ
 
 起票日: 2026-09-30
-親: [097](097-perf-samba-real-transfer-measurement.md)（実 Samba 転送の分解測定。この issue は 097 の「client 側の単一候補が
+親: [097](done/097-perf-samba-real-transfer-measurement.md)（実 Samba 転送の分解測定。この issue は 097 の「client 側の単一候補が
 wall の 10% 以上」に当たる）
 関連: `Sources/SMBee/POSIXSocketTransport.swift`（`sendBlocking` / `enqueueSend`）/ `Sources/SMBee/DirectTCPFraming.swift`
 （`segments`）/ commit `0709833 perf(transport): send direct TCP frames as segments`

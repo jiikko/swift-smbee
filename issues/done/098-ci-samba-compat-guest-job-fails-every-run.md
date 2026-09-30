@@ -1,7 +1,7 @@
 # 098 ci: samba-compat の guest job が、追加されてから一度も通っていない
 
 起票日: 2026-09-30
-親: [done/095](done/095-ci-samba-compatibility-matrix.md)（Samba compatibility matrix）/ guest job を足したのは [done/044](done/044-ci-guest-anonymous-profile-is-not-covered.md)
+親: [done/095](095-ci-samba-compatibility-matrix.md)（Samba compatibility matrix）/ guest job を足したのは [done/044](044-ci-guest-anonymous-profile-is-not-covered.md)
 関連: `.github/workflows/samba-compat.yml`（matrix の `profile: guest`）/ `test/e2e/smb/guest.conf` /
 `Tests/SMBeeTests/SMBeeE2ETests.swift`（`SMBEE_E2E_PROFILE` の分岐）
 
@@ -132,7 +132,7 @@ MS-SMB2 に厳密な A 案（server が要求したときだけ暗号化する�
 ## 受け入れ条件
 
 - [x] 失敗の原因が候補 1〜3 のどれかを、wire log を根拠に確定してこの issue に書いている（候補 2。上の節）
-- [ ] `samba-compat.yml` の guest job が success になっている（run id を記録する）
+- [x] `samba-compat.yml` の guest job が success になっている（run 36666736528、下の「決着」節）
 - [x] 候補 2 だった場合、署名・暗号を必須にしない server へ認証ありで繋ぐ組み合わせを守る E2E が残っている（guest profile の認証ありテストをそのまま残す。候補 1 の「guest では skip」は採らない）
 
 ## 進捗
@@ -141,3 +141,13 @@ MS-SMB2 に厳密な A 案（server が要求したときだけ暗号化する�
   「2 択では足りない（smbd が認証成功の後に INVALID_PARAMETER で終了している）」と指摘され、ログで裏を取って候補を 3 つに直した。
 - 2026-09-30: 手元で再現し、wire の実測と A/B 実験で候補 2 に確定（「切り分けの結果」節）。
 - 2026-09-30: 修正を実装（「修正」節）。CI の guest job の success 確認は push 後。
+- 2026-09-30: push 後に samba-compat を workflow_dispatch で起動し、guest job を含む全 job の success を確認。done へ移す。
+
+## 決着（2026-09-30）
+
+- `gh run view 36666736528`（workflow_dispatch、head `2042509`）: conclusion success。6 job すべて success
+  （`ubuntu:24.04 / guest` を含む）。
+- guest job のログ: `swift test --filter SMBeeE2ETests` が `Executed 15 tests, with 1 test skipped and 0 failures`、
+  `testAuthenticatedFastSmoke` が passed、smbd の `Server exit (NT_STATUS_INVALID_PARAMETER)` は 0 件。
+- 再発したときの見どころ: guest job の認証ありテストが `connectionLost` / `connectionClosed` で一斉に落ち、smbd に
+  `INVALID_PARAMETER` が出ていたら、3.0.x の暗号鍵の導出条件（`SMBProbeResult.supportsEncryption`）が崩れていないかを見る。

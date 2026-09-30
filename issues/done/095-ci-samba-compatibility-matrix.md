@@ -229,5 +229,5 @@ matrix job は並列実行される前提で設計する。
   `ubuntu:22.04` / `debian:12` の `smb302-encrypted-required`。
 - ただし run 全体は failure。失敗は、後から [done/044](044-ci-guest-anonymous-profile-is-not-covered.md) で matrix に足した
   `ubuntu:24.04 / guest` の job だけ。この job は追加後の最初の run（2026-07-13）から 2026-09-28 まで、
-  12 週連続で失敗している。この issue の対象外なので、[098](../098-ci-samba-compat-guest-job-fails-every-run.md) へ切り出した。
+  12 週連続で失敗している。この issue の対象外なので、[098](098-ci-samba-compat-guest-job-fails-every-run.md) へ切り出した。
 

@@ -57,10 +57,11 @@ mkdir -p "${RESOURCE_SWIFTPM_CACHE_DIR}"
 # mount below even if the image's user/HOME drifts. The mount target still assumes a root image
 # (a non-root user could not write under /root).
 #
-# prewarm-swiftpm-artifacts is mounted from SCRIPT_DIR, not read out of /workspace: the paired
-# performance run measures a reference commit by pointing RESOURCE_REPO_ROOT at an older worktree
-# (.github/workflows/performance.yml), and that worktree does not contain scripts added since.
-# Mounting it at its in-repo path keeps the script's own REPO_ROOT equal to /workspace.
+# prewarm-swiftpm-artifacts and resource-performance-container (the in-container steps) are mounted
+# from SCRIPT_DIR, not read out of /workspace: the paired performance run measures a reference commit
+# by pointing RESOURCE_REPO_ROOT at an older worktree (.github/workflows/performance.yml), and that
+# worktree does not contain scripts added since. Mounting them at their in-repo paths keeps their own
+# REPO_ROOT equal to /workspace.
 docker run --rm \
   -e RESOURCE_BASELINE_RUNS \
   -e RESOURCE_SKIP_BUILD \
@@ -71,58 +72,10 @@ docker run --rm \
   -v "${REPO_ROOT}:/workspace" \
   -v "${RESOURCE_SWIFTPM_CACHE_DIR}:/root/.cache/org.swift.swiftpm" \
   -v "${SCRIPT_DIR}/prewarm-swiftpm-artifacts:/workspace/bin/ci/prewarm-swiftpm-artifacts:ro" \
+  -v "${SCRIPT_DIR}/resource-performance-container:/workspace/bin/ci/resource-performance-container:ro" \
   -w /workspace \
   "${SWIFT_IMAGE}" \
-  bash -c '
-    set -euo pipefail
-    if [ -x /usr/bin/time ]; then
-      :
-    else
-      # Revisit this external dependency when a measurement image bundles time.
-      apt-get update -qq
-      apt-get install -y -qq time >/dev/null
-    fi
-    mkdir -p .build
-    if [ "${RESOURCE_APPEND_LOG}" != true ]; then
-      : > .build/resource-performance.log
-    fi
-    if [ "${RESOURCE_SKIP_BUILD}" != true ]; then
-      bash bin/ci/prewarm-swiftpm-artifacts
-    fi
-    test_arguments=(-c release)
-    if [ "${RESOURCE_SKIP_BUILD}" = true ]; then
-      test_arguments+=(--skip-build)
-    fi
-    emit_env() {
-      local key="$1"
-      shift
-      local value="$*"
-      if [ -z "${value}" ]; then
-        value=unknown
-      fi
-      printf "PERF_ENV %s %s\n" "${key}" "${value}"
-    }
-    swift_version="$(swift --version 2>/dev/null | head -n 1 || true)"
-    kernel="$(uname -a 2>/dev/null || true)"
-    cpu_model="$(grep -m1 -E "^(model name|Hardware|Processor)[[:space:]]*:" /proc/cpuinfo 2>/dev/null | sed -E "s/^[^:]*:[[:space:]]*//" || true)"
-    cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
-    {
-      if [ "${RESOURCE_APPEND_LOG}" != true ]; then
-        emit_env swift_version "${swift_version}"
-        emit_env kernel "${kernel}"
-        emit_env cpu_model "${cpu_model}"
-        emit_env cpu_count "${cpu_count}"
-        echo "PERF_BUILD_CACHE exact_hit=${RESOURCE_SKIP_BUILD}"
-      fi
-      for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
-        run_number=$((RESOURCE_BASELINE_RUN_OFFSET + baseline_run))
-        echo "PERF_BASELINE_RUN run=${run_number} total=${RESOURCE_BASELINE_RUN_TOTAL}"
-        /usr/bin/time -v swift test "${test_arguments[@]}" --filter "SMBee(PerformanceRegression|ResourcePerformance)Tests"
-      done
-    } 2>&1 | tee -a .build/resource-performance.log
-    chmod -R a+rX .build
-    chmod -R a+rX /root/.cache/org.swift.swiftpm
-  '
+  bash bin/ci/resource-performance-container
 
 # A missing/unreadable log must not pass as "no download": grep would exit 2 and `if` would swallow it.
 if [ ! -r "${LOG_FILE}" ]; then

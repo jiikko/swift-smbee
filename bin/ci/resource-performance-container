@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+# Runs inside the resource-performance container; bin/ci/run-resource-performance mounts it and
+# runs it from /workspace. It used to be the docker-run `bash -c` payload, where the build-cache
+# branch below could only be pinned as a string (issue 091). As functions, bin/ci/test-performance-scripts
+# sources this file, replaces the measurement steps that need /usr/bin/time and swift, and runs the
+# real resource_performance_main against a scratch directory.
+#
+# Like prewarm-swiftpm-artifacts it is mounted from the caller's SCRIPT_DIR: the paired performance
+# run points /workspace at an older worktree (.github/workflows/performance.yml) that does not
+# contain this file.
+
+resource_performance_install_time() {
+  if [ -x /usr/bin/time ]; then
+    return 0
+  fi
+  # Revisit this external dependency when a measurement image bundles time.
+  apt-get update -qq
+  apt-get install -y -qq time >/dev/null
+}
+
+resource_performance_reset_log() {
+  mkdir -p .build
+  if [ "${RESOURCE_APPEND_LOG}" != true ]; then
+    : > .build/resource-performance.log
+  fi
+}
+
+# An exact build-cache hit (RESOURCE_SKIP_BUILD=true) runs `swift test --skip-build` on the restored
+# .build, so resolving packages again would only add network work and a chance to download.
+resource_performance_prepare_build() {
+  if [ "${RESOURCE_SKIP_BUILD}" != true ]; then
+    bash bin/ci/prewarm-swiftpm-artifacts
+  fi
+}
+
+resource_performance_emit_env() {
+  local key="$1"
+  shift
+  local value="$*"
+  if [ -z "${value}" ]; then
+    value=unknown
+  fi
+  printf "PERF_ENV %s %s\n" "${key}" "${value}"
+}
+
+resource_performance_measure() {
+  local test_arguments=(-c release)
+  if [ "${RESOURCE_SKIP_BUILD}" = true ]; then
+    test_arguments+=(--skip-build)
+  fi
+  local swift_version kernel cpu_model cpu_count baseline_run run_number
+  swift_version="$(swift --version 2>/dev/null | head -n 1 || true)"
+  kernel="$(uname -a 2>/dev/null || true)"
+  cpu_model="$(grep -m1 -E "^(model name|Hardware|Processor)[[:space:]]*:" /proc/cpuinfo 2>/dev/null | sed -E "s/^[^:]*:[[:space:]]*//" || true)"
+  cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  {
+    if [ "${RESOURCE_APPEND_LOG}" != true ]; then
+      resource_performance_emit_env swift_version "${swift_version}"
+      resource_performance_emit_env kernel "${kernel}"
+      resource_performance_emit_env cpu_model "${cpu_model}"
+      resource_performance_emit_env cpu_count "${cpu_count}"
+      echo "PERF_BUILD_CACHE exact_hit=${RESOURCE_SKIP_BUILD}"
+    fi
+    for baseline_run in $(seq 1 "${RESOURCE_BASELINE_RUNS}"); do
+      run_number=$((RESOURCE_BASELINE_RUN_OFFSET + baseline_run))
+      echo "PERF_BASELINE_RUN run=${run_number} total=${RESOURCE_BASELINE_RUN_TOTAL}"
+      /usr/bin/time -v swift test "${test_arguments[@]}" --filter "SMBee(PerformanceRegression|ResourcePerformance)Tests"
+    done
+  } 2>&1 | tee -a .build/resource-performance.log
+}
+
+# The host-side runner reads .build and the SwiftPM cache after the container (running as root) exits.
+resource_performance_publish_permissions() {
+  chmod -R a+rX .build
+  chmod -R a+rX /root/.cache/org.swift.swiftpm
+}
+
+resource_performance_main() {
+  resource_performance_install_time
+  resource_performance_reset_log
+  resource_performance_prepare_build
+  resource_performance_measure
+  resource_performance_publish_permissions
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  resource_performance_main
+fi

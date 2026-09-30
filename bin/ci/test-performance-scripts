@@ -141,12 +141,13 @@ expect_resource_performance_docker_argv() {
     -v "${repo_root}:/workspace" \
     -v "${cache_dir}:/root/.cache/org.swift.swiftpm" \
     -v "${SCRIPT_DIR}/prewarm-swiftpm-artifacts:/workspace/bin/ci/prewarm-swiftpm-artifacts:ro" \
+    -v "${SCRIPT_DIR}/resource-performance-container:/workspace/bin/ci/resource-performance-container:ro" \
     -w /workspace \
     swift:test \
     bash \
-    -c \
+    bin/ci/resource-performance-container \
     > "${expected_file}"
-  head -n 25 "${argv_file}" | diff -u "${expected_file}" -
+  diff -u "${expected_file}" "${argv_file}"
 }
 
 write_canonical_log() {
@@ -230,6 +231,7 @@ test_syntax_checks() {
     "${SCRIPT_DIR}/run-performance-regression" \
     "${SCRIPT_DIR}/run-resource-performance" \
     "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+    "${SCRIPT_DIR}/resource-performance-container" \
     "${SCRIPT_DIR}/resource-performance-metadata" \
     "${SCRIPT_DIR}/parse-resource-performance" \
     "${SCRIPT_DIR}/publish-network-performance-summary" \
@@ -460,21 +462,47 @@ test_prewarm_handles_path_with_space() {
   expect_contains "${scenario_dir}/run.err" "${artifacts_dir}"
 }
 
-test_run_resource_performance_prewarm_wiring() {
-  local scenario_dir wiring_excerpt
+# Runs the real in-container steps (resource_performance_main) in a scratch workspace, with only the
+# steps that need /usr/bin/time, swift, or /root replaced. /usr/bin/time is an absolute path, so a PATH
+# shim could not stand in for it; replacing the functions after sourcing keeps the build-cache branch
+# and its call from main under test (issue 091).
+test_resource_performance_container_prewarm_branch() {
+  local scenario_dir workspace marker skip_build
   scenario_dir="$(new_scenario_dir)"
-  wiring_excerpt="${scenario_dir}/wiring-excerpt"
-  # This is a wiring pin, not a behavior test.
-  if ! grep -F -A2 -- '    if [ "${RESOURCE_SKIP_BUILD}" != true ]; then' \
-    "${SCRIPT_DIR}/run-resource-performance" >"${wiring_excerpt}"; then
-    echo 'run-resource-performance is missing the prewarm guard' >&2
-    return 1
-  fi
-  expect_contains "${wiring_excerpt}" \
-    'if [ "${RESOURCE_SKIP_BUILD}" != true ]; then' \
-    'bash bin/ci/prewarm-swiftpm-artifacts'
+  workspace="${scenario_dir}/workspace"
+  marker="${scenario_dir}/prewarm-called"
+  mkdir -p "${workspace}/bin/ci"
+  cat > "${workspace}/bin/ci/prewarm-swiftpm-artifacts" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' called >> "${FAKE_PREWARM_MARKER:?}"
+EOF
 
-  # Also a lexical pin: bash 3.2 (macOS /bin/bash) raises "unbound variable" for an
+  for skip_build in false true; do
+    rm -f "${marker}" "${scenario_dir}/steps"
+    (
+      cd "${workspace}"
+      export RESOURCE_SKIP_BUILD="${skip_build}" RESOURCE_APPEND_LOG=false \
+        FAKE_PREWARM_MARKER="${marker}" STEP_LOG="${scenario_dir}/steps"
+      # shellcheck source=bin/ci/resource-performance-container
+      source "${SCRIPT_DIR}/resource-performance-container"
+      resource_performance_install_time() { printf '%s\n' install_time >> "${STEP_LOG}"; }
+      resource_performance_measure() { printf '%s\n' measure >> "${STEP_LOG}"; }
+      resource_performance_publish_permissions() { printf '%s\n' publish_permissions >> "${STEP_LOG}"; }
+      resource_performance_main
+    )
+    printf '%s\n' install_time measure publish_permissions | diff -u - "${scenario_dir}/steps"
+    test -f "${workspace}/.build/resource-performance.log"
+    if [ "${skip_build}" = false ]; then
+      printf '%s\n' called | diff -u - "${marker}"
+    else
+      test ! -e "${marker}"
+    fi
+  done
+}
+
+test_prewarm_has_no_array_expansions() {
+  # A lexical pin: bash 3.2 (macOS /bin/bash) raises "unbound variable" for an
   # empty array expansion under set -u, which would turn the purge guard's clean
   # refusal into a crash. CI runs bash 5 on Linux, so no behavior test here can see
   # that regression. This catches an accidental reintroduction of "${name[@]}" in
@@ -581,10 +609,14 @@ test_run_resource_performance_log_path() {
     >"${scenario_dir}/resource-run.out" 2>"${scenario_dir}/resource-run.err"
   test -e "${docker_stub_marker}"
   test "$(cat "${resource_docker_log}.count")" -eq 1
-  expect_contains "${resource_docker_log}.1" \
+  expect_resource_performance_docker_argv "${resource_docker_log}.1" "${REPO_ROOT}" \
+    "${RESOURCE_SWIFTPM_CACHE_DIR:-${REPO_ROOT}/.build/swiftpm-cache}"
+  # The in-container steps moved out of the argv into resource-performance-container (issue 091);
+  # keep pinning that they still install time when the image lacks it and still emit the metadata.
+  expect_contains "${SCRIPT_DIR}/resource-performance-container" \
     'if [ -x /usr/bin/time ]; then' \
     'apt-get update -qq' \
-    'emit_env swift_version'
+    'resource_performance_emit_env swift_version'
 
   local metadata_with_digest="${scenario_dir}/metadata-with-digest.jsonl"
   PATH="${scenario_dir}:${PATH}" \
@@ -1285,9 +1317,10 @@ run_scenario test_prewarm_exhausts_attempts
 run_scenario test_prewarm_success_does_not_purge
 run_scenario test_prewarm_refuses_unsafe_targets
 run_scenario test_prewarm_handles_path_with_space
-run_scenario test_run_resource_performance_prewarm_wiring
+run_scenario test_resource_performance_container_prewarm_branch
+run_scenario test_prewarm_has_no_array_expansions
 
-expected_scenario_count=24
+expected_scenario_count=25
 printf 'ran %s scenarios\n' "${scenario_count}"
 if [ "${scenario_count}" -ne "${expected_scenario_count}" ]; then
   printf 'expected %s scenarios, ran %s\n' \

@@ -142,3 +142,57 @@ Sources に `TCP_NODELAY` の設定は 1 件も無い)。手元の Apple contain
 - 性能の実装変更 (この issue は測定と判定だけ)。
 - macOS 上の実 Samba 計測 (Apple container は CI で回らず、同一条件の反復が取れない)。必要になったら別 issue にする。
 - 既存の guardrail (`bin/ci/run-performance-regression` の閾値) の変更。
+
+## 進捗
+
+### 2026-09-30: 計測の道具を用意した（codex-lead で codex が方針をリード）
+
+- `test(e2e): issue 097 — SMB 3.0.2 の署名のみ profile（smb302-signing-required）を足す`（手順 1）。
+  手元の Apple container で `SMBeeE2ETests` 15 本（2 skip）失敗 0、probe は dialect 0x0302 / signing mandatory / cipher none。
+  samba-compat の matrix にも足した（issue 098 で開いた「3.0.x の署名のみ」経路を毎週守るため）
+- `test(perf): issue 097 — 実 Samba 転送の harness に size・JSONL・client CPU・送受信量・SHA-256 照合を足す`（手順 2・3）。
+  既定は常設 job と同じ 1 MiB × 100 のまま。READ / WRITE command 数は平文 frame のときだけ数え、暗号化 frame では `null`
+  （codex の指摘: 暗号化 profile では command が transform の中に隠れる。0 と書かない）
+- `ci(perf): issue 097 — 実 Samba 転送の分解測定を手動 workflow で回す道具を足す`（手順 4〜7）:
+  `.github/workflows/network-performance-study.yml` / `bin/ci/network-performance-study-arm` / `-run` /
+  `bin/ci/summarize-network-performance-study`。使い方は `docs/performance-resource-baseline.md` の「Issue 097」節
+- `fix(ci): issue 097 — study の arm を swift test 経由で build する`（試走の失敗の修正。下）
+
+### 手順 5（060 の A/B）の前提が崩れていた — 代替 A/B にした
+
+- **issue 098 より前の SMBee は SMB 3.0.x で常に暗号化していた**（暗号化非対応の server にも TRANSFORM を送る）。
+  そのため 060 の AES-CMAC 署名は、実 Samba の転送では一度も wire に乗っていなかった。`e91809a^` / `e91809a` をそのまま
+  `smb302-signing-required` に繋ぐと、098 と同じ機構で切断されるはず（この profile での実測はしていない）
+- 代替: 両 arm に同じ 098 の最小 backport（3.0.x は `SMB2_GLOBAL_CAP_ENCRYPTION` があるときだけ暗号鍵を作る）と HEAD の harness
+  （`-DSMBEE_LEGACY_TRANSPORT_API`）を載せる。差は 060 の変更だけになる。098 の 3 commit の Sources 差分は古い commit に
+  そのまま当たらなかった（`git apply -3` でも `SMBClient.swift` が衝突）ので、`SMBNegotiate.swift` は差分を 3-way で、
+  `SMBClient.swift` は 1 箇所の置換で当てる
+- 手元（macOS debug、`smb302-signing-required`、1 MiB × 3）で 3 arm とも build と計測が通った:
+  cmac-before read 0.404 MiB/s（p50 2468.502 ms）/ cmac-after 47.069 MiB/s（p50 19.544 ms）。**macOS の debug build の値で、
+  CI（Linux release）の判定には使わない**
+
+### 分解測定の方針（手順 6）
+
+- `perf record` は runner の docker 内で使えるか不確かなので前提にしない。代わりに、sample ごとの client CPU（user + system）÷
+  wall と、Samba container の cgroup `cpu.stat`（invocation 単位）を採る。両方が wall より十分小さければ「待ち」
+  （network / TCP の遅延 ACK 等）が律速と判定する
+- server の cgroup CPU は container 全体（warm-up や採取用の `docker exec` を含む）なので参考値として扱う
+  （codex の敵対的レビューで指摘。`bin/ci/network-performance-study-run` のコメントに明記）
+
+### 敵対的レビュー（codex、道具の red team）で直したもの / 記録したもの
+
+- 直した: MAD=0 の 1 invocation 同士を「差あり」にする / invocation 数の違う arm を比べる / 途中で落ちた部分データを集計する
+  （`--expect-invocations`）/ 固定 metadata の比較漏れ（runner image・CPU 数・docker・Samba base・署名必須・harness commit）/
+  nodelay arm の `setsockopt` 失敗の握り潰し。変異 3 本で `test_network_performance_study_summary` が red になるのを確認
+- 記録（直さない）: client CPU は `RUSAGE_SELF`（プロセス全体）の差分 / 多重比較の補正は無い（issue の比較方法の範囲内）
+
+### CI の試走
+
+- run [36680560657](https://github.com/jiikko/swift-smbee/actions/runs/36680560657): 4 job とも arm の build で失敗
+  （`swift build -c release --build-tests` は testability を有効にしないので `@testable import` が通らない）→ 上の fix
+- run [36681110725](https://github.com/jiikko/swift-smbee/actions/runs/36681110725): 再試走（profiles、1・64 MiB、invocation 1）。結果待ち
+
+### 残タスク
+
+- 試走の 64 MiB の所要時間から 1 GiB と 10 invocation の組み方を決める（手順 8）
+- profiles / cmac-ab / nodelay-ab を 10 invocation で回し、表を作って `docs/performance-resource-baseline.md` と 075 に書き戻す

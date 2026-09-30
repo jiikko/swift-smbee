@@ -386,3 +386,8 @@ direct-TCP の 4 byte header と本体を別の `send()` で書くこと（`0709
 
 **全体の wall の 10% 以上を占める client 側の単一候補は「frame header の別 send による往復待ち」**で、issue 099 として
 起票した。CCM は新しい issue を作らず 075 に書き足した（097 の完了条件どおり）。
+
+**issue 099 で修正した（2026-09-30）**: 接続直後に TCP_NODELAY を立てる。修正前後を同じ runner で比べた fix-ab
+（https://github.com/jiikko/swift-smbee/actions/runs/36701434912）で、4 profile の 1 MiB wall が -47〜-98%、64 MiB read が
++22〜+3387%。CCM の 64 MiB write だけ -12.4%（client の user CPU が約 17% 増。仮説と確かめ方は issue 099 / 075）。
+以降の表は修正前の値なので、比べるなら fix-ab か新しい profiles run を使う。

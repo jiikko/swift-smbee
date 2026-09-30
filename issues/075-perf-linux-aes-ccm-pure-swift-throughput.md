@@ -114,3 +114,15 @@ invocation 10 回の median で測った。
 - **上の「着手 trigger」（CCM read が 25 MiB/s 未満かつ CPU 律速）は、099 を直した後の CI runner の条件では満たしている**。
   runner は仮想化された 4 vCPU で、実 NAS 環境の値ではない点は残る
 - runner の CPU model で絶対値が揺れる（A の Xeon と D の EPYC で write 21.2 と 13.6）。比較は同じ job の中だけにする
+
+## 099 の修正後（2026-09-30）
+
+issue 099（接続直後に TCP_NODELAY）で往復ごとの待ちが消えた後の CCM（smb302-encrypted-required）の実転送。fix-ab
+（run [36701434912](https://github.com/jiikko/swift-smbee/actions/runs/36701434912)、runner EPYC 9V45、修正前後を同じ runner で ABBA × 10）:
+
+- 1 MiB read 263.0 → 119.3 ms、write 224.4 → 118.6 ms。64 MiB read 7.03 → 8.55 MiB/s（client CPU ÷ wall 0.69 → 0.99）
+- **64 MiB write は 9.48 → 8.31 MiB/s（-12.4%）に下がった**。client の user CPU が同じ仕事で約 17% 増えている（system は不変。user 空間のコードは
+  前後で同じ）。097 の TCP_NODELAY A/B（EPYC 7763）では同じ行が変わらなかった。仮説（未検証）: 待ちが消えて client と Samba（こちらも CCM）が
+  同時に CPU を使い、4 vCPU の runner で物理 core を取り合った。確かめるなら client と server を別の core に pin して A/B を取り直す
+- 待ちが消えた後の CCM は read / write とも CPU 律速（CPU ÷ wall 0.96〜0.99）で、1 MiB あたりの client CPU は約 115 ms（この runner）。
+  上の「着手 trigger」（CCM read が 25 MiB/s 未満かつ CPU 律速）は、099 の修正後の CI runner の条件で満たしている

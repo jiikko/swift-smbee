@@ -78,3 +78,10 @@ mount を検査するようになったことで塞げたが、**payload の中�
 - Pass C P2: `resource_performance_install_time`（apt-get）と `resource_performance_measure`（`swift test | tee`）の失敗伝播は、
   scenario が差し替えるので検査していない。旧 payload のときから未検査の範囲で、payload 全体の実行はこの issue のスコープ外。
   実 docker の Performance workflow が通ることで間接的に守られる
+
+### CI での確認（2026-09-30）
+
+- `bin/ci/verify-agent-push fc7027e`: rc=0。Performance run 36677907635 の `ci-script-tests` job で
+  `scenario: test_resource_performance_container_prewarm_branch` と `ran 25 scenarios` を確認（完了条件 3）。
+  同じ run の `resource-performance` job が、切り出した `resource-performance-container` を実 docker で 20 ペア回して
+  regression gate PASS

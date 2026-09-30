@@ -15,10 +15,16 @@ public struct SMBProbeResult: Equatable, Sendable {
     public var capabilities: UInt32 = 0
 
     /// Whether the server can decrypt SMB2 TRANSFORM messages on this connection.
-    /// 3.1.1 negotiates a cipher context; 3.0.x advertises `SMB2_GLOBAL_CAP_ENCRYPTION`.
+    /// 3.1.1 negotiates a cipher context; 3.0.x advertises `SMB2_GLOBAL_CAP_ENCRYPTION`; 2.x has no encryption.
     public var supportsEncryption: Bool {
-        if dialect == SMBNegotiateConstants.dialect311 { return cipher != nil }
-        return (capabilities & SMBNegotiateConstants.globalCapEncryption) != 0
+        switch dialect {
+        case SMBNegotiateConstants.dialect311:
+            return cipher != nil
+        case SMBNegotiateConstants.dialect300, SMBNegotiateConstants.dialect302:
+            return (capabilities & SMBNegotiateConstants.globalCapEncryption) != 0
+        default:
+            return false
+        }
     }
 }
 

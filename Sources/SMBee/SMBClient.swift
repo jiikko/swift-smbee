@@ -4213,12 +4213,14 @@ actor SMBSession {
         let authHeader = try SMB2Header.decode(authResponse)
         try SMBErrorMapper.throwIfFailure(status: authHeader.status, operation: "SESSION_SETUP")
         sessionId = authHeader.sessionId
+        let sessionFlags = try SMB2SessionSetup.decodeSessionFlags(authResponse)
         if credential.isAnonymous {
             // ⓥ Anonymous NTLM does not provide session key material, so SMB signing/encryption keys
             // cannot be derived here. If a server requires signing/encryption for guest access, the
             // later signed or encrypted operation is expected to fail until guest E2E coverage defines
             // a server-specific fallback.
             authenticationCredential = nil
+            try requireEncryptionKeyIfSessionDemandsEncryption(sessionFlags)
             return
         }
         if result.dialect == SMBNegotiateConstants.dialect311 {
@@ -4238,10 +4240,7 @@ actor SMBSession {
                 decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
             }
         }
-        let sessionFlags = try SMB2SessionSetup.decodeSessionFlags(authResponse)
-        if (sessionFlags & SMB2SessionSetup.sessionFlagEncryptData) != 0, encryptionKey == nil {
-            throw SMBError.protocolError("SESSION_SETUP requires encryption but no SMB encryption key was negotiated")
-        }
+        try requireEncryptionKeyIfSessionDemandsEncryption(sessionFlags)
 #if canImport(CryptoExtras) && !canImport(CommonCrypto)
         if let signingKey {
             signingCMACContext = try AESCMAC.Context(key: signingKey)
@@ -5748,6 +5747,15 @@ actor SMBSession {
         } catch {
             await refundCredit(charge: reservedCharge)
             throw error
+        }
+    }
+
+    /// MS-SMB2 §3.2.5.3.1: a session whose SESSION_SETUP response sets SMB2_SESSION_FLAG_ENCRYPT_DATA must
+    /// not send plaintext. Without an encryption key (anonymous session, or a server that did not advertise
+    /// encryption support) fail closed instead of letting sendSigned fall back to signed/unsigned plaintext.
+    private func requireEncryptionKeyIfSessionDemandsEncryption(_ sessionFlags: UInt16) throws {
+        if (sessionFlags & SMB2SessionSetup.sessionFlagEncryptData) != 0, encryptionKey == nil {
+            throw SMBError.protocolError("SESSION_SETUP requires encryption but no SMB encryption key was negotiated")
         }
     }
 

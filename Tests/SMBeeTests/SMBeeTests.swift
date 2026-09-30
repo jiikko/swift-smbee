@@ -3033,6 +3033,11 @@ final class SMBeeTests: XCTestCase {
         let encrypting = try SMBNegotiateCodec.decodeResponse(
             negotiateResponse(messageId: 0, capabilities: SMBNegotiateConstants.globalCapEncryption))
         XCTAssertTrue(encrypting.supportsEncryption)
+
+        // 2.x has no encryption even if a server sets the (3.x-only) capability bit.
+        let smb21 = try SMBNegotiateCodec.decodeResponse(negotiateResponse(
+            messageId: 0, dialect: SMBNegotiateConstants.dialect210, capabilities: SMBNegotiateConstants.globalCapEncryption))
+        XCTAssertFalse(smb21.supportsEncryption)
     }
 
     // Issue 098: an SMB 3.0.x server without SMB2_GLOBAL_CAP_ENCRYPTION (Samba `smb encrypt = disabled`)
@@ -3056,6 +3061,16 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSessionSetupEncryptDataWithoutEncryptionCapabilityFailsClosed() async throws {
+        try await assertSessionSetupEncryptDataFailsClosed(credential: SMBCredential(username: "user", password: "pass"))
+    }
+
+    // Anonymous NTLM yields no key material, so an ENCRYPT_DATA session must also fail closed rather than
+    // continue in plaintext.
+    func testAnonymousSessionSetupEncryptDataFailsClosed() async throws {
+        try await assertSessionSetupEncryptDataFailsClosed(credential: .anonymous)
+    }
+
+    private func assertSessionSetupEncryptDataFailsClosed(credential: SMBCredential) async throws {
         let inbound = try framed([
             negotiateResponse(messageId: 0, capabilities: 0),
             sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
@@ -3065,7 +3080,7 @@ final class SMBeeTests: XCTestCase {
         do {
             let session = try await SMBClient.connect(
                 host: "server", share: "share",
-                credential: SMBCredential(username: "user", password: "pass"),
+                credential: credential,
                 makeTransport: { transport }
             )
             await session.close()

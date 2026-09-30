@@ -39,6 +39,10 @@ on:
         description: Per-job timeout
         required: false
         default: "60"
+      profiles:
+        description: Optional space-separated subset of the experiment's profiles (e.g. to leave out one that cannot fit the time budget)
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -52,6 +56,7 @@ jobs:
       - id: plan
         env:
           EXPERIMENT: ${{ inputs.experiment }}
+          PROFILES: ${{ inputs.profiles }}
         run: |
           set -euo pipefail
           case "${EXPERIMENT}" in
@@ -69,6 +74,12 @@ jobs:
                 {"profile":"smb302-signing-required","arms":"current nodelay"}]}' ;;
             *) echo "unknown experiment ${EXPERIMENT}" >&2; exit 2 ;;
           esac
+          if [ -n "${PROFILES}" ]; then
+            matrix="$(jq -c --arg keep "${PROFILES}" \
+              '.include |= map(select(.profile as $p | ($keep | split(" ") | index($p)))) |
+               if (.include | length) == 0 then error("no profile of this experiment matched: \($keep)") else . end' \
+              <<<"${matrix}")"
+          fi
           printf 'matrix=%s\n' "$(printf '%s' "${matrix}" | tr -d '\n')" >> "${GITHUB_OUTPUT}"
 
   measure:

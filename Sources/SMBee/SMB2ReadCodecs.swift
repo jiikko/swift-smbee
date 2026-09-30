@@ -184,8 +184,6 @@ enum SMB2SessionSetup {
     }
 
     /// SESSION_SETUP response `SessionFlags` (MS-SMB2 §2.2.6).
-    static let sessionFlagIsGuest: UInt16 = 0x0001
-    static let sessionFlagIsNull: UInt16 = 0x0002
     static let sessionFlagEncryptData: UInt16 = 0x0004
 
     static func decodeSessionFlags(_ bytes: [UInt8]) throws -> UInt16 {

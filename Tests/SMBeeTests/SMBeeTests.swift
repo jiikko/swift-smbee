@@ -754,7 +754,7 @@ private enum POSIXConnectFakeEvent: Equatable {
     case connect(result: Int32, errno: Int32)
     case connectReady
     case setSocketOption(POSIXConnectFakeSocketOption)
-    case promotionObserved
+    case connectReturned
     case pollStarted
     case shutdown
     case pollReturned
@@ -1742,11 +1742,24 @@ final class SMBeeTests: XCTestCase {
             XCTAssertEqual(fake.pollTimeouts.count, testCase.expectedPolls, testCase.name)
             XCTAssertEqual(fake.connectCount, 1, testCase.name)
             XCTAssertEqual(fake.restoreCount, 1, testCase.name)
+            XCTAssertEqual(
+                fake.socketOptionCalls.filter {
+                    $0.level == Int32(IPPROTO_TCP) && $0.option == Int32(TCP_NODELAY)
+                },
+                [POSIXConnectFakeSocketOption(
+                    level: Int32(IPPROTO_TCP),
+                    option: Int32(TCP_NODELAY),
+                    value: 1,
+                    length: socklen_t(4)
+                )],
+                testCase.name
+            )
             transport.close()
         }
     }
 
-    func testPOSIXConnectSetsTCPNoDelayBeforePromotion() async throws {
+    // This test does not pin promotion order: observing it would require a test-only production seam for issue 099.
+    func testPOSIXConnectSetsTCPNoDelayAfterConnectReady() async throws {
         let fake = POSIXConnectSyscallFake()
         let transport = POSIXSocketTransport(
             timeout: .seconds(1),
@@ -1756,7 +1769,7 @@ final class SMBeeTests: XCTestCase {
         )
 
         try await transport.connect(host: "127.0.0.1", port: 445)
-        fake.syscallEvents.append(.promotionObserved)
+        fake.syscallEvents.append(.connectReturned)
 
         let tcpNoDelay = POSIXConnectFakeSocketOption(
             level: Int32(IPPROTO_TCP),
@@ -1786,13 +1799,13 @@ final class SMBeeTests: XCTestCase {
             guard case .setSocketOption(let call) = event else { return false }
             return call.level == Int32(SOL_SOCKET) && call.option == Int32(SO_SNDTIMEO)
         })
-        let promotionIndex = try XCTUnwrap(events.firstIndex(of: .promotionObserved))
+        let connectReturnedIndex = try XCTUnwrap(events.firstIndex(of: .connectReturned))
 
         XCTAssertLessThan(connectIndex, tcpNoDelayIndex)
         XCTAssertLessThan(connectReadyIndex, tcpNoDelayIndex)
         XCTAssertLessThan(tcpNoDelayIndex, receiveTimeoutIndex)
         XCTAssertLessThan(receiveTimeoutIndex, sendTimeoutIndex)
-        XCTAssertLessThan(sendTimeoutIndex, promotionIndex)
+        XCTAssertLessThan(sendTimeoutIndex, connectReturnedIndex)
         transport.close()
     }
 
@@ -1820,12 +1833,9 @@ final class SMBeeTests: XCTestCase {
                 XCTFail("TCP_NODELAY failure with \(testCase.name) failed the connection: \(error)")
                 continue
             }
-            fake.syscallEvents.append(.promotionObserved)
-
             XCTAssertEqual(fake.failedSocketOptionCount, 1, testCase.name)
             XCTAssertEqual(fake.connectCount, 1, testCase.name)
             XCTAssertEqual(fake.restoreCount, 1, testCase.name)
-            XCTAssertTrue(fake.syscallEvents.events.contains(.promotionObserved), testCase.name)
             XCTAssertEqual(
                 fake.socketOptionCalls.filter {
                     $0.level == Int32(IPPROTO_TCP) && $0.option == Int32(TCP_NODELAY)

@@ -494,9 +494,13 @@ EOF
     printf '%s\n' install_time measure publish_permissions | diff -u - "${scenario_dir}/steps"
     test -f "${workspace}/.build/resource-performance.log"
     if [ "${skip_build}" = false ]; then
-      printf '%s\n' called | diff -u - "${marker}"
-    else
-      test ! -e "${marker}"
+      if ! printf '%s\n' called | diff -u - "${marker}"; then
+        echo 'prewarm must run exactly once when RESOURCE_SKIP_BUILD=false' >&2
+        return 1
+      fi
+    elif [ -e "${marker}" ]; then
+      echo 'prewarm ran on the exact build-cache hit path (RESOURCE_SKIP_BUILD=true)' >&2
+      return 1
     fi
   done
 }

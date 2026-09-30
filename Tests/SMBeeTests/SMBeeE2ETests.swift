@@ -31,6 +31,13 @@ final class SMBeeE2ETests: XCTestCase {
             XCTAssertNil(result.signingAlgorithm)
             XCTAssertNil(result.cipher)
             XCTAssertNil(result.preauthHashAlgorithm)
+        case "smb302-signing-required":
+            XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect302)
+            XCTAssertTrue(result.signingRequired)
+            XCTAssertNil(result.signingAlgorithm)
+            XCTAssertNil(result.cipher)
+            XCTAssertFalse(result.supportsEncryption)
+            XCTAssertNil(result.preauthHashAlgorithm)
         case "smb311-signing-required":
             XCTAssertEqual(result.dialect, SMBNegotiateConstants.dialect311)
             XCTAssertTrue(result.signingRequired)

@@ -27,6 +27,9 @@ jobs:
             profile: smb302-encrypted-required
             swift_version: "6.2"
           - samba_base: ubuntu:24.04
+            profile: smb302-signing-required
+            swift_version: "6.2"
+          - samba_base: ubuntu:24.04
             profile: smb311-signing-required
             swift_version: "6.2"
           - samba_base: ubuntu:24.04

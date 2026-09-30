@@ -168,6 +168,7 @@ Apple `container` CLI は macOS 上で Linux container を動かす仕組みだ�
 Samba profile:
 
 - `smb302-encrypted-required`: PR 必須代表。SMB 3.0.2 / signing mandatory / encryption required。
+- `smb302-signing-required`: SMB 3.0.2 / signing mandatory / encryption off。AES-CMAC signing-only 経路の検証用（issue 097 の実転送計測でも使う）。
 - `smb311-signing-required`: SMB 3.1.1 / signing mandatory / encryption off。GMAC signing-only 経路の検証用。
 - `smb311-encrypted-required`: SMB 3.1.1 / signing mandatory / encryption required。GCM transform 経路の検証用。
 

@@ -112,7 +112,10 @@ for arm in "${arms[@]}"; do
   arm_commit["${arm}"]="${ARM_BASE_COMMIT}"
   arm_flags["${arm}"]="${ARM_SWIFT_FLAGS}"
   echo "Building arm ${arm} (${ARM_BASE_COMMIT}) in ${ARM_DIR}"
-  ( cd "${ARM_DIR}" && run_in_swift "swift build -c release --build-tests ${ARM_SWIFT_FLAGS}" ) \
+  # Build through `swift test`, not `swift build --build-tests`: only swift test enables testability in a
+  # release build, which the harness's @testable import needs. Without SMBEE_NETWORK_PERFORMANCE the
+  # benchmark skips, so this run only builds; the invocations below reuse it with --skip-build.
+  ( cd "${ARM_DIR}" && run_in_swift "swift test -c release ${ARM_SWIFT_FLAGS} --filter SMBeeNetworkPerformanceE2ETests" ) \
     >"${output_dir}/build-${arm}.log" 2>&1 || {
       echo "arm ${arm} failed to build; see build-${arm}.log (issue 097 step 5: record as incomparable)" >&2
       tail -40 "${output_dir}/build-${arm}.log" >&2

@@ -183,6 +183,19 @@ enum SMB2SessionSetup {
         return writer.bytes
     }
 
+    /// SESSION_SETUP response `SessionFlags` (MS-SMB2 §2.2.6).
+    static let sessionFlagIsGuest: UInt16 = 0x0001
+    static let sessionFlagIsNull: UInt16 = 0x0002
+    static let sessionFlagEncryptData: UInt16 = 0x0004
+
+    static func decodeSessionFlags(_ bytes: [UInt8]) throws -> UInt16 {
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 9 else {
+            throw SMBCodecError.invalidValue("invalid SESSION_SETUP response structure size")
+        }
+        return try reader.readUInt16LE()
+    }
+
     static func decodeResponse(_ bytes: [UInt8]) throws -> [UInt8] {
         var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
         guard try reader.readUInt16LE() == 9 else {

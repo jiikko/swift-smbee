@@ -158,7 +158,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
             [
                 try negotiateResponse(messageId: 0),
                 try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
-                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+                try sessionSetupSuccessResponse(messageId: 2),
                 try smb2TreeConnectResponse(treeId: treeId),
                 try smb2CreateResponse(fileId: fileId, messageId: 4, treeId: treeId)
             ]
@@ -193,7 +193,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         let inbound = try framed([
             try negotiateResponse(messageId: 0),
             try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try sessionSetupSuccessResponse(messageId: 2),
             try smb2TreeConnectResponse(treeId: treeId),
             try smb2CreateResponse(fileId: statFileId, messageId: 4, treeId: treeId),
             try smb2QueryInfoResponse(size: 3, messageId: 5, treeId: treeId),
@@ -233,7 +233,7 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         let inbound = try framed([
             try negotiateResponse(messageId: 0),
             try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try sessionSetupSuccessResponse(messageId: 2),
             try smb2TreeConnectResponse(treeId: treeId),
             try smb2CreateResponse(fileId: fileId, messageId: 4, treeId: treeId),
             try smb2QueryInfoResponse(size: 3, messageId: 5, treeId: treeId),
@@ -955,6 +955,14 @@ private func smb2QueryInfoResponse(size: UInt64, messageId: UInt64, treeId: UInt
     writeUInt16LE(72, to: &response, at: 66)
     writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
     response.append(contentsOf: payload)
+    return response
+}
+
+// SESSION_SETUP success response body (MS-SMB2 §2.2.6): StructureSize=9, SessionFlags,
+// SecurityBufferOffset, SecurityBufferLength. The client decodes SessionFlags from the final response.
+private func sessionSetupSuccessResponse(messageId: UInt64, sessionFlags: UInt16 = 0) throws -> [UInt8] {
+    var response = try SMB2Header(command: SMB2Commands.sessionSetup, messageId: messageId).encode()
+    response.append(contentsOf: [9, 0, UInt8(sessionFlags & 0xff), UInt8(sessionFlags >> 8), 72, 0, 0, 0])
     return response
 }
 

@@ -3025,11 +3025,85 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
+    func testNegotiateDecodeReportsServerCapabilitiesAndEncryptionSupport() throws {
+        let plain = try SMBNegotiateCodec.decodeResponse(negotiateResponse(messageId: 0, capabilities: 0x0000_0007))
+        XCTAssertEqual(plain.capabilities, 0x0000_0007)
+        XCTAssertFalse(plain.supportsEncryption)
+
+        let encrypting = try SMBNegotiateCodec.decodeResponse(
+            negotiateResponse(messageId: 0, capabilities: SMBNegotiateConstants.globalCapEncryption))
+        XCTAssertTrue(encrypting.supportsEncryption)
+    }
+
+    // Issue 098: an SMB 3.0.x server without SMB2_GLOBAL_CAP_ENCRYPTION (Samba `smb encrypt = disabled`)
+    // disconnects on TRANSFORM frames, so post-auth requests must go out as signed plaintext.
+    func testSMB302WithoutServerEncryptionCapabilitySignsTreeConnectInsteadOfEncrypting() async throws {
+        let requests = try await connectOutboundRequests(capabilities: 0, sessionFlags: 0)
+        XCTAssertGreaterThanOrEqual(requests.count, 4)
+        let treeConnect = requests[3]
+        XCTAssertEqual(Array(treeConnect[0..<4]), [0xfe, 0x53, 0x4d, 0x42])
+        let header = try SMB2Header.decode(treeConnect)
+        XCTAssertEqual(header.command, SMB2Commands.treeConnect)
+        XCTAssertNotEqual(header.flags & SMB2Flags.signed, 0)
+        XCTAssertNotEqual(Array(treeConnect[48..<64]), Array(repeating: UInt8(0), count: 16))
+    }
+
+    func testSMB302WithServerEncryptionCapabilityEncryptsTreeConnect() async throws {
+        let requests = try await connectOutboundRequests(
+            capabilities: SMBNegotiateConstants.globalCapEncryption, sessionFlags: 0)
+        XCTAssertGreaterThanOrEqual(requests.count, 4)
+        XCTAssertEqual(Array(requests[3][0..<4]), SMB3TransformHeader.protocolId)
+    }
+
+    func testSessionSetupEncryptDataWithoutEncryptionCapabilityFailsClosed() async throws {
+        let inbound = try framed([
+            negotiateResponse(messageId: 0, capabilities: 0),
+            sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
+            try sessionSetupSuccessResponse(messageId: 2, sessionFlags: SMB2SessionSetup.sessionFlagEncryptData)
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        do {
+            let session = try await SMBClient.connect(
+                host: "server", share: "share",
+                credential: SMBCredential(username: "user", password: "pass"),
+                makeTransport: { transport }
+            )
+            await session.close()
+            XCTFail("expected SESSION_SETUP encryption requirement to fail closed")
+        } catch let SMBError.protocolError(message) {
+            XCTAssertTrue(message.contains("SESSION_SETUP requires encryption"), message)
+        }
+        let requests = try unframed(transport.outbound)
+        XCTAssertFalse(requests.contains { (try? SMB2Header.decode($0).command) == SMB2Commands.treeConnect })
+        XCTAssertFalse(requests.contains { Array($0[0..<4]) == SMB3TransformHeader.protocolId })
+    }
+
+    /// Connects over a synthetic 3.0.2 exchange and returns every request the client framed.
+    /// The TREE_CONNECT response is plaintext, so the encrypting variant may fail after sending; only
+    /// the outbound wire shape is under test here.
+    private func connectOutboundRequests(capabilities: UInt32, sessionFlags: UInt16) async throws -> [[UInt8]] {
+        let inbound = try framed([
+            negotiateResponse(messageId: 0, capabilities: capabilities),
+            sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
+            try sessionSetupSuccessResponse(messageId: 2, sessionFlags: sessionFlags),
+            smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff)
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        if let session = try? await SMBClient.connect(
+            host: "server", share: "share",
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: { transport }
+        ) {
+            await session.close()
+        }
+        return try unframed(transport.outbound)
+    }
+
     func testCredentialProviderIsResolvedOnceWhenConnectingPersistentSession() async throws {
         let inbound = try framed([
             negotiateResponse(messageId: 0),
             sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
-            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try sessionSetupSuccessResponse(messageId: 2),
             smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff)
         ])
         let transport = InMemoryTransport(inbound: inbound)
@@ -3060,7 +3134,7 @@ final class SMBeeTests: XCTestCase {
         let inbound = try framed([
             negotiateResponse(messageId: 0),
             sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
-            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try sessionSetupSuccessResponse(messageId: 2),
             smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff),
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 7, messageId: 5, treeId: 0x3344),
@@ -11144,6 +11218,14 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(UInt32((value >> 32) & 0xffff_ffff), to: &bytes, at: offset + 4)
     }
 
+    // SESSION_SETUP success response body (MS-SMB2 §2.2.6): StructureSize=9, SessionFlags,
+    // SecurityBufferOffset, SecurityBufferLength. The client decodes SessionFlags from the final response.
+    private func sessionSetupSuccessResponse(messageId: UInt64, sessionFlags: UInt16 = 0) throws -> [UInt8] {
+        var response = try SMB2Header(command: SMB2Commands.sessionSetup, messageId: messageId).encode()
+        response.append(contentsOf: [9, 0, UInt8(sessionFlags & 0xff), UInt8(sessionFlags >> 8), 72, 0, 0, 0])
+        return response
+    }
+
     private func smb2StatusResponse(status: UInt32, command: UInt16, messageId: UInt64, treeId: UInt32, credits: UInt16 = 1) throws -> [UInt8] {
         try SMB2Header(status: status, command: command, credits: credits, messageId: messageId, treeId: treeId).encode()
     }
@@ -11448,7 +11530,7 @@ final class SMBeeTests: XCTestCase {
         [
             try negotiateResponse(messageId: 0),
             try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
-            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.sessionSetup, messageId: 2, treeId: 0),
+            try sessionSetupSuccessResponse(messageId: 2),
             try smb2TreeConnectResponse(treeId: treeId, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff)
         ]
     }
@@ -11529,13 +11611,16 @@ final class SMBeeTests: XCTestCase {
         return try AES128.encryptBlock(expandedKey: expandedKey, block: last)
     }
 
-    private func negotiateResponse(messageId: UInt64, dialect: UInt16 = SMBNegotiateConstants.dialect302) throws -> [UInt8] {
+    private func negotiateResponse(
+        messageId: UInt64, dialect: UInt16 = SMBNegotiateConstants.dialect302, capabilities: UInt32 = 0
+    ) throws -> [UInt8] {
         var response = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 65))
         writeUInt16LE(65, to: &response, at: 64)
         writeUInt16LE(SMBNegotiateConstants.signingEnabled, to: &response, at: 66)
         writeUInt16LE(dialect, to: &response, at: 68)
         response.replaceSubrange(72..<88, with: Array(repeating: UInt8(0x42), count: 16))
+        writeUInt32LE(capabilities, to: &response, at: 88)
         writeUInt32LE(1_048_576, to: &response, at: 92)
         writeUInt32LE(1_048_576, to: &response, at: 96)
         writeUInt32LE(1_048_576, to: &response, at: 100)

@@ -4230,8 +4230,17 @@ actor SMBSession {
             }
         } else {
             signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.exportedSessionKey)
-            encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
-            decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
+            // MS-SMB2 §3.2.5.3.1 derives 3.0.x encryption keys only when the server supports encryption
+            // (`SMB2_GLOBAL_CAP_ENCRYPTION`). sendSigned encrypts whenever encryptionKey exists, so deriving it
+            // for a non-encrypting server sends TRANSFORM frames it rejects (Samba: INVALID_PARAMETER disconnect).
+            if result.supportsEncryption {
+                encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
+                decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
+            }
+        }
+        let sessionFlags = try SMB2SessionSetup.decodeSessionFlags(authResponse)
+        if (sessionFlags & SMB2SessionSetup.sessionFlagEncryptData) != 0, encryptionKey == nil {
+            throw SMBError.protocolError("SESSION_SETUP requires encryption but no SMB encryption key was negotiated")
         }
 #if canImport(CryptoExtras) && !canImport(CommonCrypto)
         if let signingKey {

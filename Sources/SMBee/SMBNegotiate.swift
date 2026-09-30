@@ -10,6 +10,16 @@ public struct SMBProbeResult: Equatable, Sendable {
     public var maxTransactSize: UInt32
     public var maxReadSize: UInt32
     public var maxWriteSize: UInt32
+    /// Server `Capabilities` from the NEGOTIATE response (MS-SMB2 §2.2.4). For SMB 3.0.x this is the
+    /// only signal that the server supports encryption (`SMB2_GLOBAL_CAP_ENCRYPTION`).
+    public var capabilities: UInt32 = 0
+
+    /// Whether the server can decrypt SMB2 TRANSFORM messages on this connection.
+    /// 3.1.1 negotiates a cipher context; 3.0.x advertises `SMB2_GLOBAL_CAP_ENCRYPTION`.
+    public var supportsEncryption: Bool {
+        if dialect == SMBNegotiateConstants.dialect311 { return cipher != nil }
+        return (capabilities & SMBNegotiateConstants.globalCapEncryption) != 0
+    }
 }
 
 public enum SMBNegotiateConstants {
@@ -104,7 +114,7 @@ public enum SMBNegotiateCodec {
         let dialect = try reader.readUInt16LE()
         let contextCount = try reader.readUInt16LE()
         let serverGuid = try UUID(smbWireBytes: reader.readBytes(count: 16))
-        try reader.skip(count: 4)
+        let capabilities = try reader.readUInt32LE()
         let maxTransactSize = try reader.readUInt32LE()
         let maxReadSize = try reader.readUInt32LE()
         let maxWriteSize = try reader.readUInt32LE()
@@ -183,7 +193,8 @@ public enum SMBNegotiateCodec {
             serverGuid: serverGuid,
             maxTransactSize: maxTransactSize,
             maxReadSize: maxReadSize,
-            maxWriteSize: maxWriteSize
+            maxWriteSize: maxWriteSize,
+            capabilities: capabilities
         )
     }
 

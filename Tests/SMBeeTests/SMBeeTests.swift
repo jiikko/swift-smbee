@@ -743,7 +743,18 @@ private final class POSIXLifecycleRecorder: @unchecked Sendable {
     }
 }
 
+private struct POSIXConnectFakeSocketOption: Equatable {
+    let level: Int32
+    let option: Int32
+    let value: Int32?
+    let length: socklen_t
+}
+
 private enum POSIXConnectFakeEvent: Equatable {
+    case connect(result: Int32, errno: Int32)
+    case connectReady
+    case setSocketOption(POSIXConnectFakeSocketOption)
+    case promotionObserved
     case pollStarted
     case shutdown
     case pollReturned
@@ -786,6 +797,7 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
     let descriptor: Int32 = 73
     let originalFlags: Int32 = 0
     let events = POSIXConnectFakeEventRecorder()
+    let syscallEvents = POSIXConnectFakeEventRecorder()
 
     private let lock = NSLock()
     private let pollCondition = NSCondition()
@@ -805,6 +817,10 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
     private var connectCountStorage = 0
     private var getSocketErrorCountStorage = 0
     private var restoreCountStorage = 0
+    private var socketOptionCallsStorage: [POSIXConnectFakeSocketOption] = []
+    private var failedSocketOptionCountStorage = 0
+    private let failingSocketOption: Int32?
+    private let socketOptionFailureErrno: Int32
 
     init(
         connectResults: [POSIXSocketCallResult<Int32>] = [POSIXSocketCallResult(-1, errno: EINPROGRESS)],
@@ -813,6 +829,8 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
         ],
         socketErrors: [POSIXSocketCallResult<Int32>] = [POSIXSocketCallResult(0)],
         restoreResult: POSIXSocketCallResult<Int32> = POSIXSocketCallResult(0),
+        failingSocketOption: Int32? = nil,
+        socketOptionFailureErrno: Int32 = EINVAL,
         blockPoll: Bool = false,
         blockRestore: Bool = false
     ) {
@@ -820,6 +838,8 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
         self.pollSteps = pollSteps
         self.socketErrors = socketErrors
         self.restoreResult = restoreResult
+        self.failingSocketOption = failingSocketOption
+        self.socketOptionFailureErrno = socketOptionFailureErrno
         self.shouldBlockPoll = blockPoll
         self.shouldBlockRestore = blockRestore
     }
@@ -828,6 +848,8 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
     var connectCount: Int { lock.withLock { connectCountStorage } }
     var getSocketErrorCount: Int { lock.withLock { getSocketErrorCountStorage } }
     var restoreCount: Int { lock.withLock { restoreCountStorage } }
+    var socketOptionCalls: [POSIXConnectFakeSocketOption] { lock.withLock { socketOptionCallsStorage } }
+    var failedSocketOptionCount: Int { lock.withLock { failedSocketOptionCountStorage } }
 
     private func validateDescriptor(_ actual: Int32, operation: String) -> Bool {
         guard actual == descriptor else {
@@ -844,7 +866,7 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
                 guard validateDescriptor(actualDescriptor, operation: "connect") else {
                     return POSIXSocketCallResult<Int32>(-1, errno: EIO)
                 }
-                return lock.withLock {
+                let result = lock.withLock {
                     connectCountStorage += 1
                     guard !connectResults.isEmpty else {
                         XCTFail("connectResults script exhausted")
@@ -852,6 +874,8 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
                     }
                     return connectResults.removeFirst()
                 }
+                syscallEvents.append(.connect(result: result.value, errno: result.errno))
+                return result
             },
             fcntl: { [self] actualDescriptor, command, value in
                 guard validateDescriptor(actualDescriptor, operation: "fcntl") else {
@@ -873,6 +897,9 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
                 }
                 restoreCondition.unlock()
                 events.append(.restoreReturned)
+                if restoreResult.value >= 0 {
+                    syscallEvents.append(.connectReady)
+                }
                 return restoreResult
             },
             poll: { [self] actualDescriptor, requestedEvents, timeout in
@@ -937,9 +964,21 @@ private final class POSIXConnectSyscallFake: @unchecked Sendable {
                     )
                 }
             },
-            setSocketOption: { [self] actualDescriptor, _, _, _, _ in
+            setSocketOption: { [self] actualDescriptor, level, option, value, length in
                 guard validateDescriptor(actualDescriptor, operation: "setsockopt") else {
                     return POSIXSocketCallResult<Int32>(-1, errno: EIO)
+                }
+                let call = POSIXConnectFakeSocketOption(
+                    level: level,
+                    option: option,
+                    value: value?.load(as: Int32.self),
+                    length: length
+                )
+                lock.withLock { socketOptionCallsStorage.append(call) }
+                syscallEvents.append(.setSocketOption(call))
+                if let failingSocketOption, option == failingSocketOption {
+                    lock.withLock { failedSocketOptionCountStorage += 1 }
+                    return POSIXSocketCallResult<Int32>(-1, errno: socketOptionFailureErrno)
                 }
                 return POSIXSocketCallResult(0)
             },
@@ -1703,6 +1742,102 @@ final class SMBeeTests: XCTestCase {
             XCTAssertEqual(fake.pollTimeouts.count, testCase.expectedPolls, testCase.name)
             XCTAssertEqual(fake.connectCount, 1, testCase.name)
             XCTAssertEqual(fake.restoreCount, 1, testCase.name)
+            transport.close()
+        }
+    }
+
+    func testPOSIXConnectSetsTCPNoDelayBeforePromotion() async throws {
+        let fake = POSIXConnectSyscallFake()
+        let transport = POSIXSocketTransport(
+            timeout: .seconds(1),
+            syscalls: fake.syscalls,
+            shutdown: fake.shutdown,
+            close: fake.close
+        )
+
+        try await transport.connect(host: "127.0.0.1", port: 445)
+        fake.syscallEvents.append(.promotionObserved)
+
+        let tcpNoDelay = POSIXConnectFakeSocketOption(
+            level: Int32(IPPROTO_TCP),
+            option: Int32(TCP_NODELAY),
+            value: 1,
+            length: socklen_t(4)
+        )
+        XCTAssertEqual(
+            fake.socketOptionCalls.filter {
+                $0.level == Int32(IPPROTO_TCP) && $0.option == Int32(TCP_NODELAY)
+            },
+            [tcpNoDelay]
+        )
+
+        let events = fake.syscallEvents.events
+        let connectIndex = try XCTUnwrap(events.firstIndex { event in
+            if case .connect = event { return true }
+            return false
+        })
+        let connectReadyIndex = try XCTUnwrap(events.firstIndex(of: .connectReady))
+        let tcpNoDelayIndex = try XCTUnwrap(events.firstIndex(of: .setSocketOption(tcpNoDelay)))
+        let receiveTimeoutIndex = try XCTUnwrap(events.firstIndex { event in
+            guard case .setSocketOption(let call) = event else { return false }
+            return call.level == Int32(SOL_SOCKET) && call.option == Int32(SO_RCVTIMEO)
+        })
+        let sendTimeoutIndex = try XCTUnwrap(events.firstIndex { event in
+            guard case .setSocketOption(let call) = event else { return false }
+            return call.level == Int32(SOL_SOCKET) && call.option == Int32(SO_SNDTIMEO)
+        })
+        let promotionIndex = try XCTUnwrap(events.firstIndex(of: .promotionObserved))
+
+        XCTAssertLessThan(connectIndex, tcpNoDelayIndex)
+        XCTAssertLessThan(connectReadyIndex, tcpNoDelayIndex)
+        XCTAssertLessThan(tcpNoDelayIndex, receiveTimeoutIndex)
+        XCTAssertLessThan(receiveTimeoutIndex, sendTimeoutIndex)
+        XCTAssertLessThan(sendTimeoutIndex, promotionIndex)
+        transport.close()
+    }
+
+    func testPOSIXConnectContinuesWhenTCPNoDelayFails() async throws {
+        let cases: [(name: String, errno: Int32)] = [
+            ("EINVAL", EINVAL),
+            ("EAGAIN", EAGAIN)
+        ]
+
+        for testCase in cases {
+            let fake = POSIXConnectSyscallFake(
+                failingSocketOption: Int32(TCP_NODELAY),
+                socketOptionFailureErrno: testCase.errno
+            )
+            let transport = POSIXSocketTransport(
+                timeout: nil,
+                syscalls: fake.syscalls,
+                shutdown: fake.shutdown,
+                close: fake.close
+            )
+
+            do {
+                try await transport.connect(host: "127.0.0.1", port: 445)
+            } catch {
+                XCTFail("TCP_NODELAY failure with \(testCase.name) failed the connection: \(error)")
+                continue
+            }
+            fake.syscallEvents.append(.promotionObserved)
+
+            XCTAssertEqual(fake.failedSocketOptionCount, 1, testCase.name)
+            XCTAssertEqual(fake.connectCount, 1, testCase.name)
+            XCTAssertEqual(fake.restoreCount, 1, testCase.name)
+            XCTAssertTrue(fake.syscallEvents.events.contains(.promotionObserved), testCase.name)
+            XCTAssertEqual(
+                fake.socketOptionCalls.filter {
+                    $0.level == Int32(IPPROTO_TCP) && $0.option == Int32(TCP_NODELAY)
+                },
+                [POSIXConnectFakeSocketOption(
+                    level: Int32(IPPROTO_TCP),
+                    option: Int32(TCP_NODELAY),
+                    value: 1,
+                    length: socklen_t(4)
+                )],
+                testCase.name
+            )
             transport.close()
         }
     }

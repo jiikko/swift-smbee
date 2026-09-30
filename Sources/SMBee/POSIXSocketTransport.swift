@@ -402,6 +402,7 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
 
         try disableSIGPIPEIfNeeded(descriptor)
         try connectSocket(descriptor, address: address, length: length)
+        applyTCPNoDelayIfNeeded(descriptor)
         try applySocketTimeoutIfNeeded(descriptor)
 
         let completion = finishConnectingCandidate(descriptor, promote: true)
@@ -545,6 +546,24 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
             )
         }
         #endif
+    }
+
+    private func applyTCPNoDelayIfNeeded(_ descriptor: Int32) {
+        var enabled: Int32 = 1
+        let length = socklen_t(MemoryLayout<Int32>.size)
+        guard descriptorAllowsSyscall(descriptor) else { return }
+        let result = syscalls.setSocketOption(
+            descriptor,
+            Int32(IPPROTO_TCP),
+            Int32(TCP_NODELAY),
+            &enabled,
+            length
+        )
+        guard result.value != 0 else { return }
+        guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
+        FileHandle.standardError.write(
+            Data("setsockopt(TCP_NODELAY) failed: errno \(result.errno)\n".utf8)
+        )
     }
 
     private func applySocketTimeoutIfNeeded(_ descriptor: Int32) throws {

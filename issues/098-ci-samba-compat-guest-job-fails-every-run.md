@@ -86,14 +86,58 @@
   実行し、wire log で最初に落ちる request と、そのときの status を見る。
 - 切り分けの結果（どちらだったか・根拠のログ）をこの issue に書いてから直す。
 
+## 修正（2026-09-30、codex-lead で codex が方針をリード）
+
+方針はユーザーと合意した B 案: **3.0.x を 3.1.1 に揃える**（server が暗号化に対応しているときだけ暗号鍵を作る）。
+MS-SMB2 に厳密な A 案（server が要求したときだけ暗号化する）は、対応済み server での機密性を下げる挙動変更になるので採らなかった。
+
+- `fix(session): issue 098 — SMB 3.0.x で server が暗号化に対応しているときだけ暗号鍵を作る`
+  - `SMBProbeResult` に server の `capabilities` と `supportsEncryption` を追加。3.0.x は `SMB2_GLOBAL_CAP_ENCRYPTION` があるときだけ
+    `encryptionKey` / `decryptionKey` を導出する（MS-SMB2 §3.2.5.3.1）
+  - SESSION_SETUP 応答の SessionFlags を decode し（`SMB2SessionSetup.decodeSessionFlags`）、`ENCRYPT_DATA` を要求されたのに
+    暗号鍵が無ければ fail-closed
+  - unit の合成 SESSION_SETUP 最終応答を body 付きにした（`sessionSetupSuccessResponse`。実サーバは必ず body を返す）
+- `fix(session): issue 098 — codex レビューの指摘で、匿名 session の fail-closed と 2.x の暗号化判定を直す`
+  - fail-closed 検査を匿名 session の早期 return より前にも通す / `supportsEncryption` を dialect ごとに明示し 2.x は常に false
+
+### 検証
+
+- unit: `swift test` 479 本（37 skip）失敗 0
+- 退行テスト 6 本（`SMBeeTests.swift`）: NEGOTIATE の capabilities decode（2.x を含む）/ 非対応の 3.0.2 では TREE_CONNECT を署名済み平文で送る /
+  対応している 3.0.2 では transform で送る / ENCRYPT_DATA で鍵が無ければ失敗（認証あり・匿名）
+- 変異検証（使い捨て worktree。`mutate-verify` は dotfiles 専用の helper に依存していてこの repo では動かないため手で回した）:
+  - M1 常に 3.0.x の鍵を作る（修正前の挙動）→ 「非対応なら署名」のテストが red（実際に `fd534d42` = transform が出る）
+  - M2 fail-closed を外す → fail-closed テストが red / M3 鍵を一切作らない → 「対応なら暗号化」のテストが red
+  - M4 匿名の fail-closed を外す → 匿名テストが red / M5 2.x でも capabilities を見る → codec テストが red
+- 手元 E2E: guest profile の `bin/e2e/container-samba.sh` を `56a9b3a` と `59fabaf` の両方で実行し、どちらも
+  `SMBeeE2ETests` 15 本 1 skip 失敗 0、追加 E2E・CLI smoke も成功。
+  `make smoke`（smb302-encrypted-required / smb311-signing-required / smb422-reparse）は 3 つの commit の tree すべてで成功し、
+  最後は `958bb62` の `Sources/SMBee` tree `7ece416` を検証した
+- `make lint-analyze`: 自分が足した未使用の定数 2 件（unused_declaration）を `chore(session): issue 098 — 使っていない SessionFlags の定数を消す` で
+  消して 0 violations
+- codex レビュー: Pass A（設計適合）P2 ×2、Pass B（実装正当性）P2 ×1（A の 2 件目と同じ）→ 上の 2 つ目の commit で対応。
+  Pass C（敵対的）は、暗号化必須 server で平文に落ちる経路・再接続などの別入口からの迂回・受信側の回帰を攻めて、どれも壊せなかった
+
+### 却下 / 記録した指摘
+
+- Pass C P2「`SMBProbeResult` の `Equatable` に `capabilities` が加わり、他が同じでも不等になる」: 再現はするが、capabilities が違う
+  2 つの結果は実際に別物なので欠陥ではない。memberwise init は元々 public でなく、CLI の probe 出力にも項目を足していない
+- 未確認リスク P3「StructureSize が 9 以外の SESSION_SETUP success を返す server では decode が失敗して接続できない」:
+  仕様（MS-SMB2 §2.2.6）は 9 固定で、準拠 server での発火条件は示せない。実サーバで出たら再評価する
+- 未確認リスク P3「fixture を body 付きにしたことによる既存テストの検出力の変化」: 変更前の unit は合成 NEGOTIATE の Capabilities=0 の
+  まま暗号鍵を作っていたため、connect 系の unit は**暗黙に暗号化の送信経路を通っていた**（ただし transform を assert する session
+  レベルのテストは無かった）。修正後はそれらが署名経路を通る。暗号化の送信経路は、session レベルの unit では
+  `testSMB302WithServerEncryptionCapabilityEncryptsTreeConnect` の送信形だけになり、往復は E2E の暗号化 profile が守る
+
 ## 受け入れ条件
 
 - [x] 失敗の原因が候補 1〜3 のどれかを、wire log を根拠に確定してこの issue に書いている（候補 2。上の節）
 - [ ] `samba-compat.yml` の guest job が success になっている（run id を記録する）
-- [ ] 候補 2 だった場合、署名・暗号を必須にしない server へ認証ありで繋ぐ組み合わせを守る E2E が残っている
+- [x] 候補 2 だった場合、署名・暗号を必須にしない server へ認証ありで繋ぐ組み合わせを守る E2E が残っている（guest profile の認証ありテストをそのまま残す。候補 1 の「guest では skip」は採らない）
 
 ## 進捗
 
 - 2026-09-30: issue-sync の中で起票（095 を done へ移したときに検出した）。codex の反証レビューで
   「2 択では足りない（smbd が認証成功の後に INVALID_PARAMETER で終了している）」と指摘され、ログで裏を取って候補を 3 つに直した。
-- 2026-09-30: 手元で再現し、wire の実測と A/B 実験で候補 2 に確定（「切り分けの結果」節）。修正方針は codex がリード中。
+- 2026-09-30: 手元で再現し、wire の実測と A/B 実験で候補 2 に確定（「切り分けの結果」節）。
+- 2026-09-30: 修正を実装（「修正」節）。CI の guest job の success 確認は push 後。

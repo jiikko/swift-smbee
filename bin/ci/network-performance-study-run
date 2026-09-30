@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+# Runs one profile of the issue 097 real-Samba transfer study on a GitHub-hosted runner (or any host with
+# docker and a Samba container started by test/e2e/start-samba-ci.sh). Driven by
+# .github/workflows/network-performance-study.yml.
+#
+# Env:
+#   STUDY_PROFILE        profile name (test/e2e/smb/<profile>.conf, already running in SAMBA_CONTAINER)
+#   STUDY_ARMS           one or two arms for bin/ci/network-performance-study-arm (e.g. "cmac-before cmac-after")
+#   STUDY_INVOCATIONS    invocations per arm; with two arms they run in ABBA order (A B, B A, A B, ...)
+#   STUDY_SIZES_MIB / STUDY_WARMUP / STUDY_SAMPLES   forwarded to the harness
+#   STUDY_OUTPUT_DIR     receives samples.jsonl, server-cpu.jsonl, metadata.json and logs
+#   SAMBA_CONTAINER / SAMBA_BASE_IMAGE / SWIFT_VERSION
+#
+# Each invocation is a fresh `swift test` process (a fresh SMB session and fresh server files). The server's
+# CPU time comes from the Samba container's cgroup (cpu.stat usage_usec) around each invocation, so it is
+# per invocation, not per sample, and includes everything in the container during that window (smbd's
+# connection setup, the warm-ups, and the `docker exec` that reads the counter). Treat it as a reference
+# value for "is the server busy", not as the cost of the measured transfers.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+: "${STUDY_PROFILE:?}" "${STUDY_ARMS:?}" "${STUDY_INVOCATIONS:?}" "${STUDY_OUTPUT_DIR:?}"
+: "${SAMBA_CONTAINER:?}" "${SWIFT_VERSION:?}"
+STUDY_SIZES_MIB="${STUDY_SIZES_MIB:-1}"
+STUDY_WARMUP="${STUDY_WARMUP:-5}"
+STUDY_SAMPLES="${STUDY_SAMPLES:-5}"
+export STUDY_PROFILE STUDY_WARMUP
+case "${STUDY_INVOCATIONS}" in
+  ''|*[!0123456789]*) echo "STUDY_INVOCATIONS must be an integer" >&2; exit 2 ;;
+esac
+if [ "${#STUDY_INVOCATIONS}" -gt 3 ] || [ "${STUDY_INVOCATIONS}" -lt 1 ]; then
+  echo "STUDY_INVOCATIONS must be from 1 through 999" >&2
+  exit 2
+fi
+read -r -a arms <<<"${STUDY_ARMS}"
+if [ "${#arms[@]}" -lt 1 ] || [ "${#arms[@]}" -gt 2 ]; then
+  echo "STUDY_ARMS must name one or two arms" >&2
+  exit 2
+fi
+
+mkdir -p "${STUDY_OUTPUT_DIR}"
+output_dir="$(cd "${STUDY_OUTPUT_DIR}" && pwd)"
+samples="${output_dir}/samples.jsonl"
+server_cpu="${output_dir}/server-cpu.jsonl"
+: > "${samples}"
+: > "${server_cpu}"
+run_in_swift() {
+  bash "${REPO_ROOT}/test/e2e/run-swift-in-container.sh" "$1"
+}
+
+# --- fixed metadata (issue 097 "固定するもの") ---------------------------------------------------------
+docker pull -q "swift:${SWIFT_VERSION}" >/dev/null
+swift_image_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "swift:${SWIFT_VERSION}")"
+samba_version="$(docker exec "${SAMBA_CONTAINER}" smbd --version | tr -d '\r')"
+runner_cpu_model="$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' || true)"
+runner_cpu_count="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)"
+docker_version="$(docker version --format '{{.Server.Version}}')"
+
+probe_log="${output_dir}/probe.log"
+( cd "${REPO_ROOT}" && run_in_swift "swift run -c release smbcli probe smb://\${SMBEE_E2E_HOST}:\${SMBEE_E2E_PORT}" ) \
+  >"${probe_log}" 2>&1
+probe_value() {
+  local value
+  value="$(grep -m1 -E "^$1:" "${probe_log}" | sed -E "s/^$1:[[:space:]]*//" || true)"
+  printf '%s\n' "${value:-unknown}"
+}
+negotiated_dialect="$(probe_value dialect)"
+negotiated_signing="$(probe_value signing)"
+negotiated_cipher="$(probe_value cipher)"
+negotiated_signing_required="$(probe_value signingRequired)"
+
+STUDY_META_SAMBA_VERSION="${samba_version}" STUDY_META_SWIFT_IMAGE_DIGEST="${swift_image_digest}" \
+STUDY_META_RUNNER_CPU_MODEL="${runner_cpu_model}" STUDY_META_RUNNER_CPU_COUNT="${runner_cpu_count}" \
+STUDY_META_DOCKER_VERSION="${docker_version}" STUDY_META_DIALECT="${negotiated_dialect}" \
+STUDY_META_SIGNING="${negotiated_signing}" STUDY_META_SIGNING_REQUIRED="${negotiated_signing_required}" \
+STUDY_META_CIPHER="${negotiated_cipher}" STUDY_META_HARNESS_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)" \
+python3 - "${output_dir}/metadata.json" <<'PY'
+import json
+import os
+import sys
+
+environment = os.environ
+json.dump({
+    "profile": environment["STUDY_PROFILE"],
+    "samba_base": environment.get("SAMBA_BASE_IMAGE", "unknown"),
+    "samba_version": environment["STUDY_META_SAMBA_VERSION"],
+    "swift_image_digest": environment["STUDY_META_SWIFT_IMAGE_DIGEST"],
+    "runner_cpu_model": environment["STUDY_META_RUNNER_CPU_MODEL"] or "unknown",
+    "runner_cpu_count": environment["STUDY_META_RUNNER_CPU_COUNT"],
+    "runner_image": f"{environment.get('ImageOS', 'unknown')}-{environment.get('ImageVersion', 'unknown')}",
+    "docker_version": environment["STUDY_META_DOCKER_VERSION"],
+    "negotiated_dialect": environment["STUDY_META_DIALECT"],
+    "negotiated_signing": environment["STUDY_META_SIGNING"],
+    "negotiated_signing_required": environment["STUDY_META_SIGNING_REQUIRED"],
+    "negotiated_cipher": environment["STUDY_META_CIPHER"],
+    "harness_commit": environment["STUDY_META_HARNESS_COMMIT"],
+    "page_cache": f"warm (server files rewritten per invocation, then {environment.get('STUDY_WARMUP', '5')} warm-up transfers)",
+}, open(sys.argv[1], "w"), indent=2, sort_keys=True)
+PY
+cat "${output_dir}/metadata.json"
+
+# --- prepare and build every arm before measuring ----------------------------------------------------
+declare -A arm_dir arm_commit arm_flags
+for arm in "${arms[@]}"; do
+  "${SCRIPT_DIR}/network-performance-study-arm" "${arm}" "${output_dir}/arms/${arm}" >/dev/null
+  # shellcheck disable=SC1090
+  source "${output_dir}/arms/${arm}/arm.env"
+  arm_dir["${arm}"]="${ARM_DIR}"
+  arm_commit["${arm}"]="${ARM_BASE_COMMIT}"
+  arm_flags["${arm}"]="${ARM_SWIFT_FLAGS}"
+  echo "Building arm ${arm} (${ARM_BASE_COMMIT}) in ${ARM_DIR}"
+  ( cd "${ARM_DIR}" && run_in_swift "swift build -c release --build-tests ${ARM_SWIFT_FLAGS}" ) \
+    >"${output_dir}/build-${arm}.log" 2>&1 || {
+      echo "arm ${arm} failed to build; see build-${arm}.log (issue 097 step 5: record as incomparable)" >&2
+      tail -40 "${output_dir}/build-${arm}.log" >&2
+      exit 1
+    }
+done
+
+server_cpu_usec() {
+  docker exec "${SAMBA_CONTAINER}" sh -c "awk '/^usage_usec/ {print \$2}' /sys/fs/cgroup/cpu.stat"
+}
+
+run_invocation() {
+  local arm="$1" invocation="$2" jsonl_name metadata start_cpu end_cpu start_ns end_ns
+  jsonl_name=".build/network-study-${arm}-${invocation}.jsonl"
+  rm -f "${arm_dir[${arm}]}/${jsonl_name}"
+  metadata="$(python3 - "${output_dir}/metadata.json" "${arm}" "${invocation}" "${arm_commit[${arm}]}" <<'PY'
+import json, sys
+metadata = json.load(open(sys.argv[1]))
+metadata.update({
+    "arm": sys.argv[2],
+    "invocation": int(sys.argv[3]),
+    "base_commit": sys.argv[4],
+    "tcp_nodelay": sys.argv[2] == "nodelay",
+})
+print(json.dumps(metadata, sort_keys=True))
+PY
+)"
+  echo "== ${STUDY_PROFILE} ${arm} invocation ${invocation}"
+  start_cpu="$(server_cpu_usec)"
+  start_ns="$(date +%s%N)"
+  (
+    cd "${arm_dir[${arm}]}"
+    export SMBEE_NETWORK_PERFORMANCE=1 SMBEE_NETWORK_PERF_SIZES_MIB="${STUDY_SIZES_MIB}" \
+      SMBEE_NETWORK_PERF_WARMUP="${STUDY_WARMUP}" SMBEE_NETWORK_PERF_SAMPLES="${STUDY_SAMPLES}" \
+      SMBEE_NETWORK_PERF_JSONL="/work/${jsonl_name}" SMBEE_NETWORK_PERF_METADATA_JSON="${metadata}"
+    export DOCKER_RUN_ENV="SMBEE_NETWORK_PERFORMANCE SMBEE_NETWORK_PERF_SIZES_MIB SMBEE_NETWORK_PERF_WARMUP SMBEE_NETWORK_PERF_SAMPLES SMBEE_NETWORK_PERF_JSONL SMBEE_NETWORK_PERF_METADATA_JSON"
+    run_in_swift "swift test -c release --skip-build ${arm_flags[${arm}]} --filter SMBeeNetworkPerformanceE2ETests"
+  ) >>"${output_dir}/run-${arm}.log" 2>&1
+  end_ns="$(date +%s%N)"
+  end_cpu="$(server_cpu_usec)"
+  cat "${arm_dir[${arm}]}/${jsonl_name}" >>"${samples}"
+  python3 - "${server_cpu}" "${STUDY_PROFILE}" "${arm}" "${invocation}" "${start_cpu}" "${end_cpu}" "${start_ns}" "${end_ns}" <<'PY'
+import json, sys
+path, profile, arm, invocation, start_cpu, end_cpu, start_ns, end_ns = sys.argv[1:]
+with open(path, "a") as handle:
+    handle.write(json.dumps({
+        "profile": profile, "arm": arm, "invocation": int(invocation),
+        "server_cpu_ms": (int(end_cpu) - int(start_cpu)) / 1000,
+        "invocation_wall_ms": (int(end_ns) - int(start_ns)) / 1e6,
+    }) + "\n")
+PY
+}
+
+# --- measure: ABBA for two arms ------------------------------------------------------------------------
+for invocation in $(seq 1 "${STUDY_INVOCATIONS}"); do
+  if [ "${#arms[@]}" -eq 1 ]; then
+    run_invocation "${arms[0]}" "${invocation}"
+  elif [ $((invocation % 2)) -eq 1 ]; then
+    run_invocation "${arms[0]}" "${invocation}"
+    run_invocation "${arms[1]}" "${invocation}"
+  else
+    run_invocation "${arms[1]}" "${invocation}"
+    run_invocation "${arms[0]}" "${invocation}"
+  fi
+done
+
+echo "samples: $(wc -l <"${samples}")"

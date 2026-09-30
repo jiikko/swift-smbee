@@ -276,3 +276,21 @@ swift test -c release --filter SMBeeResourcePerformanceTests
 bin/ci/test-performance-scripts
 make smoke
 ```
+
+## Issue 097: real Samba transfer
+
+`samba-network-performance` job（`.github/workflows/performance.yml`）は 1 MiB × 100 の常設計測で、出力契約
+（`PERF_NETWORK` 2 行・`PERF_NETWORK_SAMPLE` 各 100 行）は変えていない。size・暗号・commit を変えた分解測定は
+手動の `.github/workflows/network-performance-study.yml` で行う。
+
+| 道具 | 役割 |
+|---|---|
+| `Tests/SMBeeTests/SMBeeNetworkPerformanceE2ETests.swift` | `SMBEE_NETWORK_PERF_SIZES_MIB` / `_WARMUP` / `_SAMPLES` / `_JSONL` / `_METADATA_JSON` を受け、sample ごとに wall・client CPU・RSS・送受信 byte・READ/WRITE command 数（平文 frame のときだけ。暗号化 frame では `null`）を JSONL に出す。最初と最後の sample は SHA-256 を照合する |
+| `bin/ci/network-performance-study-arm` | 比較する側（arm）を用意する。`current` / `nodelay`（connect 直後に `TCP_NODELAY`）/ `cmac-before`・`cmac-after`（`e91809a^` / `e91809a` に issue 098 の最小 backport と HEAD の harness を載せる） |
+| `bin/ci/network-performance-study-run` | 1 profile 分を回す。metadata（Swift image digest・Samba version・runner CPU・交渉結果）を採り、arm を全部 build してから invocation を ABBA 順に実行し、Samba container の cgroup CPU を invocation ごとに採る |
+| `bin/ci/summarize-network-performance-study` | invocation ごとの median → median / p10 / p90 / MAD / min / max。`--compare A:B` は 3×noise と 5% の両方を超えたときだけ差ありとし、固定 metadata が違う組は incomparable にする。size / SHA-256 の不一致があれば失敗する |
+
+`cmac-*` arm に issue 098 の backport が要る理由: 098 より前の SMBee は SMB 3.0.x で常に暗号鍵を作り、暗号化非対応の
+server にも TRANSFORM を送っていた。そのため 060 の AES-CMAC 署名は実 Samba の転送では一度も wire に乗らず、
+`smb302-signing-required` でも接続が切れるはずである（issue 098 と同じ機構。098 では guest profile で実測。
+この profile に古い commit をそのまま繋いだ実測はしていない）。両 arm に同じ backport を当て、差を 060 の変更だけにしている。

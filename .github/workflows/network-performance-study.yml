@@ -1,0 +1,135 @@
+name: Network performance study
+
+# Issue 097: real-Samba transfer measurement. Manual only; the always-on samba-network-performance job in
+# performance.yml keeps its 1 MiB x 100 contract. Each matrix job measures one profile on one runner, so
+# the arms of an A/B share a runner and run in ABBA order (bin/ci/network-performance-study-run).
+#
+# experiment:
+#   profiles    current HEAD on all four profiles
+#   cmac-ab     issue 060 before/after (e91809a^ / e91809a, both with the issue 098 backport) on
+#               smb302-signing-required, the profile whose signing is AES-CMAC
+#   nodelay-ab  HEAD with and without TCP_NODELAY on smb302-encrypted-required and smb302-signing-required
+
+on:
+  workflow_dispatch:
+    inputs:
+      experiment:
+        description: profiles | cmac-ab | nodelay-ab
+        required: true
+        default: profiles
+        type: choice
+        options: [profiles, cmac-ab, nodelay-ab]
+      sizes_mib:
+        description: Comma-separated payload sizes in MiB
+        required: false
+        default: "1,64"
+      invocations:
+        description: Invocations per arm (fresh process each)
+        required: false
+        default: "10"
+      samples:
+        description: Measured samples per size per invocation
+        required: false
+        default: "5"
+      warmup:
+        description: Warm-up transfers per size per invocation
+        required: false
+        default: "5"
+      timeout_minutes:
+        description: Per-job timeout
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          EXPERIMENT: ${{ inputs.experiment }}
+        run: |
+          set -euo pipefail
+          case "${EXPERIMENT}" in
+            profiles)
+              matrix='{"include":[
+                {"profile":"smb302-encrypted-required","arms":"current"},
+                {"profile":"smb302-signing-required","arms":"current"},
+                {"profile":"smb311-signing-required","arms":"current"},
+                {"profile":"smb311-encrypted-required","arms":"current"}]}' ;;
+            cmac-ab)
+              matrix='{"include":[{"profile":"smb302-signing-required","arms":"cmac-before cmac-after"}]}' ;;
+            nodelay-ab)
+              matrix='{"include":[
+                {"profile":"smb302-encrypted-required","arms":"current nodelay"},
+                {"profile":"smb302-signing-required","arms":"current nodelay"}]}' ;;
+            *) echo "unknown experiment ${EXPERIMENT}" >&2; exit 2 ;;
+          esac
+          printf 'matrix=%s\n' "$(printf '%s' "${matrix}" | tr -d '\n')" >> "${GITHUB_OUTPUT}"
+
+  measure:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      SAMBA_CONTAINER: smbee-samba-study
+      SAMBA_BASE_IMAGE: ubuntu:24.04
+      SAMBA_CONFIG: test/e2e/smb/${{ matrix.profile }}.conf
+      SMBEE_E2E_PROFILE: ${{ matrix.profile }}
+      SMBEE_E2E_HOST: 127.0.0.1
+      SMBEE_E2E_PORT: "445"
+      SWIFT_VERSION: "6.2"
+      STUDY_PROFILE: ${{ matrix.profile }}
+      STUDY_ARMS: ${{ matrix.arms }}
+      STUDY_INVOCATIONS: ${{ inputs.invocations }}
+      STUDY_SIZES_MIB: ${{ inputs.sizes_mib }}
+      STUDY_SAMPLES: ${{ inputs.samples }}
+      STUDY_WARMUP: ${{ inputs.warmup }}
+      STUDY_OUTPUT_DIR: ${{ github.workspace }}/.build/network-study
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Start Samba (${{ matrix.profile }})
+        run: bash test/e2e/start-samba-ci.sh
+      - name: Measure (${{ matrix.arms }})
+        run: bin/ci/network-performance-study-run
+      - name: Summarize
+        if: always()
+        run: |
+          set -euo pipefail
+          compare=()
+          read -r -a arms <<<"${STUDY_ARMS}"
+          if [ "${#arms[@]}" -eq 2 ]; then
+            compare=(--compare "${arms[0]}:${arms[1]}")
+          fi
+          if [ -s "${STUDY_OUTPUT_DIR}/samples.jsonl" ]; then
+            bin/ci/summarize-network-performance-study --expect-invocations "${STUDY_INVOCATIONS}" \
+              "${compare[@]}" "${STUDY_OUTPUT_DIR}/samples.jsonl" \
+              >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "No samples were recorded for ${STUDY_PROFILE} (${STUDY_ARMS})." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+      - name: Upload study artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: network-study-${{ inputs.experiment }}-${{ matrix.profile }}-${{ github.run_id }}
+          retention-days: 90
+          path: |
+            .build/network-study/*.jsonl
+            .build/network-study/*.json
+            .build/network-study/*.log
+          if-no-files-found: warn
+      - name: Samba logs and teardown
+        if: always()
+        uses: ./.github/actions/samba-teardown
+        with:
+          container: ${{ env.SAMBA_CONTAINER }}

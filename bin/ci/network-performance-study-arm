@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+# Prepares one "arm" of the issue 097 real-Samba transfer study and prints the directory to build and
+# measure in. Used by .github/workflows/network-performance-study.yml; runnable locally.
+#
+#   bin/ci/network-performance-study-arm <arm> <output-dir>
+#
+# Arms:
+#   current      the checked-out HEAD itself (no copy)
+#   nodelay      HEAD + TCP_NODELAY right after connect (issue 097 step 6)
+#   cmac-before  e91809a^ (before "perf: accelerate AES-CMAC signing", issue 060)
+#   cmac-after   e91809a
+#
+# The cmac arms are older than issue 098. Those commits encrypt every SMB 3.0.x request even when the
+# server does not support encryption, so AES-CMAC signing never reaches the wire and a signing-only
+# 3.0.2 server (test/e2e/smb/smb302-signing-required.conf) drops the connection. Both cmac arms therefore
+# get the same minimal 098 backport (derive 3.0.x encryption keys only when the server advertises
+# SMB2_GLOBAL_CAP_ENCRYPTION). The only remaining difference between them is issue 060's change.
+# They also get HEAD's benchmark harness, compiled with -DSMBEE_LEGACY_TRANSPORT_API because they
+# predate SMBTransport.send(_ segments:).
+#
+# Writes <output-dir>/arm.env with ARM_DIR, ARM_BASE_COMMIT and ARM_SWIFT_FLAGS for the caller.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+HARNESS=Tests/SMBeeTests/SMBeeNetworkPerformanceE2ETests.swift
+CMAC_COMMIT=e91809a
+# The three issue 098 commits; only SMBNegotiate.swift is taken from them as a diff.
+BACKPORT_FROM=56a9b3a^
+BACKPORT_TO=958bb62
+
+if [ "$#" -ne 2 ]; then
+  echo "usage: $0 <current|nodelay|cmac-before|cmac-after> <output-dir>" >&2
+  exit 2
+fi
+arm="$1"
+output_dir="$2"
+mkdir -p "${output_dir}"
+output_dir="$(cd "${output_dir}" && pwd)"
+
+new_worktree() {
+  local ref="$1"
+  local directory="${output_dir}/worktree"
+  git -C "${REPO_ROOT}" worktree add --detach "${directory}" "${ref}" >&2
+  printf '%s\n' "${directory}"
+}
+
+# Replaces exactly one occurrence of $2 with $3 in file $1; fails loudly if the anchor moved.
+replace_once() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path, encoding="utf-8").read()
+count = text.count(old)
+if count != 1:
+    raise SystemExit(f"{path}: expected exactly one anchor, found {count}")
+open(path, "w", encoding="utf-8").write(text.replace(old, new, 1))
+PY
+}
+
+apply_098_backport() {
+  local directory="$1"
+  git -C "${REPO_ROOT}" diff "${BACKPORT_FROM}" "${BACKPORT_TO}" -- Sources/SMBee/SMBNegotiate.swift \
+    > "${output_dir}/098-negotiate.patch"
+  git -C "${directory}" apply -3 "${output_dir}/098-negotiate.patch"
+  replace_once "${directory}/Sources/SMBee/SMBClient.swift" \
+'            signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.exportedSessionKey)
+            encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
+            decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)' \
+'            signingKey = SMBCrypto.smb3SigningKey(sessionKey: authenticate.exportedSessionKey)
+            if result.supportsEncryption {
+                encryptionKey = SMBCrypto.smb302EncryptionKey(sessionKey: authenticate.exportedSessionKey)
+                decryptionKey = SMBCrypto.smb302DecryptionKey(sessionKey: authenticate.exportedSessionKey)
+            }'
+}
+
+apply_nodelay() {
+  replace_once "$1/Sources/SMBee/POSIXSocketTransport.swift" \
+'        try connectSocket(descriptor, address: address, length: length)
+' \
+'        try connectSocket(descriptor, address: address, length: length)
+        var noDelay: Int32 = 1
+        // Study arm only: a silent failure would measure plain HEAD under the nodelay label.
+        guard DarwinOrGlibc.setsockopt(
+            descriptor, Int32(IPPROTO_TCP), Int32(TCP_NODELAY), &noDelay, socklen_t(MemoryLayout<Int32>.size)
+        ) == 0 else {
+            fatalError("issue 097 nodelay arm: setsockopt(TCP_NODELAY) failed")
+        }
+'
+}
+
+swift_flags=''
+case "${arm}" in
+  current)
+    directory="${REPO_ROOT}"
+    base_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+    ;;
+  nodelay)
+    directory="$(new_worktree HEAD)"
+    base_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+    apply_nodelay "${directory}"
+    ;;
+  cmac-before|cmac-after)
+    if [ "${arm}" = cmac-before ]; then ref="${CMAC_COMMIT}^"; else ref="${CMAC_COMMIT}"; fi
+    base_commit="$(git -C "${REPO_ROOT}" rev-parse "${ref}")"
+    directory="$(new_worktree "${base_commit}")"
+    apply_098_backport "${directory}"
+    cp "${REPO_ROOT}/${HARNESS}" "${directory}/${HARNESS}"
+    swift_flags='-Xswiftc -DSMBEE_LEGACY_TRANSPORT_API'
+    ;;
+  *)
+    echo "unknown arm: ${arm}" >&2
+    exit 2
+    ;;
+esac
+
+{
+  printf 'ARM_DIR=%q\n' "${directory}"
+  printf 'ARM_BASE_COMMIT=%q\n' "${base_commit}"
+  printf 'ARM_SWIFT_FLAGS=%q\n' "${swift_flags}"
+} > "${output_dir}/arm.env"
+if [ "${directory}" != "${REPO_ROOT}" ]; then
+  git -C "${directory}" diff --stat >&2
+fi
+printf '%s\n' "${directory}"

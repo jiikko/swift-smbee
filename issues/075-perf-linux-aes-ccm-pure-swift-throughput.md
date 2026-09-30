@@ -91,6 +91,26 @@ Tests/SMBeeTests/AESCCMBenchmarkTests.swift = SMBEE_BENCH_CCM=1 gate で再現�
 
 ## 関連の追記 (2026-09-25)
 
-実 Samba 転送 (CI の `samba-network-performance`、SMB 3.0.2 暗号化 = CCM) の律速の分解は [097](097-perf-samba-real-transfer-measurement.md) で行う。
+実 Samba 転送 (CI の `samba-network-performance`、SMB 3.0.2 暗号化 = CCM) の律速の分解は [097](done/097-perf-samba-real-transfer-measurement.md) で行う。
 097 で CCM が全体の 10% 以上と出たら、その数字をこの issue に書き足す (061 の決定)。
 
+
+## 097 の実測（2026-09-30、GitHub-hosted ubuntu-latest、Linux release、Samba 4.19.5、smb302-encrypted-required）
+
+097 の study（詳細は `docs/performance-resource-baseline.md` の「Issue 097: real Samba transfer」節）で、CCM の実転送を
+invocation 10 回の median で測った。
+
+| Run | 条件 | 64 MiB read | 64 MiB write | client CPU ÷ wall（read / write） |
+|---|---|---:|---:|---:|
+| A [36682108096](https://github.com/jiikko/swift-smbee/actions/runs/36682108096) | HEAD（Xeon 6973P） | 11.926 MiB/s | 21.174 MiB/s | 0.47 / 0.81 |
+| D [36682119995](https://github.com/jiikko/swift-smbee/actions/runs/36682119995) | HEAD（EPYC 7763） | 8.759 MiB/s | 13.590 MiB/s | 0.61 / 0.93 |
+| D | HEAD + TCP_NODELAY（EPYC 7763、同じ runner で ABBA） | 14.049 MiB/s | 13.984 MiB/s | 0.96 / 0.96 |
+
+- 今の HEAD では、CCM の read は往復ごとの待ち（issue 099。frame header を別 send で送るための Nagle / 遅延 ACK）と CCM の CPU が
+  混ざっている。write は CPU 律速（0.81〜0.93）
+- **099 の待ちを消すと（TCP_NODELAY の arm）、read も CPU 律速になり（0.96）、約 14 MiB/s で頭打ちになる**。client CPU は
+  1 MiB あたり約 68.5 ms（64 MiB で 4,384 ms）で、micro-bench の release 34.5 MiB/s（1 MiB あたり約 29 ms）より重い
+  （copy・framing・署名検証を含む実転送の値。内訳は未分解）
+- **上の「着手 trigger」（CCM read が 25 MiB/s 未満かつ CPU 律速）は、099 を直した後の CI runner の条件では満たしている**。
+  runner は仮想化された 4 vCPU で、実 NAS 環境の値ではない点は残る
+- runner の CPU model で絶対値が揺れる（A の Xeon と D の EPYC で write 21.2 と 13.6）。比較は同じ job の中だけにする

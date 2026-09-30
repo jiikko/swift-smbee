@@ -294,3 +294,95 @@ make smoke
 server にも TRANSFORM を送っていた。そのため 060 の AES-CMAC 署名は実 Samba の転送では一度も wire に乗らず、
 `smb302-signing-required` でも接続が切れるはずである（issue 098 と同じ機構。098 では guest profile で実測。
 この profile に古い commit をそのまま繋いだ実測はしていない）。両 arm に同じ backport を当て、差を 060 の変更だけにしている。
+
+### 結果（2026-09-30）
+
+#### 計測の同一性
+
+- harness / 道具: `c7458a3` 時点の master（run A・C・D は `2ecb48a`。道具の差分は profile を絞る入力だけ）
+- Swift image: `swift@sha256:9bea530093ffff8cf6c259991715ee843fe4d0f932e612f7f4b79cca6e00db87`（全 run 共通）
+- Samba: ubuntu:24.04 の `Version 4.19.5-Ubuntu`（全 run 共通）。GitHub-hosted `ubuntu24-20260920.314.1`、4 vCPU
+- 交渉結果は全 job で期待どおり（3.0.2 は dialect 0x0302・signing mandatory、context は無い。smb311-signing は GMAC、
+  smb311-encrypted は GMAC + AES-128-GCM）
+- **runner の CPU model は job ごとに違う**（run A の 4 job は Xeon 6973P / EPYC 9V74 / EPYC 9V45 / Xeon 8573C）。
+  profile をまたぐ絶対値の比較は目安で、判定は job の中（CPU ÷ wall と、同じ runner の ABBA A/B）だけで行った
+- 全 2,060 sample で size が一致し、SHA-256 の照合（最初と最後の sample、read と write の読み戻し）が全件通った
+
+| Run | 内容 | URL |
+|---|---|---|
+| A | 4 profile × 1 / 64 MiB × 10 invocation（warmup 5・sample 5） | https://github.com/jiikko/swift-smbee/actions/runs/36682108096 |
+| B | 3 profile × 1 GiB × 10 invocation（warmup 1・sample 1） | https://github.com/jiikko/swift-smbee/actions/runs/36683539581 |
+| C | 060 A/B（cmac-before / cmac-after、smb302-signing-required、ABBA × 10） | https://github.com/jiikko/swift-smbee/actions/runs/36682114125 |
+| D | TCP_NODELAY A/B（current / nodelay、smb302 の 2 profile、ABBA × 10、warmup 2） | https://github.com/jiikko/swift-smbee/actions/runs/36682119995 |
+
+raw sample（JSONL）と metadata は各 run の artifact（90 日保持）。
+
+#### 現状（HEAD、invocation median の median）
+
+| Profile | Size | Read MiB/s | Write MiB/s | Client CPU ÷ wall（read / write） |
+|---|---:|---:|---:|---:|
+| smb302-encrypted-required（CCM） | 1 MiB | 4.835 | 5.103 | 0.20 / 0.22 |
+| smb302-encrypted-required（CCM） | 64 MiB | 11.926 | 21.174 | 0.47 / 0.81 |
+| smb302-signing-required（CMAC） | 1 MiB | 5.952 | 7.618 | 0.02 / 0.03 |
+| smb302-signing-required（CMAC） | 64 MiB | 21.732 | 107.029 | 0.04 / 0.19 |
+| smb302-signing-required（CMAC） | 1 GiB | 22.132 | 155.723 | — |
+| smb311-signing-required（GMAC） | 1 MiB | 6.018 | 7.909 | 0.02 / 0.02 |
+| smb311-signing-required（GMAC） | 64 MiB | 22.499 | 144.171 | 0.04 / 0.14 |
+| smb311-signing-required（GMAC） | 1 GiB | 23.677 | 260.303 | — |
+| smb311-encrypted-required（GCM） | 1 MiB | 6.009 | 7.918 | 0.02 / 0.02 |
+| smb311-encrypted-required（GCM） | 64 MiB | 22.727 | 150.234 | 0.02 / 0.10 |
+| smb311-encrypted-required（GCM） | 1 GiB | 23.323 | 231.646 | — |
+
+Samba container の CPU ÷ invocation wall は 0.02〜0.06（run A、参考値）。smb302-encrypted-required の 1 GiB は、64 MiB の
+throughput から 1 invocation 約 268 秒（read 86 秒 + write 48 秒 × 2 転送）、10 invocation で約 45 分と見積もり、30 分の
+予算に入らないので測っていない。実際の所要: A の CCM job 23 分、B 32〜35 分、C 40 分、D の CCM job 45 分（B・C・D は
+30 分の目安を超えた）。
+
+#### 060 の A/B（run C、smb302-signing-required）
+
+両 arm とも issue 098 の最小 backport と HEAD の harness を載せた代替 A/B（手順 5）。
+
+| Size | Metric | Before median / MAD | After median / MAD | Change | Decision |
+|---:|---|---:|---:|---:|---|
+| 1 MiB | read throughput MiB/s | 10.418 / 0.096 | 74.686 / 0.812 | +616.9% | difference |
+| 1 MiB | write throughput MiB/s | 10.226 / 0.121 | 68.173 / 0.632 | +566.7% | difference |
+| 1 MiB | write client CPU ms | 90.936 / 0.572 | 8.676 / 0.054 | -90.5% | difference |
+| 64 MiB | read throughput MiB/s | 10.621 / 0.051 | 85.938 / 0.515 | +709.1% | difference |
+| 64 MiB | write throughput MiB/s | 10.522 / 0.055 | 81.305 / 0.432 | +672.7% | difference |
+| 64 MiB | write wall ms | 6082.572 / 31.591 | 787.159 / 4.210 | -87.1% | difference |
+| 64 MiB | write client CPU ms | 5736.896 / 22.240 | 476.801 / 2.064 | -91.7% | difference |
+
+**反映率**（1 MiB あたりに揃えて比べる）: 060 の synthetic（Linux 10-run、8 MiB full synthetic）は 669.927 → 23.797 ms で、
+1 MiB あたり 80.77 ms の削減。実転送の 64 MiB write は client CPU で 89.64 → 7.45 ms/MiB（82.19 ms/MiB の削減）、
+wall で 95.04 → 12.30 ms/MiB（82.74 ms/MiB の削減）。**synthetic で減らした分は、実転送の client CPU・wall にほぼ全量
+（約 102%）反映された**。throughput の比は synthetic の 28 倍に対し実転送は 7.7 倍で、after に残る 1 MiB あたり約 12.3 ms は
+CMAC 以外（下の往復待ちを含む）。
+
+#### TCP_NODELAY の A/B（run D）
+
+| Profile | Size | Metric | Current median / MAD | Nodelay median / MAD | Change | Decision |
+|---|---:|---|---:|---:|---:|---|
+| smb302-signing-required | 1 MiB | read wall ms | 168.084 / 0.249 | 5.791 / 0.066 | -96.6% | difference |
+| smb302-signing-required | 1 MiB | write wall ms | 129.209 / 0.114 | 6.636 / 0.189 | -94.9% | difference |
+| smb302-signing-required | 64 MiB | read throughput MiB/s | 21.599 / 0.010 | 259.549 / 0.388 | +1101.7% | difference |
+| smb302-signing-required | 64 MiB | write throughput MiB/s | 163.618 / 0.292 | 238.574 / 0.890 | +45.8% | difference |
+| smb302-encrypted-required | 1 MiB | read wall ms | 237.085 / 0.223 | 74.033 / 0.582 | -68.8% | difference |
+| smb302-encrypted-required | 1 MiB | write wall ms | 197.181 / 0.465 | 75.101 / 0.876 | -61.9% | difference |
+| smb302-encrypted-required | 64 MiB | read throughput MiB/s | 8.759 / 0.014 | 14.049 / 0.072 | +60.4% | difference |
+| smb302-encrypted-required | 64 MiB | write throughput MiB/s | 13.590 / 0.042 | 13.984 / 0.063 | +2.9% | within noise |
+
+client CPU はどの行もほぼ変わらない（-0.1〜-17%）。減ったのは待ち時間で、原因は `POSIXSocketTransport.sendBlocking` が
+direct-TCP の 4 byte header と本体を別の `send()` で書くこと（`0709833` で導入）と Nagle / 遅延 ACK の相互作用と考えられる。
+実装は issue 099 で扱う。
+
+#### 律速の判定（手順 6）
+
+| Profile | 判定 |
+|---|---|
+| smb302-signing-required（CMAC） | **client のその他（往復ごとの待ち）**。client CPU ÷ wall 0.02〜0.19、server も 0.06 以下。TCP_NODELAY で 1 MiB の wall が -95〜-97% |
+| smb311-signing-required（GMAC） | **client のその他（往復ごとの待ち）と推定**。1 MiB の固定遅延（166 / 126 ms）と CPU ÷ wall 0.02 が CMAC と同じ形。A/B は未実施 |
+| smb311-encrypted-required（GCM） | 同上（推定。A/B は未実施） |
+| smb302-encrypted-required（CCM） | 1 MiB と read は**往復の待ち**（TCP_NODELAY で -62〜-69%）、64 MiB の write は **client の暗号（CCM）**（CPU ÷ wall 0.81、TCP_NODELAY で変化なし）。CCM の数字は issue 075 に書き足した |
+
+**全体の wall の 10% 以上を占める client 側の単一候補は「frame header の別 send による往復待ち」**で、issue 099 として
+起票した。CCM は新しい issue を作らず 075 に書き足した（097 の完了条件どおり）。

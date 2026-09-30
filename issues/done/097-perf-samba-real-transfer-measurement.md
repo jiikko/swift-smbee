@@ -132,7 +132,7 @@ Sources に `TCP_NODELAY` の設定は 1 件も無い)。手元の Apple contain
 - [x] `swift test` (unit 全体)、`make smoke` (container Samba E2E) が green。harness の変更で CI の `samba-network-performance` job が
   壊れていない (job の summary に新しい表が出る)。
 - [x] 結果を `docs/performance-resource-baseline.md` に「Issue 097: real Samba transfer」節として書き戻した。
-- [x] **次の実装 issue は、client 側の単一の候補が全体の wall time の 10% 以上を占めるときだけ起票する**。（[099](../099-perf-direct-tcp-header-split-send-nagle-stall.md) を起票。CCM は 075 に書き足した）
+- [x] **次の実装 issue は、client 側の単一の候補が全体の wall time の 10% 以上を占めるときだけ起票する**。（[099](099-perf-direct-tcp-header-split-send-nagle-stall.md) を起票。CCM は 075 に書き足した）
   CCM が支配的と出た場合は新しい issue を作らず、075 に数字を書き足す (075 がその候補の受け皿)。
 - [x] （該当せず: 10% 以上の候補があった）**10% 以上の候補が無ければ、「現条件では network / server 律速」と結果を書き、実装変更なしで done にしてよい**。
   shaping が使えなかった・1 GiB が時間に入らなかった・古い commit で harness がコンパイルできなかった、はいずれも理由を書けば完了を妨げない。
@@ -200,7 +200,7 @@ Sources に `TCP_NODELAY` の設定は 1 件も無い)。手元の Apple contain
   wall は 95.04 → 12.30 ms/MiB で、synthetic の削減 80.77 ms/MiB に対して約 102%。throughput は 10.5 → 81.3 MiB/s
 - **律速は 4 profile とも「往復ごとの待ち」**（client CPU ÷ wall 0.02〜0.2、server も 0.06 以下）。TCP_NODELAY の A/B（run D）で
   smb302-signing-required の 1 MiB read が 168.1 → 5.8 ms（-96.6%）、64 MiB read が 21.6 → 259.5 MiB/s。原因は frame header を
-  別 send() で送ること（`0709833`）と考えられ、[099](../099-perf-direct-tcp-header-split-send-nagle-stall.md) を起票した。smb311 の 2 profile は
+  別 send() で送ること（`0709833`）と考えられ、[099](099-perf-direct-tcp-header-split-send-nagle-stall.md) を起票した。smb311 の 2 profile は
   同じ形の固定遅延からの推定（A/B は未実施）
 - **CCM（smb302-encrypted-required）の 64 MiB write は client の暗号で律速**（CPU ÷ wall 0.81〜0.93）。待ちを消すと read も
   CPU 律速（0.96、約 14 MiB/s）になる。数字は 075 に書き足した（075 の着手 trigger を 099 の修正後の条件で満たす）

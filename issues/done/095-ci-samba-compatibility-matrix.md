@@ -2,7 +2,7 @@
 
 > **旧番号 004**: 本 issue は元は `004-ci-samba-compatibility-matrix.md` だった。`004` が 3 ファイルで衝突していたため 095 へ寄せた (2026-09-08)。過去のメモで「issue 004」が Samba 互換性マトリクスの話ならこの issue。
 
-状態: **実装済み。初回 CI 実行結果待ち**
+状態: **完了**（2026-09-30 issue-sync で done へ。下の「決着」節）
 起票: 2026-06-30
 関連: `.github/workflows/e2e.yml` / `test/e2e/smb.conf` / `Tests/SMBeeTests/SMBeeE2ETests.swift`
 
@@ -220,3 +220,14 @@ matrix job は並列実行される前提で設計する。
 - GitHub Actions 上の転送速度秒数を compatibility gate にすること。
 - Samba version pin image を最初から自前管理すること。必要になるまで distro-provided Samba で始める。
 - macOS SMBX 実サーバ smoke をこの issue に含めること。これは別 issue で扱う。
+
+## 決着 (2026-09-30, issue-sync)
+
+- 完了条件 10 項目はすべて `[x]`。「初回 CI 実行結果待ち」は、以下のとおり実行済みなので解消した。
+- 実測（`gh run view 36497070303`、2026-09-28 の scheduled run）: この issue が対象とする 5 job はすべて success だった。
+  `ubuntu:24.04` の `smb302-encrypted-required` / `smb311-signing-required` / `smb311-encrypted-required`、
+  `ubuntu:22.04` / `debian:12` の `smb302-encrypted-required`。
+- ただし run 全体は failure。失敗は、後から [done/044](044-ci-guest-anonymous-profile-is-not-covered.md) で matrix に足した
+  `ubuntu:24.04 / guest` の job だけ。この job は追加後の最初の run（2026-07-13）から 2026-09-28 まで、
+  12 週連続で失敗している。この issue の対象外なので、[098](../098-ci-samba-compat-guest-job-fails-every-run.md) へ切り出した。
+

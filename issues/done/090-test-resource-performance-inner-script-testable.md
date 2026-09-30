@@ -173,7 +173,7 @@ container 内で実際に解決できることは CI でしか確かめられな
 
 ### 残タスクの切り出し
 
-上記の「payload を実際に評価する caller scenario」は [`091`](../091-test-resource-performance-payload-execution.md) として起票した。
+上記の「payload を実際に評価する caller scenario」は [`091`](091-test-resource-performance-payload-execution.md) として起票した。
 本 issue の完了条件 (3 経路が shell test で回り workflow へ配線されている / 各経路に変異を当てて red) は
 すべて満たしたので **done** とする。
 

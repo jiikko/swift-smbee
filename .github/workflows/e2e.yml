@@ -45,23 +45,28 @@ jobs:
             profile: smb311-signing-required
             scope: authenticated-smoke
             test_filter: SMBeeE2ETests.testAuthenticatedFastSmoke
+            required_test: SMBeeE2ETests.testAuthenticatedFastSmoke
           - swift_version: "6.2"
             profile: smb311-encrypted-required
             scope: encrypted-large-io
             test_filter: SMB311EncryptedLargeIOE2ETests.testSMB311EncryptedLargeReadWrite
+            required_test: SMB311EncryptedLargeIOE2ETests.testSMB311EncryptedLargeReadWrite
           - swift_version: "6.2"
             profile: guest
             scope: anonymous-smoke
             test_filter: SMBeeE2ETests.testGuestAnonymousSmoke
+            required_test: SMBeeE2ETests.testGuestAnonymousSmoke
           - swift_version: "6.2"
             profile: msdfs
             scope: dfs-referral
             test_filter: SMBDfsReferralE2ETests
+            required_test: SMBDfsReferralE2ETests.testDfsReferralDecodesSambaMsdfsLink
           - swift_version: "6.2"
             samba_base_image: debian:13-slim
             profile: smb422-reparse
             scope: reparse-point
             test_filter: SMBReparsePointE2ETests
+            required_test: SMBReparsePointE2ETests.testReadlinkAndRecursiveOperationsUseTheReparseEntry
     env:
       SAMBA_CONTAINER: smbee-samba-api-${{ matrix.profile }}-${{ matrix.swift_version }}
       SAMBA_BASE_IMAGE: ${{ matrix.samba_base_image || 'ubuntu:24.04' }}
@@ -110,13 +115,13 @@ jobs:
           if [ "$status" -ne 0 ]; then
             exit "$status"
           fi
-          if [ "${SCOPE}" = full ] && [ -z "${REQUIRED_TEST}" ]; then
-            echo 'matrix.required_test must be set for the full scope (issues/087)' >&2
+          # Every profile names the case it exists for: an empty filter match or a profile-gated
+          # XCTSkip would otherwise pass on exit status alone (issues/087, issues/102 #10).
+          if [ -z "${REQUIRED_TEST}" ]; then
+            echo "matrix.required_test must be set for every profile (${SMBEE_E2E_PROFILE})" >&2
             exit 1
           fi
-          if [ -n "${REQUIRED_TEST}" ]; then
-            bin/ci/require-xctest-passed e2e-api.log "${REQUIRED_TEST}"
-          fi
+          bin/ci/require-xctest-passed e2e-api.log "${REQUIRED_TEST}"
 
       - name: Samba logs and teardown
         if: always()

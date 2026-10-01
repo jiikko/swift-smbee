@@ -179,15 +179,7 @@ final class SMBValidateNegotiateScriptTransport: SMBTransport, @unchecked Sendab
             sessionId: requestHeader.sessionId
         ).encode()
         response.append(contentsOf: state.1.dropFirst(SMB2Header.encodedSize))
-        response[16] |= UInt8(SMB2Flags.signed & 0xff)
-        for index in 48..<64 { response[index] = 0 }
-        let signature = try SMBSessionSigning.signature(
-            algorithm: .aesCMAC,
-            key: signingKey,
-            packet: response,
-            sender: .server
-        )
-        response.replaceSubrange(48..<64, with: signature)
+        response = try signedTestPacket(response, algorithm: .aesCMAC, key: signingKey, sender: .server)
 
         let delivery = lock.withLock { () -> (PendingReceive, [UInt8])? in
             guard case .validateNegotiate(var validation) = steps[state.0] else { return nil }
@@ -328,8 +320,8 @@ final class SMBValidateNegotiateScriptTransport: SMBTransport, @unchecked Sendab
         authenticationRequest: [UInt8],
         credential: SMBCredential
     ) throws -> [UInt8] {
-        let ntResponse = try readSecurityBuffer(authenticationRequest, at: 20)
-        let encryptedSessionKey = try readSecurityBuffer(authenticationRequest, at: 52)
+        let ntResponse = try readValidatedSecurityBuffer(authenticationRequest, at: 20)
+        let encryptedSessionKey = try readValidatedSecurityBuffer(authenticationRequest, at: 52)
         guard ntResponse.count >= 16, encryptedSessionKey.count == 16 else {
             throw SMBCodecError.invalidValue("NTLM AUTHENTICATE request does not carry an SMB session key")
         }
@@ -339,50 +331,4 @@ final class SMBValidateNegotiateScriptTransport: SMBTransport, @unchecked Sendab
         return SMBCrypto.smb3SigningKey(sessionKey: exportedSessionKey)
     }
 
-    private static func readSecurityBuffer(_ bytes: [UInt8], at offset: Int) throws -> [UInt8] {
-        guard offset + 8 <= bytes.count else { throw SMBCodecError.truncated }
-        let length = Int(readUInt16LE(bytes, at: offset))
-        let bufferOffset = Int(readUInt32LE(bytes, at: offset + 4))
-        guard bufferOffset + length <= bytes.count else { throw SMBCodecError.truncated }
-        return Array(bytes[bufferOffset..<(bufferOffset + length)])
-    }
-}
-
-private func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {
-    UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
-}
-
-private func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
-    UInt32(bytes[offset]) |
-        UInt32(bytes[offset + 1]) << 8 |
-        UInt32(bytes[offset + 2]) << 16 |
-        UInt32(bytes[offset + 3]) << 24
-}
-
-private func writeUInt16LE(_ value: UInt16, to bytes: inout [UInt8], at offset: Int) {
-    bytes[offset] = UInt8(value & 0xff)
-    bytes[offset + 1] = UInt8(value >> 8)
-}
-
-private func writeUInt32LE(_ value: UInt32, to bytes: inout [UInt8], at offset: Int) {
-    for index in 0..<4 {
-        bytes[offset + index] = UInt8((value >> UInt32(index * 8)) & 0xff)
-    }
-}
-
-private func writeUInt64LE(_ value: UInt64, to bytes: inout [UInt8], at offset: Int) {
-    for index in 0..<8 {
-        bytes[offset + index] = UInt8((value >> UInt64(index * 8)) & 0xff)
-    }
-}
-
-private func appendUInt16LE(_ value: UInt16, to bytes: inout [UInt8]) {
-    bytes.append(UInt8(value & 0xff))
-    bytes.append(UInt8(value >> 8))
-}
-
-private func appendUInt32LE(_ value: UInt32, to bytes: inout [UInt8]) {
-    for index in 0..<4 {
-        bytes.append(UInt8((value >> UInt32(index * 8)) & 0xff))
-    }
 }

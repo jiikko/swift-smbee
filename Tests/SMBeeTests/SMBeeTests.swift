@@ -8357,10 +8357,10 @@ final class SMBeeTests: XCTestCase {
     func testSessionReadChunkUsesGMACSigningWithoutEncryption() async throws {
         let key = hexBytes("000102030405060708090a0b0c0d0e0f")
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let response = try signedSMB2Packet(
+        let response = try signedTestPacket(
             try smb2ReadResponse(Array("ok".utf8), messageId: 0, treeId: 0x3344),
-            key: key,
             algorithm: .aesGMAC,
+            key: key,
             sender: .server
         )
         let transport = InMemoryTransport(inbound: try framed([response]))
@@ -11175,12 +11175,6 @@ final class SMBeeTests: XCTestCase {
         return writer.bytes
     }
 
-    private func readSecurityBuffer(_ bytes: [UInt8], at offset: Int) -> [UInt8] {
-        let length = Int(readUInt16LE(bytes, at: offset))
-        let bufferOffset = Int(readUInt32LE(bytes, at: offset + 4))
-        return Array(bytes[bufferOffset..<bufferOffset + length])
-    }
-
     private func decodeNTLMv2BlobAVPairs(_ blob: [UInt8]) throws -> [(id: UInt16, value: [UInt8])] {
         var offset = 28
         var pairs: [(id: UInt16, value: [UInt8])] = []
@@ -11202,18 +11196,6 @@ final class SMBeeTests: XCTestCase {
         bytes.append(UInt8(value.count & 0xff))
         bytes.append(UInt8((value.count >> 8) & 0xff))
         bytes.append(contentsOf: value)
-    }
-
-    private func appendUInt32LE(_ value: UInt32, to bytes: inout [UInt8]) {
-        bytes.append(UInt8(value & 0xff))
-        bytes.append(UInt8((value >> 8) & 0xff))
-        bytes.append(UInt8((value >> 16) & 0xff))
-        bytes.append(UInt8((value >> 24) & 0xff))
-    }
-
-    private func appendUInt16LE(_ value: UInt16, to bytes: inout [UInt8]) {
-        bytes.append(UInt8(value & 0xff))
-        bytes.append(UInt8((value >> 8) & 0xff))
     }
 
     private func appendNDRString(_ value: String, to bytes: inout [UInt8]) {
@@ -11336,17 +11318,6 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
-    private func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {
-        UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
-    }
-
-    private func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
-        UInt32(bytes[offset])
-            | (UInt32(bytes[offset + 1]) << 8)
-            | (UInt32(bytes[offset + 2]) << 16)
-            | (UInt32(bytes[offset + 3]) << 24)
-    }
-
     private func readUInt64LE(_ bytes: [UInt8], at offset: Int) -> UInt64 {
         UInt64(readUInt32LE(bytes, at: offset)) | (UInt64(readUInt32LE(bytes, at: offset + 4)) << 32)
     }
@@ -11436,23 +11407,6 @@ final class SMBeeTests: XCTestCase {
             cursor += 1
         }
         return value
-    }
-
-    private func writeUInt16LE(_ value: UInt16, to bytes: inout [UInt8], at offset: Int) {
-        bytes[offset] = UInt8(value & 0xff)
-        bytes[offset + 1] = UInt8((value >> 8) & 0xff)
-    }
-
-    private func writeUInt32LE(_ value: UInt32, to bytes: inout [UInt8], at offset: Int) {
-        bytes[offset] = UInt8(value & 0xff)
-        bytes[offset + 1] = UInt8((value >> 8) & 0xff)
-        bytes[offset + 2] = UInt8((value >> 16) & 0xff)
-        bytes[offset + 3] = UInt8((value >> 24) & 0xff)
-    }
-
-    private func writeUInt64LE(_ value: UInt64, to bytes: inout [UInt8], at offset: Int) {
-        writeUInt32LE(UInt32(value & 0xffff_ffff), to: &bytes, at: offset)
-        writeUInt32LE(UInt32((value >> 32) & 0xffff_ffff), to: &bytes, at: offset + 4)
     }
 
     // SESSION_SETUP success response body (MS-SMB2 §2.2.6): StructureSize=9, SessionFlags,
@@ -11799,20 +11753,6 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
         response.append(contentsOf: payload)
         return response
-    }
-
-    private func signedSMB2Packet(
-        _ packet: [UInt8],
-        key: [UInt8],
-        algorithm: SMBSessionSigningAlgorithm,
-        sender: SMBSessionSigningSender
-    ) throws -> [UInt8] {
-        var signed = packet
-        signed[16] |= UInt8(SMB2Flags.signed & 0xff)
-        signed.replaceSubrange(48..<64, with: Array(repeating: 0, count: 16))
-        let signature = try SMBSessionSigning.signature(algorithm: algorithm, key: key, packet: signed, sender: sender)
-        signed.replaceSubrange(48..<64, with: signature)
-        return signed
     }
 
     private func referenceAESCMAC(key: [UInt8], message: [UInt8]) throws -> [UInt8] {

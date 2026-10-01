@@ -883,31 +883,6 @@ private func chunkLengths(fileSize: Int, chunkSize: Int) -> [Int] {
     }
 }
 
-private func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
-    UInt32(bytes[offset])
-        | (UInt32(bytes[offset + 1]) << 8)
-        | (UInt32(bytes[offset + 2]) << 16)
-        | (UInt32(bytes[offset + 3]) << 24)
-}
-
-private func writeUInt16LE(_ value: UInt16, to bytes: inout [UInt8], at offset: Int) {
-    bytes[offset] = UInt8(value & 0xff)
-    bytes[offset + 1] = UInt8((value >> 8) & 0xff)
-}
-
-private func writeUInt32LE(_ value: UInt32, to bytes: inout [UInt8], at offset: Int) {
-    bytes[offset] = UInt8(value & 0xff)
-    bytes[offset + 1] = UInt8((value >> 8) & 0xff)
-    bytes[offset + 2] = UInt8((value >> 16) & 0xff)
-    bytes[offset + 3] = UInt8((value >> 24) & 0xff)
-}
-
-private func writeUInt64LE(_ value: UInt64, to bytes: inout [UInt8], at offset: Int) {
-    for index in 0..<8 {
-        bytes[offset + index] = UInt8((value >> UInt64(index * 8)) & 0xff)
-    }
-}
-
 private func hexBytes(_ string: String) -> [UInt8] {
     precondition(string.count.isMultiple(of: 2))
     var bytes: [UInt8] = []

@@ -272,8 +272,7 @@ final class SMBNegotiateValidationTests: XCTestCase {
         XCTAssertEqual(header.command, SMB2Commands.ioctl)
         XCTAssertNotEqual(header.flags & SMB2Flags.signed, 0)
         XCTAssertNotEqual(header.signature, Array(repeating: 0, count: 16))
-        var normalizedRequest = request
-        normalizedRequest.replaceSubrange(48..<64, with: Array(repeating: 0, count: 16))
+        let normalizedRequest = testPacketSignatureInput(request)
         let expectedSignature = try SMBSessionSigning.signature(
             algorithm: .aesCMAC,
             key: signingKey,
@@ -321,7 +320,12 @@ final class SMBNegotiateValidationTests: XCTestCase {
                 dialect: responseDialect
             )
             let responses = try frame([
-                signServerPacket(treeConnectResponse(messageId: 0, sessionId: sessionId), key: signingKey),
+                try signedTestPacket(
+                    treeConnectResponse(messageId: 0, sessionId: sessionId),
+                    algorithm: .aesCMAC,
+                    key: signingKey,
+                    sender: .server
+                ),
                 response
             ])
             let transport = InMemoryTransport(inbound: responses)
@@ -368,7 +372,9 @@ final class SMBNegotiateValidationTests: XCTestCase {
     ) throws -> [UInt8] {
         switch protection {
         case .error(let status):
-            return try signServerPacket(ioctlError(status: status, messageId: 1), key: signingKey)
+            return try signedTestPacket(
+                ioctlError(status: status, messageId: 1), algorithm: .aesCMAC, key: signingKey, sender: .server
+            )
         case .outOfRange:
             let packet = try ioctlSuccess(
                 capabilities: capabilities,
@@ -378,14 +384,16 @@ final class SMBNegotiateValidationTests: XCTestCase {
                 outputOffset: 500,
                 outputCount: 100
             )
-            return try signServerPacket(packet, key: signingKey)
+            return try signedTestPacket(packet, algorithm: .aesCMAC, key: signingKey, sender: .server)
         case .signed(let outputLength):
-            return try signServerPacket(
+            return try signedTestPacket(
                 ioctlSuccess(capabilities: capabilities, guidBytes: guidBytes, securityMode: securityMode, dialect: dialect, outputLength: outputLength),
-                key: signingKey
+                algorithm: .aesCMAC,
+                key: signingKey,
+                sender: .server
             )
         case .short:
-            return try signServerPacket(
+            return try signedTestPacket(
                 ioctlSuccess(
                     capabilities: capabilities,
                     guidBytes: guidBytes,
@@ -394,14 +402,18 @@ final class SMBNegotiateValidationTests: XCTestCase {
                     outputLength: 24,
                     outputCount: 23
                 ),
-                key: signingKey
+                algorithm: .aesCMAC,
+                key: signingKey,
+                sender: .server
             )
         case .unsigned(let outputLength):
             return try ioctlSuccess(capabilities: capabilities, guidBytes: guidBytes, securityMode: securityMode, dialect: dialect, outputLength: outputLength)
         case .corruptSignature(let outputLength):
-            var packet = try signServerPacket(
+            var packet = try signedTestPacket(
                 ioctlSuccess(capabilities: capabilities, guidBytes: guidBytes, securityMode: securityMode, dialect: dialect, outputLength: outputLength),
-                key: signingKey
+                algorithm: .aesCMAC,
+                key: signingKey,
+                sender: .server
             )
             packet[48] ^= 0x01
             return packet
@@ -584,20 +596,6 @@ final class SMBNegotiateValidationTests: XCTestCase {
         return packet
     }
 
-    private func signServerPacket(_ packet: [UInt8], key: [UInt8]) throws -> [UInt8] {
-        var signed = packet
-        signed[16] |= UInt8(SMB2Flags.signed & 0xff)
-        signed.replaceSubrange(48..<64, with: Array(repeating: 0, count: 16))
-        let signature = try SMBSessionSigning.signature(
-            algorithm: .aesCMAC,
-            key: key,
-            packet: signed,
-            sender: .server
-        )
-        signed.replaceSubrange(48..<64, with: signature)
-        return signed
-    }
-
     private func encryptServerPacket(_ packet: [UInt8], key: [UInt8], invalidTag: Bool) throws -> [UInt8] {
         let nonce = Array(UInt8(0x00)...UInt8(0x0a))
         var header = SMB3TransformHeader(
@@ -638,29 +636,4 @@ final class SMBNegotiateValidationTests: XCTestCase {
         return packets
     }
 
-    private func writeUInt16LE(_ value: UInt16, to bytes: inout [UInt8], at offset: Int) {
-        bytes[offset] = UInt8(value & 0xff)
-        bytes[offset + 1] = UInt8(value >> 8)
-    }
-
-    private func writeUInt32LE(_ value: UInt32, to bytes: inout [UInt8], at offset: Int) {
-        for index in 0..<4 {
-            bytes[offset + index] = UInt8((value >> UInt32(index * 8)) & 0xff)
-        }
-    }
-
-    private func writeUInt64LE(_ value: UInt64, to bytes: inout [UInt8], at offset: Int) {
-        writeUInt32LE(UInt32(value & 0xffff_ffff), to: &bytes, at: offset)
-        writeUInt32LE(UInt32(value >> 32), to: &bytes, at: offset + 4)
-    }
-
-    private func appendUInt16LE(_ value: UInt16, to bytes: inout [UInt8]) {
-        bytes += [UInt8(value & 0xff), UInt8(value >> 8)]
-    }
-
-    private func appendUInt32LE(_ value: UInt32, to bytes: inout [UInt8]) {
-        for index in 0..<4 {
-            bytes.append(UInt8((value >> UInt32(index * 8)) & 0xff))
-        }
-    }
 }

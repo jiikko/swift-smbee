@@ -1289,13 +1289,12 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             sessionId: 0x1111_2222_3333_4444
         ).encode()
         finalResponse.append(contentsOf: [60, 0] + Array(repeating: UInt8(0), count: 58))
-        let signature = try SMBSessionSigning.signature(
+        finalResponse = try signedTestPacket(
+            finalResponse,
             algorithm: .aesCMAC,
             key: signingKey,
-            packet: finalResponse,
             sender: .server
         )
-        finalResponse.replaceSubrange(48..<64, with: signature)
         try await session.dispatchReceivedPacketThenCancelForTesting(finalResponse) {
             closeTask.cancel()
         }
@@ -2065,13 +2064,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         }
         packet.append(contentsOf: body)
         if shouldSign, let signingKey {
-            let signature = try SMBSessionSigning.signature(
-                algorithm: .aesCMAC,
-                key: signingKey,
-                packet: packet,
-                sender: .server
-            )
-            packet.replaceSubrange(48..<64, with: signature)
+            packet = try signedTestPacket(packet, algorithm: .aesCMAC, key: signingKey, sender: .server)
             if command == SMB2Commands.close, status != SMB2Status.pending, corruptCloseSignature {
                 packet[48] ^= 0xff
             }

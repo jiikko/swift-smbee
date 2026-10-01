@@ -2,9 +2,13 @@ name: E2E
 
 on:
   workflow_dispatch:
+  # issues/ だけの変更では起動しない (issue の規約検査は issues.yml)。bin/ci/verify-agent-push は
+  # この除外を前提に、issue だけの commit を直近のコードを含む祖先の run で検証する。
   push:
     branches: [master]
+    paths-ignore: ['issues/**']
   pull_request:
+    paths-ignore: ['issues/**']
 
 permissions:
   contents: read

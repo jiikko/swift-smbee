@@ -1,0 +1,30 @@
+name: Issues
+
+# issues/ の運用規約 (番号の一意性 / 命名 / human の期限 / retro の日付 / 相対リンク) を機械で守る。
+# 規約の正本は issues/README.md。Test / E2E / Performance は issues/ だけの変更では起動しない
+# (paths-ignore) ので、issue の検査はこの軽い workflow に分けた。
+# paths で絞らず毎回起動する: GitHub の paths は push 全体 (before..after) で評価され、検証する commit
+# 1 つの差分からは起動の有無を再現できない。毎回起動なら bin/ci/verify-agent-push は常にこの
+# workflow の成功を要求できる (数秒の job なので費用は小さい)。
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issues-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  issue-conventions:
+    name: issue conventions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check issue conventions
+        timeout-minutes: 5
+        run: bin/ci/test-issue-conventions

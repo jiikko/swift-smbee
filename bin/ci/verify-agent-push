@@ -10,6 +10,12 @@ Waits concurrently for the Test, E2E, and Performance workflows for a commit
 (default: HEAD). On failure, prints the failed jobs and a filtered failed-log
 tail. On success, performs the full Performance artifact/statistics check.
 
+Test, E2E, and Performance ignore pushes that only change issues/ (paths-ignore).
+When the commit only changes issues/, they are verified on the nearest ancestor
+that has runs, walking back over issue-only commits to the first commit that
+changes anything else (the trees differ only under issues/). The Issues workflow
+(issue conventions) runs on every push and is always required on the commit itself.
+
 Environment:
   AGENT_PUSH_VERIFY_TIMEOUT_SECONDS  Maximum wait time (default: 7200)
   AGENT_PUSH_VERIFY_POLL_SECONDS     Poll interval (default: 15)
@@ -29,24 +35,64 @@ commit="${1:-HEAD}"
 timeout_seconds="${AGENT_PUSH_VERIFY_TIMEOUT_SECONDS:-7200}"
 poll_seconds="${AGENT_PUSH_VERIFY_POLL_SECONDS:-15}"
 
-if ! [[ "${timeout_seconds}" =~ ^[0-9]+$ ]] || [ "${timeout_seconds}" -lt 1 ]; then
+# Explicit digits and a length cap: [0-9] follows the locale and 19+ digits break the -lt test.
+if ! [[ "${timeout_seconds}" =~ ^[0123456789]+$ ]] || [ "${#timeout_seconds}" -gt 9 ] || [ "${timeout_seconds}" -lt 1 ]; then
   echo "AGENT_PUSH_VERIFY_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
 fi
-if ! [[ "${poll_seconds}" =~ ^[0-9]+$ ]] || [ "${poll_seconds}" -lt 1 ]; then
+if ! [[ "${poll_seconds}" =~ ^[0123456789]+$ ]] || [ "${#poll_seconds}" -gt 9 ] || [ "${poll_seconds}" -lt 1 ]; then
   echo "AGENT_PUSH_VERIFY_POLL_SECONDS must be a positive integer" >&2
   exit 2
 fi
 
 cd "${REPO_ROOT}"
 commit_sha="$(git rev-parse "${commit}^{commit}")"
+
+# Must match `paths-ignore` of test.yml / e2e.yml / performance.yml
+# (bin/ci/test-agent-verifiers checks that the workflows still say issues/**).
+skip_prefix='issues/'
+max_candidates=30
+
+changed_paths() {
+  # --no-renames: a rename out of Sources/ into issues/ must count its old path too.
+  git diff --name-only --no-renames "$1^" "$1"
+}
+
+# True iff $1 has a parent and every path it changes is under issues/ (an empty commit counts:
+# its tree equals its parent's).
+only_skip_paths() {
+  local path paths
+  git rev-parse -q --verify "$1^" >/dev/null || return 1
+  paths="$(changed_paths "$1")" || return 1
+  while IFS= read -r path; do
+    [ -z "${path}" ] && continue
+    case "${path}" in
+      "${skip_prefix}"*) ;;
+      *) return 1 ;;
+    esac
+  done <<<"${paths}"
+  return 0
+}
+
+candidates=("${commit_sha}")
+cursor="${commit_sha}"
+while only_skip_paths "${cursor}"; do
+  cursor="$(git rev-parse "${cursor}^")"
+  candidates+=("${cursor}")
+  if [ "${#candidates[@]}" -gt "${max_candidates}" ]; then
+    echo "More than ${max_candidates} consecutive commits change only ${skip_prefix}; verify an older commit directly" >&2
+    exit 1
+  fi
+done
+
 deadline=$((SECONDS + timeout_seconds))
 runs_json='[]'
 state_file="$(mktemp)"
 failed_log="$(mktemp)"
 runs_file="$(mktemp)"
+chosen_file="$(mktemp)"
 cleanup() {
-  rm -f "${state_file}" "${failed_log}" "${runs_file}"
+  rm -f "${state_file}" "${failed_log}" "${runs_file}" "${chosen_file}"
 }
 trap cleanup EXIT
 started_at="${SECONDS}"
@@ -54,22 +100,36 @@ next_heartbeat="${SECONDS}"
 previous_state=''
 
 summarize_runs() {
-  python3 - "${commit_sha}" "${runs_file}" "${state_file}" <<'PY'
+  python3 - "${commit_sha}" "${runs_file}" "${state_file}" "${chosen_file}" "${candidates[@]}" <<'PY'
 import json
 import sys
 
-commit_sha, input_path, output = sys.argv[1:]
+commit_sha, input_path, output, chosen_path = sys.argv[1:5]
+candidates = sys.argv[5:]
 with open(input_path, encoding="utf-8") as stream:
     runs = json.load(stream)
-required = ("Test", "E2E", "Performance")
+code_workflows = ("Test", "E2E", "Performance")
+
+# The newest candidate that has any code workflow run is the one GitHub ran them for (a push
+# tip); every candidate's tree differs from the commit only under issues/.
+chosen = candidates[0]
+for candidate in candidates:
+    if any(run.get("headSha") == candidate and run.get("name") in code_workflows for run in runs):
+        chosen = candidate
+        break
+
+# Issues runs on every push (no path filter), so it is always required on the commit itself.
+required = [(name, chosen) for name in code_workflows] + [("Issues", commit_sha)]
 by_name = {}
 for run in runs:
-    if run.get("headSha") != commit_sha or run.get("name") not in required:
-        continue
-    by_name.setdefault(run["name"], run)
+    for name, sha in required:
+        if run.get("name") == name and run.get("headSha") == sha:
+            by_name.setdefault(name, run)
 
+with open(chosen_path, "w", encoding="utf-8") as stream:
+    stream.write(chosen + "\n")
 with open(output, "w", encoding="utf-8") as stream:
-    for name in required:
+    for name, _ in required:
         run = by_name.get(name)
         if run is None:
             stream.write(f"{name}\tmissing\t-\t-\t-\n")
@@ -94,12 +154,21 @@ report_progress() {
   printf '\n'
 }
 
+if [ "${#candidates[@]}" -gt 1 ]; then
+  echo "${commit_sha} changes only ${skip_prefix}; Test, E2E, and Performance are taken from the newest of ${#candidates[@]} candidates (back to ${candidates[${#candidates[@]}-1]}) that has runs."
+fi
 echo "Waiting for Test, E2E, and Performance workflows for ${commit_sha}..."
-while [ "${SECONDS}" -lt "${deadline}" ]; do
-  runs_json="$("${GH_RETRY}" gh run list \
-    --commit "${commit_sha}" \
-    --limit 20 \
-    --json databaseId,name,status,conclusion,url,headSha)"
+# Poll at least once even if the deadline has already passed: an empty state must never reach the
+# success checks below (it has no missing/failed rows and would pass).
+while true; do
+  runs_json='[]'
+  for candidate in "${candidates[@]}"; do
+    candidate_runs="$("${GH_RETRY}" gh run list \
+      --commit "${candidate}" \
+      --limit 20 \
+      --json databaseId,name,status,conclusion,url,headSha)"
+    runs_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]) + json.loads(sys.argv[2])))' "${runs_json}" "${candidate_runs}")"
+  done
   printf '%s\n' "${runs_json}" >"${runs_file}"
   summarize_runs
 
@@ -113,8 +182,16 @@ while [ "${SECONDS}" -lt "${deadline}" ]; do
   if ! grep -Eq $'\t(missing|queued|pending|in_progress|requested|waiting)\t' "${state_file}"; then
     break
   fi
+  if [ "${SECONDS}" -ge "${deadline}" ]; then
+    break
+  fi
   sleep "${poll_seconds}"
 done
+
+if [ "$(grep -c . "${state_file}")" -lt 4 ]; then
+  echo "No workflow state was recorded for ${commit_sha}" >&2
+  exit 1
+fi
 
 cat "${state_file}" | while IFS=$'\t' read -r name status conclusion run_id run_url; do
   printf '%-11s %-12s %-10s %s\n' "${name}" "${status}" "${conclusion:--}" "${run_url:--}"
@@ -151,7 +228,11 @@ if [ "${failed}" -ne 0 ]; then
   exit 1
 fi
 
-"${performance_verifier}" "${commit_sha}"
+verified_sha="$(<"${chosen_file}")"
+"${performance_verifier}" "${verified_sha}"
 
 echo
+if [ "${verified_sha}" != "${commit_sha}" ]; then
+  echo "Test, E2E, and Performance verified on ${verified_sha} (differs from ${commit_sha} only under ${skip_prefix})"
+fi
 echo "Verified push CI for commit: ${commit_sha}"

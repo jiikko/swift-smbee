@@ -2,9 +2,13 @@ name: Test
 
 on:
   workflow_dispatch:
+  # issues/ だけの変更では起動しない (issue の規約検査は issues.yml)。bin/ci/verify-agent-push は
+  # この除外を前提に、issue だけの commit を直近のコードを含む祖先の run で検証する。
   push:
     branches: [master]
+    paths-ignore: ['issues/**']
   pull_request:
+    paths-ignore: ['issues/**']
 
 permissions:
   contents: read
@@ -198,17 +202,6 @@ jobs:
         # stdbuf keeps per-test output line-buffered so an intermittent hang
         # (issues/013) shows the last started test instead of an empty log.
         run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" stdbuf -oL -eL swift test --skip SMBeeE2ETests
-
-  issue-conventions:
-    name: issue conventions
-    # issues/ の運用規約 (番号の一意性 / 命名 / human の期限 / retro の日付 / 相対リンク) を
-    # 機械で守る。規約の正本は issues/README.md。
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Check issue conventions
-        timeout-minutes: 5
-        run: bin/ci/test-issue-conventions
 
   e2e-launchers:
     name: E2E launcher scripts

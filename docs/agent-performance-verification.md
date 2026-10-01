@@ -15,6 +15,11 @@ bin/ci/verify-agent-push <full-commit-sha>
 このコマンドは対象SHAの`Test`、`E2E`、`Performance` workflowを並行して待つ。失敗時は
 失敗jobとlogのエラー要点を表示し、成功時はPerformance artifactをダウンロードして次を機械的に検証する。
 
+`issues/`だけを変えたpushでは、この3 workflowは起動しない（`paths-ignore`）。対象SHAが`issues/`だけの
+commitなら、親をたどって最初に`issues/`以外を変えたcommitまでを候補にし、runのある最も新しい候補で3 workflow
+を検証する（候補とのtreeの差は`issues/`だけ）。`Issues` workflow（issue規約の検査）は毎回のpushで
+起動し、対象SHA自身でのsuccessを常に要求する。
+
 - 3 workflowと必須jobがsuccess
 - workflowと必須stepがsuccess
 - current/referenceを同一CPUで20ペア測定

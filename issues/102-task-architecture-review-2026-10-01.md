@@ -22,7 +22,7 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 | 8 | P3 | `STATUS_CANCELLED` が経路によって別の型で返る | 一般の経路は `SMBErrorMapper.throwIfFailure`（`CancellationError`）、SESSION_SETUP#1 だけが `SMBErrorMapper.map`（`SMBError.cancelled`）を直接呼ぶ。レビュワーが挙げた IOCTL は、許可外の status を `SMB2ReadCodecs` で `throwIfFailure` に渡しており該当しない（反証レビューで訂正） |
 | 12 | P2 | ACL の `AceCount`（最大 65,535）で、中身の検証前に容量を確保する | `SMB2ReadCodecs.swift` の `decodeACL` が `aclSize` の検証の後、`entries.reserveCapacity(aceCount)` を ACE を読む前に行う。[`done/027`](done/027-robustness-ndr-count-validation-allows-inconsistent-arrays.md) は NDR 配列が対象で、この経路は含まない |
 | 13 | P3 | SMB 署名の比較が constant-time でない | `verifyResponseSignature` が `expected == header.signature`（`Array ==`）。CCM の tag は `constantTimeEqual`。遠隔からの測定可能性は未確認 |
-| 16 | P2 | POSIX の部分受信のたびに、残りの全量を確保してゼロ初期化する | `POSIXSocketTransport.receiveBlocking(maxLength:)` が毎回 `[UInt8](repeating: 0, count: maxLength)`。小さい部分読みが続くと確保と初期化が残量に比例して繰り返される（効果の大きさは未実測） |
+| 16 | P2 | POSIX の部分受信のたびに、残りの全量を確保してゼロ初期化する | `POSIXSocketTransport.receiveBlocking(maxLength:)` が毎回、`maxLength` 個のゼロで初期化した配列を作る。小さい部分読みが続くと確保と初期化が残量に比例して繰り返される（効果の大きさは未実測） |
 
 ## 未検証（レビュワーの静的な主張のまま。着手前に裏を取る）
 

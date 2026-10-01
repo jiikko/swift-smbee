@@ -607,11 +607,12 @@ final class SMBeeE2ETests: XCTestCase {
         }
     }
 
-    /// This full-file test is intentionally not run in CI. The Linux pure-Swift CCM
-    /// fallback measured ~0.3 MiB/s on ubuntu-latest (run 30509016532), so reading 4 GiB
-    /// extrapolates to ~3.8 hours — impractical for a scheduled job (issue 075). PR/push
-    /// E2E covers the boundary crossing with `testReadRangesAround4GiBBoundary`;
-    /// set `SMBEE_E2E_LARGE=1` for an explicit full read.
+    /// This full-file test is not run in CI. Since issue 075 (Linux CCM via swift-crypto)
+    /// it finishes in ~38 s on a local Linux arm64 client against the encrypted Samba
+    /// container (2026-10-01); before that it extrapolated to ~3.8 hours. Restoring it as a
+    /// CI job was left undecided (it adds a ~4.3 GB transfer to every run). PR/push E2E covers
+    /// the boundary crossing with `testReadRangesAround4GiBBoundary`; set
+    /// `SMBEE_E2E_LARGE=1` for an explicit full read.
     func testReadStreamCountsFileLargerThan4GiB() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["SMBEE_E2E"] == "1" else {
@@ -637,7 +638,7 @@ final class SMBeeE2ETests: XCTestCase {
         // bin/e2e/container-samba.sh and test/e2e/start-samba-ci.sh; nothing is
         // stored in git and creating it writes almost no data (sparse). Note that
         // running this full read still makes the server read, encrypt, and send
-        // ~4.3 GB — that transfer is what exceeds CI job time (issue 075).
+        // ~4.3 GB, which is why it stays opt-in.
         //
         // This test validates that the streaming read path keeps offsets and
         // lengths on the UInt64 route while crossing the 4GiB boundary. It only
@@ -662,8 +663,8 @@ final class SMBeeE2ETests: XCTestCase {
         XCTAssertEqual(total, stat.size)
     }
 
-    /// Uses a 2 MiB range instead of a full-file read because the Linux pure-Swift CCM
-    /// fallback runs at ~0.3 MiB/s (issue 075). Starting 64 KiB before `UInt32.max` makes
+    /// Uses a 2 MiB range instead of a full-file read so every PR/push run stays cheap (the
+    /// full read moves ~4.3 GB). Starting 64 KiB before `UInt32.max` makes
     /// the stream cursor and later READ offsets cross it, and the non-zero sentinel placed
     /// after the boundary proves those offsets were not truncated to UInt32 (an offset wrap
     /// into the all-zero sparse region would otherwise return identical bytes).

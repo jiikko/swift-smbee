@@ -182,7 +182,9 @@ private struct CMACBlockStream {
     }
 }
 
-// swift-crypto 4.5.0 dispatches through BoringSSL's aes.cc.inc / aes_nohw / gcm_nohw paths; SMBee adds no table lookup.
-// The resulting side-channel properties depend on that BoringSSL dispatch and implementation.
+// Side channels (checked against the swift-crypto 4.5.0 checkout): BCM_aes_encrypt in aes.cc.inc picks AES instructions
+// (aes_hw), then vpaes, then aes_nohw, whose header calls it a constant-time bitsliced implementation; gcm_nohw's
+// header calls its GHASH constant-time. SMBee itself adds no table lookup. Re-check these files when swift-crypto's
+// BoringSSL changes; the guarantee is BoringSSL's, not SMBee's.
 
 #endif

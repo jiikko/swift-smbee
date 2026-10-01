@@ -34,7 +34,7 @@
 | P1 | prefix read の往復削減 続き（issue 067 B/C/D） | B: CREATE+READ+CLOSE の compound（3→1 往復の本命）、C: READ パイプライン、D: 同時 open handle 上限。実測レイテンシと consumer 実害を見てから着手判断。 |
 | P1 | Kerberos / GSS | 0.1では非対応。将来実装する場合はauth backend、SPNEGO、session key、実サーバ検証が必要。 |
 | P1 | durable / persistent handle | 現在は非対応。実装する場合は切断・復旧state machineと実サーバE2Eが必要。 |
-| P2 | Linux AES-CCM throughput（issue 075） | 2026-08-01: key schedule hoisting で release 34.5 MiB/s（4.1 倍）。旧 CI の ~0.3 MiB/s は debug ビルドが支配要因と確定。残: x86 で release exact-filter の one-shot 実測（25 分以下確認）→ scheduled 全読 E2E 復活、production 性能（NAS 実効の 1/3）は trigger 数値付きで継続。 |
+| ✅ | Linux AES-CCM throughput（issue 075） | 2026-10-01: Linux の nonce 11 byte を swift-crypto の公開 API（AES.CMAC + AES.GCM + AES.permute）で組み立て、micro-bench 約 15 倍、実転送 64 MiB read 15.1 → 136.3 MiB/s（CPU 律速から外れた）。4 GiB 全読は手元 Linux arm64 で約 38 秒。CI への全読の復活は未決（毎回 ~4.3 GB の転送が増える）。 |
 | P3 | fd close race の残リスク（issue 073） | 2026-08-01 に `timeout==nil` connect の未解決経路を nonblocking connect + 100ms poll heartbeat で解消。残りは getaddrinfo の停止不能・send/recv の shutdown wake 依存・将来 parallel connect 時の (generation,fd)。 |
 | P2 | 実サーバ固有機能 | Unicode、share/volume、ACL/SID、reparse、sparse、deadline、keepalive、lockをmatrixで確認する。 |
 | P3 | WRITE 競合時の prefix read 遅延（issue 068 で切り分け済み） | 2026-08-01 に request 側 ts_ns で切り分け完了: 送信側（credit / 送信直列化）は不変で、増分は全てサーバ応答待ち（localhost でも ~3.5 倍）。実害 gate（p50 +16.7ms）未達のため QoS 対応せず。consumer 実害が出たら CREDIT_FIFO_HOL_READ_TIMING を実環境で再実行。 |
@@ -167,7 +167,7 @@ Windows SMB Server 対応: **pending**（実サーバ smoke 環境待ち）。�
 - `SMB2CreditWindow` actor と messageId keyed demux は実装済み。
 - multi-credit READ/WRITE で messageId が CreditCharge 分進まないバグは修正済み。
 - local read/write chunk cap は 1 MiB へ引き上げ済み。
-- PR/push には 4GiB 境界 range-read E2E（境界前後の点読み + `UInt32.max − 64KiB` から 2MiB の境界横断 streaming read）がある。週次の 4GiB 全読 workflow は Linux pure-Swift CCM の throughput（issue 075、外挿約 3.8 時間）が現実的な job 時間に収まらないため廃止した（P0-0 参照）。
+- PR/push には 4GiB 境界 range-read E2E（境界前後の点読み + `UInt32.max − 64KiB` から 2MiB の境界横断 streaming read）がある。週次の 4GiB 全読 workflow は Linux pure-Swift CCM の throughput（issue 075、外挿約 3.8 時間）が現実的な job 時間に収まらないため廃止した（P0-0 参照）。 issue 075 の高速化（2026-10-01）後は手元 Linux arm64 で約 38 秒で、CI への復活は未決。
 - SMB 3.1.1 encrypted session の 2MiB+ READ/WRITE は push CI E2E で検証済み（1MiB 境界超過の multi-credit WRITE を含む）。
 
 継続検証:

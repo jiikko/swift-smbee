@@ -92,7 +92,7 @@
   streaming read を追加して置換した。全読テスト
   `testReadStreamCountsFileLargerThan4GiB` は `SMBEE_E2E_LARGE=1` gate で温存。
 - CCM throughput の高速化と scheduled 全読 E2E の復活判断は
-  `issues/075-perf-linux-aes-ccm-pure-swift-throughput.md` で追跡する。
+  `issues/done/075-perf-linux-aes-ccm-pure-swift-throughput.md` で追跡する。
 
 ### P0-1. 互換 matrix を実サーバで埋める
 

@@ -117,5 +117,5 @@ CANCEL request failed: connectionClosed
 
 - `issues/done/065-leak-cleanup-wire-operations-have-no-deadline.md`（状態 done。cleanup timeout の実装。本 issue はその timeout が「効いたとき」の巻き添え範囲の話）
 - [`done/080`](done/080-bug-ci-multiflight-connection-closed.md)（本 issue の発火を CI で観測した調査。2026-09-08 追記の出典）
-- [`075`](075-perf-linux-aes-ccm-pure-swift-throughput.md)（CI で receive loop を塞いでいる throughput）
+- [`075`](done/075-perf-linux-aes-ccm-pure-swift-throughput.md)（CI で receive loop を塞いでいる throughput）。2026-10-01 に 075 で解消（Linux の CCM は release の実転送で 1 MiB read 68 → 10 ms、debug の micro-bench で約 55 倍）。この issue の cleanup deadline の構造問題は継続
 - obaket `macOS/issues/437`（session 分離で consumer 側に吸収する案）

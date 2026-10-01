@@ -4,7 +4,7 @@
 起票: 2026-07-31
 関連: `Tests/SMBeeTests/SMBeeE2ETests.swift`（`testReadRangesAround4GiBBoundary` の定数） /
 `bin/e2e/container-samba.sh` / `test/e2e/start-samba-ci.sh`（fixture 作成の dd 引数） /
-`issues/075-perf-linux-aes-ccm-pure-swift-throughput.md`（この検証を導入した経緯）
+`issues/done/075-perf-linux-aes-ccm-pure-swift-throughput.md`（この検証を導入した経緯）
 
 ## 問題
 

@@ -3,7 +3,7 @@
 起票日: 2026-09-25
 親: [done/061](061-perf-create-measurement-driven-follow-up-issues.md) (測定駆動の個別 issue を起こすメタ issue)
 関連: [done/060](060-perf-profile-and-reduce-aes-cmac-write-cost.md) (AES-CMAC 改善) /
-[075](../075-perf-linux-aes-ccm-pure-swift-throughput.md) (Linux AES-CCM fallback) /
+[075](075-perf-linux-aes-ccm-pure-swift-throughput.md) (Linux AES-CCM fallback) /
 `Tests/SMBeeTests/SMBeeNetworkPerformanceE2ETests.swift` / `.github/workflows/performance.yml` の `samba-network-performance` job /
 `docs/performance-resource-baseline.md`
 

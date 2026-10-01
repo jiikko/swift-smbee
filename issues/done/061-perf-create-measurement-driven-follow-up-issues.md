@@ -135,7 +135,7 @@ large-file concurrency/credit windowだが、根拠を取得する前に実装ta
 
 ### 起票しなかった候補と理由
 
-- **Linux の AES-CCM fallback** → 新規起票せず、既存の [075](../075-perf-linux-aes-ccm-pure-swift-throughput.md) を受け皿にする。
+- **Linux の AES-CCM fallback** → 新規起票せず、既存の [075](075-perf-linux-aes-ccm-pure-swift-throughput.md) を受け皿にする。
   097 の分解測定で CCM が 10% 以上と出たら、その数字を 075 に書き足す。
 - **TCP_NODELAY 未設定** → 手元の A/B (097 の予備測定) ではノイズの範囲で、10% 以上の根拠が無い。Linux での A/B を 097 の分解測定に入れた。
 - packet normalization copy / write packet assembly / large-file concurrency・credit window → 097 の分解結果が出るまで根拠が無いので起票しない

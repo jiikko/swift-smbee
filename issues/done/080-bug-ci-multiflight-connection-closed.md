@@ -5,7 +5,7 @@
 - 状態: **調査完了 (2026-09-08)。「wire multi-flight の race」という bug 疑いは棄却**
 - 関連: `Tests/SMBeeTests/SMBeeSharedSessionRangedReadE2ETests.swift`
   (`testSharedSessionRangedReadsHaveMultipleWireResponsesInFlight`) / `Sources/SMBee/SMBClient.swift` /
-  [`075`](../075-perf-linux-aes-ccm-pure-swift-throughput.md) /
+  [`075`](075-perf-linux-aes-ccm-pure-swift-throughput.md) /
   [`069`](../069-bug-cleanup-failure-kills-shared-session.md) /
   [`done/062`](062-design-cancel-tears-down-shared-session.md) /
   [`done/065`](065-leak-cleanup-wire-operations-have-no-deadline.md) / obaket issue 462
@@ -164,3 +164,10 @@ keepalive failure (`814-830`) / send・setup failure (`5631`, `5674` 他)。
 
 - `SMBEE_PERF=1` の CI run 1 回で 12.4s の `close_transport cause=` を確定させる → issue 069 の着手時
 - multi-flight の主張を決定論的テストへ移す (上記 gate 解除条件 1) → 未起票
+
+## 075 の対応で変わった前提（2026-10-01 追記）
+
+issue 075 で Linux の CCM（nonce 11 byte）が swift-crypto（BoringSSL）経由になり、実転送の 1 MiB read は 68 ms → 10 ms（release、fix-ab）になった。
+暗号は BoringSSL の C 実装なので debug build でも CCM 自体は速いはずだが、**debug の CI で 1 MiB の暗号化 response が何秒になったかは未実測**。
+gate（`SMBEE_E2E_WIRE_MULTIFLIGHT=1`）は外していない。外す前に、上の条件 2（dispatch job で複数回連続 green）を今の HEAD で確かめる。
+テストの doc コメントと skip メッセージの「18〜26 秒」は 075 以前の値として残っている。

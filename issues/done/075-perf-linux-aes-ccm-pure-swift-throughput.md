@@ -91,7 +91,7 @@ Tests/SMBeeTests/AESCCMBenchmarkTests.swift = SMBEE_BENCH_CCM=1 gate で再現�
 
 ## 関連の追記 (2026-09-25)
 
-実 Samba 転送 (CI の `samba-network-performance`、SMB 3.0.2 暗号化 = CCM) の律速の分解は [097](done/097-perf-samba-real-transfer-measurement.md) で行う。
+実 Samba 転送 (CI の `samba-network-performance`、SMB 3.0.2 暗号化 = CCM) の律速の分解は [097](097-perf-samba-real-transfer-measurement.md) で行う。
 097 で CCM が全体の 10% 以上と出たら、その数字をこの issue に書き足す (061 の決定)。
 
 
@@ -150,4 +150,33 @@ issue 099（接続直後に TCP_NODELAY）で往復ごとの待ちが消えた�
 
 ### 実測
 - micro-bench（Apple container swift:6.2 linux/arm64 -c 4 -m 8G、release、`SMBEE_BENCH_CCM=1`、1 MiB × 8）: 実装時の codex の計測で、同じ container で before / after を交互に 3 組の median が seal 26.9 → 393.9 MiB/s、open 27.0 → 397.5 MiB/s（約 14.6 倍）
-- 実転送（study の fix-ab）: 未実測（この節の後に追記する）
+- micro-bench の独立な再計測（Claude、同じ条件で base 97fb630 / head d9cc852 を ABAB × 3、median）: seal 22.4 → 347.4 MiB/s、open 22.4 → 352.3 MiB/s（約 15.5 倍）
+- debug（Linux arm64 container、1 回ずつ）: seal 0.98 → 53.4 MiB/s、open 0.86 → 52.8 MiB/s
+- macOS（CommonCrypto 経路、R5 の非劣化の確認、release、base / head を ABAB × 3 の median）: seal 1,248 → 1,260 MiB/s、open 1,252 → 1,264 MiB/s（差なし。組ごとの揺れは ±20% 程度）
+- 実転送 fix-ab（run [36800446125](https://github.com/jiikko/swift-smbee/actions/runs/36800446125)、Xeon Platinum 8370C 4 vCPU、smb302-encrypted-required、
+  baseline 97fb630 と current d9cc852 を各 10 invocation、SHA-256 照合 160 件 pass。全行「difference」）:
+
+  | 項目 | baseline | current | 変化 |
+  |---|---:|---:|---:|
+  | 1 MiB read wall | 68.4 ms | 10.2 ms | -85.1% |
+  | 1 MiB write wall | 69.0 ms | 10.6 ms | -84.7% |
+  | 64 MiB read | 15.1 MiB/s | 136.3 MiB/s | +801% |
+  | 64 MiB write | 15.2 MiB/s | 140.0 MiB/s | +822% |
+  | 64 MiB read の client CPU | 4,090 ms | 332 ms | -91.9% |
+
+  64 MiB read の client CPU ÷ wall は 0.97 → 0.71。**上の「着手 trigger」（CCM read が 25 MiB/s 未満かつ CPU 律速）は外れた**
+- 4 GiB 全読（`testReadStreamCountsFileLargerThan4GiB`、release、Linux arm64 の swift:6.2 container から smb302-encrypted-required の
+  Samba container へ、手元 Apple container）: 38.4 秒で pass。fixture は `test/e2e/container-init.sh` の `truncate -s 4296998912` で作られ、
+  テストは stat の size が UInt32.max を超えることと、読んだ累積 byte 数が stat の size に一致することを assert する（約 107 MiB/s）。
+  x86 は未実測（fix-ab の 64 MiB read 136 MiB/s からの見積もりで 30 秒台 + build）
+- 完了条件 3 の判断: 30 分の目安には十分収まる。**判断は「今は CI に全読を戻さない」**。理由は性能ではなく CI 費用（毎回 ~4.3 GB の転送と
+  job が増える）。境界を跨ぐ読みは PR/push の 2 MiB range E2E が守っている。戻すときは issue の旧条件どおり x86 で one-shot 実測してから
+- 完了条件 1 の扱い: release と debug の両方で CCM 単体の前後を計測した（debug は下に追記）。「律速を profiling で確定」は、旧経路の律速は
+  2026-08-01 の節（AES block 暗号）で確定済みで、新しい経路の内訳は**測っていない**。設計レビュー（D3）で「合格基準（2 倍以上・trigger 外れ）を
+  満たしたら内訳は要らない、満たさなかったときだけ測る」と決めたため。完了条件 1 のこの部分はこの決定で置き換えた
+- 上の「残作業 2」（production 性能）の決着: trigger（CCM read が 25 MiB/s 未満かつ CPU 律速）は CI runner の fix-ab で外れた（136 MiB/s、CPU ÷ wall 0.71）。
+  実 NAS / 実 Linux 利用の値は未実測。再開の trigger は旧と同じ数値（実 Linux 利用で CCM read が 25 MiB/s 未満かつ CPU 律速）
+- smoke（`make smoke`）は macOS client（CommonCrypto 経路）で green。Linux の高速経路の実 Samba 照合は CI の E2E（Linux、smb302-encrypted-required）で green
+- 古くなった記述を更新: `Tests/SMBeeTests/SMBeeE2ETests.swift` の 4 GiB 全読と 2 MiB range のコメント、`docs/coverage.md`、`todo2.md`
+- 関連の未解決: `Tests/SMBeeTests/SMBeeSharedSessionRangedReadE2ETests.swift` の gate は「1 MiB の暗号化 response に 18〜26 秒かかる」を理由にしており、
+  その gate を外す条件は issue 080 が持つ。この issue の結果（1 MiB read 10 ms）で前提が変わったことを 080 に書いた

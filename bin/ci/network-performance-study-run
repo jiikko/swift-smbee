@@ -52,7 +52,7 @@ run_in_swift() {
 }
 
 # --- fixed metadata (issue 097 "固定するもの") ---------------------------------------------------------
-docker pull -q "swift:${SWIFT_VERSION}" >/dev/null
+DOCKER_PULL_RETRY_FORCE=1 "${SCRIPT_DIR}/docker-pull-retry" "swift:${SWIFT_VERSION}"
 swift_image_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "swift:${SWIFT_VERSION}")"
 samba_version="$(docker exec "${SAMBA_CONTAINER}" smbd --version | tr -d '\r')"
 runner_cpu_model="$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' || true)"

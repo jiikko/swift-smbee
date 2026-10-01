@@ -168,7 +168,7 @@ jobs:
         id: swift-version
         run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Swift version
-        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
+        run: bin/ci/docker-pull-retry "${{ steps.swift-version.outputs.image }}" && docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Address Sanitizer tests
         timeout-minutes: 15
         # detect_leaks=0: LeakSanitizer flags only XCTest/Swift-runtime harness
@@ -188,7 +188,7 @@ jobs:
         id: swift-version
         run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Swift version
-        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
+        run: bin/ci/docker-pull-retry "${{ steps.swift-version.outputs.image }}" && docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Build on Linux
         run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift build
       - name: Unit tests on Linux
@@ -234,7 +234,7 @@ jobs:
         id: swift-version
         run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Swift version
-        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
+        run: bin/ci/docker-pull-retry "${{ steps.swift-version.outputs.image }}" && docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Check Swift test registration coverage
         timeout-minutes: 10
         env:
@@ -256,7 +256,7 @@ jobs:
         id: swift-version
         run: echo "image=swift:$(tr -d '[:space:]' < .swift-version)" >> "$GITHUB_OUTPUT"
       - name: Swift version
-        run: docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
+        run: bin/ci/docker-pull-retry "${{ steps.swift-version.outputs.image }}" && docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Check code coverage
         timeout-minutes: 15
         env:

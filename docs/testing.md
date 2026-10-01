@@ -84,6 +84,8 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   cancel 後の同一 session 再利用を回帰検証する。lock CLI は CLI smoke で検証する。
 - `.github/workflows/samba-compat.yml` は重い互換性 matrix。`workflow_dispatch` と週次 schedule で、
   distro-provided Samba、Swift 6.2、`test/e2e/smb/*.conf` profile の代表組み合わせを回す。
+- CI の docker image は最初の `docker run` の前に `bin/ci/docker-pull-retry` で取得する（registry の一時的な
+  通信失敗を再試行する。既に在る image は取得しない）。新しく image を使う job / script を足したら同じ形で取得する。
 
 ### ローカル実行 — Apple container / macOS
 

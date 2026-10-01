@@ -62,6 +62,8 @@ mkdir -p "${RESOURCE_SWIFTPM_CACHE_DIR}"
 # by pointing RESOURCE_REPO_ROOT at an older worktree (.github/workflows/performance.yml), and that
 # worktree does not contain scripts added since. Mounting them at their in-repo paths keeps their own
 # REPO_ROOT equal to /workspace.
+"${SCRIPT_DIR}/docker-pull-retry" "${SWIFT_IMAGE}"
+
 docker run --rm \
   -e RESOURCE_BASELINE_RUNS \
   -e RESOURCE_SKIP_BUILD \

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -u
+unset CDPATH
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: bin/ci/docker-pull-retry <image>...
+
+Pulls each image unless it is already present locally, retrying transient registry
+failures (e.g. Docker Hub "connection reset by peer"). Call it before the first
+`docker run` of an image so a flaky pull fails the step with a retry log instead of
+failing the test step itself.
+
+An image that is already present is not pulled again: jobs that start the same image
+many times (resource performance runs it 20+ times) would otherwise contact the
+registry on every start, adding a network failure point.
+
+Environment:
+  DOCKER_PULL_RETRY_FORCE          1 = pull even if the image is present (a caller that records the
+                                   current tag's digest, e.g. the network performance study)
+  DOCKER_PULL_RETRY_ATTEMPTS       Total attempts per image (default: 5)
+  DOCKER_PULL_RETRY_INITIAL_DELAY  Initial delay in seconds (default: 5)
+  DOCKER_PULL_RETRY_MAX_DELAY      Maximum delay in seconds (default: 60)
+USAGE
+}
+
+if [ "$#" -lt 1 ]; then
+  usage
+  exit 2
+fi
+
+attempts="${DOCKER_PULL_RETRY_ATTEMPTS:-5}"
+initial_delay="${DOCKER_PULL_RETRY_INITIAL_DELAY:-5}"
+max_delay="${DOCKER_PULL_RETRY_MAX_DELAY:-60}"
+
+validate_integer() {
+  local name="$1"
+  local value="$2"
+  local minimum="$3"
+  # Explicit digits and a length cap: [0-9] follows the locale (ja_JP accepts full-width digits) and
+  # 19+ digits make the -lt comparison error out.
+  if ! [[ "${value}" =~ ^[0123456789]+$ ]] || [ "${#value}" -gt 9 ] || [ "${value}" -lt "${minimum}" ]; then
+    echo "${name} must be an integer >= ${minimum}" >&2
+    exit 2
+  fi
+}
+
+validate_integer DOCKER_PULL_RETRY_ATTEMPTS "${attempts}" 1
+validate_integer DOCKER_PULL_RETRY_INITIAL_DELAY "${initial_delay}" 0
+validate_integer DOCKER_PULL_RETRY_MAX_DELAY "${max_delay}" 0
+
+for image in "$@"; do
+  if [ "${DOCKER_PULL_RETRY_FORCE:-0}" != 1 ] && docker image inspect "${image}" >/dev/null 2>&1; then
+    continue
+  fi
+  attempt=1
+  delay="${initial_delay}"
+  while true; do
+    if docker pull -q "${image}" >/dev/null; then
+      break
+    else
+      status=$?
+    fi
+    if [ "${attempt}" -ge "${attempts}" ]; then
+      echo "docker pull failed after ${attempt} attempts: ${image}" >&2
+      exit "${status}"
+    fi
+    echo "docker pull attempt ${attempt}/${attempts} failed; retrying in ${delay}s: ${image}" >&2
+    sleep "${delay}"
+    attempt=$((attempt + 1))
+    delay=$((delay * 2))
+    if [ "${delay}" -gt "${max_delay}" ]; then
+      delay="${max_delay}"
+    fi
+  done
+done

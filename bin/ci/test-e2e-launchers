@@ -52,8 +52,9 @@ new_repo() {
   local init_body="$1"
   local root
   root="$(mktemp -d "${temporary}/repo.XXXXXX")"
-  mkdir -p "${root}/bin/e2e" "${root}/test/e2e/smb" "${root}/fakebin" "${root}/log"
+  mkdir -p "${root}/bin/e2e" "${root}/bin/ci" "${root}/test/e2e/smb" "${root}/fakebin" "${root}/log"
   cp "${REPO_ROOT}/bin/e2e/container-samba.sh" "${root}/bin/e2e/"
+  cp "${REPO_ROOT}/bin/ci/docker-pull-retry" "${root}/bin/ci/"
   cp "${REPO_ROOT}/test/e2e/start-samba-ci.sh" "${REPO_ROOT}/test/e2e/launcher-common.sh" "${root}/test/e2e/"
   printf '[global]\n' > "${root}/test/e2e/smb/fixture.conf"
   if [[ "${init_body}" != "-" ]]; then

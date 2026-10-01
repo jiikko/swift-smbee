@@ -27,6 +27,8 @@ smbee_e2e_load_container_init "${REPO_ROOT}" || exit 1
 # fresh, but local reproduction and self-hosted runners benefit from cleanup.
 docker rm -f "${SAMBA_CONTAINER}" >/dev/null 2>&1 || true
 
+"${REPO_ROOT}/bin/ci/docker-pull-retry" "${SAMBA_BASE_IMAGE}"
+
 docker run -d --name "${SAMBA_CONTAINER}" -p "${SMBEE_E2E_PORT}:445" \
   -v "${SAMBA_CONFIG_PATH}:/tmp/smbee-smb.conf:ro" \
   "${SAMBA_BASE_IMAGE}" \

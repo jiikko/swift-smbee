@@ -30,6 +30,8 @@ for name in ${DOCKER_RUN_ENV:-}; do
   extra_env_args+=(-e "${name}")
 done
 
+"$(dirname "${BASH_SOURCE[0]}")/../../bin/ci/docker-pull-retry" "swift:${SWIFT_VERSION}"
+
 docker run --rm --network host \
   -e SMBEE_E2E_HOST -e SMBEE_E2E_PORT -e SMBEE_E2E_PROFILE \
   "${extra_env_args[@]}" \

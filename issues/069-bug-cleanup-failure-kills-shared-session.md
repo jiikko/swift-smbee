@@ -119,3 +119,39 @@ CANCEL request failed: connectionClosed
 - [`done/080`](done/080-bug-ci-multiflight-connection-closed.md)（本 issue の発火を CI で観測した調査。2026-09-08 追記の出典）
 - [`075`](done/075-perf-linux-aes-ccm-pure-swift-throughput.md)（CI で receive loop を塞いでいる throughput）。2026-10-01 に 075 で解消（Linux の CCM は release の実転送で 1 MiB read 68 → 10 ms、debug の micro-bench で約 55 倍）。この issue の cleanup deadline の構造問題は継続
 - obaket `macOS/issues/437`（session 分離で consumer 側に吸収する案）
+
+## 2026-10-01: M1（FileId の CLOSE）を実装した（codex-drive）
+
+採用した設計は issue の表の A 案（tombstone drain + bounded quarantine）と B 案の組み合わせ。範囲を 2 段に分けた。
+
+- **M1（済み）**: FileId の CLOSE（`bestEffortClose` / `closeCreatedHandle`）。commit `fix(session): issue 069 M1 — FileId の CLOSE の後始末が期限を超えても共有 transport を閉じず、tombstone で遅延応答を待つ`
+- **M2（未着手）**: scoped TREE_DISCONNECT（`bestEffortTreeDisconnect`）。同じ TreeId の操作が終わるのを待つ barrier と、隔離した TreeId の admission が要るので分けた。
+  `disconnect` は session 全体の明示的な終了なので、今まで通り transport を閉じる（変えない）。[`102`](102-task-architecture-review-2026-10-01.md) の #9（`withTree` が TREE_DISCONNECT の失敗を結果に反映しない）も M2 で扱う
+
+### M1 の契約（正本は [`done/065`](done/065-leak-cleanup-wire-operations-have-no-deadline.md) の 2026-10-01 追記）
+
+- cleanup の期限は caller の待ちだけを終える。送信済みの CLOSE は tombstone として残し、遅延応答を受け取る。SMB CANCEL は送らない
+- 未解決の FileId は ledger（sending / draining / retiredUnknown）で持ち、後続の wire 操作を admission で拒否する
+- 全体を畳むのは wire fault・ledger 64 件超・drain 上限（session の `requestTimeout`）・送信中の期限切れだけ
+
+### 設計レビューで決めたこと（再提起を防ぐため残す）
+
+- interim（STATUS_PENDING）は署名を検証しない。MS-SMB2 §3.2.5.1.3 がクライアントに検証を禁じている。設計の段階で「interim も検証」を入れたが、
+  敵対レビュー 2 周目で仕様違反と指摘されて戻した。偽の interim で AsyncId をすり替えても、署名済みの最終応答と食い違って wire fault になる
+- cleanup の応答の SessionId / TreeId は 0 を含めて完全一致。0 を許す既存の規則は SESSION_SETUP のためのもので、cleanup にだけ当てない。TreeId 0 も正当な値（MS-SMB2 §2.2.1.2）
+- **直していない（既知）**: 受信した credit は署名・相関の検証より前に反映される。全応答に共通の既存の順序で、069 で入ったものではない。
+  cleanup だけ例外にすると経路で規則が分かれる。直すなら全経路で（コードにコメントあり）。署名だけの session では、署名されない interim の credit 値を
+  中間者が改変できる（仕様に由来する信用境界。確実に防ぐには暗号化 session）
+- **残るリスク**: 応答の来ない CLOSE が最後の credit を持っていると、他の credit 待ちは drain 上限（既定 60 秒）まで待ち、最後は全体が閉じる。
+  この場面だけは今までの 5 秒より遅くなる。`requestTimeout == nil` の session では drain 上限が無く、件数上限 64 だけになる
+
+### 検証
+
+- 変異はテストごとに red を確認（commit message に一覧）。macOS `swift test` 509 件（3 回連続 green）、Linux container 491 件、
+  `make lint-analyze` と strict SwiftLint 0 violations、`make smoke`（3 profile）green
+- CI で観測された失敗がどの cleanup 経路だったかは未確定のまま（`SMBEE_PERF=1` の run が無い）。issue 075 で受信処理が速くなり、
+  CI の発火条件（受信 loop が復号で塞がる）はおそらく消えた。M1 の効果は「CLOSE 経路の巻き添えを止める」に限る
+
+### 再開の条件（M2）
+
+TREE_DISCONNECT の期限切れで共有 session が落ちたことが観測されたとき、または `withTree` の後始末の結果を API に反映する要求が出たとき。

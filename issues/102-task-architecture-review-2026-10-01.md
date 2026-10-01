@@ -60,3 +60,17 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 ## 次の一手
 
 裏取り済みのうち、着手する価値が高いのは #1（security、P1）と #10（CI の素通り）。どれを別 issue に切り出すかはユーザーの判断。
+
+## 進捗
+
+- **#1（対応済み、2026-10-02）**: SMB 3.0 / 3.0.2 で、匿名でない session は TREE_CONNECT が成功するたびに `FSCTL_VALIDATE_NEGOTIATE_INFO` を送り、
+  NEGOTIATE の 4 値を照合する。応答は暗号化か署名を必須（`signingRequired` を見ない）。失敗・非対応はすべて接続の失敗（fail-closed。ユーザーの判断）。
+  匿名の資格情報は検証を省く（SMBee のポリシーの例外）。資格情報を渡したのに guest / null にされた 3.0.x 接続は失敗。
+  commit `security(negotiate): SMB 3.0.x で TREE_CONNECT ごとに FSCTL_VALIDATE_NEGOTIATE_INFO を送り、NEGOTIATE の downgrade を検出する (issue 102 #1)`。
+  手順と方針の正本は `docs/smb-protocol.md`。実機（macOS SMBX・Windows・NAS）での確認は未実施（Tier 3）。非対応の機器には 3.0.x で接続できなくなる可能性がある
+- 設計レビューの途中で見つけた既存バグも直した: 共有の暗号化必須の判定が Capabilities の `0x8`（`SMB2_SHARE_CAP_DFS`）も見ていた。
+  commit `fix(tree): 共有の暗号化必須の判定から Capabilities 0x8 (SMB2_SHARE_CAP_DFS) を外す`
+- **#10（対応済み、2026-10-01）**: `e2e.yml` の 6 profile と `samba-compat.yml` の 7 profile すべてで、その profile のための test が 1 回 pass したことを必須にした。
+  commit `ci: profile 別の E2E は、その profile のための test が 1 回 pass したことを必須にする (issue 102 #10)`。e2e.yml は CI のログで 6 profile 分の `passed once` を確認。
+  samba-compat.yml は週次の定期 run で確認する（手動起動は費用のため見送り）
+- 残り: 裏取り済みの #7（close 後の再接続）・#8・#11（credential の保持）・#12（ACL の過大確保）・#13・#16 と、未検証の 13 件

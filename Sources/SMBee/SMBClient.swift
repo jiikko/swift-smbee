@@ -4083,6 +4083,7 @@ actor SMBSession {
     // The source credential is needed only while SESSION_SETUP is being built. Derived session
     // keys are sufficient afterwards; reconnect obtains a fresh value from its provider.
     private var authenticationCredential: SMBCredential?
+    private var credentialWasAnonymous = false
     private let transport: SMBTransport
     private var messageId: UInt64 = 0
     private var sessionId: UInt64 = 0
@@ -4091,6 +4092,9 @@ actor SMBSession {
     private var signingCMACContext: AESCMAC.Context?
 #endif
     private var signingRequired = false
+    private var sessionFlags: UInt16 = 0
+    private var negotiateRequestSnapshot: SMBNegotiateRequestSnapshot?
+    private var negotiateResponseResult: SMBProbeResult?
     private var encryptionKey: [UInt8]?
     private var decryptionKey: [UInt8]?
     private var signingAlgorithm: SMBSessionSigningAlgorithm = .aesCMAC
@@ -4109,6 +4113,8 @@ actor SMBSession {
     private static let maxOrphanResponses = 64
     private var receiveLoopRunning = false
     private var requestSentCountForTestingStorage = 0
+    private var validateNegotiateSentCountForTestingStorage = 0
+    private var validateNegotiateSuccessCountForTestingStorage = 0
     private var requestTimeoutCompletionCountForTestingStorage = 0
     private var receivedPacketDispatchCountForTestingStorage = 0
     private var wireFailure: Error?
@@ -4145,6 +4151,7 @@ actor SMBSession {
         self.port = port
         self.diagnosticSessionId = diagnosticSessionId
         self.authenticationCredential = credential
+        self.credentialWasAnonymous = credential.isAnonymous
         self.transport = transport
         self.signingKey = signingKey
 #if canImport(CryptoExtras) && !canImport(CommonCrypto)
@@ -4174,10 +4181,17 @@ actor SMBSession {
         wireFailure = nil
         transportClosed = false
         await creditWindow.reset(initialCredits: initialCredits)
+        let requestSnapshot = try SMBNegotiateRequestSnapshot(
+            clientGuid: UUID().smbWireBytes,
+            capabilities: SMBNegotiateConstants.globalCapEncryption,
+            securityMode: SMBNegotiateConstants.signingEnabled,
+            dialects: SMBNegotiateCodec.authenticatedDialects
+        )
+        negotiateRequestSnapshot = requestSnapshot
         let negotiate = try SMBNegotiateCodec.encodeRequest(
-            clientGuid: UUID(),
+            snapshot: requestSnapshot,
             messageId: nextMessageId(),
-            offeredDialects: SMBNegotiateCodec.authenticatedDialects
+            salt: Array(repeating: 0, count: 32)
         )
         var preauthMessages: [[UInt8]] = []
         debugDump("NEGOTIATE request", negotiate)
@@ -4185,6 +4199,7 @@ actor SMBSession {
             negotiate, responseLabel: "NEGOTIATE response",
             preauthMessages: &preauthMessages, foldResponse: true)
         let result = try SMBNegotiateCodec.decodeResponse(negotiateResponse)
+        negotiateResponseResult = result
         signingRequired = result.signingRequired
         maxReadSize = result.maxReadSize
         maxWriteSize = result.maxWriteSize
@@ -4251,12 +4266,22 @@ actor SMBSession {
         let authHeader = try SMB2Header.decode(authResponse)
         try SMBErrorMapper.throwIfFailure(status: authHeader.status, operation: "SESSION_SETUP")
         sessionId = authHeader.sessionId
-        let sessionFlags = try SMB2SessionSetup.decodeSessionFlags(authResponse)
+        sessionFlags = try SMB2SessionSetup.decodeSessionFlags(authResponse)
         if credential.isAnonymous {
             // ⓥ Anonymous NTLM does not provide session key material, so SMB signing/encryption keys
             // cannot be derived here. If a server requires signing/encryption for guest access, the
             // later signed or encrypted operation is expected to fail until guest E2E coverage defines
             // a server-specific fallback.
+            authenticationCredential = nil
+            try requireEncryptionKeyIfSessionDemandsEncryption(sessionFlags)
+            return
+        }
+        let isGuestOrNull = (sessionFlags & (SMB2SessionSetup.sessionFlagIsGuest | SMB2SessionSetup.sessionFlagIsNull)) != 0
+        if isGuestOrNull,
+           result.dialect == SMBNegotiateConstants.dialect300 || result.dialect == SMBNegotiateConstants.dialect302 {
+            throw SMBError.protocolError("SMB 3.0.x credentials were mapped to a guest or null session")
+        }
+        if isGuestOrNull {
             authenticationCredential = nil
             try requireEncryptionKeyIfSessionDemandsEncryption(sessionFlags)
             return
@@ -4294,6 +4319,38 @@ actor SMBSession {
         authenticationCredential != nil
     }
 
+    func sessionFlagsForTesting() -> UInt16 {
+        sessionFlags
+    }
+
+    func hasSigningKeyForTesting() -> Bool {
+        signingKey != nil
+    }
+
+    func validateNegotiateCountsForTesting() -> (sent: Int, succeeded: Int) {
+        (validateNegotiateSentCountForTestingStorage, validateNegotiateSuccessCountForTestingStorage)
+    }
+
+    func isTransportClosedForTesting() -> Bool {
+        transportClosed
+    }
+
+    func installValidateNegotiateStateForTesting(
+        snapshot: SMBNegotiateRequestSnapshot,
+        serverResult: SMBProbeResult,
+        sessionId: UInt64,
+        sessionFlags: UInt16 = 0,
+        encryptionKey: [UInt8]? = nil,
+        decryptionKey: [UInt8]? = nil
+    ) {
+        negotiateRequestSnapshot = snapshot
+        negotiateResponseResult = serverResult
+        self.sessionId = sessionId
+        self.sessionFlags = sessionFlags
+        self.encryptionKey = encryptionKey
+        self.decryptionKey = decryptionKey
+    }
+
     private func logNegotiatePerf(_ result: SMBProbeResult) async {
         guard SMBPerfLog.isEnabled else { return }
         let cipherLabel: String
@@ -4319,10 +4376,52 @@ actor SMBSession {
         debugDump("TREE_CONNECT request", packet)
         let response = try await signedWireTransaction(packet: packet, responseLabel: "TREE_CONNECT response")
         let result = try SMB2TreeConnect.decodeResponse(response)
+        try await validateNegotiateAfterTreeConnect(treeId: result.treeId, shareEncryptionRequired: result.encryptionRequired)
         if result.encryptionRequired, encryptionKey == nil {
             throw SMBError.protocolError("TREE_CONNECT requires encryption but no SMB encryption key was negotiated")
         }
         return result.treeId
+    }
+
+    private func validateNegotiateAfterTreeConnect(treeId: UInt32, shareEncryptionRequired: Bool) async throws {
+        // SMBee policy exception: anonymous credentials skip this check and receive no downgrade detection.
+        guard let negotiated = negotiateResponseResult,
+              negotiated.dialect == SMBNegotiateConstants.dialect300 || negotiated.dialect == SMBNegotiateConstants.dialect302,
+              !credentialWasAnonymous
+        else {
+            return
+        }
+        do {
+            guard let requestSnapshot = negotiateRequestSnapshot else {
+                throw SMBCodecError.invalidValue("missing NEGOTIATE request snapshot")
+            }
+            guard signingKey != nil else {
+                throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO requires a signing key")
+            }
+            let request = try SMB2ValidateNegotiateInfo.encodeRequest(
+                messageId: nextMessageId(),
+                sessionId: sessionId,
+                treeId: treeId,
+                snapshot: requestSnapshot
+            )
+            debugDump("FSCTL_VALIDATE_NEGOTIATE_INFO request", request)
+            let encrypt = shareEncryptionRequired ||
+                (sessionFlags & SMB2SessionSetup.sessionFlagEncryptData) != 0
+            let frame = try await validateNegotiateWireTransaction(packet: request, encrypt: encrypt)
+            let response = try SMB2ValidateNegotiateInfo.decodeResponse(frame.bytes)
+            guard response.capabilities == negotiated.capabilities,
+                  response.serverGuid == negotiated.serverGuid,
+                  response.securityMode == negotiated.rawSecurityMode,
+                  response.dialect == negotiated.dialect
+            else {
+                throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO response does not match NEGOTIATE")
+            }
+            validateNegotiateSuccessCountForTestingStorage += 1
+        } catch {
+            // Fail closed because a 3.0.x tree is not usable until the negotiated parameters are authenticated.
+            closeTransport(cause: "validate_negotiate_failure", diagnosticError: error)
+            throw error
+        }
     }
 
     func create(treeId: UInt32, path: String, directory: Bool) async throws -> [UInt8] {
@@ -5849,6 +5948,29 @@ actor SMBSession {
         return response.bytes
     }
 
+    private func validateNegotiateWireTransaction(packet: [UInt8], encrypt: Bool) async throws -> SMBReceivedFrame {
+        let requestHeader = try SMB2Header.decode(packet)
+        let frame = try await withTaskCancellationHandler {
+            try await demuxedWireTransaction(
+                packet: packet,
+                responseLabel: "VALIDATE_NEGOTIATE_INFO response",
+                longPoll: false,
+                requestTimeoutPolicy: .eligible,
+                send: { packet, messageId in
+                    try await self.sendValidateNegotiateSigned(packet, messageId: messageId, encrypt: encrypt)
+                }
+            )
+        } onCancel: {
+            Task {
+                if let target = await self.cancelInFlightRequest(messageId: requestHeader.messageId) {
+                    await self.sendCancelWithoutGate(target: target)
+                }
+            }
+        }
+        try verifyValidateNegotiateProtection(frame)
+        return frame
+    }
+
     private func signedLongPollWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
         let requestHeader = try SMB2Header.decode(packet)
         let response = try await withTaskCancellationHandler {
@@ -6093,17 +6215,7 @@ actor SMBSession {
         // signed/encrypted op. Post-auth traffic is patched in sendSigned before it delegates
         // here for anonymous (unsigned) sessions.
         try Task.checkCancellation()
-        let reservedCharge = try await reserveCredit(packet)
-        if let messageId, !markSendStarted(messageId: messageId) {
-            await refundCredit(charge: reservedCharge)
-            throw CancellationError()
-        }
-        do {
-            try await transport.send(DirectTCPFraming.segments([packet]))
-        } catch {
-            await refundCredit(charge: reservedCharge)
-            throw error
-        }
+        try await sendPlaintext(packet, messageId: messageId)
     }
 
     /// MS-SMB2 §3.2.5.3.1: a session whose SESSION_SETUP response sets SMB2_SESSION_FLAG_ENCRYPT_DATA must
@@ -6117,10 +6229,9 @@ actor SMBSession {
 
     private func sendSigned(_ packet: [UInt8], messageId: UInt64? = nil) async throws {
         // Single credit-patch point for all post-auth traffic: sendSigned handles every
-        // signedWireTransaction op and delegates to sendEncrypted / sendUnsigned below, so
-        // patching once here (before signing/sealing) covers signed, encrypted, and anonymous
-        // paths while leaving the preauth NEGOTIATE/SESSION_SETUP messages (sent directly via
-        // sendUnsigned) untouched for 3.1.1 preauth-integrity.
+        // signedWireTransaction op, so patching once here (before signing/sealing) covers signed,
+        // encrypted, and anonymous paths while leaving the preauth NEGOTIATE/SESSION_SETUP messages
+        // (sent directly via sendUnsigned) untouched for 3.1.1 preauth-integrity.
         var packet = packet
         await applyCreditRequest(to: &packet)
         try Task.checkCancellation()
@@ -6131,12 +6242,38 @@ actor SMBSession {
         // No signing key means an anonymous/guest session (NTLM anonymous yields no session key
         // material). Such sessions cannot sign; the server granted access without requiring signing
         // (signingRequired was false at NEGOTIATE), so send the packet unsigned.
-        guard let signingKey else {
+        guard signingKey != nil else {
             try await sendUnsigned(packet, messageId: messageId)
             return
         }
-        // Sign it in place: mutation gives this local buffer unique ownership, avoiding
-        // a second payload-sized copy before the transport framing copy.
+        packet = try signedPacket(packet)
+        try await sendPlaintext(packet, messageId: messageId)
+    }
+
+    private func sendValidateNegotiateSigned(_ packet: [UInt8], messageId: UInt64, encrypt: Bool) async throws {
+        var packet = packet
+        await applyCreditRequest(to: &packet)
+        guard signingKey != nil else {
+            throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO request requires a signing key")
+        }
+        // MS-SMB2 §3.2.5.5 requires signing before §3.1.4.3 applies transform encryption.
+        packet = try signedPacket(packet)
+        if encrypt {
+            guard encryptionKey != nil else {
+                throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO requires unavailable SMB encryption")
+            }
+            try await sendEncrypted(packet, messageId: messageId)
+        } else {
+            try await sendPlaintext(packet, messageId: messageId)
+        }
+        validateNegotiateSentCountForTestingStorage += 1
+    }
+
+    private func signedPacket(_ packet: [UInt8]) throws -> [UInt8] {
+        guard let signingKey else {
+            throw SMBCodecError.invalidValue("SMB packet signing requires a signing key")
+        }
+        var packet = packet
         packet[16] |= UInt8(SMB2Flags.signed & 0xff)
         for index in 48..<64 { packet[index] = 0 }
         let signature: [UInt8]
@@ -6154,6 +6291,10 @@ actor SMBSession {
         )
 #endif
         for index in 0..<16 { packet[48 + index] = signature[index] }
+        return packet
+    }
+
+    private func sendPlaintext(_ packet: [UInt8], messageId: UInt64?) async throws {
         let reservedCharge = try await reserveCredit(packet)
         if let messageId, !markSendStarted(messageId: messageId) {
             await refundCredit(charge: reservedCharge)
@@ -6167,8 +6308,29 @@ actor SMBSession {
         }
     }
 
+    private func verifyValidateNegotiateProtection(_ frame: SMBReceivedFrame) throws {
+        if frame.decryptedFromTransform { return }
+        guard let signingKey else {
+            throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO response has no authenticated protection")
+        }
+        let packet = frame.bytes
+        let header = try SMB2Header.decode(packet)
+        guard (header.flags & SMB2Flags.signed) != 0 else {
+            throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO response is neither signed nor encrypted")
+        }
+        let expected = try SMBSessionSigning.signature(
+            algorithm: signingAlgorithm,
+            key: signingKey,
+            packet: packet,
+            sender: .server
+        )
+        guard AESCCM.constantTimeEqual(expected, header.signature) else {
+            throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO response signature verification failed")
+        }
+    }
+
     private func sendEncrypted(_ packet: [UInt8], messageId: UInt64? = nil) async throws {
-        // packet is already credit-patched by sendSigned (the sole caller); do not re-patch.
+        // Callers patch credits before signing/sealing; do not patch the packet again here.
         guard let encryptionKey else { throw SMBCodecError.invalidValue("missing SMB encryption key") }
         let nonceLength = encryptionAlgorithm == .aes128GCM ? 12 : 11
         let nonce = nextTransformNonce(length: nonceLength)

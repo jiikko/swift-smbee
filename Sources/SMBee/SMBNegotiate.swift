@@ -3,6 +3,7 @@ import Foundation
 public struct SMBProbeResult: Equatable, Sendable {
     public var dialect: UInt16
     public var signingRequired: Bool
+    var rawSecurityMode: UInt16 = 0
     public var signingAlgorithm: UInt16?
     public var cipher: UInt16?
     public var preauthHashAlgorithm: UInt16?
@@ -25,6 +26,39 @@ public struct SMBProbeResult: Equatable, Sendable {
         default:
             return false
         }
+    }
+
+    public static func == (lhs: SMBProbeResult, rhs: SMBProbeResult) -> Bool {
+        lhs.dialect == rhs.dialect &&
+            lhs.signingRequired == rhs.signingRequired &&
+            lhs.signingAlgorithm == rhs.signingAlgorithm &&
+            lhs.cipher == rhs.cipher &&
+            lhs.preauthHashAlgorithm == rhs.preauthHashAlgorithm &&
+            lhs.serverGuid == rhs.serverGuid &&
+            lhs.maxTransactSize == rhs.maxTransactSize &&
+            lhs.maxReadSize == rhs.maxReadSize &&
+            lhs.maxWriteSize == rhs.maxWriteSize &&
+            lhs.capabilities == rhs.capabilities
+    }
+}
+
+struct SMBNegotiateRequestSnapshot: Equatable, Sendable {
+    let clientGuid: [UInt8]
+    let capabilities: UInt32
+    let securityMode: UInt16
+    let dialects: [UInt16]
+
+    init(clientGuid: [UInt8], capabilities: UInt32, securityMode: UInt16, dialects: [UInt16]) throws {
+        guard clientGuid.count == 16 else {
+            throw SMBCodecError.invalidValue("NEGOTIATE ClientGuid must be 16 bytes")
+        }
+        guard !dialects.isEmpty else {
+            throw SMBCodecError.invalidValue("NEGOTIATE requires at least one dialect")
+        }
+        self.clientGuid = clientGuid
+        self.capabilities = capabilities
+        self.securityMode = securityMode
+        self.dialects = dialects
     }
 }
 
@@ -75,12 +109,23 @@ public enum SMBNegotiateCodec {
         salt: [UInt8] = Array(repeating: 0, count: 32),
         offeredDialects: [UInt16] = probeDialects
     ) throws -> [UInt8] {
-        guard !offeredDialects.isEmpty else {
-            throw SMBCodecError.invalidValue("NEGOTIATE requires at least one dialect")
-        }
+        let snapshot = try SMBNegotiateRequestSnapshot(
+            clientGuid: clientGuid.smbWireBytes,
+            capabilities: SMBNegotiateConstants.globalCapEncryption,
+            securityMode: SMBNegotiateConstants.signingEnabled,
+            dialects: offeredDialects
+        )
+        return try encodeRequest(snapshot: snapshot, messageId: messageId, salt: salt)
+    }
+
+    static func encodeRequest(
+        snapshot: SMBNegotiateRequestSnapshot,
+        messageId: UInt64 = 0,
+        salt: [UInt8] = Array(repeating: 0, count: 32)
+    ) throws -> [UInt8] {
         let contexts = try encodeNegotiateContexts(salt: salt)
         let header = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
-        let dialectBytes = MemoryLayout<UInt16>.size * offeredDialects.count
+        let dialectBytes = MemoryLayout<UInt16>.size * snapshot.dialects.count
         let fixedBodySize = 36
         let contextOffset = alignedTo8(header.count + fixedBodySize + dialectBytes)
         let paddingLength = contextOffset - (header.count + fixedBodySize + dialectBytes)
@@ -88,17 +133,17 @@ public enum SMBNegotiateCodec {
         var writer = SMBByteWriter()
         writer.writeBytes(header)
         writer.writeUInt16LE(36)
-        try writer.writeUInt16LE(count: offeredDialects.count, of: "NEGOTIATE dialect list")
-        writer.writeUInt16LE(SMBNegotiateConstants.signingEnabled)
+        try writer.writeUInt16LE(count: snapshot.dialects.count, of: "NEGOTIATE dialect list")
+        writer.writeUInt16LE(snapshot.securityMode)
         writer.writeUInt16LE(0)
-        writer.writeUInt32LE(SMBNegotiateConstants.globalCapEncryption)
-        writer.writeBytes(clientGuid.smbWireBytes)
+        writer.writeUInt32LE(snapshot.capabilities)
+        writer.writeBytes(snapshot.clientGuid)
         // MS-SMB2 2.2.3 requires NegotiateContextOffset to be relative to the
         // SMB2 header start and 8-byte aligned when dialect 0x0311 is offered.
         writer.writeUInt32LE(UInt32(contextOffset))
         writer.writeUInt16LE(negotiateContextCount)
         writer.writeUInt16LE(0)
-        for dialect in offeredDialects {
+        for dialect in snapshot.dialects {
             writer.writeUInt16LE(dialect)
         }
         writer.writeBytes(Array(repeating: 0, count: paddingLength))
@@ -193,6 +238,7 @@ public enum SMBNegotiateCodec {
         return SMBProbeResult(
             dialect: dialect,
             signingRequired: (securityMode & SMBNegotiateConstants.signingRequired) != 0,
+            rawSecurityMode: securityMode,
             signingAlgorithm: signingAlgorithm,
             cipher: cipher,
             preauthHashAlgorithm: preauthHashAlgorithm,

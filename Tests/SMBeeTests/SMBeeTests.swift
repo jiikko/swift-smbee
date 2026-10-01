@@ -2668,7 +2668,7 @@ final class SMBeeTests: XCTestCase {
         let destination = FileManager.default.temporaryDirectory
             .appendingPathComponent("smbee-deadline-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: destination) }
-        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous)))
         SMBTransportTestOverride.factory = { transport }
         defer { SMBTransportTestOverride.factory = nil }
 
@@ -2689,7 +2689,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMBeeCopyDirectoryOperationTimeout() async throws {
-        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous)))
         SMBTransportTestOverride.factory = { transport }
         defer { SMBTransportTestOverride.factory = nil }
 
@@ -2710,7 +2710,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMBeeRecursiveDeleteOperationTimeout() async throws {
-        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous)))
         SMBTransportTestOverride.factory = { transport }
         defer { SMBTransportTestOverride.factory = nil }
 
@@ -2750,7 +2750,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMBeeUploadOperationTimeoutDuringIO() async throws {
-        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous)))
         SMBTransportTestOverride.factory = { transport }
         defer { SMBTransportTestOverride.factory = nil }
 
@@ -2777,7 +2777,7 @@ final class SMBeeTests: XCTestCase {
         try Data([1, 2, 3]).write(to: localDirectory.appendingPathComponent("file.txt"))
         defer { try? FileManager.default.removeItem(at: localDirectory) }
 
-        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses()))
+        let transport = ScriptedBlockingReceiveTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous)))
         SMBTransportTestOverride.factory = { transport }
         defer { SMBTransportTestOverride.factory = nil }
 
@@ -3309,13 +3309,17 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testCredentialProviderIsResolvedOnceWhenConnectingPersistentSession() async throws {
+        let providerCredential = SMBCredential(
+            username: "provider-user", password: "provider-pass", domain: "provider-domain"
+        )
         let inbound = try framed([
             negotiateResponse(messageId: 0),
             sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
             try sessionSetupSuccessResponse(messageId: 2),
-            smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff)
+            smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff),
+            try SMBValidateNegotiateScript.responseTemplate()
         ])
-        let transport = InMemoryTransport(inbound: inbound)
+        let transport = SMBValidateNegotiateScriptTransport(inbound: inbound, credential: providerCredential)
         let providerCalls = LockedCounter()
 
         let session = try await SMBClient.connect(
@@ -3323,7 +3327,7 @@ final class SMBeeTests: XCTestCase {
             share: "share",
             credentialProvider: {
                 providerCalls.increment()
-                return SMBCredential(username: "provider-user", password: "provider-pass", domain: "provider-domain")
+                return providerCredential
             },
             makeTransport: { transport }
         )
@@ -3340,18 +3344,22 @@ final class SMBeeTests: XCTestCase {
 
     func testCredentialProviderIsResolvedOnceForOneShotStat() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let providerCredential = SMBCredential(
+            username: "one-shot-user", password: "one-shot-pass", domain: "one-shot-domain"
+        )
         let inbound = try framed([
             negotiateResponse(messageId: 0),
             sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
             try sessionSetupSuccessResponse(messageId: 2),
             smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff),
+            try SMBValidateNegotiateScript.responseTemplate(),
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 7, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0)
         ])
-        let transport = InMemoryTransport(inbound: inbound)
+        let transport = SMBValidateNegotiateScriptTransport(inbound: inbound, credential: providerCredential)
         let providerCalls = LockedCounter()
 
         let stat = try await SMBClient.stat(
@@ -3360,7 +3368,7 @@ final class SMBeeTests: XCTestCase {
             path: "known.txt",
             credentialProvider: {
                 providerCalls.increment()
-                return SMBCredential(username: "one-shot-user", password: "one-shot-pass", domain: "one-shot-domain")
+                return providerCredential
             },
             makeTransport: { transport }
         )
@@ -3375,7 +3383,7 @@ final class SMBeeTests: XCTestCase {
 
     func testSMBeeFacadeStatUsesTransportOverride() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 7, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
@@ -3394,19 +3402,23 @@ final class SMBeeTests: XCTestCase {
 
         XCTAssertEqual(stat.size, 7)
         let requests = try unframed(transport.outbound)
-        XCTAssertEqual(requests.count, 9)
+        XCTAssertEqual(requests.count, 10)
     }
 
     func testSMBeeFacadeCredentialProviderReadUsesTransportOverride() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let providerCredential = SMBCredential(username: "provider-user", password: "provider-pass")
+        let transport = SMBValidateNegotiateScriptTransport(
+            inbound: try framed(authenticatedTreeResponses(credential: providerCredential) + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 5, messageId: 5, treeId: 0x3344),
             smb2ReadResponse(Array("hello".utf8), messageId: 6, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0)
-        ]))
+            ]),
+            credential: providerCredential
+        )
         SMBTransportTestOverride.factory = { transport }
         defer { SMBTransportTestOverride.factory = nil }
         let providerCalls = LockedCounter()
@@ -3415,7 +3427,7 @@ final class SMBeeTests: XCTestCase {
             host: "server",
             credentialProvider: {
                 providerCalls.increment()
-                return SMBCredential(username: "provider-user", password: "provider-pass")
+                return providerCredential
             },
             share: "share",
             path: "hello.txt"
@@ -3424,12 +3436,12 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(data, Array("hello".utf8))
         XCTAssertEqual(providerCalls.value, 1)
         let requests = try unframed(transport.outbound)
-        XCTAssertEqual(requests.count, 10)
+        XCTAssertEqual(requests.count, 11)
     }
 
     func testSMBeeFacadeListStreamsDirectoryEntriesUsingTransportOverride() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "a.txt", isDirectory: false, fileSize: 1, nextOffset: 0)
@@ -3461,7 +3473,7 @@ final class SMBeeTests: XCTestCase {
         // resubscribed watch stays blocked on its next long-poll until the test cancels,
         // instead of looping into another reconnect.
         let secondTransport = ControlledReceiveTransport()
-        secondTransport.enqueueInbound(try framed(authenticatedTreeResponses() + [
+        secondTransport.enqueueInbound(try framed(authenticatedTreeResponses(credential: .anonymous) + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2ChangeNotifyResponse(
                 entries: [makeFileNotifyEntry(action: 1, name: "created.txt", nextOffset: 0)],
@@ -3470,7 +3482,7 @@ final class SMBeeTests: XCTestCase {
             )
         ]))
         let factory = TransportFactorySequence([
-            InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
                 smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344)
             ])),
             secondTransport
@@ -3509,13 +3521,13 @@ final class SMBeeTests: XCTestCase {
     func testSMBeeFacadeMutatingOperationsUseTransportOverride() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let factory = TransportFactorySequence([
-            InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
                 smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 5, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 6, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 7, treeId: 0)
             ])),
-            InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
                 smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
                 smb2WriteResponse(count: 3, messageId: 5, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 6, treeId: 0x3344),
@@ -3523,14 +3535,14 @@ final class SMBeeTests: XCTestCase {
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0)
             ])),
-            InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
                 smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.setInfo, messageId: 5, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0)
             ])),
-            InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+            SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
                 smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 5, treeId: 0x3344),
                 smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 6, treeId: 0x3344),
@@ -3549,7 +3561,7 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMBeeFacadeConnectUsesTransportOverrideAndTeardown() async throws {
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 4, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 5, treeId: 0)
         ]))
@@ -3563,12 +3575,12 @@ final class SMBeeTests: XCTestCase {
         )
         await session.close()
 
-        // handshake (NEGOTIATE + SESSION_SETUP x2 + TREE_CONNECT) + best-effort teardown.
-        XCTAssertEqual(try unframed(transport.outbound).count, 6)
+        // Handshake + VALIDATE_NEGOTIATE_INFO + best-effort teardown.
+        XCTAssertEqual(try unframed(transport.outbound).count, 7)
     }
 
     func testSMBeeFacadeEchoUsesTransportOverrideAndTeardown() async throws {
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2EchoResponse(messageId: 4),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 6, treeId: 0)
@@ -3583,13 +3595,13 @@ final class SMBeeTests: XCTestCase {
         )
 
         let requests = try unframed(transport.outbound)
-        XCTAssertEqual(requests.count, 7)
-        // Requests after TREE_CONNECT are transform-encrypted in this fixture.
+        XCTAssertEqual(requests.count, 8)
+        // Post-auth requests are signed in this plaintext SMB 3.0.2 fixture.
     }
 
     func testSMBeeFacadeReadlinkUsesTransportOverrideAndTeardown() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2IoctlResponse(
                 output: reparseSymlinkBuffer(substituteName: "\\??\\C:\\target.txt", printName: "target.txt"),
@@ -3616,12 +3628,12 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(reparsePoint.kind, .symlink)
         XCTAssertEqual(reparsePoint.substituteName, "\\??\\C:\\target.txt")
         XCTAssertEqual(reparsePoint.printName, "target.txt")
-        XCTAssertEqual(try unframed(transport.outbound).count, 9)
+        XCTAssertEqual(try unframed(transport.outbound).count, 10)
     }
 
     func testSMBeeFacadeWithDirectoryStreamUsesTransportOverride() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "a.txt", isDirectory: false, fileSize: 1, nextOffset: 0)
@@ -3673,7 +3685,7 @@ final class SMBeeTests: XCTestCase {
         volume.writeUInt8(0)                // Reserved
         volume.writeBytes(label)
 
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(payload: fullSize.bytes, messageId: 5),
             smb2QueryInfoResponse(payload: attribute.bytes, messageId: 6),
@@ -3699,7 +3711,7 @@ final class SMBeeTests: XCTestCase {
 
     func testSMBeeFacadeUpdateMetadataUsesTransportOverride() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.setInfo, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
@@ -3717,9 +3729,9 @@ final class SMBeeTests: XCTestCase {
             update: SMBFileMetadataUpdate(attributes: 0x20)
         )
 
-        // NEGOTIATE + SESSION_SETUP x2 + TREE_CONNECT + CREATE + SET_INFO + CLOSE + teardown x2.
-        // Requests are transform-encrypted so we assert the frame count, not decoded headers.
-        XCTAssertEqual(try unframed(transport.outbound).count, 9)
+        // NEGOTIATE + SESSION_SETUP x2 + TREE_CONNECT + VNI + CREATE + SET_INFO + CLOSE + teardown x2.
+        // The count also covers the signed VNI request in this SMB 3.0.2 fixture.
+        XCTAssertEqual(try unframed(transport.outbound).count, 10)
     }
 
     func testSMBeeFacadeSecurityInfoUsesTransportOverride() async throws {
@@ -3749,7 +3761,7 @@ final class SMBeeTests: XCTestCase {
         sd.writeBytes(group)
         sd.writeBytes(acl)
 
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(payload: sd.bytes, messageId: 5),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
@@ -4166,7 +4178,7 @@ final class SMBeeTests: XCTestCase {
         var allocated = SMBByteWriter()
         allocated.writeUInt64LE(0)
         allocated.writeUInt64LE(64 * 1024)
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
             // setSparse: create, ioctl(SET_SPARSE), close
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2IoctlResponse(output: [], status: SMB2Status.success, messageId: 5, treeId: 0x3344, fileId: fileId, ctlCode: SMB2Ioctl.fsctlSetSparse),
@@ -5738,7 +5750,7 @@ final class SMBeeTests: XCTestCase {
     func testDirectoryEntryMatchingUsesLeafPatternAndReturnsCanonicalName() async throws {
         let directoryFileId = Array(UInt8(32)..<UInt8(48))
         let treeId: UInt32 = 0x3344
-        let transport = InMemoryTransport(inbound: try framed(
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(
             authenticatedTreeResponses(treeId: treeId) + [
                 try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
                 try smb2QueryDirectoryResponse(
@@ -5776,7 +5788,7 @@ final class SMBeeTests: XCTestCase {
         // 返す server 実装で throw せず空配列になることを固定する。
         let directoryFileId = Array(UInt8(32)..<UInt8(48))
         let treeId: UInt32 = 0x3344
-        let transport = InMemoryTransport(inbound: try framed(
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(
             authenticatedTreeResponses(treeId: treeId) + [
                 try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
                 try smb2StatusResponse(status: SMB2Status.noSuchFile, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
@@ -5800,7 +5812,7 @@ final class SMBeeTests: XCTestCase {
         // pattern に要求表記をそのまま返し、canonical を隠してしまう (2026-08-19 実測)。
         let directoryFileId = Array(UInt8(32)..<UInt8(48))
         let treeId: UInt32 = 0x3344
-        let transport = InMemoryTransport(inbound: try framed(
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(
             authenticatedTreeResponses(treeId: treeId) + [
                 try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
                 try smb2QueryDirectoryResponse(
@@ -5831,7 +5843,7 @@ final class SMBeeTests: XCTestCase {
         // 列挙に無い leaf は nil (照合が false positive を作らないこと)。
         let directoryFileId = Array(UInt8(32)..<UInt8(48))
         let treeId: UInt32 = 0x3344
-        let transport = InMemoryTransport(inbound: try framed(
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(
             authenticatedTreeResponses(treeId: treeId) + [
                 try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
                 try smb2QueryDirectoryResponse(
@@ -5860,7 +5872,7 @@ final class SMBeeTests: XCTestCase {
         // 「権限が無いディレクトリが空に見える」最悪の退行になる)。
         let directoryFileId = Array(UInt8(32)..<UInt8(48))
         let treeId: UInt32 = 0x3344
-        let transport = InMemoryTransport(inbound: try framed(
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(
             authenticatedTreeResponses(treeId: treeId) + [
                 try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
                 try smb2StatusResponse(status: SMB2Status.accessDenied, command: SMB2Commands.queryDirectory, messageId: 5, treeId: treeId),
@@ -5889,7 +5901,7 @@ final class SMBeeTests: XCTestCase {
         // public API 単体でも安全であること: ".." を含む path の親を CREATE に
         // 渡さない (wire に出る前に reject する)。
         let treeId: UInt32 = 0x3344
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses(treeId: treeId)))
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses(treeId: treeId)))
         let session = try await SMBClient.connect(
             host: "server",
             share: "share",
@@ -8557,8 +8569,9 @@ final class SMBeeTests: XCTestCase {
     }
 
     func testSMBClientConnectPropagatesRequestTimeoutToConnectedSession() async throws {
-        let transport = ScriptedBlockingReceiveTransport(
-            inbound: try framed(authenticatedTreeResponses())
+        let transport = SMBValidateNegotiateScriptTransport(
+            inbound: try framed(authenticatedTreeResponses()),
+            blockWhenDrained: true
         )
         let client = try await awaitWithTimeout("SMBClient.connect request-timeout fixture") {
             try await SMBClient.connect(
@@ -10135,7 +10148,7 @@ final class SMBeeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        let prefixTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let prefixTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 11, messageId: 5, treeId: 0x3344),
             smb2ReadResponse(Array("hello ".utf8), messageId: 6, treeId: 0x3344),
@@ -10143,7 +10156,7 @@ final class SMBeeTests: XCTestCase {
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0)
         ]))
-        let resumeTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let resumeTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 11, messageId: 5, treeId: 0x3344),
             smb2ReadResponse(Array("world".utf8), messageId: 6, treeId: 0x3344),
@@ -10176,7 +10189,7 @@ final class SMBeeTests: XCTestCase {
         let firstId = hexBytes("00112233445566778899aabbccddeeff")
         let secondId = hexBytes("102132435465768798a9babbdcddedef")
         let directoryId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        let listTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let listTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "a.txt", isDirectory: false, fileSize: 5, nextOffset: 0)
@@ -10189,7 +10202,7 @@ final class SMBeeTests: XCTestCase {
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 9, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 10, treeId: 0)
         ]))
-        let firstTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let firstTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: firstId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 5, messageId: 5, treeId: 0x3344),
             smb2ReadResponse(Array("alpha".utf8), messageId: 6, treeId: 0x3344),
@@ -10197,7 +10210,7 @@ final class SMBeeTests: XCTestCase {
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0)
         ]))
-        let secondTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let secondTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: secondId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 4, messageId: 5, treeId: 0x3344),
             smb2ReadResponse(Array("beta".utf8), messageId: 6, treeId: 0x3344),
@@ -10227,7 +10240,7 @@ final class SMBeeTests: XCTestCase {
             .appendingPathComponent("smbee-reparse-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: destination) }
         let directoryId = hexBytes("00000000000000000000000000000046")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
             smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(
                 entries: [
@@ -10275,7 +10288,7 @@ final class SMBeeTests: XCTestCase {
         let firstId = hexBytes("00112233445566778899aabbccddeeff")
         let secondId = hexBytes("102132435465768798a9babbdcddedef")
         let directoryId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        let listTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let listTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "ok.txt", isDirectory: false, fileSize: 2, nextOffset: 0)
@@ -10288,7 +10301,7 @@ final class SMBeeTests: XCTestCase {
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 9, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 10, treeId: 0)
         ]))
-        let firstTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let firstTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: firstId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 2, messageId: 5, treeId: 0x3344),
             smb2ReadResponse(Array("ok".utf8), messageId: 6, treeId: 0x3344),
@@ -10296,7 +10309,7 @@ final class SMBeeTests: XCTestCase {
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0)
         ]))
-        let secondTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let secondTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: secondId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 3, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.accessDenied, command: SMB2Commands.read, messageId: 6, treeId: 0x3344),
@@ -10336,7 +10349,7 @@ final class SMBeeTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let directoryId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "planned.txt", isDirectory: false, fileSize: 7, nextOffset: 0)
@@ -10377,7 +10390,7 @@ final class SMBeeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
         let rootId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         let nestedId = hexBytes("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        let listRootTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let listRootTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: rootId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "keep.log", isDirectory: false, fileSize: 1, nextOffset: 128),
@@ -10389,7 +10402,7 @@ final class SMBeeTests: XCTestCase {
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0)
         ]))
-        let listNestedTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let listNestedTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: nestedId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "child.log", isDirectory: false, fileSize: 1, nextOffset: 128),
@@ -10433,7 +10446,7 @@ final class SMBeeTests: XCTestCase {
 
         let directoryId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         let partialId = hexBytes("00112233445566778899aabbccddeeff")
-        let listTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let listTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "done.txt", isDirectory: false, fileSize: 4, nextOffset: 128),
@@ -10444,7 +10457,7 @@ final class SMBeeTests: XCTestCase {
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0)
         ]))
-        let partialTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let partialTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: partialId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 7, messageId: 5, treeId: 0x3344),
             smb2ReadResponse(Array("updated".utf8), messageId: 6, treeId: 0x3344),
@@ -10490,7 +10503,7 @@ final class SMBeeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let directoryId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        let transport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: directoryId, messageId: 4, treeId: 0x3344),
             smb2QueryDirectoryResponse(entries: [
                 makeDirectoryEntry(name: "done.txt", isDirectory: false, fileSize: 4, nextOffset: 128),
@@ -10536,21 +10549,21 @@ final class SMBeeTests: XCTestCase {
         let mismatchStatId = hexBytes("102132435465768798a9babbdcddedef")
         let mismatchUploadId = hexBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         let missingUploadId = hexBytes("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        let doneStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let doneStatTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: doneId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 4, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0)
         ]))
-        let mismatchStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let mismatchStatTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: mismatchStatId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 1, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0)
         ]))
-        let mismatchUploadTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let mismatchUploadTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: mismatchUploadId, messageId: 4, treeId: 0x3344),
             smb2WriteResponse(count: 6, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 6, treeId: 0x3344),
@@ -10558,12 +10571,12 @@ final class SMBeeTests: XCTestCase {
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 8, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 9, treeId: 0)
         ]))
-        let missingStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let missingStatTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2StatusResponse(status: SMB2Status.objectNameNotFound, command: SMB2Commands.create, messageId: 4, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 6, treeId: 0)
         ]))
-        let missingUploadTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let missingUploadTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: missingUploadId, messageId: 4, treeId: 0x3344),
             smb2WriteResponse(count: 3, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: 6, treeId: 0x3344),
@@ -10613,14 +10626,14 @@ final class SMBeeTests: XCTestCase {
 
         let doneId = hexBytes("00112233445566778899aabbccddeeff")
         let mismatchId = hexBytes("102132435465768798a9babbdcddedef")
-        let doneStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let doneStatTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: doneId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 4, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 7, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 8, treeId: 0)
         ]))
-        let mismatchStatTransport = InMemoryTransport(inbound: try framed(authenticatedTreeResponses() + [
+        let mismatchStatTransport = SMBValidateNegotiateScriptTransport(inbound: try framed(authenticatedTreeResponses() + [
             smb2CreateResponse(fileId: mismatchId, messageId: 4, treeId: 0x3344),
             smb2QueryInfoResponse(size: 1, messageId: 5, treeId: 0x3344),
             smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 6, treeId: 0x3344),
@@ -11351,7 +11364,7 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
-    private func outboundFrames(_ transport: InMemoryTransport, containCommand command: UInt16) throws -> Bool {
+    private func outboundFrames(_ transport: SMBValidateNegotiateScriptTransport, containCommand command: UInt16) throws -> Bool {
         try outboundFrames(transport.outbound, containCommand: command)
     }
 
@@ -11750,13 +11763,20 @@ final class SMBeeTests: XCTestCase {
         return response
     }
 
-    private func authenticatedTreeResponses(treeId: UInt32 = 0x3344) throws -> [[UInt8]] {
-        [
-            try negotiateResponse(messageId: 0),
+    private func authenticatedTreeResponses(
+        treeId: UInt32 = 0x3344,
+        credential: SMBCredential = SMBCredential(username: "user", password: "pass")
+    ) throws -> [[UInt8]] {
+        var responses = [
+            try negotiateResponse(messageId: 0, dialect: SMBNegotiateConstants.dialect302),
             try sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
             try sessionSetupSuccessResponse(messageId: 2),
             try smb2TreeConnectResponse(treeId: treeId, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff)
         ]
+        if !credential.isAnonymous {
+            responses.append(try SMBValidateNegotiateScript.responseTemplate(treeId: treeId))
+        }
+        return responses
     }
 
     private func smb2QueryDirectoryResponse(entries: [[UInt8]], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
@@ -11843,13 +11863,22 @@ final class SMBeeTests: XCTestCase {
         writeUInt16LE(65, to: &response, at: 64)
         writeUInt16LE(SMBNegotiateConstants.signingEnabled, to: &response, at: 66)
         writeUInt16LE(dialect, to: &response, at: 68)
+        if dialect == SMBNegotiateConstants.dialect311 {
+            writeUInt16LE(2, to: &response, at: 70)
+        }
         response.replaceSubrange(72..<88, with: Array(repeating: UInt8(0x42), count: 16))
         writeUInt32LE(capabilities, to: &response, at: 88)
         writeUInt32LE(1_048_576, to: &response, at: 92)
         writeUInt32LE(1_048_576, to: &response, at: 96)
         writeUInt32LE(1_048_576, to: &response, at: 100)
-    writeUInt16LE(UInt16(response.count), to: &response, at: 116)
+        writeUInt16LE(UInt16(response.count), to: &response, at: 116)
         writeUInt16LE(0, to: &response, at: 118)
+        if dialect == SMBNegotiateConstants.dialect311 {
+            writeUInt32LE(136, to: &response, at: 124)
+            response.append(contentsOf: Array(repeating: 0, count: 7))
+            appendContext(type: SMBNegotiateConstants.preauthContext, data: [1, 0, 0, 0, 1, 0], to: &response)
+            appendContext(type: SMBNegotiateConstants.signingContext, data: [1, 0, 2, 0], padTo8: false, to: &response)
+        }
         return response
     }
 

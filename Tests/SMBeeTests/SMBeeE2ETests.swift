@@ -77,6 +77,10 @@ final class SMBeeE2ETests: XCTestCase {
 
         let credential = SMBCredential.anonymous
         let session = try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        let wireSession = await session.wireSessionForTesting()
+        let validationCounts = await wireSession.validateNegotiateCountsForTesting()
+        XCTAssertEqual(validationCounts.sent, 0)
+        XCTAssertEqual(validationCounts.succeeded, 0)
         let suffix = UUID().uuidString
         let path = "guest-smoke-\(suffix).txt"
         let payload = Array("guest smoke \(suffix)\n".utf8)
@@ -104,6 +108,9 @@ final class SMBeeE2ETests: XCTestCase {
         }
 
         let environment = ProcessInfo.processInfo.environment
+        guard environment["SMBEE_E2E_PROFILE"] != "guest" else {
+            throw XCTSkip("The guest profile is covered by the anonymous guest smoke")
+        }
         let host = environment["SMBEE_E2E_HOST"] ?? "127.0.0.1"
         let portString = environment["SMBEE_E2E_PORT"] ?? "445"
         guard let port = UInt16(portString) else {
@@ -124,6 +131,22 @@ final class SMBeeE2ETests: XCTestCase {
 
         let credential = SMBCredential(username: username, password: password)
         let session = try await SMBee.connect(host: host, port: port, credential: credential, share: share)
+        let wireSession = await session.wireSessionForTesting()
+        let validationCounts = await wireSession.validateNegotiateCountsForTesting()
+        switch environment["SMBEE_E2E_PROFILE"] ?? "smb302-encrypted-required" {
+        case "smb302-encrypted-required", "smb302-signing-required":
+            XCTAssertGreaterThanOrEqual(validationCounts.sent, 1)
+            XCTAssertGreaterThanOrEqual(validationCounts.succeeded, 1)
+            let beforeIPCTree = await wireSession.validateNegotiateCountsForTesting()
+            _ = try await session.listShares()
+            let afterIPCTree = await wireSession.validateNegotiateCountsForTesting()
+            XCTAssertGreaterThan(afterIPCTree.succeeded, beforeIPCTree.succeeded)
+        case "smb311-signing-required", "smb311-encrypted-required":
+            XCTAssertEqual(validationCounts.sent, 0)
+            XCTAssertEqual(validationCounts.succeeded, 0)
+        default:
+            XCTFail("Unknown SMBEE_E2E_PROFILE")
+        }
         let sessionEntries = try await session.list()
         await session.close()
         XCTAssertTrue(sessionEntries.contains { $0.name == "known.txt" && !$0.isDirectory })

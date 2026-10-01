@@ -96,6 +96,22 @@ UTF-16LE encode する。macOS SMBX / Samba での NFC/NFD 実測は compatibili
 - 各 command の request/response 構造（`StructureSize` 先頭、可変長 buffer の offset/length 方式）も
   MS-SMB2 のメッセージ構文節を参照。**buffer の offset は SMB2 header 先頭からの byte**。
 
+### SMB 3.0.x の NEGOTIATE 検証
+
+SMB 3.0 / 3.0.2 では、資格情報が匿名でない接続について、各 TREE_CONNECT の成功後、TreeId を呼び出し元へ返す前に
+`FSCTL_VALIDATE_NEGOTIATE_INFO` を送る（MS-SMB2 §3.2.5.5）。NEGOTIATE 要求で実際に送った ClientGuid・Capabilities・
+SecurityMode・Dialects を同一 snapshot から IOCTL 入力にも使い、応答の ServerCapabilities・ServerGuid・生の 16 bit
+ServerSecurityMode・Dialect を NEGOTIATE 応答と完全一致させる。3.1.1 は preauth integrity を使うためこの IOCTL を送らない。
+
+要求は署名する（§3.2.5.5）。session または share が暗号化を要求する場合は、その署名済み SMB2 メッセージを transform で包む
+（§3.1.4.3）。応答は AEAD 検証済み transform、または署名フラグと MAC が有効な平文だけを受け入れる。成功 status 以外、
+保護なし、壊れた署名 / AEAD、範囲外または短い Buffer、値の不一致はすべて接続失敗として transport を閉じる。FSCTL 非対応も
+fail-closed とする。匿名資格情報だけは SMBee のポリシー例外として検証を省略し、その経路では downgrade 検出を提供しない。
+資格情報を渡したのに 3.0.x の SESSION_SETUP が IS_GUEST / IS_NULL を返す場合は接続を失敗させる。
+
+SESSION_SETUP の `IS_GUEST` bit を消す攻撃は個別には検知しない。検証応答には NTLM 認証から導いた鍵の署名が必要で、guest 扱いのサーバーはその鍵で有効な署名を作れず、その鍵で署名できるなら鍵は共有されており downgrade ではない。
+この検証は成功した TREE_CONNECT ごとに同期 IOCTL を 1 往復増やす。MS-SMB2 §3.2.5.5 に従うコストとして受け入れる。
+
 ### NTLMv2（MS-NLMP）ⓥ
 
 - 3 メッセージ: NEGOTIATE_MESSAGE(type1) → CHALLENGE_MESSAGE(type2) → AUTHENTICATE_MESSAGE(type3)。

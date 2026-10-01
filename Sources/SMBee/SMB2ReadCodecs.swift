@@ -184,6 +184,8 @@ enum SMB2SessionSetup {
     }
 
     /// SESSION_SETUP response `SessionFlags` (MS-SMB2 §2.2.6).
+    static let sessionFlagIsGuest: UInt16 = 0x0001
+    static let sessionFlagIsNull: UInt16 = 0x0002
     static let sessionFlagEncryptData: UInt16 = 0x0004
 
     static func decodeSessionFlags(_ bytes: [UInt8]) throws -> UInt16 {
@@ -803,6 +805,107 @@ enum SMB2Write {
         }
         try reader.skip(count: 2)
         return try reader.readUInt32LE()
+    }
+}
+
+struct SMB2ValidateNegotiateInfoResponse: Equatable, Sendable {
+    let capabilities: UInt32
+    let serverGuid: UUID
+    let securityMode: UInt16
+    let dialect: UInt16
+}
+
+enum SMB2ValidateNegotiateInfo {
+    static let ctlCode: UInt32 = 0x0014_0204
+    static let fileId = Array(repeating: UInt8(0xff), count: 16)
+    static let responseSize = 24
+    private static let requestBufferOffset = SMB2Header.encodedSize + 56
+    private static let responseBufferOffset = SMB2Header.encodedSize + 48
+    private static let isFsctl: UInt32 = 0x0000_0001
+
+    static func encodeInput(snapshot: SMBNegotiateRequestSnapshot) throws -> [UInt8] {
+        var writer = SMBByteWriter()
+        writer.writeUInt32LE(snapshot.capabilities)
+        writer.writeBytes(snapshot.clientGuid)
+        writer.writeUInt16LE(snapshot.securityMode)
+        try writer.writeUInt16LE(count: snapshot.dialects.count, of: "VALIDATE_NEGOTIATE_INFO dialect list")
+        for dialect in snapshot.dialects {
+            writer.writeUInt16LE(dialect)
+        }
+        return writer.bytes
+    }
+
+    static func encodeRequest(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        snapshot: SMBNegotiateRequestSnapshot
+    ) throws -> [UInt8] {
+        let input = try encodeInput(snapshot: snapshot)
+        let header = try SMB2Header(
+            command: SMB2Commands.ioctl,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
+        var writer = SMBByteWriter()
+        writer.writeBytes(header)
+        writer.writeUInt16LE(57)
+        writer.writeUInt16LE(0)
+        writer.writeUInt32LE(ctlCode)
+        writer.writeBytes(fileId)
+        writer.writeUInt32LE(UInt32(requestBufferOffset))
+        writer.writeUInt32LE(UInt32(input.count))
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(UInt32(requestBufferOffset))
+        writer.writeUInt32LE(0)
+        writer.writeUInt32LE(UInt32(responseSize))
+        writer.writeUInt32LE(isFsctl)
+        writer.writeUInt32LE(0)
+        writer.writeBytes(input)
+        return writer.bytes
+    }
+
+    static func decodeResponse(_ bytes: [UInt8]) throws -> SMB2ValidateNegotiateInfoResponse {
+        let header = try SMB2Header.decode(bytes)
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "VALIDATE_NEGOTIATE_INFO")
+        var reader = SMBByteReader(bytes: Array(bytes.dropFirst(SMB2Header.encodedSize)))
+        guard try reader.readUInt16LE() == 49 else {
+            throw SMBCodecError.invalidValue("invalid VALIDATE_NEGOTIATE_INFO IOCTL response structure size")
+        }
+        try reader.skip(count: 2)
+        guard try reader.readUInt32LE() == ctlCode else {
+            throw SMBCodecError.invalidValue("invalid VALIDATE_NEGOTIATE_INFO response control code")
+        }
+        guard try reader.readBytes(count: 16) == fileId else {
+            throw SMBCodecError.invalidValue("invalid VALIDATE_NEGOTIATE_INFO response FileId")
+        }
+        _ = try reader.readUInt32LE()
+        _ = try reader.readUInt32LE()
+        let outputOffset = UInt64(try reader.readUInt32LE())
+        let outputCount = UInt64(try reader.readUInt32LE())
+        guard try reader.readUInt32LE() == 0 else {
+            throw SMBCodecError.invalidValue("invalid VALIDATE_NEGOTIATE_INFO response flags")
+        }
+        _ = try reader.readUInt32LE()
+        guard outputOffset >= UInt64(responseBufferOffset),
+              outputOffset + outputCount <= UInt64(bytes.count),
+              outputCount >= UInt64(responseSize)
+        else {
+            throw SMBCodecError.invalidValue("invalid VALIDATE_NEGOTIATE_INFO response output range")
+        }
+        let start = Int(outputOffset)
+        var outputReader = SMBByteReader(bytes: Array(bytes[start..<(start + responseSize)]))
+        let capabilities = try outputReader.readUInt32LE()
+        let serverGuid = try UUID(smbWireBytes: outputReader.readBytes(count: 16))
+        let securityMode = try outputReader.readUInt16LE()
+        let dialect = try outputReader.readUInt16LE()
+        return SMB2ValidateNegotiateInfoResponse(
+            capabilities: capabilities,
+            serverGuid: serverGuid,
+            securityMode: securityMode,
+            dialect: dialect
+        )
     }
 }
 

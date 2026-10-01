@@ -126,3 +126,28 @@ issue 099（接続直後に TCP_NODELAY）で往復ごとの待ちが消えた�
   同時に CPU を使い、4 vCPU の runner で物理 core を取り合った。確かめるなら client と server を別の core に pin して A/B を取り直す
 - 待ちが消えた後の CCM は read / write とも CPU 律速（CPU ÷ wall 0.96〜0.99）で、1 MiB あたりの client CPU は約 115 ms（この runner）。
   上の「着手 trigger」（CCM read が 25 MiB/s 未満かつ CPU 律速）は、099 の修正後の CI runner の条件で満たしている
+
+## 2026-10-01 対応: 公開 API で CCM を組み立てる Linux の高速経路（codex-drive）
+
+### 採用した設計
+- 「公開 API では CCM を組めない」という前提は誤りだった。swift-crypto の CryptoExtras（Linux だけの依存）にある公開 API で組める:
+  - CBC-MAC = `AES.CMAC` に zero pad 済みの完全 block 列を渡し、**最後の block にだけ K_1 = dbl(E_K(0)) を XOR** する（CMAC 内部の最後の XOR と打ち消し合う）
+  - CTR = 先頭 16 byte は `AES.permute` で E_K(A_1)、17 byte 目以降は `AES.GCM.seal` を nonce `0x03 || nonce(11)` で **1 回** 呼んだ ciphertext（GCM の payload counter は 2 から始まり CCM の A_2 以降と一致。分けて呼ぶと keystream を繰り返す。GCM tag は捨てる）
+  - tag マスク E_K(A_0) は `AES.permute`
+  - 下限版: `AES.permute` は swift-crypto 2.2.4、`AES.CMAC` は 3.14.0 から在り、`from: "4.0.0"` で使える
+- 対象は Linux（CryptoExtras あり・CommonCrypto なし）で nonce 11 byte（SMB 3.0.2）だけ。Apple は CommonCrypto、他の nonce 長と他 platform は pure-Swift のまま
+- payload 長の上限（q=4 で < 2^32）を backend 選択の前の共通 `validate` へ移した（高速経路が上限を迂回しないため）
+- K_1 の doubling は branchless（既存の `AESCMAC.dbl` は `carry` で分岐するので流用しない）
+- CMAC 鍵の専用使用（SP 800-38B）: CMAC API は CCM の CBC-MAC と同じ値を計算する手段として使い、CMAC の tag は外へ出さない。CCM は元々同じ鍵を CTR と CBC-MAC に使う。ユーザー承認済み（2026-10-01）
+- side-channel: AES / GHASH は swift-crypto 4.5.0 の BoringSSL の dispatch（hardware / vpaes / bitsliced constant-time の aes_nohw、constant-time の gcm_nohw）に依存。SMBee は table を持たない
+- 却下: SealedBox 由来の copy（ピークで入力の約 4 倍）を `Data(bytesNoCopy:)` で消す案。SMB の frame は MaxRead/WriteSize で上限があり、unsafe な寿命管理を足す価値が無い（コードにコメント）
+
+### 検証
+- 独立な固定値: pyca/cryptography 46.0.7（OpenSSL）で nonce 11 / tag 16 を 20 組（AAD 32 と空、payload 0〜1 MiB+17、CBC-MAC 入力が 8,192 byte の flush 境界で終わる 2 組）。生成スクリプトはテストのコメントにある。macOS の CommonCrypto 経路も Linux の高速経路・pure-Swift もこの値と一致
+- 変異（Linux container、6 本とも red）: B_0 の q flag / CTR を counter 2 から / flush で最後の block まで / K_1 補正を外す / K_1 の reduction を外す / tag 比較を常に true
+- レビュー: D3（設計）2 本、実装後の 3 lens（正しさ・素通り・敵対）。採用 1 件（8,192 byte 境界の固定値）、却下 1 件（上の copy）。正しさ・敵対 lens は CCM と一致しない入力を作れなかった
+- commit: `perf(crypto): issue 075 — Linux の nonce 11 byte の AES-CCM を swift-crypto の公開 API で組み立てる`
+
+### 実測
+- micro-bench（Apple container swift:6.2 linux/arm64 -c 4 -m 8G、release、`SMBEE_BENCH_CCM=1`、1 MiB × 8）: 実装時の codex の計測で、同じ container で before / after を交互に 3 組の median が seal 26.9 → 393.9 MiB/s、open 27.0 → 397.5 MiB/s（約 14.6 倍）
+- 実転送（study の fix-ab）: 未実測（この節の後に追記する）

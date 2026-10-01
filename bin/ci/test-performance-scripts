@@ -306,6 +306,35 @@ test_prewarm_retry_then_success() {
     'prewarm: swift package resolve failed (attempt 1/3); purged '
 }
 
+test_prewarm_waits_between_attempts() {
+  local scenario_dir artifacts_dir call_log sleep_log
+  scenario_dir="$(new_scenario_dir)"
+  artifacts_dir="${scenario_dir}/cache/org.swift.swiftpm/artifacts"
+  call_log="${scenario_dir}/swift-calls.log"
+  sleep_log="${scenario_dir}/sleep-calls.log"
+  mkdir -p "${artifacts_dir}"
+  write_prewarm_fake_swift "${scenario_dir}"
+  # A fake sleep records the delay instead of waiting, so the scenario stays fast and the
+  # count shows a pause only happens between attempts (not after the last one).
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$1" >> "%s"\n' "${sleep_log}" > "${scenario_dir}/bin/sleep"
+  chmod +x "${scenario_dir}/bin/sleep"
+
+  if PATH="${scenario_dir}/bin:${PATH}" \
+    FAKE_SWIFT_FAIL_UNTIL=99 \
+    FAKE_SWIFT_CALL_LOG="${call_log}" \
+    SWIFTPM_ARTIFACTS_DIR="${artifacts_dir}" \
+    SWIFTPM_PREWARM_RETRY_DELAY=7 \
+      "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
+      >"${scenario_dir}/run.out" 2>"${scenario_dir}/run.err"; then
+    echo 'prewarm unexpectedly succeeded while every resolve failed' >&2
+    return 1
+  fi
+
+  test "$(wc -l < "${call_log}")" -eq 3
+  test "$(grep -c -x 7 "${sleep_log}")" -eq 2
+  test "$(wc -l < "${sleep_log}")" -eq 2
+}
+
 test_prewarm_exhausts_attempts() {
   local scenario_dir artifacts_dir sentinel call_log purge_count
   scenario_dir="$(new_scenario_dir)"
@@ -1401,6 +1430,7 @@ run_scenario test_summary_edge_cases
 run_scenario test_artifact_and_summary_parse_failure
 run_scenario test_missing_log_metadata
 run_scenario test_prewarm_retry_then_success
+run_scenario test_prewarm_waits_between_attempts
 run_scenario test_prewarm_exhausts_attempts
 run_scenario test_prewarm_success_does_not_purge
 run_scenario test_prewarm_refuses_unsafe_targets
@@ -1408,7 +1438,7 @@ run_scenario test_prewarm_handles_path_with_space
 run_scenario test_resource_performance_container_prewarm_branch
 run_scenario test_prewarm_has_no_array_expansions
 
-expected_scenario_count=26
+expected_scenario_count=27
 printf 'ran %s scenarios\n' "${scenario_count}"
 if [ "${scenario_count}" -ne "${expected_scenario_count}" ]; then
   printf 'expected %s scenarios, ran %s\n' \

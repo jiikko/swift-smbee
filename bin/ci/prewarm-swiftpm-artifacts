@@ -33,6 +33,19 @@ if [ "${#max_attempts}" -gt 2 ] ||
   exit 2
 fi
 
+# Seconds to wait before retrying a failed resolve (default 0). A transient registry / release
+# download failure (e.g. GitHub 504) usually needs a short pause to clear.
+retry_delay="${SWIFTPM_PREWARM_RETRY_DELAY:-0}"
+case "${retry_delay}" in
+  ''|*[!0123456789]*)
+    printf 'prewarm: SWIFTPM_PREWARM_RETRY_DELAY must be an integer from 0 through 300\n' >&2
+    exit 2
+    ;;
+esac
+if [ "${#retry_delay}" -gt 3 ] || [ "${retry_delay}" -gt 300 ]; then
+  printf 'prewarm: SWIFTPM_PREWARM_RETRY_DELAY must be an integer from 0 through 300\n' >&2
+  exit 2
+fi
 if [[ ${SWIFTPM_ARTIFACTS_DIR+x} ]]; then
   artifacts_dir="${SWIFTPM_ARTIFACTS_DIR}"
 else
@@ -154,6 +167,9 @@ while [ "${attempt}" -le "${max_attempts}" ]; do
     exit 2
   fi
   attempt=$((attempt + 1))
+  if [ "${attempt}" -le "${max_attempts}" ] && [ "${retry_delay}" -gt 0 ]; then
+    sleep "${retry_delay}"
+  fi
 done
 
 printf 'swift package resolve failed after %s attempts\n' "${max_attempts}" >&2

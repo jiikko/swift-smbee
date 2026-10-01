@@ -38,4 +38,5 @@ docker run --rm --network host \
   -v "${PWD}:/work" -w /work \
   "swift:${SWIFT_VERSION}" \
   bash -euxo pipefail -c "swift --version
+bin/ci/swiftpm-resolve-then
 $1"

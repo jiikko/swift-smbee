@@ -24,6 +24,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve packages (retry transient download failures)
+        run: bin/ci/swiftpm-resolve-then
       - name: Verify SwiftLint has no warnings
         # The command plugin uses the repository-pinned SwiftLint binary from
         # SwiftLintPlugins. --strict promotes every warning to an error.
@@ -35,6 +37,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve packages (retry transient download failures)
+        run: bin/ci/swiftpm-resolve-then
       - name: Analyze against a clean verbose build
         # analyzer rules は上の `lint` (build tool plugin と同じ経路) では評価されない。
         # bin/ci/lint-analyze がクリーン build のコンパイラログを作って analyze --strict を回す
@@ -48,6 +52,8 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve packages (retry transient download failures)
+        run: bin/ci/swiftpm-resolve-then
       - name: Verify Swift version compatibility
         run: |
           required="$(tr -d '[:space:]' < .swift-version)"
@@ -127,6 +133,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      - name: Resolve packages (retry transient download failures)
+        run: bin/ci/swiftpm-resolve-then
       - name: Verify Swift version compatibility
         run: |
           required="$(tr -d '[:space:]' < .swift-version)"
@@ -179,7 +187,7 @@ jobs:
         # allocations on Linux (XCTestCaseRun / awaitUsingExpectation weak refs —
         # verified none trace into SMBee code). ASan itself (heap overflow /
         # use-after-free) stays fully active, which is what this job is for.
-        run: docker run --rm -e ASAN_OPTIONS=detect_leaks=0 -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift test --sanitize=address --skip SMBeeE2ETests
+        run: docker run --rm -e ASAN_OPTIONS=detect_leaks=0 -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bin/ci/swiftpm-resolve-then swift test --sanitize=address --skip SMBeeE2ETests
 
   linux-build-test:
     name: linux-build-test / .swift-version
@@ -194,14 +202,14 @@ jobs:
       - name: Swift version
         run: bin/ci/docker-pull-retry "${{ steps.swift-version.outputs.image }}" && docker run --rm "${{ steps.swift-version.outputs.image }}" swift --version
       - name: Build on Linux
-        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" swift build
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bin/ci/swiftpm-resolve-then swift build
       - name: Unit tests on Linux
         timeout-minutes: 10
         # Samba-backed tests run in the E2E workflows. Keep the generic Linux
         # job on deterministic unit/vector coverage.
         # stdbuf keeps per-test output line-buffered so an intermittent hang
         # (issues/013) shows the last started test instead of an empty log.
-        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" stdbuf -oL -eL swift test --skip SMBeeE2ETests
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bin/ci/swiftpm-resolve-then stdbuf -oL -eL swift test --skip SMBeeE2ETests
 
   e2e-launchers:
     name: E2E launcher scripts
@@ -232,7 +240,7 @@ jobs:
         timeout-minutes: 10
         env:
           MIN_DISCOVERED_TESTS: "20"
-        run: docker run --rm -e MIN_DISCOVERED_TESTS -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bash scripts/check-test-discovery.sh
+        run: docker run --rm -e MIN_DISCOVERED_TESTS -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bin/ci/swiftpm-resolve-then bash scripts/check-test-discovery.sh
 
   code-coverage:
     name: code-coverage / .swift-version
@@ -257,7 +265,7 @@ jobs:
         # The official swift:* images ship llvm-cov but NOT python3, which
         # check-code-coverage.sh uses to parse the llvm-cov JSON and render the report.
         # Install it inside the container before running the script.
-        run: docker run --rm -e MIN_LINE_COVERAGE -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bash -c "apt-get update -qq && apt-get install -y -qq python3 >/dev/null && bash scripts/check-code-coverage.sh"
+        run: docker run --rm -e MIN_LINE_COVERAGE -v "$PWD:/workspace" -w /workspace "${{ steps.swift-version.outputs.image }}" bin/ci/swiftpm-resolve-then bash -c "apt-get update -qq && apt-get install -y -qq python3 >/dev/null && bash scripts/check-code-coverage.sh"
       - name: Publish coverage to job summary
         # The coverage script runs inside `docker run`, so $GITHUB_STEP_SUMMARY (a host
         # runner file) is not visible in the container. Publish the Markdown report from

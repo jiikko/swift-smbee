@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# usage: bin/ci/swiftpm-resolve-then [command...]
+#
+# Resolves SwiftPM packages with retries (bin/ci/prewarm-swiftpm-artifacts), then execs the
+# command, if any. CI uses it before the first swift command of a job / container so a transient
+# download failure (e.g. GitHub release 504 for SwiftLintBinary, run 36867843651) retries instead
+# of failing the build step.
+#
+# The artifact cache must exist before prewarm runs: its purge guard refuses a missing parent,
+# and fresh runners / containers have no SwiftPM cache yet.
+#
+# Environment:
+#   SWIFTPM_ARTIFACTS_DIR        default: macOS ~/Library/Caches/org.swift.swiftpm/artifacts,
+#                                otherwise ${XDG_CACHE_HOME:-~/.cache}/org.swift.swiftpm/artifacts
+#   SWIFTPM_PREWARM_RETRY_DELAY  seconds between attempts (default here: 15)
+set -euo pipefail
+unset CDPATH
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "${SWIFTPM_ARTIFACTS_DIR:-}" ]]; then
+  if [[ "$(uname -s)" == Darwin ]]; then
+    SWIFTPM_ARTIFACTS_DIR="${HOME}/Library/Caches/org.swift.swiftpm/artifacts"
+  else
+    SWIFTPM_ARTIFACTS_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/org.swift.swiftpm/artifacts"
+  fi
+fi
+mkdir -p "${SWIFTPM_ARTIFACTS_DIR}"
+SWIFTPM_ARTIFACTS_DIR="${SWIFTPM_ARTIFACTS_DIR}" \
+  SWIFTPM_PREWARM_RETRY_DELAY="${SWIFTPM_PREWARM_RETRY_DELAY:-15}" \
+  "${SCRIPT_DIR}/prewarm-swiftpm-artifacts"
+if [[ $# -gt 0 ]]; then
+  exec "$@"
+fi

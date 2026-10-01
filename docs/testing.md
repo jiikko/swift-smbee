@@ -86,6 +86,9 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
   distro-provided Samba、Swift 6.2、`test/e2e/smb/*.conf` profile の代表組み合わせを回す。
 - CI の docker image は最初の `docker run` の前に `bin/ci/docker-pull-retry` で取得する（registry の一時的な
   通信失敗を再試行する。既に在る image は取得しない）。新しく image を使う job / script を足したら同じ形で取得する。
+- SwiftPM の依存（GitHub の release から取る SwiftLintBinary など）は、各 job / container の最初の swift コマンドの前に
+  `bin/ci/swiftpm-resolve-then [command...]` で取得する（`bin/ci/prewarm-swiftpm-artifacts` を 15 秒おきに最大 3 回。キャッシュの
+  ディレクトリを先に作る）。新しく swift を動かす job を足したら同じ形にする。
 
 ### ローカル実行 — Apple container / macOS
 

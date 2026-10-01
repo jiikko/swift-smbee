@@ -302,6 +302,7 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
     private var inbound: [UInt8]
     private var outboundStorage: [UInt8] = []
     private var blocked = false
+    private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
     private var closeCountStorage = 0
 
     init(inbound: [UInt8]) {
@@ -320,6 +321,19 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
         lock.withLock { closeCountStorage }
     }
 
+    func waitUntilBlockedAfterScript() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if blocked {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                blockedWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
     func connect(host: String, port: UInt16) async throws {
         try Task.checkCancellation()
         _ = host
@@ -335,17 +349,20 @@ private final class ScriptedBlockingReceiveTransport: SMBTransport, @unchecked S
 
     func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
-        let chunk = lock.withLock { () -> [UInt8]? in
+        let state = lock.withLock { () -> ([UInt8]?, [CheckedContinuation<Void, Never>]) in
             guard !inbound.isEmpty else {
                 blocked = true
-                return nil
+                let waiters = blockedWaiters
+                blockedWaiters.removeAll()
+                return (nil, waiters)
             }
             let count = min(maxLength, inbound.count)
             let chunk = Array(inbound.prefix(count))
             inbound.removeFirst(count)
-            return chunk
+            return (chunk, [])
         }
-        if let chunk {
+        for waiter in state.1 { waiter.resume() }
+        if let chunk = state.0 {
             return chunk
         }
         return try await withTaskCancellationHandler {
@@ -2558,20 +2575,36 @@ final class SMBeeTests: XCTestCase {
         }
     }
 
-    func testBestEffortCloseInvalidatesTransportWhenCloseResponseIsMissing() async {
+    func testBestEffortCloseTimeoutKeepsTransportOpenWithCleanupTombstone() async throws {
+        // This previously asserted that the cleanup deadline itself invalidates the shared
+        // transport. Issue 069 keeps the CLOSE correlated and leaves teardown to wire faults/bounds.
+        let clock = ManualSMBSleeper()
         let transport = ScriptedBlockingReceiveTransport(inbound: [])
         let session = SMBSession(
             host: "server",
             port: 445,
             credential: .anonymous,
             transport: transport,
-            cleanupTimeout: .milliseconds(25)
+            cleanupTimeout: .seconds(5),
+            cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
         )
-
-        await session.bestEffortClose(treeId: 1, fileId: [UInt8](repeating: 1, count: 16))
+        let closeTask = Task { await session.bestEffortClose(treeId: 1, fileId: [UInt8](repeating: 1, count: 16)) }
+        try await awaitWithTimeout("receive blocked after script") { await transport.waitUntilBlockedAfterScript() }
+        try await awaitWithTimeout("CLOSE reached production sent state") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        try await awaitWithTimeout("cleanup timer registered") {
+            await clock.waitUntilCallCount(atLeast: 1)
+        }
+        clock.fireNext()
+        try await awaitWithTimeout("best-effort CLOSE returned") { await closeTask.value }
 
         XCTAssertTrue(transport.didBlockAfterScript)
-        XCTAssertEqual(transport.closeCount, 1)
+        XCTAssertEqual(transport.closeCount, 0)
+        let tombstoneCount = await session.cleanupTombstoneCountForTesting()
+        let ledgerCount = await session.cleanupLedgerCountForTesting()
+        XCTAssertEqual(tombstoneCount, 1)
+        XCTAssertEqual(ledgerCount, 1)
     }
 
     func testDisconnectInvalidatesTransportWhenTreeDisconnectResponseIsMissing() async {
@@ -2590,21 +2623,33 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(transport.closeCount, 1)
     }
 
-    func testCloseCreatedHandleInvalidatesTransportWhenCloseResponseIsMissing() async {
+    func testCloseCreatedHandleTimeoutThrowsWithoutInvalidatingTransport() async throws {
+        let clock = ManualSMBSleeper()
         let transport = ScriptedBlockingReceiveTransport(inbound: [])
         let session = SMBSession(
             host: "server",
             port: 445,
             credential: .anonymous,
             transport: transport,
-            cleanupTimeout: .milliseconds(25)
+            cleanupTimeout: .seconds(5),
+            cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
         )
-
-        do {
+        let closeTask = Task {
             try await session.closeCreatedHandle(
                 treeId: 1,
                 fileId: [UInt8](repeating: 1, count: 16)
             )
+        }
+        try await awaitWithTimeout("receive blocked after script") { await transport.waitUntilBlockedAfterScript() }
+        try await awaitWithTimeout("CLOSE reached production sent state") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        try await awaitWithTimeout("cleanup timer registered") {
+            await clock.waitUntilCallCount(atLeast: 1)
+        }
+        clock.fireNext()
+        do {
+            try await awaitWithTimeout("CLOSE timeout returned") { try await closeTask.value }
             XCTFail("CLOSE unexpectedly completed without a response")
         } catch SMBTransportError.timedOut {
         } catch {
@@ -2612,7 +2657,11 @@ final class SMBeeTests: XCTestCase {
         }
 
         XCTAssertTrue(transport.didBlockAfterScript)
-        XCTAssertEqual(transport.closeCount, 1)
+        XCTAssertEqual(transport.closeCount, 0)
+        let tombstoneCount = await session.cleanupTombstoneCountForTesting()
+        let ledgerCount = await session.cleanupLedgerCountForTesting()
+        XCTAssertEqual(tombstoneCount, 1)
+        XCTAssertEqual(ledgerCount, 1)
     }
 
     func testSMBeeDownloadDirectoryOperationTimeout() async throws {

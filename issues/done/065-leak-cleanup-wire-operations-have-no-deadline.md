@@ -112,3 +112,16 @@ cleanupを必ず終わらせる要件が衝突するため、明示的なsession
 - cleanup failure/timeout時はtransportを閉じ、pending responseとcredit waiterをdrainする。
 - `closeTransport()`をidempotent化し、複数cleanup pathが競合してもtransport closeは1回にした。
 - responseを返さないtransport fixtureでCLOSEとTREE_DISCONNECTの回帰testを追加した。
+
+## 2026-10-01 追記: issue 069 M1 による FileId CLOSE 契約の変更
+
+上記「cleanup failure/timeout時はtransportを閉じる」は **TREE_DISCONNECT / `disconnect` には引き続き適用**する。
+FileId の `bestEffortClose` / `closeCreatedHandle` は issue 069 M1 で次の契約へ変更した。
+
+- CLOSE の `cleanupTimeout` は呼び出し元の待ちだけを終える。送信完了後は pending response を cleanup tombstone として保持し、SMB CANCEL は送らない。
+- 期限時点で send 中なら frame が全送信されたか判別できないため wire fault として session を閉じる。送信前なら FileId を `retiredUnknown` にして CLOSE を中止する。
+- 遅延した最終成功応答で FileId を解決する。`STATUS_CANCELLED` または失敗 status は FileId を `retiredUnknown` にする。どちらも通常の status 結果だけでは共有 transport を閉じない。wire fault は従来どおり閉じる。
+- 未解決 FileId ledger は `.sending` を含めて64件まで。送信済み CLOSE が tombstone のまま残る上限は session の `requestTimeout` と同じ期間で、`requestTimeout == nil` なら件数上限だけで制限する。件数上限または drain 上限を超えると session を閉じる。
+- ledger に未解決または `retiredUnknown` として残る FileId の後続 wire 操作は admission で拒否する。成功応答後に同じ FileId を使う内部経路は監査で見つからなかった。
+
+receive failure、send failure、frame / 相関 / 署名異常は、cleanup CLOSE の caller が既に戻った後でも共有 transport を閉じ、pending response と credit waiter を失敗させる。credit を保持した CLOSE に応答がない場合、他の credit waiter は drain 上限まで待つことがある。

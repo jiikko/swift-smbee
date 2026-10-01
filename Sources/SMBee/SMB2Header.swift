@@ -227,10 +227,18 @@ actor SMB2CreditWindow {
         let continuation: CheckedContinuation<UInt32, Error>
     }
 
+    private struct PendingWaiterCountObserver {
+        let id: UInt64
+        let target: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
     private var available: UInt32
     private let diagnosticSessionId: String
     private var waiters: [Waiter] = []
+    private var waiterCountWaiters: [PendingWaiterCountObserver] = []
     private var nextWaiterId: UInt64 = 0
+    private var nextWaiterCountObserverId: UInt64 = 0
     private var state: State = .active
 
     init(initialCredits: UInt32 = 1, diagnosticSessionId: String) {
@@ -244,6 +252,30 @@ actor SMB2CreditWindow {
 
     var pendingWaiterCount: Int {
         waiters.count
+    }
+
+    func waitForPendingWaiterCount(atLeast count: Int) async {
+        let id = nextWaiterCountObserverId
+        nextWaiterCountObserverId &+= 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled || waiters.count >= count || isFailed {
+                    continuation.resume()
+                } else {
+                    waiterCountWaiters.append(PendingWaiterCountObserver(
+                        id: id,
+                        target: count,
+                        continuation: continuation
+                    ))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelPendingWaiterCountObserver(id: id) }
+        }
+    }
+
+    var pendingWaiterCountObserverCountForTesting: Int {
+        waiterCountWaiters.count
     }
 
     func reserve(
@@ -284,6 +316,7 @@ actor SMB2CreditWindow {
                     enqueuedAt: enqueuedAt,
                     continuation: continuation
                 ))
+                resumeWaiterCountWaiters()
                 SMBPerfLog.line(
                     "[wire] credit_wait session=\(diagnosticSessionId) " +
                         "\(Self.identityFields(messageId: messageId, command: command))" +
@@ -305,6 +338,7 @@ actor SMB2CreditWindow {
         state = .failed(error)
         let parked = waiters
         waiters.removeAll()
+        resumeAllWaiterCountObservers()
         for waiter in parked {
             waiter.continuation.resume(throwing: error)
         }
@@ -313,6 +347,7 @@ actor SMB2CreditWindow {
     func reset(initialCredits: UInt32) {
         let parked = waiters
         waiters.removeAll()
+        resumeAllWaiterCountObservers()
         for waiter in parked {
             waiter.continuation.resume(throwing: CancellationError())
         }
@@ -324,6 +359,7 @@ actor SMB2CreditWindow {
         guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
         let waiter = waiters.remove(at: index)
         waiter.continuation.resume(throwing: CancellationError())
+        resumeWaiterCountWaiters()
         resumeReadyWaiters()
     }
 
@@ -361,6 +397,38 @@ actor SMB2CreditWindow {
             }
             waiter.continuation.resume(returning: available)
         }
+        resumeWaiterCountWaiters()
+    }
+
+    private func resumeWaiterCountWaiters() {
+        var remaining: [PendingWaiterCountObserver] = []
+        for observer in waiterCountWaiters {
+            if waiters.count >= observer.target {
+                observer.continuation.resume()
+            } else {
+                remaining.append(observer)
+            }
+        }
+        waiterCountWaiters = remaining
+    }
+
+    private func resumeAllWaiterCountObservers() {
+        let observers = waiterCountWaiters
+        waiterCountWaiters.removeAll()
+        for observer in observers {
+            observer.continuation.resume()
+        }
+    }
+
+    private func cancelPendingWaiterCountObserver(id: UInt64) {
+        guard let index = waiterCountWaiters.firstIndex(where: { $0.id == id }) else { return }
+        let observer = waiterCountWaiters.remove(at: index)
+        observer.continuation.resume()
+    }
+
+    private var isFailed: Bool {
+        if case .failed = state { return true }
+        return false
     }
 
     private static func identityFields(messageId: UInt64?, command: UInt16?) -> String {

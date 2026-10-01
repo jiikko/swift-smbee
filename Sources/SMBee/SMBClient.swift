@@ -3998,6 +3998,16 @@ private enum SMBPendingResponseSendPhase {
     case sent
 }
 
+private struct SMBFileIdLedgerKey: Hashable {
+    let bytes: [UInt8]
+}
+
+private enum SMBCleanupAttemptState: Equatable {
+    case sending
+    case draining(UInt64)
+    case retiredUnknown
+}
+
 private struct SMBPendingResponse {
     let label: String
     let longPoll: Bool
@@ -4015,6 +4025,26 @@ private struct SMBPendingResponse {
     var sendPhase: SMBPendingResponseSendPhase
     var cancellationRequested = false
     var continuationResumed = false
+    var cleanupFileId: SMBFileIdLedgerKey?
+    var cleanupTombstone = false
+    var cleanupTimeoutTask: Task<Void, Never>?
+    var cleanupDrainTask: Task<Void, Never>?
+}
+
+private enum SMBTestingCountWaitKind: Equatable {
+    case pendingResponses
+    case requestSent
+    case requestSentWaiterRegistrations
+    case cleanupLedger
+    case receivedPacketDispatches
+}
+
+private struct SMBTestingCountWaiter {
+    let id: UInt64
+    let kind: SMBTestingCountWaitKind
+    let target: Int
+    let isAtLeast: Bool
+    let continuation: CheckedContinuation<Void, Never>
 }
 
 /// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
@@ -4027,6 +4057,7 @@ private struct SMBPendingResponse {
 /// SMB server と呼び出し元の ordering に依存するため、共有 session API を公開する際に別途整理する。
 actor SMBSession {
     private static let defaultCleanupTimeout: Duration = .seconds(5)
+    private static let maxCleanupAttempts = 64
     private static let diagnosticSessionIdLock = NSLock()
     nonisolated(unsafe) private static var nextDiagnosticSessionNumber: UInt64 = 1
 
@@ -4071,7 +4102,10 @@ actor SMBSession {
     private let creditWindow: SMB2CreditWindow
     private let initialCredits: UInt32
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
-    private var pendingCountWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var cleanupLedger: [SMBFileIdLedgerKey: SMBCleanupAttemptState] = [:]
+    private var testingCountWaiters: [SMBTestingCountWaiter] = []
+    private var nextTestingCountWaiterId: UInt64 = 0
+    private var requestSentWaiterRegistrationCountForTestingStorage = 0
     private var orphanResponses: [UInt64: SMBReceivedFrame] = [:]
     private static let maxOrphanResponses = 64
     private var receiveLoopRunning = false
@@ -4083,6 +4117,7 @@ actor SMBSession {
     private let cleanupTimeout: Duration
     private let requestTimeout: Duration?
     private let requestTimeoutSleeper: @Sendable (Duration) async throws -> Void
+    private let cleanupTimeoutSleeper: @Sendable (Duration) async throws -> Void
 
     /// - Parameter requestTimeout: Per-request response timeout started only after the
     ///   complete request has been sent. It is independent of transport socket timeouts;
@@ -4099,6 +4134,9 @@ actor SMBSession {
         cleanupTimeout: Duration = SMBSession.defaultCleanupTimeout,
         requestTimeout: Duration? = nil,
         requestTimeoutSleeper: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        },
+        cleanupTimeoutSleeper: @escaping @Sendable (Duration) async throws -> Void = {
             try await Task.sleep(for: $0)
         }
     ) {
@@ -4125,6 +4163,7 @@ actor SMBSession {
         self.cleanupTimeout = cleanupTimeout
         self.requestTimeout = requestTimeout
         self.requestTimeoutSleeper = requestTimeoutSleeper
+        self.cleanupTimeoutSleeper = cleanupTimeoutSleeper
     }
 
     func connect() async throws {
@@ -4328,14 +4367,6 @@ actor SMBSession {
             let fileId = try await create(treeId: treeId, request: .delete(path: path, directory: true))
             try await closeCreatedHandle(treeId: treeId, fileId: fileId)
         }
-    }
-
-    func queryDirectory(treeId: UInt32, fileId: [UInt8]) async throws -> [SMBDirectoryEntry] {
-        let collector = SMBDirectoryEntryCollector()
-        try await queryDirectory(treeId: treeId, fileId: fileId) { entry in
-            collector.append(entry)
-        }
-        return collector.entries
     }
 
     /// - Note: `searchPattern` は MS-SMB2 の正式な機能だが、**SMBee 内部に利用者はいない**
@@ -5338,41 +5369,34 @@ actor SMBSession {
     func close(treeId: UInt32, fileId: [UInt8]) async throws {
         let packet = try SMB2Close.encodeRequest(messageId: nextMessageId(), sessionId: sessionId, treeId: treeId, fileId: fileId)
         debugDump("CLOSE request", packet)
-        let response = try await signedWireTransaction(packet: packet, responseLabel: "CLOSE response")
-        if SMBPerfLog.effectiveIsEnabled, let header = try? SMB2Header.decode(response) {
+        let response = try await signedWireTransaction(
+            packet: packet,
+            responseLabel: "CLOSE response",
+            cleanupFileId: fileId
+        )
+        let header = try SMB2Header.decode(response)
+        if SMBPerfLog.effectiveIsEnabled {
             SMBPerfLog.line("[wire] close_status session=\(diagnosticSessionId) file=\(Self.fileIdPrefix(fileId)) status=0x\(String(format: "%08x", header.status))")
         }
+        try SMBErrorMapper.throwIfFailure(status: header.status, operation: "CLOSE")
     }
 
-    /// CLOSE is part of the operation result for create/delete-on-close paths. If it fails,
-    /// the FileId lifetime is unknown and the session must not remain reusable.
     func closeCreatedHandle(treeId: UInt32, fileId: [UInt8]) async throws {
-        do {
-            try await SMBOperationDeadline.run(timeout: cleanupTimeout) {
-                try await self.close(treeId: treeId, fileId: fileId)
-            }
-        } catch {
-            closeTransport(cause: "close_created_handle", diagnosticError: error)
-            throw error
-        }
+        try await close(treeId: treeId, fileId: fileId)
     }
 
     /// Cleanup path: do not inherit caller cancellation while trying to release a handle.
     func bestEffortClose(treeId: UInt32, fileId: [UInt8]) async {
-        let timeout = cleanupTimeout
         let task = Task.detached { [self] in
             let started = SMBPerfLog.effectiveIsEnabled ? ContinuousClock.now : nil
             do {
-                try await SMBOperationDeadline.run(timeout: timeout) {
-                    try await self.close(treeId: treeId, fileId: fileId)
-                }
+                try await self.close(treeId: treeId, fileId: fileId)
             } catch {
                 if let started {
                     let elapsed = SMBPerfLog.milliseconds(ContinuousClock.now - started)
                     let timedOut = error is SMBTransportError && (error as? SMBTransportError) == .timedOut
                     SMBPerfLog.line("[wire] cleanup_close_failed session=\(diagnosticSessionId) file=\(Self.fileIdPrefix(fileId)) elapsed_ms=\(elapsed) error=\(Self.diagnosticError(error)) timeout=\(timedOut)")
                 }
-                await self.closeTransport(cause: "best_effort_close", diagnosticError: error)
             }
         }
         await task.value
@@ -5457,6 +5481,8 @@ actor SMBSession {
         transportClosed = true
         transport.close()
         failWire(error: SMBTransportError.connectionClosed)
+        cleanupLedger.removeAll()
+        resumeCleanupLedgerCountWaiters()
     }
 
     // Internal-only seams keep deterministic diagnostics tests independent of the process
@@ -5493,22 +5519,107 @@ actor SMBSession {
         await creditWindow.pendingWaiterCount
     }
 
-    func creditBalanceForTesting() async -> UInt32 {
-        await creditWindow.balance
+    func waitForPendingCountForTesting(atLeast count: Int) async {
+        await waitForTestingCount(.pendingResponses, atLeast: count)
     }
 
-    func waitForPendingCountForTesting(atLeast count: Int) async {
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            if pendingResponses.values.filter({ !$0.continuationResumed }).count >= count {
-                continuation.resume()
-            } else {
-                pendingCountWaiters.append((count, continuation))
-            }
+    func waitForRequestSentCountForTesting(atLeast count: Int) async {
+        await waitForTestingCount(.requestSent, atLeast: count)
+    }
+
+    func waitForRequestSentWaiterRegistrationCountForTesting(atLeast count: Int) async {
+        await waitForTestingCount(.requestSentWaiterRegistrations, atLeast: count)
+    }
+
+    func setSessionIdForTesting(_ sessionId: UInt64) {
+        self.sessionId = sessionId
+    }
+
+    func pendingAsyncIdForTesting(messageId: UInt64) -> UInt64? {
+        pendingResponses[messageId]?.asyncId
+    }
+
+    func parkCleanupPendingForTesting(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8]
+    ) async throws {
+        let fileKey = SMBFileIdLedgerKey(bytes: fileId)
+        cleanupLedger[fileKey] = .sending
+        resumeCleanupLedgerCountWaiters()
+        _ = try await withCheckedThrowingContinuation { continuation in
+            pendingResponses[messageId] = SMBPendingResponse(
+                label: "testing cleanup",
+                longPoll: false,
+                requestTimeoutPolicy: .eligible,
+                expectedCommand: SMB2Commands.close,
+                expectedSessionId: sessionId,
+                expectedTreeId: treeId,
+                continuation: continuation,
+                sendTask: nil,
+                timeoutTask: nil,
+                sendPhase: .registered,
+                cancellationRequested: false,
+                continuationResumed: false,
+                cleanupFileId: fileKey
+            )
+            pendingResponses[messageId]?.cleanupTimeoutTask = startCleanupTimeout(messageId: messageId)
         }
+    }
+
+    func queueOrphanAndMarkRequestSentForTesting(_ packet: [UInt8]) throws {
+        let header = try SMB2Header.decode(packet)
+        orphanResponses[header.messageId] = SMBReceivedFrame(bytes: packet, decryptedFromTransform: false)
+        _ = markRequestSent(messageId: header.messageId)
     }
 
     func pendingCountForTesting() -> Int {
         pendingResponses.values.filter { !$0.continuationResumed }.count
+    }
+
+    func wirePendingRecordCountForTesting() -> Int {
+        pendingResponses.count
+    }
+
+    func cleanupTombstoneCountForTesting() -> Int {
+        pendingResponses.values.filter(\.cleanupTombstone).count
+    }
+
+    func cleanupLedgerCountForTesting() -> Int {
+        cleanupLedger.count
+    }
+
+    func waitForCleanupLedgerCountForTesting(_ target: Int) async {
+        await waitForTestingCount(.cleanupLedger, equalTo: target)
+    }
+
+    func waitForCreditWaiterCountForTesting(atLeast count: Int) async {
+        await creditWindow.waitForPendingWaiterCount(atLeast: count)
+    }
+
+    func testingCountWaiterCountForTesting() -> Int {
+        testingCountWaiters.count
+    }
+
+    func cleanupAttemptStateForTesting(fileId: [UInt8]) -> String? {
+        guard let state = cleanupLedger[SMBFileIdLedgerKey(bytes: fileId)] else { return nil }
+        return switch state {
+        case .sending:
+            "sending"
+        case .draining(let messageId):
+            "draining:\(messageId)"
+        case .retiredUnknown:
+            "retiredUnknown"
+        }
+    }
+
+    func orphanResponseCountForTesting() -> Int {
+        orphanResponses.count
+    }
+
+    func requestDidTimeOutForTesting(messageId: UInt64, command: UInt16) {
+        requestDidTimeOut(messageId: messageId, command: command)
     }
 
     func sentPendingResponseCountForTesting() -> Int {
@@ -5539,24 +5650,131 @@ actor SMBSession {
         receivedPacketDispatchCountForTestingStorage
     }
 
+    func waitForReceivedPacketDispatchCountForTesting(atLeast target: Int) async {
+        await waitForTestingCount(.receivedPacketDispatches, atLeast: target)
+    }
+
     func dispatchReceivedPacketForTesting(_ packet: [UInt8]) throws {
         try dispatchReceivedPacket(SMBReceivedFrame(bytes: packet, decryptedFromTransform: false))
     }
 
-    private func resumePendingCountWaiters() {
-        var ready: [CheckedContinuation<Void, Never>] = []
-        var pending: [(Int, CheckedContinuation<Void, Never>)] = []
-        for (target, continuation) in pendingCountWaiters {
-            if pendingResponses.values.filter({ !$0.continuationResumed }).count >= target {
-                ready.append(continuation)
+    func dispatchReceivedPacketThenCancelForTesting(
+        _ packet: [UInt8],
+        cancel: @Sendable () -> Void
+    ) throws {
+        try dispatchReceivedPacket(SMBReceivedFrame(bytes: packet, decryptedFromTransform: false))
+        cancel()
+    }
+
+    private func waitForTestingCount(
+        _ kind: SMBTestingCountWaitKind,
+        atLeast target: Int
+    ) async {
+        await waitForTestingCount(kind, target: target, isAtLeast: true)
+    }
+
+    private func waitForTestingCount(
+        _ kind: SMBTestingCountWaitKind,
+        equalTo target: Int
+    ) async {
+        await waitForTestingCount(kind, target: target, isAtLeast: false)
+    }
+
+    private func waitForTestingCount(
+        _ kind: SMBTestingCountWaitKind,
+        target: Int,
+        isAtLeast: Bool
+    ) async {
+        let id = nextTestingCountWaiterId
+        nextTestingCountWaiterId &+= 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled || wireFailure != nil || testingCountSatisfied(kind, target: target, isAtLeast: isAtLeast) {
+                    continuation.resume()
+                } else {
+                    testingCountWaiters.append(SMBTestingCountWaiter(
+                        id: id,
+                        kind: kind,
+                        target: target,
+                        isAtLeast: isAtLeast,
+                        continuation: continuation
+                    ))
+                    if kind == .requestSent {
+                        requestSentWaiterRegistrationCountForTestingStorage += 1
+                        resumeRequestSentWaiterRegistrationCountWaiters()
+                    }
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelTestingCountWaiter(id: id) }
+        }
+    }
+
+    private func testingCountSatisfied(
+        _ kind: SMBTestingCountWaitKind,
+        target: Int,
+        isAtLeast: Bool
+    ) -> Bool {
+        let value: Int
+        switch kind {
+        case .pendingResponses:
+            value = pendingResponses.values.filter { !$0.continuationResumed }.count
+        case .requestSent:
+            value = requestSentCountForTestingStorage
+        case .requestSentWaiterRegistrations:
+            value = requestSentWaiterRegistrationCountForTestingStorage
+        case .cleanupLedger:
+            value = cleanupLedger.count
+        case .receivedPacketDispatches:
+            value = receivedPacketDispatchCountForTestingStorage
+        }
+        return isAtLeast ? value >= target : value == target
+    }
+
+    private func resumeSatisfiedTestingCountWaiters() {
+        var remaining: [SMBTestingCountWaiter] = []
+        for waiter in testingCountWaiters {
+            if testingCountSatisfied(waiter.kind, target: waiter.target, isAtLeast: waiter.isAtLeast) {
+                waiter.continuation.resume()
             } else {
-                pending.append((target, continuation))
+                remaining.append(waiter)
             }
         }
-        pendingCountWaiters = pending
-        for continuation in ready {
-            continuation.resume()
+        testingCountWaiters = remaining
+    }
+
+    private func resumeAllTestingCountWaiters() {
+        let waiters = testingCountWaiters
+        testingCountWaiters.removeAll()
+        for waiter in waiters {
+            waiter.continuation.resume()
         }
+    }
+
+    private func cancelTestingCountWaiter(id: UInt64) {
+        guard let index = testingCountWaiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = testingCountWaiters.remove(at: index)
+        waiter.continuation.resume()
+    }
+
+    private func resumePendingCountWaiters() {
+        resumeSatisfiedTestingCountWaiters()
+    }
+
+    private func resumeRequestSentCountWaiters() {
+        resumeSatisfiedTestingCountWaiters()
+    }
+
+    private func resumeRequestSentWaiterRegistrationCountWaiters() {
+        resumeSatisfiedTestingCountWaiters()
+    }
+
+    private func resumeCleanupLedgerCountWaiters() {
+        resumeSatisfiedTestingCountWaiters()
+    }
+
+    private func resumeReceivedPacketDispatchWaiters() {
+        resumeSatisfiedTestingCountWaiters()
     }
 
     private func unsignedWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
@@ -5602,7 +5820,8 @@ actor SMBSession {
         packet: [UInt8],
         responseLabel: String,
         verifySignature: Bool = true,
-        requestTimeoutPolicy: SMBRequestTimeoutPolicy = .eligible
+        requestTimeoutPolicy: SMBRequestTimeoutPolicy = .eligible,
+        cleanupFileId: [UInt8]? = nil
     ) async throws -> [UInt8] {
         let requestHeader = try SMB2Header.decode(packet)
         let response = try await withTaskCancellationHandler {
@@ -5611,9 +5830,14 @@ actor SMBSession {
                 responseLabel: responseLabel,
                 longPoll: false,
                 requestTimeoutPolicy: requestTimeoutPolicy,
+                cleanupFileId: cleanupFileId,
                 send: { packet, messageId in try await self.sendSigned(packet, messageId: messageId) }
             )
         } onCancel: {
+            // Cleanup CLOSE has an actor-owned timer and retains correlation state until the
+            // response is drained. Sending SMB CANCEL here would introduce a second, ambiguous
+            // FileId lifetime transition while the original CLOSE may still be in flight.
+            guard cleanupFileId == nil else { return }
             Task {
                 if let target = await self.cancelInFlightRequest(messageId: requestHeader.messageId) {
                     await self.sendCancelWithoutGate(target: target)
@@ -5654,6 +5878,7 @@ actor SMBSession {
         responseLabel: String,
         longPoll: Bool,
         requestTimeoutPolicy: SMBRequestTimeoutPolicy,
+        cleanupFileId: [UInt8]? = nil,
         send: @escaping @Sendable ([UInt8], UInt64) async throws -> Void
     ) async throws -> SMBReceivedFrame {
         let requestHeader = try SMB2Header.decode(packet)
@@ -5669,6 +5894,20 @@ actor SMBSession {
         if transportClosed {
             throw SMBTransportError.connectionClosed
         }
+        try validateFileIdAdmission(packet: packet, cleanupFileId: cleanupFileId)
+        let cleanupKey = cleanupFileId.map(SMBFileIdLedgerKey.init(bytes:))
+        if let cleanupKey {
+            guard cleanupLedger[cleanupKey] == nil else {
+                throw SMBCodecError.invalidValue("SMB FileId already has an unresolved CLOSE attempt")
+            }
+            guard cleanupLedger.count < Self.maxCleanupAttempts else {
+                let error = SMBCodecError.invalidValue("SMB cleanup ledger limit exceeded")
+                closeTransport(cause: "cleanup_ledger_limit", diagnosticError: error)
+                throw SMBTransportError.connectionClosed
+            }
+            cleanupLedger[cleanupKey] = .sending
+            resumeCleanupLedgerCountWaiters()
+        }
         return try await withCheckedThrowingContinuation { continuation in
             pendingResponses[requestHeader.messageId] = SMBPendingResponse(
                 label: responseLabel,
@@ -5682,8 +5921,12 @@ actor SMBSession {
                 timeoutTask: nil,
                 sendPhase: .registered,
                 cancellationRequested: false,
-                continuationResumed: false
+                continuationResumed: false,
+                cleanupFileId: cleanupKey
             )
+            if cleanupKey != nil {
+                pendingResponses[requestHeader.messageId]?.cleanupTimeoutTask = startCleanupTimeout(messageId: requestHeader.messageId)
+            }
             SMBPerfLog.line("[wire] pending session=\(diagnosticSessionId) message_id=\(requestHeader.messageId) command=\(requestHeader.command) label=\(responseLabel) ts_ns=\(SMBPerfLog.timestampNanoseconds())")
             let sendTask = Task {
                 do {
@@ -5712,6 +5955,120 @@ actor SMBSession {
             }
             pendingResponses[requestHeader.messageId]?.sendTask = sendTask
         }
+    }
+
+    /// FileIds are never returned by the public API (SMBDirectoryEntry.fileId is a file
+    /// index). Open/read/write/list/stat/watch/ACL/reparse/rename/copy paths keep each wire
+    /// FileId in a local operation scope and await all work using it before either CLOSE
+    /// helper runs. This admission check is a backstop for any later internal path: once a
+    /// CLOSE attempt starts, no new handle operation may use that 16-byte identity until a
+    /// successful CLOSE response resolves it. A failed or unknown identity stays retired.
+    private func validateFileIdAdmission(packet: [UInt8], cleanupFileId: [UInt8]?) throws {
+        let header = try SMB2Header.decode(packet)
+        guard let offset = Self.fileIdOffsetInRequest(command: header.command) else {
+            if cleanupFileId != nil {
+                throw SMBCodecError.invalidValue("cleanup CLOSE packet does not carry a FileId")
+            }
+            return
+        }
+        guard offset + 16 <= packet.count else { throw SMBCodecError.truncated }
+        let fileId = Array(packet[offset..<offset + 16])
+        if let cleanupFileId {
+            guard header.command == SMB2Commands.close, fileId == cleanupFileId else {
+                throw SMBCodecError.invalidValue("cleanup CLOSE FileId does not match its ledger key")
+            }
+            return
+        }
+        guard cleanupLedger[SMBFileIdLedgerKey(bytes: fileId)] == nil else {
+            throw SMBCodecError.invalidValue("SMB FileId is unresolved after CLOSE")
+        }
+    }
+
+    private static func fileIdOffsetInRequest(command: UInt16) -> Int? {
+        switch command {
+        case SMB2Commands.close, SMB2Commands.flush, SMB2Commands.lock,
+             SMB2Commands.ioctl, SMB2Commands.queryDirectory, SMB2Commands.changeNotify:
+            SMB2Header.encodedSize + 8
+        case SMB2Commands.read, SMB2Commands.write, SMB2Commands.setInfo:
+            SMB2Header.encodedSize + 16
+        case SMB2Commands.queryInfo:
+            SMB2Header.encodedSize + 24
+        default:
+            nil
+        }
+    }
+
+    private func startCleanupTimeout(messageId: UInt64) -> Task<Void, Never> {
+        let duration = cleanupTimeout
+        let sleeper = cleanupTimeoutSleeper
+        return Task.detached { [weak self] in
+            do {
+                try await sleeper(duration)
+            } catch {
+                return
+            }
+            await self?.cleanupTimeoutDidFire(messageId: messageId)
+        }
+    }
+
+    private func startCleanupDrainTimeout(messageId: UInt64, duration: Duration) -> Task<Void, Never> {
+        let sleeper = requestTimeoutSleeper
+        return Task.detached { [weak self] in
+            do {
+                try await sleeper(duration)
+            } catch {
+                return
+            }
+            await self?.cleanupDrainTimeoutDidFire(messageId: messageId)
+        }
+    }
+
+    private func cleanupTimeoutDidFire(messageId: UInt64) {
+        guard var pending = pendingResponses[messageId],
+              let fileId = pending.cleanupFileId,
+              !pending.continuationResumed else {
+            return
+        }
+        pending.cleanupTimeoutTask = nil
+        pending.timeoutTask?.cancel()
+        pending.timeoutTask = nil
+
+        switch pending.sendPhase {
+        case .registered:
+            pendingResponses.removeValue(forKey: messageId)
+            pending.sendTask?.cancel()
+            cleanupLedger[fileId] = .retiredUnknown
+            resumeCleanupLedgerCountWaiters()
+            pending.continuationResumed = true
+            pending.continuation.resume(throwing: SMBTransportError.timedOut)
+            resumePendingCountWaiters()
+        case .sending:
+            // The transport has no complete-frame send acknowledgement. At this point a CLOSE
+            // may be partial or complete, so this is a wire fault and the session must close.
+            closeTransport(cause: "cleanup_close_timeout_sending", diagnosticError: SMBTransportError.timedOut)
+        case .sent:
+            pending.cleanupTombstone = true
+            pending.continuationResumed = true
+            cleanupLedger[fileId] = .draining(messageId)
+            pending.cleanupDrainTask = requestTimeout.map {
+                startCleanupDrainTimeout(messageId: messageId, duration: $0)
+            }
+            pendingResponses[messageId] = pending
+            pending.continuation.resume(throwing: SMBTransportError.timedOut)
+        }
+    }
+
+    private func cleanupDrainTimeoutDidFire(messageId: UInt64) {
+        guard let pending = pendingResponses[messageId],
+              pending.cleanupTombstone,
+              let fileId = pending.cleanupFileId,
+              cleanupLedger[fileId] == .draining(messageId) else {
+            return
+        }
+        // requestTimeout is the response tolerance for this session; a nil value intentionally
+        // leaves only the 64-entry ledger bound. We cannot restore credit until the server grants it,
+        // so unrelated credit waiters may remain parked until this bound closes the session.
+        closeTransport(cause: "cleanup_close_drain_timeout", diagnosticError: SMBTransportError.timedOut)
     }
 
     nonisolated private static func sendAndLog(
@@ -5904,7 +6261,13 @@ actor SMBSession {
                 let frame = try await receiveDecryptedFrame(label: "SMB response")
                 try dispatchReceivedPacket(frame)
             } catch {
-                failWire(error: error)
+                if pendingResponses.values.contains(where: { $0.cleanupFileId != nil }) {
+                    closeTransport(cause: "cleanup_close_receive_failure", diagnosticError: error)
+                } else {
+                    // Preserve the existing receive-fault path for TREE_DISCONNECT and all
+                    // non-cleanup operations; their wrappers own the terminal teardown policy.
+                    failWire(error: error)
+                }
                 receiveLoopRunning = false
                 return
             }
@@ -5913,7 +6276,10 @@ actor SMBSession {
     }
 
     private func dispatchReceivedPacket(_ frame: SMBReceivedFrame) throws {
-        defer { receivedPacketDispatchCountForTestingStorage += 1 }
+        defer {
+            receivedPacketDispatchCountForTestingStorage += 1
+            resumeReceivedPacketDispatchWaiters()
+        }
         let packet = frame.bytes
         let header = try SMB2Header.decode(packet)
         SMBPerfLog.line("[wire] recv session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "") ts_ns=\(SMBPerfLog.timestampNanoseconds())")
@@ -5942,9 +6308,29 @@ actor SMBSession {
         // SESSION_SETUP/legacy test and server responses may carry zero session/tree
         // before the authenticated context is established; once populated, both are
         // part of the correlation key.
-        guard header.command == pending.expectedCommand,
-              pending.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == pending.expectedSessionId else {
+        guard header.command == pending.expectedCommand else {
             throw SMBCodecError.invalidValue("SMB response correlation mismatch command=\(header.command)/\(pending.expectedCommand) session=\(header.sessionId)/\(pending.expectedSessionId)")
+        }
+        if pending.cleanupFileId != nil {
+            guard header.sessionId == pending.expectedSessionId else {
+                throw SMBCodecError.invalidValue("SMB cleanup response correlation mismatch session=\(header.sessionId)/\(pending.expectedSessionId)")
+            }
+            // MS-SMB2 §3.2.5.1.3 forbids the client from verifying interim STATUS_PENDING
+            // signatures; the server is also advised not to sign them (§3.3.4.2). Final
+            // cleanup responses and other non-interim frames remain signature-verified.
+            if try !SMB2AsyncInterim.isInterim(header) {
+                try verifySigned(frame)
+            }
+            if !header.isAsync {
+                guard header.treeId == pending.expectedTreeId else {
+                    throw SMBCodecError.invalidValue("SMB cleanup response correlation mismatch tree=\(header.treeId)/\(pending.expectedTreeId)")
+                }
+            }
+        } else {
+            // SESSION_SETUP and legacy responses may use zero before authentication; preserve that rule outside cleanup.
+            guard pending.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == pending.expectedSessionId else {
+                throw SMBCodecError.invalidValue("SMB response correlation mismatch command=\(header.command)/\(pending.expectedCommand) session=\(header.sessionId)/\(pending.expectedSessionId)")
+            }
         }
         // Async responses carry an AsyncId instead of a TreeId (MS-SMB2 §2.2.1.1); the
         // TreeId correlation below therefore applies to sync responses only. The AsyncId
@@ -5955,19 +6341,31 @@ actor SMBSession {
         // down every unrelated in-flight operation (issues/078 review M1/M2).
         if try SMB2AsyncInterim.isInterim(header) {
             guard let interimAsyncId = header.asyncId, interimAsyncId != 0 else {
+                if pending.cleanupFileId != nil {
+                    throw SMBCodecError.invalidValue("SMB2 STATUS_PENDING cleanup interim carries a zero AsyncId")
+                }
                 failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 STATUS_PENDING interim carries a zero AsyncId")
                 return
             }
             if let storedAsyncId = pending.asyncId {
                 guard storedAsyncId == interimAsyncId else {
+                    if pending.cleanupFileId != nil {
+                        throw SMBCodecError.invalidValue("SMB2 cleanup interim AsyncId mismatch \(interimAsyncId)/\(storedAsyncId)")
+                    }
                     failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 interim AsyncId mismatch \(interimAsyncId)/\(storedAsyncId)")
                     return
                 }
             } else {
+                // An unsigned interim can establish an AsyncId, but its value is not
+                // authenticated. The signed final response must match it; a substituted
+                // AsyncId therefore becomes a wire fault at final-response correlation.
                 pending.asyncId = interimAsyncId
             }
             pending.pendingCount += 1
             if !pending.longPoll && pending.pendingCount > SMB2AsyncInterim.maxPendingResponses {
+                if pending.cleanupFileId != nil {
+                    throw SMBCodecError.invalidValue("too many cleanup CLOSE STATUS_PENDING responses")
+                }
                 pendingResponses.removeValue(forKey: header.messageId)
                 pending.timeoutTask?.cancel()
                 if !pending.continuationResumed {
@@ -5986,6 +6384,11 @@ actor SMBSession {
             // A final async response is only valid for a request that was seen going
             // async, and it must carry the AsyncId stored from the interim.
             guard let storedAsyncId = pending.asyncId, header.asyncId == storedAsyncId else {
+                if pending.cleanupFileId != nil {
+                    throw SMBCodecError.invalidValue(
+                        "SMB2 cleanup async final AsyncId mismatch \(header.asyncId.map(String.init) ?? "nil")/\(pending.asyncId.map(String.init) ?? "no interim")"
+                    )
+                }
                 failCorrelatedRequest(
                     messageId: header.messageId,
                     pending: pending,
@@ -5995,15 +6398,32 @@ actor SMBSession {
             }
         } else if !pending.continuationResumed {
             guard pending.asyncId == nil else {
+                if pending.cleanupFileId != nil {
+                    throw SMBCodecError.invalidValue("SMB2 cleanup sync final response after async interim (message id \(header.messageId))")
+                }
                 failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 sync final response after async interim (message id \(header.messageId))")
                 return
             }
-            guard pending.expectedTreeId == 0 || header.treeId == 0 || header.treeId == pending.expectedTreeId else {
+            guard pending.cleanupFileId != nil || pending.expectedTreeId == 0 || header.treeId == 0 || header.treeId == pending.expectedTreeId else {
                 throw SMBCodecError.invalidValue("SMB response correlation mismatch tree=\(header.treeId)/\(pending.expectedTreeId)")
+            }
+        } else if pending.cleanupFileId != nil {
+            guard pending.asyncId == nil else {
+                throw SMBCodecError.invalidValue("SMB2 cleanup sync final response after async interim (message id \(header.messageId))")
             }
         }
         pendingResponses.removeValue(forKey: header.messageId)
         pending.timeoutTask?.cancel()
+        pending.cleanupTimeoutTask?.cancel()
+        pending.cleanupDrainTask?.cancel()
+        if let cleanupFileId = pending.cleanupFileId {
+            if header.status == SMB2Status.success {
+                cleanupLedger.removeValue(forKey: cleanupFileId)
+            } else {
+                cleanupLedger[cleanupFileId] = .retiredUnknown
+            }
+            resumeCleanupLedgerCountWaiters()
+        }
         if !pending.continuationResumed {
             pending.continuationResumed = true
             pending.continuation.resume(returning: frame)
@@ -6026,7 +6446,10 @@ actor SMBSession {
         }
         requestSentCountForTestingStorage += 1
         pending.sendPhase = .sent
-        if pending.cancellationRequested {
+        if let cleanupFileId = pending.cleanupFileId {
+            cleanupLedger[cleanupFileId] = .draining(messageId)
+            resumeCleanupLedgerCountWaiters()
+        } else if pending.cancellationRequested {
             // Keep the cancellation tombstone: a later interim must still be able to
             // store its AsyncId so the final response can be correlated (issues/078).
         } else if pending.requestTimeoutPolicy.isEligible, let requestTimeout {
@@ -6042,11 +6465,16 @@ actor SMBSession {
             }
         }
         pendingResponses[messageId] = pending
+        resumeRequestSentCountWaiters()
         if let orphan = orphanResponses.removeValue(forKey: messageId) {
             do {
                 try dispatchReceivedPacket(orphan)
             } catch {
-                failPendingResponse(messageId: messageId, error: error)
+                if pending.cleanupFileId != nil {
+                    closeTransport(cause: "cleanup_close_orphan_dispatch", diagnosticError: error)
+                } else {
+                    failPendingResponse(messageId: messageId, error: error)
+                }
                 return nil
             }
         }
@@ -6064,6 +6492,11 @@ actor SMBSession {
     }
 
     private func requestDidTimeOut(messageId: UInt64, command: UInt16) {
+        if let pending = pendingResponses[messageId], pending.cleanupTombstone {
+            // A request timeout may already have been enqueued when cleanup converted this
+            // record into a tombstone; retain it so a delayed CLOSE remains correlated.
+            return
+        }
         guard var pending = pendingResponses.removeValue(forKey: messageId),
               !pending.continuationResumed else {
             return
@@ -6164,6 +6597,8 @@ actor SMBSession {
         orphanResponses.removeAll()
         for var waiter in pending.values {
             waiter.timeoutTask?.cancel()
+            waiter.cleanupTimeoutTask?.cancel()
+            waiter.cleanupDrainTask?.cancel()
             // A cancelled tombstone may still own a blocked send task. It must be cancelled
             // even though its continuation has already been resumed.
             waiter.sendTask?.cancel()
@@ -6191,6 +6626,7 @@ actor SMBSession {
         if firstFault {
             SMBPerfLog.line("[wire] first_fault session=\(diagnosticSessionId) error=\(Self.diagnosticError(error))")
         }
+        resumeAllTestingCountWaiters()
         failAllPendingResponses(error: failure)
     }
 
@@ -6233,6 +6669,7 @@ actor SMBSession {
     }
 
     private func recordCreditGrant(_ packet: [UInt8], label: String) async {
+        // Known order: credits are applied before signature/correlation dispatch; do not special-case cleanup here. Any fix must cover every response path.
         guard let header = try? SMB2Header.decode(packet) else { return }
         let balance = await creditWindow.grant(header.credits)
         debugLine("\(label) credit grant=\(header.credits) balance=\(balance)")

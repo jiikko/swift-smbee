@@ -8133,7 +8133,7 @@ final class SMBeeTests: XCTestCase {
             treeId: 0x3344,
             shareType: 1,
             shareFlags: SMBTreeConnectConstants.shareFlagEncryptData,
-            capabilities: SMBTreeConnectConstants.shareCapEncryptData,
+            capabilities: SMBTreeConnectConstants.shareCapDFS,
             maximalAccess: 0x001f_01ff
         )
 
@@ -8142,9 +8142,24 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(parsed.treeId, 0x3344)
         XCTAssertEqual(parsed.shareType, 1)
         XCTAssertEqual(parsed.shareFlags, SMBTreeConnectConstants.shareFlagEncryptData)
-        XCTAssertEqual(parsed.capabilities, SMBTreeConnectConstants.shareCapEncryptData)
+        XCTAssertEqual(parsed.capabilities, SMBTreeConnectConstants.shareCapDFS)
         XCTAssertTrue(parsed.encryptionRequired)
         XCTAssertEqual(parsed.maximalAccess, 0x001f_01ff)
+    }
+
+    func testTreeConnectDFSShareCapabilityDoesNotRequireEncryption() throws {
+        let response = try smb2TreeConnectResponse(
+            treeId: 0x3344,
+            shareType: 1,
+            shareFlags: 0,
+            capabilities: SMBTreeConnectConstants.shareCapDFS,
+            maximalAccess: 0x001f_01ff
+        )
+
+        let parsed = try SMB2TreeConnect.decodeResponse(response)
+
+        XCTAssertEqual(parsed.capabilities, SMBTreeConnectConstants.shareCapDFS)
+        XCTAssertFalse(parsed.encryptionRequired)
     }
 
     func testSetInfoBasicRequestUsesFileBasicInformation() throws {

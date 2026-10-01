@@ -388,14 +388,13 @@ struct SMBTreeConnectResult: Equatable, Sendable {
     var maximalAccess: UInt32
 
     var encryptionRequired: Bool {
-        (shareFlags & SMBTreeConnectConstants.shareFlagEncryptData) != 0 ||
-            (capabilities & SMBTreeConnectConstants.shareCapEncryptData) != 0
+        (shareFlags & SMBTreeConnectConstants.shareFlagEncryptData) != 0
     }
 }
 
 enum SMBTreeConnectConstants {
     static let shareFlagEncryptData: UInt32 = 0x0000_8000
-    static let shareCapEncryptData: UInt32 = 0x0000_0008
+    static let shareCapDFS: UInt32 = 0x0000_0008
 }
 
 public struct SMBReadRange: Equatable, Sendable {

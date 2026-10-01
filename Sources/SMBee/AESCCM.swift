@@ -10,7 +10,98 @@ public enum AESCCM {
         authenticatedData: [UInt8],
         tagLength: Int = 16
     ) throws -> (ciphertext: [UInt8], tag: [UInt8]) {
-        try validate(key: key, nonce: nonce, tagLength: tagLength)
+        try validate(key: key, nonce: nonce, tagLength: tagLength, messageLength: plaintext.count)
+        #if canImport(CryptoExtras) && !canImport(CommonCrypto)
+        if nonce.count == 11 {
+            return try AESCCMCryptoExtras.sealValidated(
+                key: key,
+                nonce: nonce,
+                plaintext: plaintext,
+                authenticatedData: authenticatedData,
+                tagLength: tagLength
+            )
+        }
+        #endif
+        return try fallbackSeal(
+            key: key,
+            nonce: nonce,
+            plaintext: plaintext,
+            authenticatedData: authenticatedData,
+            tagLength: tagLength
+        )
+    }
+
+    public static func open(
+        key: [UInt8],
+        nonce: [UInt8],
+        ciphertext: [UInt8],
+        authenticatedData: [UInt8],
+        tag: [UInt8]
+    ) throws -> [UInt8] {
+        try validate(key: key, nonce: nonce, tagLength: tag.count, messageLength: ciphertext.count)
+        #if canImport(CryptoExtras) && !canImport(CommonCrypto)
+        if nonce.count == 11 {
+            return try AESCCMCryptoExtras.openValidated(
+                key: key,
+                nonce: nonce,
+                ciphertext: ciphertext,
+                authenticatedData: authenticatedData,
+                tag: tag
+            )
+        }
+        #endif
+        return try fallbackOpen(
+            key: key,
+            nonce: nonce,
+            ciphertext: ciphertext,
+            authenticatedData: authenticatedData,
+            tag: tag
+        )
+    }
+
+    /// The portable backend (CommonCrypto on Apple, pure Swift elsewhere), callable with any nonce length.
+    /// On Linux this is what non-11-byte nonces use, so tests compare the CryptoExtras path against it.
+    static func sealFallback(
+        key: [UInt8],
+        nonce: [UInt8],
+        plaintext: [UInt8],
+        authenticatedData: [UInt8],
+        tagLength: Int = 16
+    ) throws -> (ciphertext: [UInt8], tag: [UInt8]) {
+        try validate(key: key, nonce: nonce, tagLength: tagLength, messageLength: plaintext.count)
+        return try fallbackSeal(
+            key: key,
+            nonce: nonce,
+            plaintext: plaintext,
+            authenticatedData: authenticatedData,
+            tagLength: tagLength
+        )
+    }
+
+    static func openFallback(
+        key: [UInt8],
+        nonce: [UInt8],
+        ciphertext: [UInt8],
+        authenticatedData: [UInt8],
+        tag: [UInt8]
+    ) throws -> [UInt8] {
+        try validate(key: key, nonce: nonce, tagLength: tag.count, messageLength: ciphertext.count)
+        return try fallbackOpen(
+            key: key,
+            nonce: nonce,
+            ciphertext: ciphertext,
+            authenticatedData: authenticatedData,
+            tag: tag
+        )
+    }
+
+    private static func fallbackSeal(
+        key: [UInt8],
+        nonce: [UInt8],
+        plaintext: [UInt8],
+        authenticatedData: [UInt8],
+        tagLength: Int
+    ) throws -> (ciphertext: [UInt8], tag: [UInt8]) {
         let operationKey = try prepareOperationKey(key)
         let tag = try authenticationTag(
             operationKey: operationKey,
@@ -24,14 +115,13 @@ public enum AESCCM {
         return (stream, encryptedTag)
     }
 
-    public static func open(
+    private static func fallbackOpen(
         key: [UInt8],
         nonce: [UInt8],
         ciphertext: [UInt8],
         authenticatedData: [UInt8],
         tag: [UInt8]
     ) throws -> [UInt8] {
-        try validate(key: key, nonce: nonce, tagLength: tag.count)
         let operationKey = try prepareOperationKey(key)
         let plaintext = try ctrCrypt(operationKey: operationKey, nonce: nonce, input: ciphertext)
         // Recompute the CBC-MAC over the decrypted plaintext directly (issues/014):
@@ -51,6 +141,26 @@ public enum AESCCM {
         return plaintext
     }
 
+    static func validate(key: [UInt8], nonce: [UInt8], tagLength: Int, messageLength: Int) throws {
+        guard key.count == 16 else { throw SMBCodecError.invalidValue("AES-CCM requires a 16-byte key") }
+        guard (7...13).contains(nonce.count) else { throw SMBCodecError.invalidValue("AES-CCM nonce must be 7...13 bytes") }
+        guard (4...16).contains(tagLength), tagLength % 2 == 0 else {
+            throw SMBCodecError.invalidValue("AES-CCM tag length must be even and 4...16 bytes")
+        }
+        guard isMessageLengthAllowed(messageLength, nonceLength: nonce.count) else {
+            throw SMBCodecError.invalidValue("AES-CCM message too large for nonce length")
+        }
+    }
+
+    static func isMessageLengthAllowed(_ messageLength: Int, nonceLength: Int) -> Bool {
+        guard messageLength >= 0, (7...13).contains(nonceLength) else { return false }
+        let q = 15 - nonceLength
+        // q >= 8 (nonce 7 バイト) は Int の全域が表現可能なので長さ制限は不要。
+        // Swift の << は過剰シフトで 0 になるため、そのまま比較すると全 message を
+        // 誤って reject する (codex P2)。
+        return q >= 8 || messageLength < (1 << (8 * q))
+    }
+
     private static func encryptTag(
         _ tag: [UInt8], operationKey: [UInt8], nonce: [UInt8]
     ) throws -> [UInt8] {
@@ -62,14 +172,6 @@ public enum AESCCM {
         return encryptedTag
     }
 
-    private static func validate(key: [UInt8], nonce: [UInt8], tagLength: Int) throws {
-        guard key.count == 16 else { throw SMBCodecError.invalidValue("AES-CCM requires a 16-byte key") }
-        guard (7...13).contains(nonce.count) else { throw SMBCodecError.invalidValue("AES-CCM nonce must be 7...13 bytes") }
-        guard (4...16).contains(tagLength), tagLength % 2 == 0 else {
-            throw SMBCodecError.invalidValue("AES-CCM tag length must be even and 4...16 bytes")
-        }
-    }
-
     private static func authenticationTag(
         operationKey: [UInt8],
         nonce: [UInt8],
@@ -78,12 +180,6 @@ public enum AESCCM {
         tagLength: Int
     ) throws -> [UInt8] {
         let q = 15 - nonce.count
-        // q >= 8 (nonce 7 バイト) は Int の全域が表現可能なので長さ制限は不要。
-        // Swift の << は過剰シフトで 0 になるため、そのまま比較すると全 message を
-        // 誤って reject する (codex P2)。
-        guard q >= 8 || message.count < (1 << (8 * q)) else {
-            throw SMBCodecError.invalidValue("AES-CCM message too large for nonce length")
-        }
         var b0Flags = UInt8(((tagLength - 2) / 2) << 3) | UInt8(q - 1)
         if !authenticatedData.isEmpty { b0Flags |= 0x40 }
         var macInput = [b0Flags] + nonce + encodeLength(message.count, bytes: q)
@@ -102,13 +198,13 @@ public enum AESCCM {
         return [UInt8(q - 1)] + nonce + encodeLength(counter, bytes: q)
     }
 
-    private static func encodeLength(_ value: Int, bytes: Int) -> [UInt8] {
+    static func encodeLength(_ value: Int, bytes: Int) -> [UInt8] {
         (0..<bytes).map { shift in
             UInt8((value >> (8 * (bytes - 1 - shift))) & 0xff)
         }
     }
 
-    private static func encodeAADLength(_ length: Int) throws -> [UInt8] {
+    static func encodeAADLength(_ length: Int) throws -> [UInt8] {
         if length < 0xff00 {
             return [UInt8((length >> 8) & 0xff), UInt8(length & 0xff)]
         }
@@ -123,7 +219,7 @@ public enum AESCCM {
         return encoded
     }
 
-    private static func constantTimeEqual(_ lhs: [UInt8], _ rhs: [UInt8]) -> Bool {
+    static func constantTimeEqual(_ lhs: [UInt8], _ rhs: [UInt8]) -> Bool {
         guard lhs.count == rhs.count else { return false }
         var diff: UInt8 = 0
         for index in 0..<lhs.count {
@@ -146,7 +242,7 @@ public enum AESCCM {
         // counter (payload は counter=1 起点)。CommonCrypto の CTR は 16-byte block 全体を
         // big-endian インクリメントするため、counter が q バイト境界を溢れない限り
         // CCM の A_i 系列と一致する。溢れ条件 (block 数 + 1 >= 2^(8q)) は
-        // authenticationTag の message 長ガード (message.count < 2^(8q)) が先に弾く。
+        // 共通 validate の message 長ガード (message.count < 2^(8q)) が先に弾く。
         var cryptorOrNil: CCCryptorRef?
         let iv = counterBlock(nonce: nonce, counter: 1)
         let createStatus = iv.withUnsafeBufferPointer { ivPointer in

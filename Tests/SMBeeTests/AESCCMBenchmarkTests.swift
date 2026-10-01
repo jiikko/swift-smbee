@@ -1,9 +1,9 @@
 import XCTest
 @testable import SMBee
 
-/// Env-gated micro-benchmark for issue 075: measures the pure-Swift AES-CCM fallback
-/// throughput that gates Linux SMB 3.0.2 encrypted reads. Run with SMBEE_BENCH_CCM=1;
-/// it prints CCM_BENCH lines and asserts nothing about speed (measurement only).
+/// Env-gated micro-benchmark for issue 075: measures the selected AES-CCM backend for
+/// Linux SMB 3.0.2 nonce-11 traffic and Apple CommonCrypto traffic. Run with
+/// SMBEE_BENCH_CCM=1; it prints CCM_BENCH lines and asserts nothing about speed.
 final class AESCCMBenchmarkTests: XCTestCase {
     func testAESCCMThroughputMeasurement() throws {
         guard ProcessInfo.processInfo.environment["SMBEE_BENCH_CCM"] == "1" else {

@@ -50,7 +50,7 @@ final class AESCCMBackendTests: XCTestCase {
         "aad0\tlen=1048593\ttag=08814b5920faefd556b06f3438cc21d8\tct=sha256:2863745bd0438e78f48df19d17321b75d3875efbb4951b94de4f5db3888c8a06",
         // The CBC-MAC input (B_0 + AAD block(s) + payload) ends exactly on the 8,192-byte flush batch boundary.
         "aad0\tlen=8176\ttag=3d7e0285912630563637480949c21c87\tct=sha256:e263dc57d9f06969217d909c9a3484660ec923cd881f3764f2b0a4f6990f4acf",
-        "aad32\tlen=8128\ttag=9980d3e7282612ceeba93547f6e4a6bf\tct=sha256:3fed0b50ec961d6f6ef1314f40a6a288e4b59a46ea2e2b245668ab0c8f2f7812",
+        "aad32\tlen=8128\ttag=9980d3e7282612ceeba93547f6e4a6bf\tct=sha256:3fed0b50ec961d6f6ef1314f40a6a288e4b59a46ea2e2b245668ab0c8f2f7812"
     ].map { line -> FixedVector in
         let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
         let lengthField = fields[1].dropFirst("len=".count)

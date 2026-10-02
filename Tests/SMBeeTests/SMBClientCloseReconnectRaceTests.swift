@@ -14,6 +14,232 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
         }
     }
 
+    func testConcurrentSessionCloseWaitsForFirstCleanup() async throws {
+        let cleanupSleeper = SMBContinuationSleeperGate()
+        let transport = SMBContinuationWatchTransport()
+        defer {
+            if transport.closeCount == 0 { transport.failConnection() }
+            cleanupSleeper.fireAll()
+            cleanupSleeper.reset()
+        }
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 4,
+            cleanupTimeoutSleeper: { try await cleanupSleeper.sleep(for: $0) }
+        )
+        let client = SMBClientSession(session: session, treeId: 1)
+        let firstClose = Task { await client.close() }
+
+        try await smbIssue102AwaitWithTimeout("first close TREE_DISCONNECT") {
+            try await transport.waitForCommand(SMB2Commands.treeDisconnect)
+        }
+        try await smbIssue102AwaitWithTimeout("first close cleanup deadline registration") {
+            try await cleanupSleeper.waitForCallCount(1)
+        }
+        XCTAssertEqual(cleanupSleeper.callCount, 1)
+        XCTAssertEqual(cleanupSleeper.pendingCallWaiterCount, 0)
+
+        let secondCloseEvent = SMBContinuationCloseEventLatch()
+        defer { secondCloseEvent.reset() }
+        let secondClose = Task {
+            await client.closeForTesting(onEvent: secondCloseEvent.signal)
+        }
+        let event = try await smbIssue102AwaitWithTimeout("second close join or early return") {
+            try await secondCloseEvent.wait()
+        }
+        XCTAssertEqual(event, .joinedExistingCleanup)
+        XCTAssertEqual(secondCloseEvent.pendingWaiterCount, 0)
+        XCTAssertEqual(transport.closeCount, 0, "the first cleanup is still held by TREE_DISCONNECT")
+        XCTAssertEqual(
+            transport.sentCommands.filter { $0 == SMB2Commands.treeDisconnect }.count,
+            1,
+            "both callers share the same cleanup request"
+        )
+
+        try transport.completeTreeDisconnect()
+        await firstClose.value
+        await secondClose.value
+        XCTAssertEqual(transport.closeCount, 1)
+        XCTAssertEqual(transport.sentCommands.filter { $0 == SMB2Commands.treeDisconnect }.count, 1)
+        XCTAssertEqual(cleanupSleeper.pendingSleepCount, 0)
+    }
+
+    func testScopedTreeCloseWaitsForFirstCleanup() async throws {
+        let cleanupSleeper = SMBContinuationSleeperGate()
+        let transport = SMBContinuationWatchTransport()
+        defer {
+            if transport.closeCount == 0 { transport.failConnection() }
+            cleanupSleeper.fireAll()
+            cleanupSleeper.reset()
+        }
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 4,
+            cleanupTimeoutSleeper: { try await cleanupSleeper.sleep(for: $0) }
+        )
+        let child = SMBClientTreeSession(session: session, treeId: 1)
+        let firstClose = Task { await child.close() }
+
+        try await smbIssue102AwaitWithTimeout("scoped tree first TREE_DISCONNECT") {
+            try await transport.waitForCommand(SMB2Commands.treeDisconnect)
+        }
+        try await smbIssue102AwaitWithTimeout("scoped tree cleanup deadline registration") {
+            try await cleanupSleeper.waitForCallCount(1)
+        }
+        XCTAssertEqual(cleanupSleeper.callCount, 1)
+        XCTAssertEqual(cleanupSleeper.pendingCallWaiterCount, 0)
+
+        let secondCloseEvent = SMBContinuationCloseEventLatch()
+        defer { secondCloseEvent.reset() }
+        let secondClose = Task {
+            await child.closeForTesting(onEvent: secondCloseEvent.signal)
+        }
+        let event = try await smbIssue102AwaitWithTimeout("scoped tree second close join or early return") {
+            try await secondCloseEvent.wait()
+        }
+        XCTAssertEqual(event, .joinedExistingCleanup)
+        XCTAssertEqual(secondCloseEvent.pendingWaiterCount, 0)
+        XCTAssertEqual(transport.closeCount, 0, "the first scoped-tree cleanup is still held")
+
+        try transport.completeTreeDisconnect()
+        await firstClose.value
+        await secondClose.value
+        XCTAssertEqual(transport.sentCommands.filter { $0 == SMB2Commands.treeDisconnect }.count, 1)
+        XCTAssertEqual(cleanupSleeper.pendingSleepCount, 0)
+    }
+
+    func testCloseBoundsPendingScopedTreeSetupAndClosesTransport() async throws {
+        let setupDeadlineSleeper = SMBContinuationSleeperGate()
+        let cleanupSleeper = SMBContinuationSleeperGate()
+        let transport = SMBContinuationWatchTransport()
+        defer {
+            if transport.closeCount == 0 { transport.failConnection() }
+            setupDeadlineSleeper.fireAll()
+            cleanupSleeper.fireAll()
+            setupDeadlineSleeper.reset()
+            cleanupSleeper.reset()
+        }
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 4,
+            cleanupTimeoutSleeper: { try await cleanupSleeper.sleep(for: $0) }
+        )
+        let client = SMBClientSession(
+            session: session,
+            treeId: 1,
+            closeSetupDeadlineSleeper: { try await setupDeadlineSleeper.sleep(for: $0) }
+        )
+        let bodyCalls = SMBContinuationCountBarrier()
+        let setup: Task<Void, Error> = Task {
+            try await client.withTree(share: "other") { _ in bodyCalls.signal() }
+        }
+
+        try await smbIssue102AwaitWithTimeout("TREE_CONNECT setup request") {
+            try await transport.waitForCommand(SMB2Commands.treeConnect)
+        }
+        let close = Task { await client.close() }
+        try await smbIssue102AwaitWithTimeout("close-owned setup deadline registration") {
+            try await setupDeadlineSleeper.waitForCallCount(1)
+        }
+        XCTAssertEqual(setupDeadlineSleeper.callCount, 1)
+        XCTAssertEqual(setupDeadlineSleeper.pendingCallWaiterCount, 0)
+        XCTAssertEqual(setupDeadlineSleeper.pendingSleepCount, 1)
+
+        setupDeadlineSleeper.fireNext()
+        try await smbIssue102AwaitWithTimeout("close after setup deadline closes transport") {
+            await close.value
+        }
+        do {
+            try await smbIssue102AwaitWithTimeout("TREE_CONNECT released by close deadline") {
+                try await setup.value
+            }
+            XCTFail("expected the close deadline to fail the pending TREE_CONNECT")
+        } catch SMBTransportError.connectionClosed {
+            // The close-owned setup deadline closes the transport to release the request.
+        }
+
+        XCTAssertEqual(bodyCalls.currentCount, 0, "a setup completing after close must not start its body")
+        XCTAssertEqual(transport.closeCount, 1)
+        XCTAssertEqual(setupDeadlineSleeper.pendingSleepCount, 0)
+        XCTAssertEqual(cleanupSleeper.pendingSleepCount, 0)
+    }
+
+    func testCloseWaitsForScopedTreeSetupAndOwnsPublishedChild() async throws {
+        let setupDeadlineSleeper = SMBContinuationSleeperGate()
+        let cleanupSleeper = SMBContinuationSleeperGate()
+        let transport = SMBContinuationWatchTransport()
+        defer {
+            if transport.closeCount == 0 { transport.failConnection() }
+            setupDeadlineSleeper.fireAll()
+            cleanupSleeper.fireAll()
+            setupDeadlineSleeper.reset()
+            cleanupSleeper.reset()
+        }
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 4,
+            cleanupTimeoutSleeper: { try await cleanupSleeper.sleep(for: $0) }
+        )
+        let client = SMBClientSession(
+            session: session,
+            treeId: 1,
+            closeSetupDeadlineSleeper: { try await setupDeadlineSleeper.sleep(for: $0) }
+        )
+        let bodyCalls = SMBContinuationCountBarrier()
+        let setup: Task<Void, Error> = Task {
+            try await client.withTree(share: "other") { _ in bodyCalls.signal() }
+        }
+
+        try await smbIssue102AwaitWithTimeout("TREE_CONNECT before close") {
+            try await transport.waitForCommand(SMB2Commands.treeConnect)
+        }
+        let close = Task { await client.close() }
+        try await smbIssue102AwaitWithTimeout("close-owned setup deadline before TREE_CONNECT response") {
+            try await setupDeadlineSleeper.waitForCallCount(1)
+        }
+        XCTAssertEqual(setupDeadlineSleeper.callCount, 1)
+        XCTAssertEqual(setupDeadlineSleeper.pendingCallWaiterCount, 0)
+        XCTAssertEqual(setupDeadlineSleeper.pendingSleepCount, 1)
+
+        try transport.completeTreeConnect(treeId: 0x5566)
+        do {
+            try await smbIssue102AwaitWithTimeout("close prevents scoped body from starting") {
+                try await setup.value
+            }
+            XCTFail("expected close to reject the scoped tree after setup")
+        } catch SMBError.connectionLost(operation: "SESSION") {
+            // The close task takes ownership of the connected child before setup drains.
+        }
+
+        try await smbIssue102AwaitWithTimeout("close-owned child TREE_DISCONNECT") {
+            try await transport.waitForCommand(SMB2Commands.treeDisconnect, occurrence: 1)
+        }
+        XCTAssertEqual(setupDeadlineSleeper.pendingSleepCount, 0, "successful setup cancels its deadline")
+        try transport.completeTreeDisconnect()
+        try await smbIssue102AwaitWithTimeout("primary TREE_DISCONNECT after child cleanup") {
+            try await transport.waitForCommand(SMB2Commands.treeDisconnect, occurrence: 2)
+        }
+        try transport.completeTreeDisconnect()
+        try await smbIssue102AwaitWithTimeout("close after setup handoff") { await close.value }
+
+        XCTAssertEqual(bodyCalls.currentCount, 0)
+        XCTAssertEqual(transport.sentTreeDisconnectTreeIDs, [0x5566, 1])
+        XCTAssertEqual(transport.closeCount, 1)
+        XCTAssertEqual(cleanupSleeper.pendingSleepCount, 0)
+    }
+
     func testConcurrentReconnectRequestsShareOneCandidateSession() async throws {
         let providerGate = SMBContinuationCredentialGate(credential: .anonymous)
         let requestBarrier = SMBContinuationCountBarrier()

@@ -140,6 +140,10 @@ final class SMBContinuationCountBarrier: @unchecked Sendable {
     private var count = 0
     private var waiters: [(id: UUID, target: Int, continuation: CheckedContinuation<Void, Error>)] = []
 
+    var currentCount: Int {
+        lock.withLock { count }
+    }
+
     func signal() {
         let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
             count += 1
@@ -414,9 +418,11 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
     private let watchLock = NSLock()
     private let autoRespondChangeNotify: Bool
     private var createRequest: SMB2Header?
+    private var treeConnectRequest: SMB2Header?
     private var treeDisconnectRequest: SMB2Header?
     private var changeNotifyRequest: SMB2Header?
     private var watchedCommands: [UInt16] = []
+    private var treeDisconnectTreeIDs: [UInt32] = []
     private var afterCommandSignalHook: (@Sendable (UInt16) async -> Void)?
 
     init(autoRespondChangeNotify: Bool = false) {
@@ -434,7 +440,10 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
             watchedCommands.append(header.command)
             switch header.command {
             case SMB2Commands.create: createRequest = header
-            case SMB2Commands.treeDisconnect: treeDisconnectRequest = header
+            case SMB2Commands.treeConnect: treeConnectRequest = header
+            case SMB2Commands.treeDisconnect:
+                treeDisconnectRequest = header
+                treeDisconnectTreeIDs.append(header.treeId)
             case SMB2Commands.changeNotify: changeNotifyRequest = header
             default: break
             }
@@ -455,6 +464,10 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
         watchLock.withLock { watchedCommands }
     }
 
+    var sentTreeDisconnectTreeIDs: [UInt32] {
+        watchLock.withLock { treeDisconnectTreeIDs }
+    }
+
     func installAfterCommandSignalHook(_ hook: (@Sendable (UInt16) async -> Void)?) {
         watchLock.withLock { afterCommandSignalHook = hook }
     }
@@ -472,6 +485,22 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
         response.append(contentsOf: Array(repeating: 0, count: 88))
         writeUInt16LE(89, to: &response, at: 64)
         response.replaceSubrange(128..<144, with: Array(repeating: 0x55, count: 16))
+        try enqueue(response)
+    }
+
+    func completeTreeConnect(treeId: UInt32 = 0x5566) throws {
+        guard let request = watchLock.withLock({ treeConnectRequest }) else {
+            throw SMBCodecError.invalidValue("test transport has no TREE_CONNECT request")
+        }
+        var response = try SMB2Header(
+            command: SMB2Commands.treeConnect,
+            messageId: request.messageId,
+            treeId: treeId,
+            sessionId: request.sessionId
+        ).encode()
+        response.append(contentsOf: Array(repeating: 0, count: 16))
+        writeUInt16LE(16, to: &response, at: 64)
+        response[66] = 1
         try enqueue(response)
     }
 
@@ -525,6 +554,196 @@ final class SMBContinuationAsyncGate: @unchecked Sendable {
             return pending
         }
         pending?.resume()
+    }
+}
+
+final class SMBContinuationCloseEventLatch: @unchecked Sendable {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<SMBClientCloseEvent, Error>
+    }
+
+    private let lock = NSLock()
+    private var eventStorage: SMBClientCloseEvent?
+    private var waiters: [Waiter] = []
+
+    var pendingWaiterCount: Int {
+        lock.withLock { waiters.count }
+    }
+
+    func signal(_ event: SMBClientCloseEvent) {
+        let continuations = lock.withLock { () -> [CheckedContinuation<SMBClientCloseEvent, Error>] in
+            guard eventStorage == nil else { return [] }
+            eventStorage = event
+            let continuations = waiters.map(\.continuation)
+            waiters.removeAll()
+            return continuations
+        }
+        continuations.forEach { $0.resume(returning: event) }
+    }
+
+    func wait() async throws -> SMBClientCloseEvent {
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let state = lock.withLock { () -> (event: SMBClientCloseEvent?, cancelled: Bool) in
+                    if Task.isCancelled { return (nil, true) }
+                    if let eventStorage { return (eventStorage, false) }
+                    waiters.append(Waiter(id: waiterID, continuation: continuation))
+                    return (nil, false)
+                }
+                if state.cancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else if let event = state.event {
+                    continuation.resume(returning: event)
+                }
+            }
+        } onCancel: {
+            self.cancelWaiter(waiterID)
+        }
+    }
+
+    func reset() {
+        let continuations = lock.withLock { () -> [CheckedContinuation<SMBClientCloseEvent, Error>] in
+            eventStorage = nil
+            let continuations = waiters.map(\.continuation)
+            waiters.removeAll()
+            return continuations
+        }
+        continuations.forEach { $0.resume(throwing: CancellationError()) }
+    }
+
+    private func cancelWaiter(_ waiterID: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<SMBClientCloseEvent, Error>? in
+            guard let index = waiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return waiters.remove(at: index).continuation
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
+final class SMBContinuationSleeperGate: @unchecked Sendable {
+    private struct SleepWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private struct CallWaiter {
+        let id: UUID
+        let target: Int
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private let lock = NSLock()
+    private var callCountStorage = 0
+    private var sleepWaiters: [SleepWaiter] = []
+    private var callWaiters: [CallWaiter] = []
+
+    var callCount: Int {
+        lock.withLock { callCountStorage }
+    }
+
+    var pendingSleepCount: Int {
+        lock.withLock { sleepWaiters.count }
+    }
+
+    var pendingCallWaiterCount: Int {
+        lock.withLock { callWaiters.count }
+    }
+
+    func sleep(for duration: Duration) async throws {
+        _ = duration
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { continuation in
+                let state = lock.withLock { () -> (readyCallWaiters: [CheckedContinuation<Void, Error>], cancelled: Bool) in
+                    callCountStorage += 1
+                    let ready = callWaiters
+                        .filter { callCountStorage >= $0.target }
+                        .map(\.continuation)
+                    callWaiters.removeAll { callCountStorage >= $0.target }
+                    if Task.isCancelled {
+                        return (ready, true)
+                    }
+                    sleepWaiters.append(SleepWaiter(id: waiterID, continuation: continuation))
+                    return (ready, false)
+                }
+                state.readyCallWaiters.forEach { $0.resume() }
+                if state.cancelled {
+                    continuation.resume(throwing: CancellationError())
+                }
+            }
+        } onCancel: {
+            self.cancelSleepWaiter(waiterID)
+        }
+    }
+
+    func waitForCallCount(_ target: Int) async throws {
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let state = lock.withLock { () -> (ready: Bool, cancelled: Bool) in
+                    if Task.isCancelled { return (false, true) }
+                    guard callCountStorage < target else { return (true, false) }
+                    callWaiters.append(CallWaiter(id: waiterID, target: target, continuation: continuation))
+                    return (false, false)
+                }
+                if state.cancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else if state.ready {
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            self.cancelCallWaiter(waiterID)
+        }
+    }
+
+    func fireNext() {
+        let continuation = lock.withLock { sleepWaiters.isEmpty ? nil : sleepWaiters.removeFirst().continuation }
+        continuation?.resume()
+    }
+
+    func fireAll() {
+        let continuations = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+            let continuations = sleepWaiters.map(\.continuation)
+            sleepWaiters.removeAll()
+            return continuations
+        }
+        continuations.forEach { $0.resume() }
+    }
+
+    func reset() {
+        let pending = lock.withLock { () -> (
+            sleeps: [CheckedContinuation<Void, Error>],
+            calls: [CheckedContinuation<Void, Error>]
+        ) in
+            let sleeps = sleepWaiters.map(\.continuation)
+            let calls = callWaiters.map(\.continuation)
+            sleepWaiters.removeAll()
+            callWaiters.removeAll()
+            callCountStorage = 0
+            return (sleeps, calls)
+        }
+        pending.sleeps.forEach { $0.resume(throwing: CancellationError()) }
+        pending.calls.forEach { $0.resume(throwing: CancellationError()) }
+    }
+
+    private func cancelSleepWaiter(_ waiterID: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard let index = sleepWaiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return sleepWaiters.remove(at: index).continuation
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    private func cancelCallWaiter(_ waiterID: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard let index = callWaiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return callWaiters.remove(at: index).continuation
+        }
+        continuation?.resume(throwing: CancellationError())
     }
 }
 

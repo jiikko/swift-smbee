@@ -662,9 +662,15 @@ private final class SMBDownloadSink: @unchecked Sendable {
     }
 }
 
+enum SMBClientCloseEvent: Sendable, Equatable {
+    case joinedExistingCleanup
+    case returnedWithoutJoining
+}
+
 public actor SMBClientSession {
     // Keep writes comparable to reads; credit/negotiated limits still clamp this.
     static let localWriteChunkLimit = 1024 * 1024
+    private static let closeSetupTimeout: Duration = .seconds(5)
 
     // Both prefix APIs share this bound. readPrefix needs it because it retains the complete
     // result. For withPrefixReadStream it keeps the prefix API from being used as an unbounded
@@ -684,22 +690,43 @@ public actor SMBClientSession {
         let requestTimeout: Duration?
     }
 
+    private struct ScopedTree: Sendable {
+        let session: SMBSession
+        let treeId: UInt32
+        let child: SMBClientTreeSession
+    }
+
     private var session: SMBSession
     private var treeId: UInt32
-    private var childTreeIds: Set<UInt32> = []
+    private var childTrees: [UUID: ScopedTree] = [:]
+    private var treeSetupSessions: [UUID: SMBSession] = [:]
     private let reconnectInfo: ReconnectInfo?
     private var keepAliveTask: Task<Void, Never>?
     private var isClosed = false
+    private var closeTask: Task<Void, Never>?
+    private var closeSetupDeadlineTask: Task<Void, Never>?
+    private var closeSetupDrainWaiterID: UUID?
+    private var closeSetupDrainContinuation: CheckedContinuation<Void, Never>?
+    private var closeSetupDeadlineExpired = false
+    private let closeSetupDeadlineSleeper: @Sendable (Duration) async throws -> Void
     private var sessionGeneration: UInt64 = 0
     private var reconnectTask: Task<Void, Never>?
     private var reconnectTaskID: UUID?
     private var reconnectWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
     private var reconnectCandidate: (taskID: UUID, session: SMBSession)?
 
-    init(session: SMBSession, treeId: UInt32, reconnectInfo: ReconnectInfo? = nil) {
+    init(
+        session: SMBSession,
+        treeId: UInt32,
+        reconnectInfo: ReconnectInfo? = nil,
+        closeSetupDeadlineSleeper: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        }
+    ) {
         self.session = session
         self.treeId = treeId
         self.reconnectInfo = reconnectInfo
+        self.closeSetupDeadlineSleeper = closeSetupDeadlineSleeper
     }
 
     func retainsAuthenticationCredentialForTesting() async -> Bool {
@@ -853,8 +880,27 @@ public actor SMBClientSession {
     }
 
     public func close() async {
-        guard !isClosed else { return }
+        await close(onEvent: nil)
+    }
+
+    func closeForTesting(onEvent: @escaping @Sendable (SMBClientCloseEvent) -> Void) async {
+        await close(onEvent: onEvent)
+    }
+
+    private func close(onEvent: (@Sendable (SMBClientCloseEvent) -> Void)?) async {
+        if let closeTask {
+            onEvent?(.joinedExistingCleanup)
+            await closeTask.value
+            return
+        }
+        guard !isClosed else {
+            onEvent?(.returnedWithoutJoining)
+            return
+        }
+
         isClosed = true
+        let closingSession = session
+        let closingTreeId = treeId
         let waiters = Array(reconnectWaiters.values)
         reconnectWaiters.removeAll()
         waiters.forEach { $0.resume(throwing: SMBError.connectionLost(operation: "RECONNECT")) }
@@ -863,17 +909,88 @@ public actor SMBClientSession {
         reconnectTask?.cancel()
         reconnectTask = nil
         reconnectTaskID = nil
+        let keepAliveTask = self.keepAliveTask
+        self.keepAliveTask = nil
+        keepAliveTask?.cancel()
+
+        let task = Task {
+            await self.performClose(
+                session: closingSession,
+                treeId: closingTreeId,
+                candidateSession: candidateSession,
+                keepAliveTask: keepAliveTask
+            )
+        }
+        closeTask = task
+        await task.value
+    }
+
+    private func performClose(
+        session closingSession: SMBSession,
+        treeId closingTreeId: UInt32,
+        candidateSession: SMBSession?,
+        keepAliveTask: Task<Void, Never>?
+    ) async {
         if let candidateSession {
             await candidateSession.closeTransport(cause: "client_close_during_reconnect")
         }
-        keepAliveTask?.cancel()
+        await waitForTreeSetupsOrCloseDeadline()
         await keepAliveTask?.value
-        keepAliveTask = nil
-        for childTreeId in childTreeIds {
-            await session.bestEffortTreeDisconnect(treeId: childTreeId)
+
+        let children = Array(childTrees.values)
+        childTrees.removeAll()
+        for child in children {
+            await child.child.closeIfMatching(session: child.session, treeId: child.treeId)
         }
-        childTreeIds.removeAll()
-        await session.disconnect(treeId: treeId)
+        await closingSession.disconnect(treeId: closingTreeId)
+    }
+
+    private func waitForTreeSetupsOrCloseDeadline() async {
+        guard !treeSetupSessions.isEmpty else { return }
+        let waiterID = UUID()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            closeSetupDrainWaiterID = waiterID
+            closeSetupDrainContinuation = continuation
+            closeSetupDeadlineTask = Task {
+                do {
+                    try await self.closeSetupDeadlineSleeper(Self.closeSetupTimeout)
+                } catch {
+                    guard !Task.isCancelled else { return }
+                }
+                await self.closeTreeSetupDeadlineDidFire(waiterID: waiterID)
+            }
+        }
+    }
+
+    private func closeTreeSetupDeadlineDidFire(waiterID: UUID) async {
+        guard closeSetupDrainWaiterID == waiterID,
+              let continuation = closeSetupDrainContinuation
+        else {
+            return
+        }
+        closeSetupDrainWaiterID = nil
+        closeSetupDrainContinuation = nil
+        closeSetupDeadlineTask = nil
+        closeSetupDeadlineExpired = true
+        let setupSessions = Array(treeSetupSessions.values)
+        for setupSession in setupSessions {
+            await setupSession.closeTransport(cause: "client_close_tree_setup_deadline")
+        }
+        continuation.resume()
+    }
+
+    private func finishTreeSetup(_ setupID: UUID) {
+        treeSetupSessions[setupID] = nil
+        guard treeSetupSessions.isEmpty,
+              let continuation = closeSetupDrainContinuation
+        else {
+            return
+        }
+        closeSetupDrainWaiterID = nil
+        closeSetupDrainContinuation = nil
+        closeSetupDeadlineTask?.cancel()
+        closeSetupDeadlineTask = nil
+        continuation.resume()
     }
 
     public func echo() async throws {
@@ -962,17 +1079,37 @@ public actor SMBClientSession {
         operation: @Sendable (SMBClientTreeSession) async throws -> T
     ) async throws -> T {
         try ensureOpen()
-        let childTreeId = try await session.treeConnect(share: share)
-        childTreeIds.insert(childTreeId)
-        let child = SMBClientTreeSession(session: session, treeId: childTreeId)
+        let setupID = UUID()
+        let setupSession = session
+        treeSetupSessions[setupID] = setupSession
+        let childTreeId: UInt32
+        do {
+            childTreeId = try await setupSession.treeConnect(share: share)
+        } catch {
+            finishTreeSetup(setupID)
+            throw error
+        }
+        guard !(isClosed && closeSetupDeadlineExpired) else {
+            finishTreeSetup(setupID)
+            throw SMBError.connectionLost(operation: "SESSION")
+        }
+        let child = SMBClientTreeSession(session: setupSession, treeId: childTreeId)
+        let childID = UUID()
+        // The child retains the exact wire session and TreeId that TREE_CONNECT returned, so
+        // close cannot accidentally apply a stale TreeId to a replacement reconnect session.
+        childTrees[childID] = ScopedTree(session: setupSession, treeId: childTreeId, child: child)
+        finishTreeSetup(setupID)
+        guard !isClosed else {
+            throw SMBError.connectionLost(operation: "SESSION")
+        }
         do {
             let result = try await operation(child)
             await child.close()
-            childTreeIds.remove(childTreeId)
+            childTrees[childID] = nil
             return result
         } catch {
             await child.close()
-            childTreeIds.remove(childTreeId)
+            childTrees[childID] = nil
             throw error
         }
     }
@@ -1774,6 +1911,7 @@ public actor SMBClientTreeSession {
     private let session: SMBSession
     private let treeId: UInt32
     private var isClosed = false
+    private var closeTask: Task<Void, Never>?
 
     init(session: SMBSession, treeId: UInt32) {
         self.session = session
@@ -1781,9 +1919,34 @@ public actor SMBClientTreeSession {
     }
 
     public func close() async {
-        guard !isClosed else { return }
+        await close(onEvent: nil)
+    }
+
+    func closeForTesting(onEvent: @escaping @Sendable (SMBClientCloseEvent) -> Void) async {
+        await close(onEvent: onEvent)
+    }
+
+    func closeIfMatching(session expectedSession: SMBSession, treeId expectedTreeId: UInt32) async {
+        guard session === expectedSession, treeId == expectedTreeId else { return }
+        await close(onEvent: nil)
+    }
+
+    private func close(onEvent: (@Sendable (SMBClientCloseEvent) -> Void)?) async {
+        if let closeTask {
+            onEvent?(.joinedExistingCleanup)
+            await closeTask.value
+            return
+        }
+        guard !isClosed else {
+            onEvent?(.returnedWithoutJoining)
+            return
+        }
         isClosed = true
-        await session.bestEffortTreeDisconnect(treeId: treeId)
+        let task = Task {
+            await session.bestEffortTreeDisconnect(treeId: treeId)
+        }
+        closeTask = task
+        await task.value
     }
 
     public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
@@ -5667,7 +5830,7 @@ actor SMBSession {
         let timeout = cleanupTimeout
         let task = Task.detached { [self] in
             do {
-                try await SMBOperationDeadline.run(timeout: timeout) {
+                try await SMBOperationDeadline.run(timeout: timeout, sleeper: cleanupTimeoutSleeper) {
                     try await self.treeDisconnect(treeId: treeId)
                 }
             } catch {
@@ -5707,10 +5870,10 @@ actor SMBSession {
         let task = Task.detached { [self] in
             var diagnosticError: Error?
             do {
-                try await SMBOperationDeadline.run(timeout: timeout) {
+                try await SMBOperationDeadline.run(timeout: timeout, sleeper: cleanupTimeoutSleeper) {
                     try await self.treeDisconnect(treeId: treeId)
                 }
-                try await SMBOperationDeadline.run(timeout: timeout) {
+                try await SMBOperationDeadline.run(timeout: timeout, sleeper: cleanupTimeoutSleeper) {
                     try await self.logoff()
                 }
             } catch {

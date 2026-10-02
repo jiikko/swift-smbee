@@ -48,6 +48,11 @@ do not infer that every overload accepts the same arguments.
   operations are not atomic and have no overall ordering guarantee; callers must coordinate
   competing operations such as writes to the same path. Callbacks accepted by the actors are
   `@Sendable` and may run away from the caller's executor.
+- Repeated or concurrent `close()` calls on an SMB client session or scoped tree share one
+  cleanup operation; each caller returns after that cleanup finishes. Session close releases
+  reconnect waiters and closes an in-progress candidate without waiting for credential-provider
+  code to return. A scoped-tree setup already in progress gets a bounded grace period; if it does
+  not finish, the affected transport is closed to release it.
 - Cancelling a task requests cooperative cancellation. An in-flight SMB request may send
   SMB2 CANCEL or drain its response to preserve session correlation before returning.
 - `operationTimeout` is also cooperative. It reports `SMBTransportError.timedOut` only

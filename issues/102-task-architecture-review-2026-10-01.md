@@ -94,7 +94,7 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 | 20 | 本物 | P3 | NWConnection の transport は segment 版の send を持たず、protocol の既定実装が frame 全体を連結する（性能への影響は未実測） |
 | 21 | 本物 | P3 | NWConnection の経路で TCP_NODELAY を明示していない（実効値・遅延差は未実測） |
 
-## 裏取り済みの残り 6 件の対応（2026-10-02、codex-drive の軽量パス）
+## 裏取り済みの対応（2026-10-02、codex-drive の軽量パス）
 
 | # | 結果 | commit |
 |---|---|---|
@@ -104,6 +104,7 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 | 12 | 対応済み。reserveCapacity を min(aceCount, (aclSize - 8) / 4) で抑える | `fix(acl): ACE の件数で過大に確保しない …` |
 | 13 | 対応済み。署名の比較を constant-time に | `fix(signing): SMB 署名の比較を constant-time にする` |
 | 16 | issue 010 M3（常駐の受信ループ）で受信経路を作り直すので、READ/WRITE パイプライン化と一緒に計測つきで扱う（未着手） | — |
+| 17 | 対応済み。session と scoped tree の close が共有 cleanup task に join する。close は reconnect waiter を先に解放し、candidate を閉じ、TREE_CONNECT setup は注入可能な close deadline で drain する。期限を超えた setup の transport は閉じる | worktree（未 commit） |
 
 不採用（記録）: 匿名 session でサーバが署名必須を示しても、匿名には署名鍵が無いので署名なしの応答を受け入れる（MS-SMB2 の匿名 session の扱い。
 VALIDATE_NEGOTIATE_INFO の匿名の例外と同じ方針）。#7 の設計・実装は sol の敵対レビューを計 3 周（設計 1・実装 2）通し、最後の周は指摘 0 件。

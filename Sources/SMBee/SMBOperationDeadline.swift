@@ -10,6 +10,14 @@ public enum SMBOperationDeadline {
         timeout: Duration?,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
+        try await run(timeout: timeout, sleeper: { try await Task.sleep(for: $0) }, operation: operation)
+    }
+
+    static func run<T: Sendable>(
+        timeout: Duration?,
+        sleeper: @escaping @Sendable (Duration) async throws -> Void,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
         guard let timeout else {
             return try await operation()
         }
@@ -19,7 +27,7 @@ public enum SMBOperationDeadline {
                 try await operation()
             }
             group.addTask {
-                try await Task.sleep(for: timeout)
+                try await sleeper(timeout)
                 throw SMBTransportError.timedOut
             }
 

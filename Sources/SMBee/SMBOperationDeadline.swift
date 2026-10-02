@@ -9,6 +9,7 @@ public enum SMBOperationDeadline {
     /// Per-task clock seam used by deterministic tests. Child tasks inherit the value, so
     /// callers can exercise a public API's deadline without changing production behavior.
     @TaskLocal static var sleeperForTesting: (@Sendable (Duration) async throws -> Void)?
+    @TaskLocal static var operationCancellationObserverForTesting: (@Sendable () -> Void)?
 
     public static func run<T: Sendable>(
         timeout: Duration?,
@@ -33,7 +34,14 @@ public enum SMBOperationDeadline {
 
         return try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {
-                try await operation()
+                guard let cancellationObserver = operationCancellationObserverForTesting else {
+                    return try await operation()
+                }
+                return try await withTaskCancellationHandler {
+                    try await operation()
+                } onCancel: {
+                    cancellationObserver()
+                }
             }
             group.addTask {
                 try await sleeper(timeout)

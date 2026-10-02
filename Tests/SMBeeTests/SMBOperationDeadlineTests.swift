@@ -3,6 +3,17 @@ import XCTest
 @testable import SMBee
 
 final class SMBOperationDeadlineTests: XCTestCase {
+    func testDeadlineHangGuardPropagatesImmediateFailure() async throws {
+        do {
+            try await awaitWithDeadlineHangGuard("immediate operation failure") {
+                throw SMBTransportError.timedOut
+            }
+            XCTFail("the hang guard must preserve the operation error")
+        } catch SMBTransportError.timedOut {
+            // Expected operation failure.
+        }
+    }
+
     func testClientSessionStreamDeadlineWaitsForCloseCompletion() async throws {
         let fileId = deadlineFileId
         let transport = try makeDeadlineTransport([
@@ -34,8 +45,12 @@ final class SMBOperationDeadlineTests: XCTestCase {
         guard await waitForDeadlineTimer(clock, operation: operation, gates: [chunkGate], label: "stream timer") else {
             return
         }
-        clock.fireNext()
-        await assertDeadlineExpired(operation, clock: clock, gates: [chunkGate], label: "session stream")
+        await assertDeadlineExpiresAfterCancellation(
+            operation,
+            clock: clock,
+            gates: [chunkGate],
+            label: "session stream"
+        )
 
         let commands = try deadlineCommands(transport.outbound)
         XCTAssertEqual(commands.filter { $0 == SMB2Commands.close }.count, 1)
@@ -76,8 +91,12 @@ final class SMBOperationDeadlineTests: XCTestCase {
         guard await waitForDeadlineTimer(oneShotClock, operation: oneShotOperation, gates: [oneShotGate], label: "one-shot stream timer") else {
             return
         }
-        oneShotClock.fireNext()
-        await assertDeadlineExpired(oneShotOperation, clock: oneShotClock, gates: [oneShotGate], label: "one-shot stream")
+        await assertDeadlineExpiresAfterCancellation(
+            oneShotOperation,
+            clock: oneShotClock,
+            gates: [oneShotGate],
+            label: "one-shot stream"
+        )
         let oneShotCommands = try deadlineCommands(oneShotTransport.outbound)
         XCTAssertEqual(oneShotCommands.filter { $0 == SMB2Commands.close }.count, 1)
         XCTAssertEqual(oneShotTransport.closeCount, 1, "the one-shot transport closes only after handle cleanup")
@@ -125,12 +144,12 @@ final class SMBOperationDeadlineTests: XCTestCase {
         ) else {
             return
         }
-        clock.fireNext()
-        guard await waitForCancellationObservation(installGate, operation: operation, clock: clock, label: "session download install cancellation") else {
-            return
-        }
-        installGate.releaseNormally()
-        await assertDeadlineExpired(operation, clock: clock, gates: [], label: "session download")
+        await assertDeadlineExpiresAfterCancellation(
+            operation,
+            clock: clock,
+            cancellationGates: [installGate],
+            label: "session download"
+        )
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [])
@@ -147,6 +166,7 @@ final class SMBOperationDeadlineTests: XCTestCase {
     }
 
     func testSessionDeadlinesStartBeforeActorAdmission() async throws {
+        // Keep the actor blocked until the manual sleeper reports deadline registration.
         let streamTransport = SMBDeadlineTransport(inbound: [])
         let streamSession = SMBSession(host: "server", port: 445, credential: .anonymous, transport: streamTransport)
         let streamClient = SMBClientSession(session: streamSession, treeId: deadlineTreeId)
@@ -158,9 +178,16 @@ final class SMBOperationDeadlineTests: XCTestCase {
         }
 
         let streamClock = SMBDeadlineManualSleeper()
+        let streamCancellation = SMBDeadlineTestEvent()
         let streamOperation = Task {
-            try await SMBOperationDeadline.$sleeperForTesting.withValue({ try await streamClock.sleep(for: $0) }, operation: {
-                try await streamClient.withReadStream(path: "file.bin", operationTimeout: .seconds(30)) { _ in }
+            try await SMBOperationDeadline.$operationCancellationObserverForTesting.withValue({
+                streamCancellation.signal()
+            }, operation: {
+                try await SMBOperationDeadline.$sleeperForTesting.withValue({
+                    try await streamClock.sleep(for: $0)
+                }, operation: {
+                    try await streamClient.withReadStream(path: "file.bin", operationTimeout: .seconds(30)) { _ in }
+                })
             })
         }
         do {
@@ -168,16 +195,28 @@ final class SMBOperationDeadlineTests: XCTestCase {
                 try await streamClock.waitForCallCount(1)
             }
         } catch {
-            streamBlocker.release()
-            streamOperation.cancel()
-            streamClock.reset()
-            _ = try? await awaitWithDeadlineHangGuard("stream actor blocker drain") { await streamActorTask.value }
-            _ = try? await awaitWithDeadlineHangGuard("stream operation drain") { try await streamOperation.value }
+            await releaseDeadlineOperationAndDrain(
+                streamOperation,
+                actorTask: streamActorTask,
+                blocker: streamBlocker,
+                clock: streamClock,
+                label: "stream"
+            )
             XCTFail("stream deadline did not start before actor admission: \(error)")
             return
         }
         XCTAssertEqual(streamClock.requestedDurations, [.seconds(30)])
-        streamClock.fireNext()
+        XCTAssertTrue(streamClock.fireNext())
+        guard await waitForQueuedDeadlineOperationCancellation(
+            streamCancellation,
+            operation: streamOperation,
+            actorTask: streamActorTask,
+            blocker: streamBlocker,
+            clock: streamClock,
+            label: "stream"
+        ) else {
+            return
+        }
         streamBlocker.release()
         try await awaitWithDeadlineHangGuard("stream actor blocker release") { await streamActorTask.value }
         await assertDeadlineExpired(streamOperation, clock: streamClock, gates: [], label: "stream queued behind actor")
@@ -199,9 +238,16 @@ final class SMBOperationDeadlineTests: XCTestCase {
         }
 
         let downloadClock = SMBDeadlineManualSleeper()
+        let downloadCancellation = SMBDeadlineTestEvent()
         let downloadOperation = Task {
-            try await SMBOperationDeadline.$sleeperForTesting.withValue({ try await downloadClock.sleep(for: $0) }, operation: {
-                try await downloadClient.download(path: "file.bin", localFile: destination, operationTimeout: .seconds(30))
+            try await SMBOperationDeadline.$operationCancellationObserverForTesting.withValue({
+                downloadCancellation.signal()
+            }, operation: {
+                try await SMBOperationDeadline.$sleeperForTesting.withValue({
+                    try await downloadClock.sleep(for: $0)
+                }, operation: {
+                    try await downloadClient.download(path: "file.bin", localFile: destination, operationTimeout: .seconds(30))
+                })
             })
         }
         do {
@@ -209,16 +255,28 @@ final class SMBOperationDeadlineTests: XCTestCase {
                 try await downloadClock.waitForCallCount(1)
             }
         } catch {
-            downloadBlocker.release()
-            downloadOperation.cancel()
-            downloadClock.reset()
-            _ = try? await awaitWithDeadlineHangGuard("download actor blocker drain") { await downloadActorTask.value }
-            _ = try? await awaitWithDeadlineHangGuard("download operation drain") { try await downloadOperation.value }
+            await releaseDeadlineOperationAndDrain(
+                downloadOperation,
+                actorTask: downloadActorTask,
+                blocker: downloadBlocker,
+                clock: downloadClock,
+                label: "download"
+            )
             XCTFail("download deadline did not start before actor admission: \(error)")
             return
         }
         XCTAssertEqual(downloadClock.requestedDurations, [.seconds(30)])
-        downloadClock.fireNext()
+        XCTAssertTrue(downloadClock.fireNext())
+        guard await waitForQueuedDeadlineOperationCancellation(
+            downloadCancellation,
+            operation: downloadOperation,
+            actorTask: downloadActorTask,
+            blocker: downloadBlocker,
+            clock: downloadClock,
+            label: "download"
+        ) else {
+            return
+        }
         downloadBlocker.release()
         try await awaitWithDeadlineHangGuard("download actor blocker release") { await downloadActorTask.value }
         await assertDeadlineExpired(downloadOperation, clock: downloadClock, gates: [], label: "download queued behind actor")
@@ -360,12 +418,12 @@ final class SMBOperationDeadlineTests: XCTestCase {
         ) else {
             return
         }
-        clock.fireNext()
-        guard await waitForCancellationObservation(installGate, operation: operation, clock: clock, label: "one-shot install cancellation") else {
-            return
-        }
-        installGate.releaseNormally()
-        await assertDeadlineExpired(operation, clock: clock, gates: [], label: "one-shot install")
+        await assertDeadlineExpiresAfterCancellation(
+            operation,
+            clock: clock,
+            cancellationGates: [installGate],
+            label: "one-shot install"
+        )
 
         if overwriteExistingDestination {
             XCTAssertEqual(try Data(contentsOf: destination), Data("original".utf8), "cancellation must prevent replacing an existing destination")
@@ -408,8 +466,12 @@ final class SMBOperationDeadlineTests: XCTestCase {
         guard await waitForDeadlineTimer(streamClock, operation: stream, gates: [streamGate], label: "stream provider timer") else {
             return
         }
-        streamClock.fireNext()
-        await assertDeadlineExpired(stream, clock: streamClock, gates: [streamGate], label: "stream provider")
+        await assertDeadlineExpiresAfterCancellation(
+            stream,
+            clock: streamClock,
+            gates: [streamGate],
+            label: "stream provider"
+        )
         XCTAssertEqual(streamTransportCount.value, 0)
         streamClock.reset()
         streamGate.reset()
@@ -439,8 +501,12 @@ final class SMBOperationDeadlineTests: XCTestCase {
         guard await waitForDeadlineTimer(downloadClock, operation: download, gates: [downloadGate], label: "download provider timer") else {
             return
         }
-        downloadClock.fireNext()
-        await assertDeadlineExpired(download, clock: downloadClock, gates: [downloadGate], label: "download provider")
+        await assertDeadlineExpiresAfterCancellation(
+            download,
+            clock: downloadClock,
+            gates: [downloadGate],
+            label: "download provider"
+        )
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
         downloadClock.reset()
         downloadGate.reset()
@@ -571,12 +637,12 @@ final class SMBOperationDeadlineTests: XCTestCase {
             return
         }
         XCTAssertEqual(clock.requestedDurations, [.seconds(30)])
-        clock.fireNext()
-        guard await waitForCancellationObservation(cancellationGate, operation: operation, clock: clock, label: "resume \(phase.rawValue) cancellation") else {
-            return
-        }
-        cancellationGate.releaseNormally()
-        await assertDeadlineExpired(operation, clock: clock, gates: [], label: "resume \(phase.rawValue)")
+        await assertDeadlineExpiresAfterCancellation(
+            operation,
+            clock: clock,
+            cancellationGates: [cancellationGate],
+            label: "resume \(phase.rawValue)"
+        )
 
         XCTAssertEqual(factory.makeCount, 1, "cancellation must prevent the append one-shot connection")
         XCTAssertEqual(try Data(contentsOf: destination), Data("hello ".utf8), "cancellation must preserve the resume destination")
@@ -780,9 +846,11 @@ private final class SMBDeadlineManualSleeper: @unchecked Sendable {
         try await callsChanged.wait(until: target)
     }
 
-    func fireNext() {
+    func fireNext() -> Bool {
         let waiter = lock.withLock { timers.isEmpty ? nil : timers.removeFirst() }
-        waiter?.continuation.resume()
+        // Simulate the timer throwing inside its child before operation cancellation is observed.
+        waiter?.continuation.resume(throwing: SMBTransportError.timedOut)
+        return waiter != nil
     }
 
     func reset() {
@@ -816,6 +884,7 @@ private final class SMBDeadlineAsyncGate: @unchecked Sendable {
     private var waiters: [Waiter] = []
     private var released = false
     private let entered = SMBDeadlineTestEvent()
+    private let cancellation = SMBDeadlineTestEvent()
 
     func suspend() async throws {
         let id = UUID()
@@ -837,11 +906,16 @@ private final class SMBDeadlineAsyncGate: @unchecked Sendable {
             }
         } onCancel: {
             self.cancelWaiter(id: id)
+            self.cancellation.signal()
         }
     }
 
     func waitUntilEntered() async throws {
         try await entered.wait(until: 1)
+    }
+
+    func waitUntilCancellationObserved() async throws {
+        try await cancellation.wait(until: 1)
     }
 
     func release() {
@@ -863,6 +937,7 @@ private final class SMBDeadlineAsyncGate: @unchecked Sendable {
         }
         pending.forEach { $0.resume(throwing: CancellationError()) }
         entered.reset()
+        cancellation.reset()
     }
 
     private func cancelWaiter(id: UUID) {
@@ -879,8 +954,11 @@ private final class SMBDeadlineCancellationReleaseGate: @unchecked Sendable {
     private var waiters: [CheckedContinuation<Void, Error>] = []
     private var released = false
     private var cancellationObserved = false
+    private var resumedNormallyWhileCancelledCountStorage = 0
     private let entered = SMBDeadlineTestEvent()
     private let cancellation = SMBDeadlineTestEvent()
+
+    var resumedNormallyWhileCancelledCount: Int { lock.withLock { resumedNormallyWhileCancelledCountStorage } }
 
     func suspendUntilReleased() async throws {
         try await withTaskCancellationHandler {
@@ -905,6 +983,9 @@ private final class SMBDeadlineCancellationReleaseGate: @unchecked Sendable {
             }
             if shouldSignal { self.cancellation.signal() }
         }
+        if Task.isCancelled {
+            lock.withLock { resumedNormallyWhileCancelledCountStorage += 1 }
+        }
     }
 
     func waitUntilEntered() async throws {
@@ -925,10 +1006,22 @@ private final class SMBDeadlineCancellationReleaseGate: @unchecked Sendable {
         pending.forEach { $0.resume() }
     }
 
+    func releaseNormallyAfterCancellation() -> Int {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+            released = true
+            let pending = waiters
+            waiters.removeAll()
+            return pending
+        }
+        pending.forEach { $0.resume() }
+        return pending.count
+    }
+
     func reset() {
         let pending = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
             released = false
             cancellationObserved = false
+            resumedNormallyWhileCancelledCountStorage = 0
             let pending = waiters
             waiters.removeAll()
             return pending
@@ -1055,15 +1148,21 @@ private final class SMBDeadlineResumeOnce<T: Sendable>: @unchecked Sendable {
     private var completed = false
 
     func install(_ continuation: CheckedContinuation<T, Error>) {
-        let result = lock.withLock { () -> Result<T, Error>? in
-            if completed, let result {
+        let storedResult = lock.withLock { () -> Result<T, Error>? in
+            if completed, let storedResult = self.result {
                 self.result = nil
-                return result
+                return storedResult
             }
             self.continuation = continuation
             return nil
         }
-        if let result { continuation.resume(with: result) }
+        guard let storedResult else { return }
+        switch storedResult {
+        case .success(let value):
+            continuation.resume(returning: value)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
     }
 
     func resume(_ result: Result<T, Error>) {
@@ -1077,7 +1176,13 @@ private final class SMBDeadlineResumeOnce<T: Sendable>: @unchecked Sendable {
             self.result = result
             return nil
         }
-        continuation?.resume(with: result)
+        guard let continuation else { return }
+        switch result {
+        case .success(let value):
+            continuation.resume(returning: value)
+        case .failure(let error):
+            continuation.resume(throwing: error)
+        }
     }
 }
 
@@ -1192,6 +1297,72 @@ private func waitForDeadlineTimer(
     }
 }
 
+private func assertDeadlineExpiresAfterCancellation(
+    _ operation: Task<Void, Error>,
+    clock: SMBDeadlineManualSleeper,
+    gates: [SMBDeadlineAsyncGate] = [],
+    cancellationGates: [SMBDeadlineCancellationReleaseGate] = [],
+    label: String
+) async {
+    guard clock.fireNext() else {
+        await failAndDrainDeadlineOperation(
+            operation,
+            gates: gates,
+            cancellationGates: cancellationGates,
+            clock: clock,
+            label: label,
+            error: SMBDeadlineHangGuardError(label: "\(label) timer was not registered")
+        )
+        return
+    }
+
+    for gate in gates {
+        do {
+            try await awaitWithDeadlineHangGuard("\(label) operation cancellation") {
+                try await gate.waitUntilCancellationObserved()
+            }
+        } catch {
+            await failAndDrainDeadlineOperation(
+                operation,
+                gates: gates,
+                cancellationGates: cancellationGates,
+                clock: clock,
+                label: label,
+                error: error
+            )
+            return
+        }
+    }
+
+    for gate in cancellationGates {
+        guard await waitForCancellationObservation(
+            gate,
+            operation: operation,
+            clock: clock,
+            label: "\(label) operation cancellation"
+        ) else {
+            return
+        }
+        let resumedWaiterCount = gate.releaseNormallyAfterCancellation()
+        guard resumedWaiterCount == 1 else {
+            await failAndDrainDeadlineOperation(
+                operation,
+                gates: gates,
+                cancellationGates: cancellationGates,
+                clock: clock,
+                label: label,
+                error: SMBDeadlineHangGuardError(label: "\(label) cancellation gate had \(resumedWaiterCount) waiters")
+            )
+            return
+        }
+    }
+
+    await assertDeadlineExpired(operation, clock: clock, gates: gates, label: label)
+    cancellationGates.forEach {
+        XCTAssertEqual($0.resumedNormallyWhileCancelledCount, 1, "\(label) gate must resume normally after the operation task is cancelled")
+    }
+}
+
 private func assertDeadlineExpired(
     _ operation: Task<Void, Error>,
     clock: SMBDeadlineManualSleeper,
@@ -1209,9 +1380,59 @@ private func assertDeadlineExpired(
     }
 }
 
+private func releaseDeadlineOperationAndDrain(
+    _ operation: Task<Void, Error>,
+    actorTask: Task<Void, Never>,
+    blocker: SMBDeadlineActorBlocker,
+    clock: SMBDeadlineManualSleeper,
+    label: String
+) async {
+    blocker.release()
+    do {
+        try await awaitWithDeadlineHangGuard("\(label) actor blocker drain") { await actorTask.value }
+    } catch {
+        XCTFail("\(label) actor blocker did not drain: \(error)")
+    }
+    do {
+        try await awaitWithDeadlineHangGuard("\(label) operation drain") { try await operation.value }
+    } catch let error as SMBDeadlineHangGuardError {
+        XCTFail("\(label) operation did not drain after actor release: \(error)")
+    } catch {
+        // The empty transport can fail once the operation enters the actor; this only drains it.
+    }
+    clock.reset()
+}
+
+private func waitForQueuedDeadlineOperationCancellation(
+    _ cancellation: SMBDeadlineTestEvent,
+    operation: Task<Void, Error>,
+    actorTask: Task<Void, Never>,
+    blocker: SMBDeadlineActorBlocker,
+    clock: SMBDeadlineManualSleeper,
+    label: String
+) async -> Bool {
+    do {
+        try await awaitWithDeadlineHangGuard("\(label) queued operation cancellation") {
+            try await cancellation.wait(until: 1)
+        }
+        return true
+    } catch {
+        await releaseDeadlineOperationAndDrain(
+            operation,
+            actorTask: actorTask,
+            blocker: blocker,
+            clock: clock,
+            label: label
+        )
+        XCTFail("\(label) operation child was not cancelled before actor admission was released: \(error)")
+        return false
+    }
+}
+
 private func failAndDrainDeadlineOperation(
     _ operation: Task<Void, Error>,
     gates: [SMBDeadlineAsyncGate],
+    cancellationGates: [SMBDeadlineCancellationReleaseGate] = [],
     clock: SMBDeadlineManualSleeper,
     label: String,
     error: Error
@@ -1219,7 +1440,9 @@ private func failAndDrainDeadlineOperation(
     XCTFail("\(label): \(error)")
     operation.cancel()
     gates.forEach { $0.release() }
+    cancellationGates.forEach { $0.releaseNormally() }
     clock.reset()
     _ = try? await awaitWithDeadlineHangGuard("\(label) operation drain") { try await operation.value }
     gates.forEach { $0.reset() }
+    cancellationGates.forEach { $0.reset() }
 }

@@ -10272,8 +10272,250 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(plaintextRead, sentinel)
         XCTAssertTrue(plaintextCapture.messages.joined(separator: "\n").contains(sentinelHex))
 
+        let untransformedReadResponse = try smb2ReadResponse(sentinel, messageId: 0, treeId: 0x3344)
+        let untransformedTransport = InMemoryTransport(inbound: try framed([untransformedReadResponse]))
+        let untransformedCapture = SMBTraceLogCapture()
+        let untransformedLogger = SMBSessionDebugLogger(
+            configuration: SMBSessionDebugConfiguration(enabled: true, traceWire: true, traceWireFull: true),
+            sink: { untransformedCapture.append($0) }
+        )
+        let untransformedSession = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: untransformedTransport,
+            debugLogger: untransformedLogger
+        )
+        await untransformedSession.installEncryptionStateForTesting(
+            encryptionKey: encryptionKey,
+            decryptionKey: encryptionKey
+        )
+        let untransformedSessionFlags = await untransformedSession.sessionFlagsForTesting()
+        XCTAssertEqual(untransformedSessionFlags, 0)
+        let untransformedRead = try await untransformedSession.readChunk(
+            treeId: 0x3344,
+            fileId: Array(repeating: 0x33, count: 16),
+            offset: 0,
+            length: UInt64(sentinel.count)
+        )
+        XCTAssertEqual(untransformedRead, sentinel)
+
+        let untransformedMessages = untransformedCapture.messages
+        XCTAssertTrue(untransformedMessages.contains {
+            $0.hasPrefix("SMB response") && $0.contains("<redacted; encrypted session plaintext>")
+        })
+        XCTAssertFalse(untransformedMessages.joined(separator: "\n").contains(SMBDebug.hex(untransformedReadResponse)))
+        XCTAssertFalse(untransformedMessages.joined(separator: "\n").contains(sentinelHex))
+
         await encryptedSession.closeTransport(cause: "wire_trace_redaction_test")
         await plaintextSession.closeTransport(cause: "wire_trace_positive_control_test")
+        await untransformedSession.closeTransport(cause: "wire_trace_untransformed_response_test")
+    }
+
+    func testEncryptedInvalidResponseDoesNotLeakDecryptedBytesThroughDiagnostics() async throws {
+        let sentinel = Array("DECRYPTED_ERROR_SENTINEL_10219".utf8)
+        let sentinelHex = SMBDebug.hex(sentinel)
+        let encryptionKey = Array(repeating: UInt8(0x6b), count: 16)
+        let invalidPlaintext = sentinel + Array(repeating: UInt8(0x00), count: 80 - sentinel.count)
+        let encryptedResponse = try smb3CCMTransform(
+            invalidPlaintext,
+            key: encryptionKey,
+            nonce: (31...41).map(UInt8.init),
+            sessionId: 0
+        )
+        let transport = InMemoryTransport(inbound: try framed([encryptedResponse]))
+        let debugCapture = SMBTraceLogCapture()
+        let debugLogger = SMBSessionDebugLogger(
+            configuration: SMBSessionDebugConfiguration(enabled: true, traceWire: true, traceWireFull: true),
+            sink: { debugCapture.append($0) }
+        )
+        let perfCapture = SMBTraceLogCapture()
+        SMBPerfLog.enabledOverride = true
+        SMBPerfLog.testSink = { perfCapture.append($0) }
+        defer {
+            SMBPerfLog.testSink = nil
+            SMBPerfLog.enabledOverride = nil
+        }
+
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            debugLogger: debugLogger
+        )
+        await session.installEncryptionStateForTesting(
+            encryptionKey: encryptionKey,
+            decryptionKey: encryptionKey
+        )
+
+        var returnedErrorDescription: String?
+        do {
+            _ = try await awaitWithTimeout("invalid encrypted response fails read") {
+                try await session.readChunk(
+                    treeId: 0x3344,
+                    fileId: Array(repeating: 0x44, count: 16),
+                    offset: 0,
+                    length: 1
+                )
+            }
+            XCTFail("expected invalid decrypted SMB2 header to fail dispatch")
+        } catch let error as SMBCodecError {
+            guard case .invalidValue(let message) = error else {
+                return XCTFail("expected SMBCodecError.invalidValue, got \(error)")
+            }
+            XCTAssertEqual(message, "invalid SMB2 protocol id: length=80")
+            returnedErrorDescription = String(describing: error)
+        }
+        await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 1)
+
+        let debugOutput = debugCapture.messages.joined(separator: "\n")
+        let perfOutput = perfCapture.messages.joined(separator: "\n")
+        XCTAssertTrue(debugCapture.messages.contains {
+            $0.hasPrefix("decrypted ") && $0.contains("<redacted; encrypted session plaintext>")
+        })
+        XCTAssertTrue(perfCapture.messages.contains { $0.contains("[wire] first_fault") })
+        XCTAssertFalse(debugOutput.contains(sentinelHex))
+        XCTAssertFalse(perfOutput.contains(sentinelHex))
+        XCTAssertFalse(returnedErrorDescription?.contains(sentinelHex) ?? true)
+        await session.closeTransport(cause: "invalid_encrypted_response_redaction_test")
+    }
+
+    func testDefaultEnvironmentTraceUsesRealStderrAndKeepsFullTracePositiveControls() async throws {
+        let childFlag = "SMBEE_TRACE_STDERR_PROBE_CHILD"
+        if ProcessInfo.processInfo.environment[childFlag] == "1" {
+            try await runDefaultEnvironmentTraceProbe()
+            return
+        }
+
+        let process = try defaultEnvironmentTraceProbeProcess(childFlag: childFlag)
+        // stdout is discarded instead of piped: reading two pipes sequentially deadlocks once the
+        // unread one fills its buffer while the child is still writing.
+        let stderr = Pipe()
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = stderr
+        try process.run()
+        let childStderr = try XCTUnwrap(
+            String(bytes: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+        )
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "trace probe child exited with status \(process.terminationStatus)")
+
+        let fixtures = try defaultEnvironmentTraceProbeFixtures()
+        let outputLines = childStderr.split(separator: "\n").map(String.init)
+        let encryptedHex = SMBDebug.hex(fixtures.encryptedResponse)
+        let plaintextHex = SMBDebug.hex(fixtures.plaintextResponse)
+        let encryptedSentinelHex = SMBDebug.hex(fixtures.encryptedSentinel)
+        XCTAssertTrue(outputLines.contains { $0.contains("SMB response (") && $0.contains(encryptedHex) })
+        XCTAssertTrue(outputLines.contains { $0.contains("SMB response (") && $0.contains(plaintextHex) })
+        XCTAssertTrue(outputLines.contains {
+            $0.contains("direct-TCP header") && $0.hasSuffix(" (4 bytes): \(fixtures.encryptedFrameHeaderHex)")
+        })
+        XCTAssertTrue(outputLines.contains {
+            $0.contains("direct-TCP header") && $0.hasSuffix(" (4 bytes): \(fixtures.plaintextFrameHeaderHex)")
+        })
+        XCTAssertTrue(childStderr.contains("<redacted; encrypted session plaintext>"))
+        XCTAssertFalse(childStderr.contains(encryptedSentinelHex))
+    }
+
+    private func defaultEnvironmentTraceProbeProcess(childFlag: String) throws -> Process {
+        let process = Process()
+        var environment = ProcessInfo.processInfo.environment
+        environment[childFlag] = "1"
+        environment["SMBEE_DEBUG"] = "1"
+        environment["SMBEE_TRACE_WIRE"] = "1"
+        environment["SMBEE_TRACE_WIRE_FULL"] = "1"
+        environment["SMBEE_PERF"] = "0"
+        process.environment = environment
+
+        #if os(macOS)
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = [
+            "xctest",
+            "-XCTest",
+            "SMBeeTests/testDefaultEnvironmentTraceUsesRealStderrAndKeepsFullTracePositiveControls",
+            Bundle(for: SMBeeTests.self).bundleURL.path
+        ]
+        #else
+        process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        // swift-corelibs-xctest takes the selected test as a positional `Module.Class/method` argument.
+        process.arguments = [
+            "SMBeeTests.SMBeeTests/testDefaultEnvironmentTraceUsesRealStderrAndKeepsFullTracePositiveControls"
+        ]
+        #endif
+        return process
+    }
+
+    private func runDefaultEnvironmentTraceProbe() async throws {
+        let fixtures = try defaultEnvironmentTraceProbeFixtures()
+        let encryptedTransport = InMemoryTransport(inbound: try framed([fixtures.encryptedResponse]))
+        let encryptedSession = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: encryptedTransport
+        )
+        await encryptedSession.installEncryptionStateForTesting(
+            encryptionKey: fixtures.encryptionKey,
+            decryptionKey: fixtures.encryptionKey
+        )
+        let sessionFlags = await encryptedSession.sessionFlagsForTesting()
+        XCTAssertEqual(sessionFlags, 0)
+        let encryptedRead = try await encryptedSession.readChunk(
+            treeId: 0x3344,
+            fileId: Array(repeating: 0x55, count: 16),
+            offset: 0,
+            length: UInt64(fixtures.encryptedSentinel.count)
+        )
+        XCTAssertEqual(encryptedRead, fixtures.encryptedSentinel)
+        await encryptedSession.closeTransport(cause: "stderr_trace_probe_encrypted_done")
+
+        let plaintextTransport = InMemoryTransport(inbound: try framed([fixtures.plaintextResponse]))
+        let plaintextSession = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: plaintextTransport
+        )
+        let plaintextRead = try await plaintextSession.readChunk(
+            treeId: 0x3344,
+            fileId: Array(repeating: 0x66, count: 16),
+            offset: 0,
+            length: UInt64(fixtures.plaintextSentinel.count)
+        )
+        XCTAssertEqual(plaintextRead, fixtures.plaintextSentinel)
+        await plaintextSession.closeTransport(cause: "stderr_trace_probe_plaintext_done")
+    }
+
+    private func defaultEnvironmentTraceProbeFixtures() throws -> (
+        encryptionKey: [UInt8],
+        encryptedSentinel: [UInt8],
+        encryptedResponse: [UInt8],
+        encryptedFrameHeaderHex: String,
+        plaintextSentinel: [UInt8],
+        plaintextResponse: [UInt8],
+        plaintextFrameHeaderHex: String
+    ) {
+        let encryptionKey = Array(repeating: UInt8(0x73), count: 16)
+        let encryptedSentinel = Array("ENCRYPTED_STDERR_SENTINEL_10219".utf8)
+        let encryptedReadResponse = try smb2ReadResponse(encryptedSentinel, messageId: 0, treeId: 0x3344)
+        let encryptedResponse = try smb3CCMTransform(
+            encryptedReadResponse,
+            key: encryptionKey,
+            nonce: (51...61).map(UInt8.init),
+            sessionId: 0
+        )
+        let plaintextSentinel = Array("PLAIN_STDERR_FULL_TRACE_10219".utf8)
+        let plaintextResponse = try smb2ReadResponse(plaintextSentinel, messageId: 0, treeId: 0x3344)
+        return (
+            encryptionKey,
+            encryptedSentinel,
+            encryptedResponse,
+            SMBDebug.hex(Array(try DirectTCPFraming.frame(encryptedResponse).prefix(4))),
+            plaintextSentinel,
+            plaintextResponse,
+            SMBDebug.hex(Array(try DirectTCPFraming.frame(plaintextResponse).prefix(4)))
+        )
     }
 
     func testWriteChunkRangesCoverBoundarySizes() throws {

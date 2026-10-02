@@ -119,7 +119,7 @@ public struct SMB2Header: Equatable, Sendable {
         let protocolId = try reader.readBytes(count: 4)
         guard protocolId == [0xfe, 0x53, 0x4d, 0x42] else {
             throw SMBCodecError.invalidValue(
-                "invalid SMB2 protocol id: firstBytes=\(SMBDebug.hexPrefix(bytes, count: 32)) length=\(bytes.count)"
+                "invalid SMB2 protocol id: length=\(bytes.count)"
             )
         }
         guard try reader.readUInt16LE() == 64 else {

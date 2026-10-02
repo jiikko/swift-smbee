@@ -340,7 +340,12 @@ final class SMBNegotiateValidationTests: XCTestCase {
             $0.hasPrefix("FSCTL_VALIDATE_NEGOTIATE_INFO request") &&
                 $0.contains("<redacted; encrypted session plaintext>")
         })
+        XCTAssertTrue(capture.messages.contains {
+            $0.hasPrefix("SMB response (\(validationResponse.count) bytes): ") &&
+                $0.contains("<redacted; encrypted session plaintext>")
+        })
         XCTAssertFalse(capture.messages.joined(separator: "\n").contains(SMBDebug.hex(validationRequest)))
+        XCTAssertFalse(capture.messages.joined(separator: "\n").contains(SMBDebug.hex(validationResponse)))
         let counts = await session.validateNegotiateCountsForTesting()
         XCTAssertEqual(counts.sent, 1)
         XCTAssertEqual(counts.succeeded, 1)

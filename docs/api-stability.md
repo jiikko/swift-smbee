@@ -69,6 +69,17 @@ do not infer that every overload accepts the same arguments.
 New cases may be added during 0.x. Consumers should use a fallback branch when switching
 over errors and should not parse human-readable associated strings.
 
+## Network transport implementation note
+
+`NWConnectionTransport` currently turns each nonempty segment into its own `Data`, then
+enqueues the frame's segments in one Network.framework batch under a per-frame content
+context. `NWConnection.send` also accepts `DispatchData`; per-segment `Data` is used here
+because it keeps ownership and buffer lifetime explicit for Swift `[UInt8]` inputs without
+adding discontiguous-storage conversion and retention machinery. The performance effect of
+this implementation has not been measured. A send returns after all of its
+`contentProcessed` callbacks complete; this indicates processing by Network.framework, not
+an acknowledgement from the peer.
+
 ## Credential migration
 
 `SMBCredential.password` remains source-compatible in 0.1, but direct secret reads and

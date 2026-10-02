@@ -239,6 +239,7 @@ test_syntax_checks() {
     "${SCRIPT_DIR}/network-performance-study-arm" \
     "${SCRIPT_DIR}/network-performance-study-rtt" \
     "${SCRIPT_DIR}/network-performance-study-run" \
+    "${SCRIPT_DIR}/network-performance-study-run-lib.sh" \
     "${SCRIPT_DIR}/publish-resource-performance-summary" \
     "${SCRIPT_DIR}/write-resource-performance-artifact" \
     "${SCRIPT_DIR}/gh-retry" \
@@ -691,12 +692,64 @@ test_network_performance_study_rtt_shaping() (
     echo 'network study initializes the RTT shaper before selecting a nonzero level' >&2
     return 1
   fi
-  test "$(grep -Fc 'run_rtt_shaper guard "${rtt_target}" >/dev/null' "$SCRIPT_DIR/network-performance-study-run")" -eq 2
+  if ! awk '/^run_invocation/ { inside=1 } inside { print } /^}$/ && inside { exit }' \
+    "$SCRIPT_DIR/network-performance-study-run" \
+    | grep -Fq 'append_guarded_sample "${rtt_target}"'; then
+    echo 'network study does not route arm sample adoption through the guarded append helper' >&2
+    return 1
+  fi
+
+  local stale_output_dir stale_state helper_sample adopted_sample guard_calls
+  stale_output_dir="$scenario_dir/zero-only-with-state"
+  stale_state="$stale_output_dir/network-shape-state"
+  mkdir -p "$stale_output_dir"
+  printf '%s\n' 'previous-shaping-state' >"$stale_state"
+  if STUDY_PROFILE=P STUDY_ARMS=current STUDY_INVOCATIONS=1 STUDY_OUTPUT_DIR="$stale_output_dir" \
+    SAMBA_CONTAINER=smbee-samba-study SWIFT_VERSION=6.2 STUDY_RTT_LEVELS=0 \
+    "$SCRIPT_DIR/network-performance-study-run" >"$scenario_dir/zero-state.out" 2>&1; then
+    echo 'zero-only network study accepted existing RTT shaping state' >&2
+    return 1
+  fi
+  if ! grep -Fq 'existing shaping state' "$scenario_dir/zero-state.out"; then
+    echo 'zero-only network study did not reject existing RTT shaping state before measuring' >&2
+    return 1
+  fi
+  expect_contains "$scenario_dir/zero-state.out" \
+    'existing shaping state' 'new Samba container/output directory' 'explicitly clear'
+  test "$(<"$stale_state")" = 'previous-shaping-state'
+  test ! -e "$stale_output_dir/samples.jsonl"
+
+  helper_sample="$scenario_dir/arm-sample.jsonl"
+  adopted_sample="$scenario_dir/adopted-samples.jsonl"
+  guard_calls="$scenario_dir/guard-calls.log"
+  printf '%s\n' '{"candidate_sample":true}' >"$helper_sample"
+  : >"$adopted_sample"
+  : >"$guard_calls"
+  source "$SCRIPT_DIR/network-performance-study-run-lib.sh"
+  run_rtt_shaper() {
+    printf '%s\n' "$*" >>"$guard_calls"
+    [ "${FAKE_GUARD_FAIL:-0}" != 1 ] || return 41
+  }
+  if FAKE_GUARD_FAIL=1 append_guarded_sample 5 "$helper_sample" "$adopted_sample" \
+    >"$scenario_dir/guarded-append.out" 2>&1; then
+    echo 'arm sample was adopted after its post-measurement guard failed' >&2
+    return 1
+  fi
+  test ! -s "$adopted_sample"
+  grep -Fx 'guard 5' "$guard_calls"
+  append_guarded_sample 0 "$helper_sample" "$adopted_sample"
+  grep -Fx '{"candidate_sample":true}' "$adopted_sample"
 
   cat >"$scenario_dir/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [ "$1" = -n ]; then shift; fi
+if [ "$1" = -n ]; then
+  shift
+  export FAKE_SUDO_NONINTERACTIVE=1
+else
+  export FAKE_SUDO_NONINTERACTIVE=0
+fi
+export FAKE_SUDO_ACTIVE=1
 exec "$@"
 EOF
   cat >"$scenario_dir/bin/docker" <<'EOF'
@@ -732,27 +785,100 @@ elif [ "${FAKE_TC_SCOPE:-host}" = host ] && [ "$1" = -j ]; then
 fi
 EOF
   cat >"$scenario_dir/fake-tc.py" <<'EOF'
-import json, os, sys
+import json
+import os
+import sys
+
 state_path = os.path.join(os.environ["FAKE_TC_STATE_DIR"], "state.json")
 os.makedirs(os.path.dirname(state_path), exist_ok=True)
 try:
     state = json.load(open(state_path, encoding="utf-8"))
 except FileNotFoundError:
     state = {"qdiscs": {}, "filters": {}}
+
 def save():
-    json.dump(state, open(state_path, "w", encoding="utf-8"))
+    temporary_path = state_path + ".tmp-" + str(os.getpid())
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+    os.replace(temporary_path, state_path)
+
 def val(args, name, default=""):
-    try: return args[args.index(name) + 1]
-    except (ValueError, IndexError): return default
-if sys.argv[1] == "bump":
-    _, _, scope, device, pref, count = sys.argv
-    entry = state["filters"].setdefault(f"{scope}|{device}|{pref}", {})
-    entry["packets"] = entry.get("packets", 0) + int(count)
+    try:
+        return args[args.index(name) + 1]
+    except (ValueError, IndexError):
+        return default
+
+def actions_for(entry, target=None, action_override=None):
+    action = action_override or entry["action"]
+    if action == "redirect":
+        return [{"order": 1, "kind": "mirred", "mirred_action": "redirect", "direction": "egress",
+                 "to_dev": target if target is not None else entry["target"],
+                 "control_action": {"type": "stolen"}}]
+    return [{"order": 1, "kind": "gact", "control_action": {"type": action}}]
+
+def filter_key(scope, device, chain, pref):
+    return f"{scope}|{device}|{chain}|{pref}"
+
+def classify(scope, device, protocol, src_ip, src_port, dst_ip, dst_port, ip_proto):
+    packet = {"protocol": protocol, "ip_proto": ip_proto, "src_ip": src_ip, "src_port": src_port,
+              "dst_ip": dst_ip, "dst_port": dst_port}
+    entries = sorted(
+        (entry for entry in state["filters"].values()
+         if entry["scope"] == scope and entry["device"] == device and entry["chain"] == 0),
+        key=lambda entry: entry["pref"],
+    )
+    for entry in entries:
+        if entry["protocol"] not in ("all", packet["protocol"]):
+            continue
+        if entry["kind"] == "flower":
+            keys = {"ip_proto": ip_proto, "src_ip": src_ip, "src_port": int(src_port),
+                    "dst_ip": dst_ip, "dst_port": int(dst_port)}
+            if any(str(entry.get("proto" if name == "ip_proto" else name)) != str(value)
+                   for name, value in keys.items()):
+                continue
+        entry["packets"] = entry.get("packets", 0) + 1
+        if entry["action"] in ("continue", "pipe"):
+            continue
+        save()
+        if entry["action"] == "redirect":
+            return entry["target"]
+        return entry["action"]
     save()
+    return "none"
+
+if sys.argv[1] == "classify":
+    _, _, scope, device, protocol, src_ip, src_port, dst_ip, dst_port, ip_proto = sys.argv
+    print(classify(scope, device, protocol, src_ip, src_port, dst_ip, dst_port, ip_proto))
     raise SystemExit(0)
+
+if sys.argv[1] == "classify-probe":
+    unrelated_only = os.environ.get("FAKE_PROBE_UNRELATED_ONLY", "0") == "1"
+    server_packets = os.environ.get("FAKE_PROBE_SERVER_PACKETS", "1") != "0"
+    host_packets = os.environ.get("FAKE_PROBE_HOST_PACKETS", "1") != "0"
+    def require_redirect(scope, device, src_ip, src_port, dst_ip, dst_port, target):
+        actual = classify(scope, device, "ip", src_ip, src_port, dst_ip, dst_port, "tcp")
+        if actual != target:
+            raise SystemExit(f"fake classifier expected redirect to {target}, got {actual}")
+    if unrelated_only:
+        if server_packets:
+            require_redirect("server", "eth0", "198.51.100.10", "40000", "172.18.0.2", "445", "ifb-study")
+        if host_packets:
+            require_redirect("host", "veth-study", "172.18.0.2", "445", "198.51.100.20", "53000", "ifb-study-host")
+    else:
+        for port in range(50001, 50016):
+            if server_packets:
+                require_redirect("server", "eth0", "172.18.0.1", str(port), "172.18.0.2", "445", "ifb-study")
+            if host_packets:
+                require_redirect("host", "veth-study", "172.18.0.2", "445", "172.18.0.1", str(port), "ifb-study-host")
+    raise SystemExit(0)
+
 args = sys.argv[1:]
-stats = bool(args and args[0] == "-s")
-if stats: args = args[1:]
+json_output = False
+stats = False
+while args and args[0] in ("-j", "-json", "-s", "-statistics"):
+    flag = args.pop(0)
+    json_output = json_output or flag in ("-j", "-json")
+    stats = stats or flag in ("-s", "-statistics")
 scope = os.environ.get("FAKE_TC_SCOPE", "host")
 with open(os.environ["FAKE_TOOL_LOG"], "a", encoding="utf-8") as log:
     log.write(f"tc {scope} {' '.join(args)}\n")
@@ -767,12 +893,20 @@ if args[0] == "qdisc":
             delay = os.environ.get("FAKE_TC_HOST_DELAY_OVERRIDE", delay)
         if scope == "server" and dev == "ifb-study":
             delay = os.environ.get("FAKE_TC_SERVER_DELAY_OVERRIDE", delay)
-        if delay:
-            print(f"qdisc netem 8001: root refcnt 2 limit 1000 delay {delay}")
-            if stats: print(" Sent 1000 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)")
+        if json_output:
+            options = {"limit": 1000}
+            if delay and delay != "0ms":
+                options["delay"] = {"delay": float(delay[:-2]) / 1000.0, "jitter": 0.0}
+            print(json.dumps([{"kind": "netem", "handle": "8001:", "root": True, "options": options}]))
+        elif delay:
+            delay_text = "" if delay == "0ms" else f" delay {delay}"
+            print(f"qdisc netem 8001: root refcnt 2 limit 1000{delay_text}")
+            if stats:
+                print(" Sent 1000 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)")
     elif op == "del":
         if "ingress" in args:
-            state["filters"] = {k:v for k,v in state["filters"].items() if not k.startswith(f"{scope}|{dev}|")}
+            state["filters"] = {k: v for k, v in state["filters"].items()
+                                 if not (v["scope"] == scope and v["device"] == dev)}
         else: state["qdiscs"].pop(key, None)
         save()
     raise SystemExit(0)
@@ -780,32 +914,75 @@ if args[0] != "filter": raise SystemExit(2)
 op, dev = args[1], val(args, "dev")
 if op == "show":
     if stats and os.environ.get("FAKE_TC_FILTER_READ_FAIL") == "1": raise SystemExit(48)
-    for key, entry in sorted(state["filters"].items(), key=lambda row: int(row[0].rsplit("|", 1)[1])):
-        sc, dv, pref = key.split("|")
-        if sc != scope or dv != dev: continue
+    entries = sorted((entry for entry in state["filters"].values()
+                      if entry["scope"] == scope and entry["device"] == dev),
+                     key=lambda entry: (entry["pref"], entry["chain"]))
+    rows = []
+    for entry in entries:
+        pref = str(entry["pref"])
         kind = entry["kind"]
-        print(f"filter protocol {'ip' if kind == 'flower' else 'all'} pref {pref} {kind} chain 0")
-        if kind == "flower":
-            print("  ip_proto {proto} src_ip {src_ip} src_port {src_port} dst_ip {dst_ip} dst_port {dst_port}".format(**entry))
+        protocol = entry["protocol"]
+        chain = entry["chain"]
         target = entry["target"]
-        if pref == "1000":
+        action_override = None
+        if entry["pref"] == 1000:
+            protocol = os.environ.get(f"FAKE_TC_{scope.upper()}_MATCHALL_PROTOCOL_OVERRIDE", protocol)
+            chain = int(os.environ.get(f"FAKE_TC_{scope.upper()}_MATCHALL_CHAIN_OVERRIDE", chain))
             target = os.environ.get(f"FAKE_TC_{scope.upper()}_REDIRECT_OVERRIDE", target)
-        print(f"  action order 1: mirred (Egress Redirect to device {target}) stolen")
-        if stats:
-            packets = entry.get("packets", 0)
-            if os.environ.get("FAKE_TC_BAD_COUNTER") == "1" and int(pref) >= 101: packets = "NaN"
-            print(f"    Sent 100 bytes {packets} pkt (dropped 0, overlimits 0 requeues 0)")
+            action_override = os.environ.get(f"FAKE_TC_{scope.upper()}_MATCHALL_ACTION_OVERRIDE")
+        if json_output:
+            # tc emits a classifier summary and a concrete filter node for each flower filter.
+            rows.append({"protocol": protocol, "pref": entry["pref"], "kind": kind,
+                         "chain": chain, "options": {}})
+            options = {"actions": actions_for(entry, target, action_override)}
+            if kind == "flower":
+                options["handle"] = f"0x{entry['pref']:x}"
+                options["keys"] = {"ip_proto": entry["proto"], "src_ip": entry["src_ip"],
+                                    "src_port": int(entry["src_port"]), "dst_ip": entry["dst_ip"],
+                                    "dst_port": int(entry["dst_port"])}
+            row = {"protocol": protocol, "pref": entry["pref"], "kind": kind,
+                   "chain": chain, "options": options}
+            if stats:
+                row["stats"] = {"packets": entry.get("packets", 0), "bytes": 0}
+            rows.append(row)
+        else:
+            summary = f"filter protocol {protocol} pref {pref} {kind} chain {chain}"
+            print(summary)
+            node = summary + (f" handle 0x{entry['pref']:x}" if kind == "flower" else "")
+            print(node)
+            if kind == "flower":
+                print("  ip_proto {proto} src_ip {src_ip} src_port {src_port} dst_ip {dst_ip} dst_port {dst_port}".format(**entry))
+            if entry["action"] == "redirect":
+                print(f"  action order 1: mirred (Egress Redirect to device {target}) stolen")
+            else:
+                print(f"  action order 1: gact action {action_override or entry['action']}")
+            if stats:
+                packets = entry.get("packets", 0)
+                if os.environ.get("FAKE_TC_BAD_COUNTER") == "1" and entry["pref"] >= 101:
+                    packets = "NaN"
+                print(f"    Sent 100 bytes {packets} pkt (dropped 0, overlimits 0 requeues 0)")
+    if json_output:
+        if os.environ.get("FAKE_TC_PRECEDING_TERMINAL") == "1":
+            rows.extend([
+                {"protocol": "ip", "pref": 99, "chain": 0},
+                {"protocol": "ip", "pref": 99, "kind": "matchall", "chain": 0,
+                 "options": {"actions": [{"order": 1, "kind": "gact", "control_action": {"type": "drop"}}]}},
+            ])
+        print(json.dumps(rows))
     raise SystemExit(0)
 if op == "replace" and os.environ.get("FAKE_FAIL_TC_FILTER") == "1": raise SystemExit(47)
 pref = val(args, "pref", "49152")
-key = f"{scope}|{dev}|{pref}"
+chain = int(val(args, "chain", "0"))
+key = filter_key(scope, dev, chain, int(pref))
 if op == "del":
     state["filters"].pop(key, None); save(); raise SystemExit(0)
 target_args = args[args.index("redirect"):] if "redirect" in args else []
+action = "redirect" if "mirred" in args else "continue" if "continue" in args else "pipe" if "pipe" in args else \
+    "drop" if "drop" in args or "shot" in args else "pass" if "pass" in args else "stop"
 state["filters"][key] = {
-    "kind": "flower" if "flower" in args else "matchall",
-    "target": val(target_args, "dev"),
-    "src_ip": val(args, "src_ip"), "src_port": val(args, "src_port"),
+    "scope": scope, "device": dev, "pref": int(pref), "protocol": val(args, "protocol", "all"),
+    "chain": chain, "kind": "flower" if "flower" in args else "matchall", "action": action,
+    "target": val(target_args, "dev"), "src_ip": val(args, "src_ip"), "src_port": val(args, "src_port"),
     "dst_ip": val(args, "dst_ip"), "dst_port": val(args, "dst_port"),
     "proto": val(args, "ip_proto"), "packets": 0,
 }
@@ -822,6 +999,12 @@ printf 'modprobe %s\n' "$*" >>"${FAKE_TOOL_LOG}"
 EOF
   cat >"$scenario_dir/bin/stat" <<'EOF'
 #!/usr/bin/env bash
+set -euo pipefail
+if [ "${FAKE_SUDO_ACTIVE:-0}" != 1 ] || [ "${FAKE_SUDO_NONINTERACTIVE:-0}" != 1 ]; then
+  echo 'fake stat was not invoked through sudo -n' >&2
+  exit 83
+fi
+printf 'sudo -n stat %s\n' "$*" >>"${FAKE_TOOL_LOG}"
 printf '%s\n' "${FAKE_NETNS_INODE:-9001}"
 EOF
   cat >"$scenario_dir/bin/python3" <<'EOF'
@@ -829,24 +1012,18 @@ EOF
 set -euo pipefail
 if [ "$1" = "$FAKE_RTT_PROBE_SCRIPT" ]; then
   mode="$2"
-  printf '%s\n' "$3" >>"$FAKE_PROBE_TARGETS"
+  printf '%s:%s\n' "$3" "$4" >>"$FAKE_PROBE_TARGETS"
   if [ "$mode" = direct ]; then
     [ "${FAKE_PROBE_FAIL_DIRECT:-0}" = 1 ] && exit 42
     printf '%s\n' "${FAKE_TCP_MEDIAN_MS:-10.000}"
     exit 0
   fi
   workdir="$5"
-  { printf '%s\n' 172.18.0.1; for port in $(seq 50001 50015); do printf '%s\n' "$port"; done; } >"$workdir/ready"
-  for _ in $(seq 1 500); do [ -f "$workdir/go" ] && break; sleep 0.01; done
-  bump() { "$FAKE_REAL_PYTHON" "$FAKE_TC_PY" bump "$1" "$2" "$3" "$4"; }
-  if [ "${FAKE_PROBE_UNRELATED_ONLY:-0}" = 1 ]; then
-    bump host veth-study 1000 15; bump server eth0 1000 15
-  else
-    for pref in $(seq 101 115); do
-      [ "${FAKE_PROBE_SERVER_PACKETS:-1}" = 0 ] || bump server eth0 "$pref" 1
-      [ "${FAKE_PROBE_HOST_PACKETS:-1}" = 0 ] || bump host veth-study "$pref" 1
-    done
-  fi
+  { printf '%s\n' 172.18.0.1; for port in $(seq 50001 50015); do printf '%s\n' "$port"; done; } \
+    >"$workdir/ready.tmp"
+  mv "$workdir/ready.tmp" "$workdir/ready"
+  while [ ! -f "$workdir/go" ]; do sleep 0.01; done
+  "$FAKE_REAL_PYTHON" "$FAKE_TC_PY" classify-probe
   printf '%s\n' "${FAKE_TCP_MEDIAN_MS:-10.000}" >"$workdir/result"
 else
   exec "$FAKE_REAL_PYTHON" "$@"
@@ -861,7 +1038,7 @@ EOF
   FAKE_REAL_PYTHON="$(command -v python3)"; export FAKE_REAL_PYTHON
   export PATH="$scenario_dir/bin:$PATH"
   export STUDY_RTT_STATE_FILE="$state_file" STUDY_RTT_JSONL="$jsonl_file"
-  export SAMBA_CONTAINER=smbee-samba-study SMBEE_E2E_HOST=127.0.0.1 SMBEE_E2E_PORT=445
+  export SAMBA_CONTAINER=smbee-samba-study SMBEE_E2E_HOST=127.0.0.1 SMBEE_E2E_PORT=1445 SMBEE_E2E_BACKEND_PORT=445
 
   # The default zero RTT path runs calibration without tc, ip, or modprobe.
   base_ms="$(FAKE_TCP_MEDIAN_MS=10.000 "$SCRIPT_DIR/network-performance-study-rtt" calibrate)"
@@ -873,8 +1050,11 @@ EOF
     echo 'RTT 0 probe unexpectedly survived a fake network failure' >&2; return 1
   fi
   test ! -s "$tc_log"
-  if ! grep -Fq '172.18.0.2' "$scenario_dir/probe-targets.log"; then
-    echo 'RTT calibration did not connect to the Samba container IP directly' >&2; return 1
+  if ! grep -Fq '172.18.0.2:445' "$scenario_dir/probe-targets.log"; then
+    echo 'RTT calibration did not connect to the Samba container IP on the backend port 445' >&2; return 1
+  fi
+  if grep -Fq '172.18.0.2:1445' "$scenario_dir/probe-targets.log"; then
+    echo 'RTT direct probe used the host-published port instead of backend port 445' >&2; return 1
   fi
 
   # Reject a host link that advertises an index but is not the reciprocal veth peer.
@@ -883,16 +1063,28 @@ EOF
   if FAKE_PEER_MISMATCH=1 "$SCRIPT_DIR/network-performance-study-rtt" setup >"$scenario_dir/bad-peer.out" 2>&1; then
     echo 'RTT shaper accepted a non-reciprocal host veth peer' >&2; return 1
   fi
+  if grep -Fq 'fake stat was not invoked through sudo -n' "$scenario_dir/bad-peer.out"; then
+    echo 'RTT setup invoked netns stat without sudo -n' >&2
+    return 1
+  fi
   expect_contains "$scenario_dir/bad-peer.out" 'could not prove the Samba eth0 and host veth are reciprocal peers'
   if grep -F 'tc host qdisc replace' "$tc_log"; then
     echo 'RTT shaper configured before validating the reciprocal peer' >&2; return 1
   fi
 
   export STUDY_RTT_STATE_FILE="$state_file" STUDY_RTT_JSONL="$jsonl_file"
-  "$SCRIPT_DIR/network-performance-study-rtt" setup >"$scenario_dir/setup.out"
+  if ! "$SCRIPT_DIR/network-performance-study-rtt" setup >"$scenario_dir/setup.out" 2>&1; then
+    cat "$scenario_dir/setup.out" >&2
+    return 1
+  fi
+  if ! grep -Fq 'sudo -n stat -Lc %i /proc/4321/ns/net' "$tc_log"; then
+    echo 'RTT setup did not invoke netns stat through sudo -n' >&2
+    return 1
+  fi
   expect_contains "$tc_log" \
     'ip -j -d link show dev eth0' \
     'ip -j -d link show' \
+    'sudo -n stat -Lc %i /proc/4321/ns/net' \
     'tc host qdisc replace dev ifb-study-host root netem delay 0ms' \
     'tc host filter replace dev veth-study parent ffff: protocol all pref 1000 matchall action mirred egress redirect dev ifb-study-host' \
     'tc server qdisc replace dev ifb-study root netem delay 0ms' \
@@ -902,6 +1094,51 @@ EOF
   fi
 
   "$SCRIPT_DIR/network-performance-study-rtt" set 5 >"$scenario_dir/set-5.out"
+  for bad_state in \
+    FAKE_TC_HOST_MATCHALL_PROTOCOL_OVERRIDE=ipv6 \
+    FAKE_TC_SERVER_MATCHALL_CHAIN_OVERRIDE=1 \
+    FAKE_TC_HOST_MATCHALL_ACTION_OVERRIDE=drop \
+    FAKE_TC_PRECEDING_TERMINAL=1; do
+    if env "$bad_state" "$SCRIPT_DIR/network-performance-study-rtt" guard 5 \
+      >"$scenario_dir/${bad_state%%=*}.out" 2>&1; then
+      echo "RTT guard accepted unsafe filter state: $bad_state" >&2
+      return 1
+    fi
+  done
+  expect_contains "$scenario_dir/FAKE_TC_HOST_MATCHALL_PROTOCOL_OVERRIDE.out" \
+    'chain 0 protocol all pref 1000 matchall redirect'
+  expect_contains "$scenario_dir/FAKE_TC_SERVER_MATCHALL_CHAIN_OVERRIDE.out" \
+    'chain 0 protocol all pref 1000 matchall redirect'
+  expect_contains "$scenario_dir/FAKE_TC_HOST_MATCHALL_ACTION_OVERRIDE.out" \
+    'chain 0 protocol all pref 1000 matchall redirect'
+  expect_contains "$scenario_dir/FAKE_TC_PRECEDING_TERMINAL.out" 'terminal or unknown filter before pref 1000'
+  FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter replace dev veth-study parent ffff: \
+    protocol ipv6 pref 999 matchall action gact drop
+  classify_result="$("$FAKE_REAL_PYTHON" "$FAKE_TC_PY" classify host veth-study ip \
+    172.18.0.2 445 172.18.0.1 50001 tcp)"
+  if [ "$classify_result" != ifb-study-host ]; then
+    echo "fake classifier treated protocol ipv6 as matching an IPv4 probe: $classify_result" >&2
+    return 1
+  fi
+  FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter del dev veth-study parent ffff: pref 999
+  FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter replace dev veth-study parent ffff: \
+    protocol ip pref 999 matchall chain 1 action gact drop
+  classify_result="$("$FAKE_REAL_PYTHON" "$FAKE_TC_PY" classify host veth-study ip \
+    172.18.0.2 445 172.18.0.1 50001 tcp)"
+  if [ "$classify_result" != ifb-study-host ]; then
+    echo "fake classifier let a chain 1 filter affect a chain 0 probe: $classify_result" >&2
+    return 1
+  fi
+  FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter del dev veth-study parent ffff: pref 999
+  FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter replace dev veth-study parent ffff: \
+    protocol ip pref 999 matchall action gact drop
+  classify_result="$("$FAKE_REAL_PYTHON" "$FAKE_TC_PY" classify host veth-study ip \
+    172.18.0.2 445 172.18.0.1 50001 tcp)"
+  if [ "$classify_result" != drop ]; then
+    echo "fake classifier did not stop at the earlier terminal action: $classify_result" >&2
+    return 1
+  fi
+  FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter del dev veth-study parent ffff: pref 999
   if FAKE_DOCKER_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
     "$SCRIPT_DIR/network-performance-study-rtt" guard 5 >"$scenario_dir/restart.out" 2>&1; then
     echo 'RTT guard accepted a changed container generation' >&2; return 1
@@ -924,6 +1161,14 @@ EOF
   "$SCRIPT_DIR/network-performance-study-rtt" set 0 >"$scenario_dir/reset-0.out"
   base_ms="$(FAKE_TCP_MEDIAN_MS=10.000 "$SCRIPT_DIR/network-performance-study-rtt" calibrate)"
   test "$base_ms" = 10.000
+  "$FAKE_REAL_PYTHON" - "$FAKE_TC_STATE_DIR/state.json" <<'PY'
+import json
+import sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in ("host|veth-study|0|1000", "server|eth0|0|1000"):
+    if state["filters"][key].get("packets", 0) < 15:
+        raise SystemExit(f"calibration packets did not continue through pref 1000 redirect: {key}")
+PY
   "$SCRIPT_DIR/network-performance-study-rtt" set 5 >"$scenario_dir/set-5-again.out"
   FAKE_TCP_MEDIAN_MS=15.000 "$SCRIPT_DIR/network-performance-study-rtt" verify 5 "$base_ms" >"$scenario_dir/verify-5.out"
   "$SCRIPT_DIR/network-performance-study-rtt" set 20 >"$scenario_dir/set-20.out"
@@ -933,7 +1178,7 @@ EOF
     'tc server qdisc replace dev ifb-study root netem delay 2.5ms' \
     'tc host qdisc replace dev ifb-study-host root netem delay 10ms' \
     'tc server qdisc replace dev ifb-study root netem delay 10ms' \
-    'tc server filter replace dev eth0 parent ffff: protocol ip pref 101 flower ip_proto tcp src_ip 172.18.0.1 src_port 50001 dst_ip 172.18.0.2 dst_port 445 action mirred egress redirect dev ifb-study'
+    'tc server filter replace dev eth0 parent ffff: protocol ip pref 101 flower ip_proto tcp src_ip 172.18.0.1 src_port 50001 dst_ip 172.18.0.2 dst_port 445 action gact continue'
   expect_contains "$jsonl_file" \
     '"requested_rtt_ms": 0' \
     '"requested_rtt_ms": 5' \
@@ -1774,6 +2019,12 @@ test_missing_log_metadata() {
     '- CPU model: `unknown`' \
     '- CPU count: `unknown`'
 }
+
+if [ "${1:-}" = "--rtt-only" ]; then
+  run_scenario test_network_performance_study_rtt_shaping
+  echo 'RTT shaping script tests passed.'
+  exit 0
+fi
 
 run_scenario test_syntax_checks
 run_scenario test_agent_verifiers

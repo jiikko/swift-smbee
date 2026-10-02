@@ -109,10 +109,15 @@ def held_probe(host, port, workdir):
         client_ips = {connection.getsockname()[0] for connection in connections}
         if len(client_ips) != 1:
             raise RuntimeError("probe sessions selected more than one client IP")
-        with open(os.path.join(workdir, "ready"), "w", encoding="utf-8") as handle:
+        ready_path = os.path.join(workdir, "ready")
+        temporary_ready_path = ready_path + ".tmp"
+        with open(temporary_ready_path, "w", encoding="utf-8") as handle:
             handle.write(next(iter(client_ips)) + "\n")
             for connection in connections:
                 handle.write(str(connection.getsockname()[1]) + "\n")
+        # Publish the complete 16-field tuple list atomically so the shell cannot
+        # install filters from a partially written readiness file.
+        os.replace(temporary_ready_path, ready_path)
 
         go_path = os.path.join(workdir, "go")
         deadline = time.monotonic() + 30

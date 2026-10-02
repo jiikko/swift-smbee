@@ -81,17 +81,10 @@ for rtt_level in "${rtt_levels[@]}"; do
   [ "${rtt_level}" = 0 ] || zero_rtt_only=0
 done
 if [ "${zero_rtt_only}" -eq 1 ]; then
-  # A reused output directory must not make the default 0 ms path inspect or clean
-  # old shaping state. The CI Samba launcher creates a fresh container/veth per run.
-  python3 - "${rtt_state}" <<'PY'
-import os
-import sys
-
-try:
-    os.unlink(sys.argv[1])
-except FileNotFoundError:
-    pass
-PY
+  if [ -e "${rtt_state}" ] || [ -L "${rtt_state}" ]; then
+    echo "zero-only RTT run found existing shaping state at ${rtt_state}; use a new Samba container/output directory or explicitly clear the previous RTT shaping state before measuring" >&2
+    exit 1
+  fi
 fi
 : > "${samples}"
 : > "${server_cpu}"
@@ -111,6 +104,7 @@ run_rtt_shaper() {
     return "${rc}"
   fi
 }
+source "${SCRIPT_DIR}/network-performance-study-run-lib.sh"
 cleanup_rtt_shaping() {
   local status=$?
   trap - EXIT
@@ -248,10 +242,7 @@ PY
   end_cpu="$(server_cpu_usec)"
   # A restart or changed veth after the arm invalidates this invocation. Do this
   # before appending the harness JSONL so a stale-shaper sample cannot be adopted.
-  if [ "${rtt_target}" != 0 ]; then
-    run_rtt_shaper guard "${rtt_target}" >/dev/null
-  fi
-  cat "${arm_dir[${arm}]}/${jsonl_name}" >>"${samples}"
+  append_guarded_sample "${rtt_target}" "${arm_dir[${arm}]}/${jsonl_name}" "${samples}"
   python3 - "${server_cpu}" "${STUDY_PROFILE}" "${arm}" "${invocation}" "${start_cpu}" "${end_cpu}" \
     "${start_ns}" "${end_ns}" "${rtt_target}" <<'PY'
 import json, sys

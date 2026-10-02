@@ -16,7 +16,9 @@
 
 Network RTT studyはActionsの`Network performance study`を`workflow_dispatch`し、`experiment=profiles`と
 `rtt_levels=0,5,20`を指定すると、各profileの同じrunner上で追加RTT 0 / 5 / 20 msを測定する（対象はこの3値のsubset、既定は`0`）。
-0 msだけの既定条件ではshaping用の`tc` / `ip` / `modprobe`を実行しない。非ゼロ条件では対象netnsのnetlink情報とhost側の相互veth peerを確認し、Samba container IPへの直接接続でTCP確立後に15回のSMB2 NEGOTIATE request / responseを計時する。各probe tuple専用の両方向filter counterと、読み戻したIFB netem delay / ingress redirect先を照合し、各armの前後にもcontainer世代、netns inode、peer、shaper状態を再確認する。計測値が許容差を外れる、またはprobeに対応するpacket counterが不足する場合はsampleを採用せずjobを失敗させ、`network-shape.jsonl`と`network-shape.log`に条件・観測値・qdisc診断を残す。summaryは`Added RTT`ごとに集計する。
+0 msだけの既定条件ではshaping用の`tc` / `ip` / `modprobe`を実行しない。既存のRTT shaping stateが残るzero-only runは、状態を消さず測定前に失敗するため、新しいSamba container/output directoryを使うか、前回stateを明示的にclearする。非ゼロ条件では対象netnsのnetlink情報とhost側の相互veth peerを確認し、Samba container IPの内部port 445へ直接接続してTCP確立後に15回のSMB2 NEGOTIATE request / responseを計時する。`SMBEE_E2E_PORT`はhostで公開するport、backend portはcontainer内のSamba port 445として扱う。校正probeのflower filterはcounterを取りながら分類を続け、実測と同じpref 1000 matchallからIFBへredirectする。各probe tuple専用の両方向filter counterと、構造化読み戻しによるIFB netem delay / ingress redirect先を照合し、各armの前後にもcontainer世代、netns inode、peer、shaper状態を再確認する。計測値が許容差を外れる、またはprobeに対応するpacket counterが不足する場合はsampleを採用せずjobを失敗させ、`network-shape.jsonl`と`network-shape.log`に条件・観測値・qdisc診断を残す。summaryは`Added RTT`ごとに集計する。
+
+RTT guardの脅威モデルは、このscript自身の誤設定とSamba containerの再起動・差し替えから測定を守ること。arm実行中に外部プロセスが`tc`を変更して途中で元に戻すケースは検出対象外とする。GitHub-hosted runnerでは、このworkflow以外に`tc`を変更する主体はいない前提を置く。
 
 ## Resource log contract (version 1)
 

@@ -4,6 +4,9 @@ unset CDPATH
 
 # Shape the Samba container boundary in both directions. RTT checks use direct
 # Samba-container connections and exact-flow counters so proxy setup and unrelated traffic cannot validate a probe.
+# Threat model: guards protect against this script's own misconfiguration and Samba container restart/replacement.
+# External tc changes during measurement are out of scope; the hosted Actions runner has no other tc writer.
+# SMBEE_E2E_PORT is the host-published port; direct probes and tc tuples use the Samba container backend port.
 #
 #   network-performance-study-rtt setup
 #   network-performance-study-rtt set <0|5|20>
@@ -15,7 +18,7 @@ unset CDPATH
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 : "${SAMBA_CONTAINER:=smbee-samba-study}"
-: "${SMBEE_E2E_PORT:=445}"
+: "${SMBEE_E2E_BACKEND_PORT:=445}"
 : "${STUDY_RTT_STATE_FILE:=.build/network-study/network-shape-state}"
 : "${STUDY_RTT_JSONL:=${STUDY_RTT_STATE_FILE}.jsonl}"
 SERVER_IFB=ifb-study
@@ -277,7 +280,7 @@ PY
 
 capture_boundary() {
   read_container_snapshot
-  netns_inode="$(capture_required stat -Lc %i "/proc/$server_pid/ns/net")"
+  netns_inode="$(capture_required sudo -n stat -Lc %i "/proc/$server_pid/ns/net")"
   [[ "$netns_inode" =~ ^[0-9]+$ ]] || fail "invalid Samba network namespace inode: $netns_inode"
   read_topology
 }
@@ -338,55 +341,111 @@ assert_boundary_unchanged() {
 assert_shaping_state() {
   local rtt="$1" delay host_qdisc server_qdisc host_filters server_filters
   delay="$(delay_for_rtt "$rtt")"
-  host_qdisc="$(capture_required sudo -n tc qdisc show dev "$HOST_IFB")"
-  server_qdisc="$(capture_required namespace tc qdisc show dev "$SERVER_IFB")"
-  host_filters="$(capture_required sudo -n tc filter show dev "$host_veth" parent ffff:)"
-  server_filters="$(capture_required namespace tc filter show dev eth0 parent ffff:)"
+  host_qdisc="$(capture_required sudo -n tc -j qdisc show dev "$HOST_IFB")"
+  server_qdisc="$(capture_required namespace tc -j qdisc show dev "$SERVER_IFB")"
+  host_filters="$(capture_required sudo -n tc -j filter show dev "$host_veth" parent ffff:)"
+  server_filters="$(capture_required namespace tc -j filter show dev eth0 parent ffff:)"
   if ! python3 - "$delay" "$HOST_IFB" "$SERVER_IFB" "$host_qdisc" "$server_qdisc" \
     "$host_filters" "$server_filters" <<'PY'
-import re
+import json
+import math
 import sys
 
 delay, host_ifb, server_ifb, host_qdisc, server_qdisc, host_filters, server_filters = sys.argv[1:]
 
-def qdisc_matches(output):
-    return any(
-        line.startswith("qdisc netem ")
-        and " root " in line
-        and re.search(r"\bdelay\s+" + re.escape(delay) + r"(?:\s|$)", line)
-        for line in output.splitlines()
+def json_rows(output, label):
+    try:
+        rows = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"{label} is not valid tc JSON: {error}") from error
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise SystemExit(f"{label} is not a tc JSON row array")
+    return rows
+
+def qdisc_matches(output, expected_ms):
+    rows = json_rows(output, "qdisc readback")
+    candidates = [row for row in rows if row.get("kind") == "netem" and row.get("root") is True]
+    if len(candidates) != 1:
+        return False
+    options = candidates[0].get("options")
+    if not isinstance(options, dict):
+        return False
+    # iproute2 omits q_netem's delay object when latency is zero. In tc -j,
+    # a present delay value is expressed in seconds; absence therefore means 0.
+    if "delay" not in options:
+        observed_seconds = 0.0
+    else:
+        delay_object = options["delay"]
+        if not isinstance(delay_object, dict) or "delay" not in delay_object:
+            return False
+        observed_seconds = delay_object["delay"]
+    if isinstance(observed_seconds, bool) or not isinstance(observed_seconds, (int, float)):
+        return False
+    return math.isclose(observed_seconds, expected_ms / 1000.0, rel_tol=0.0, abs_tol=1e-9)
+
+def is_node(row):
+    options = row.get("options")
+    if not isinstance(options, dict):
+        return False
+    if row.get("kind") == "flower":
+        return options.get("handle") not in (None, "", 0)
+    # Summary rows carry an empty options object; the concrete classifier node has
+    # classifier-specific options, even when it has no action (for example, a classid).
+    return bool(options)
+
+def action_rows(row):
+    actions = row.get("options", {}).get("actions", [])
+    return actions if isinstance(actions, list) else []
+
+def control_type(action):
+    control = action.get("control_action")
+    return control.get("type") if isinstance(control, dict) else None
+
+def redirect_to(row, target):
+    actions = action_rows(row)
+    return len(actions) == 1 and actions[0].get("kind") == "mirred" and \
+        actions[0].get("mirred_action") == "redirect" and actions[0].get("direction") == "egress" and \
+        actions[0].get("to_dev") == target
+
+def only_continues(row):
+    actions = action_rows(row)
+    return bool(actions) and all(
+        action.get("kind") == "gact" and control_type(action) in ("continue", "pipe")
+        for action in actions
     )
 
-def filter_blocks(output):
-    blocks = []
-    current = []
-    for line in output.splitlines():
-        if line.startswith("filter "):
-            if current:
-                blocks.append("\n".join(current))
-            current = [line]
-        elif current:
-            current.append(line)
-    if current:
-        blocks.append("\n".join(current))
-    return blocks
+def can_match_ipv4(protocol):
+    # Explicit non-IPv4 EtherTypes cannot match the probe's IPv4 packets. Treat an
+    # omitted or unfamiliar protocol as potentially matching, so an unknown earlier
+    # terminal node cannot silently bypass the pref 1000 redirect.
+    non_ipv4 = {"ipv6", "arp", "rarp", "802.2", "802.3", "pppoed", "pppoes", "mpls_uc", "mpls_mc"}
+    return protocol not in non_ipv4
 
-def redirect_matches(output, target):
-    for block in filter_blocks(output):
-        folded = block.lower()
-        if "pref 1000" in folded and "matchall" in folded and "mirred" in folded and \
-                "redirect to device " + target.lower() in folded:
-            return True
-    return False
+def check_filters(output, target, label):
+    rows = json_rows(output, f"{label} ingress filter readback")
+    nodes = [row for row in rows if is_node(row)]
+    expected = [row for row in nodes
+                if row.get("pref") == 1000 and row.get("chain", 0) == 0 and
+                row.get("protocol") == "all" and row.get("kind") == "matchall" and redirect_to(row, target)]
+    if len(expected) != 1:
+        raise SystemExit(f"{label} ingress has no unique chain 0 protocol all pref 1000 matchall redirect to {target}")
+    for row in nodes:
+        if row.get("chain", 0) != 0:
+            continue
+        pref = row.get("pref")
+        if not isinstance(pref, int):
+            raise SystemExit(f"{label} ingress has a filter node without a numeric preference: {row}")
+        if pref >= 1000:
+            continue
+        if can_match_ipv4(row.get("protocol")) and not only_continues(row):
+            raise SystemExit(f"{label} ingress has a terminal or unknown filter before pref 1000: {row}")
 
-if not qdisc_matches(host_qdisc):
+if not qdisc_matches(host_qdisc, float(delay[:-2])):
     raise SystemExit(f"host IFB qdisc does not report root netem delay {delay}: {host_qdisc}")
-if not qdisc_matches(server_qdisc):
+if not qdisc_matches(server_qdisc, float(delay[:-2])):
     raise SystemExit(f"Samba IFB qdisc does not report root netem delay {delay}: {server_qdisc}")
-if not redirect_matches(host_filters, host_ifb):
-    raise SystemExit(f"host ingress filter does not redirect matchall to {host_ifb}: {host_filters}")
-if not redirect_matches(server_filters, server_ifb):
-    raise SystemExit(f"Samba ingress filter does not redirect matchall to {server_ifb}: {server_filters}")
+check_filters(host_filters, host_ifb, "host")
+check_filters(server_filters, server_ifb, "Samba")
 PY
   then
     fail "tc readback does not match requested RTT $rtt ms (delay $delay) or expected bidirectional redirects"
@@ -458,93 +517,117 @@ cmd_setup() {
 
 direct_probe() {
   local measured
-  if measured="$(python3 "$SCRIPT_DIR/network-performance-study-rtt-probe.py" direct "$server_ip" "$SMBEE_E2E_PORT")"; then
+  if measured="$(python3 "$SCRIPT_DIR/network-performance-study-rtt-probe.py" direct "$server_ip" "$SMBEE_E2E_BACKEND_PORT")"; then
     printf '%s\n' "$measured"
   else
     fail 'direct-to-container SMB2 NEGOTIATE RTT probe could not complete all 15 roundtrips'
   fi
 }
 
-read_filter_count() {
-  local side="$1" pref="$2" output count
+read_filter_counts() {
+  local side="$1" output counts rc
+  local -a tc_command=()
   if [ "$side" = host ]; then
-    if output="$(capture_required sudo -n tc -s filter show dev "$host_veth" parent ffff:)"; then :; else
-      fail "could not read host probe filter counter for pref $pref"
-    fi
+    tc_command=(sudo -n tc -s filter show dev "$host_veth" parent ffff:)
   else
-    if output="$(capture_required namespace tc -s filter show dev eth0 parent ffff:)"; then :; else
-      fail "could not read Samba probe filter counter for pref $pref"
-    fi
+    tc_command=(sudo -n nsenter -t "$server_pid" -n -- tc -s filter show dev eth0 parent ffff:)
   fi
-  if count="$(printf '%s\n' "$output" | awk -v wanted="$pref" '
+  if output="$("${tc_command[@]}" 2>&1)"; then :; else
+    rc=$?
+    last_failed_command="$(printf '%q ' "${tc_command[@]}")"
+    fail "could not read $side probe filter counters: command failed (exit $rc): $last_failed_command; output: $output"
+  fi
+  if counts="$(printf '%s\n' "$output" | awk '
     /^filter / {
       selected = 0
       for (field = 1; field < NF; field++) {
-        if ($field == "pref" && $(field + 1) == wanted) selected = 1
+        if ($field == "pref" && $(field + 1) ~ /^[0-9]+$/ &&
+            $(field + 1) >= 101 && $(field + 1) <= 115) {
+          selected = 1
+          selected_pref = $(field + 1)
+        }
       }
     }
     selected && /Sent/ {
       for (field = 1; field <= NF; field++) {
         if ($field == "pkt" && field > 1) {
           value = $(field - 1)
-          if (value ~ /^[0-9]+$/) { print value; found = 1; exit }
+          if (value ~ /^[0-9]+$/) {
+            print selected_pref "\t" value
+            found[selected_pref] = 1
+            selected = 0
+          }
         }
       }
     }
-    END { if (!found) exit 1 }
+    END {
+      for (wanted = 101; wanted <= 115; wanted++) {
+        if (!found[wanted]) exit 1
+      }
+    }
   ')"; then :; else
-    fail "tc packet counter is missing or non-integer for $side probe filter pref $pref"
+    fail "tc packet counter is missing or non-integer for $side probe filters pref 101-115"
   fi
-  [[ "$count" =~ ^[0-9]+$ ]] || fail "tc packet counter is not an integer for $side probe filter pref $pref: $count"
-  printf '%s\n' "$count"
+  printf '%s\n' "$counts"
 }
 
-probe_filter_output() {
-  local side="$1"
-  if [ "$side" = host ]; then
-    capture_required sudo -n tc filter show dev "$host_veth" parent ffff:
-  else
-    capture_required namespace tc filter show dev eth0 parent ffff:
-  fi
-}
-
-check_probe_filter() {
-  local side="$1" pref="$2" client_ip="$3" client_port="$4" output
-  if output="$(probe_filter_output "$side")"; then :; else
-    fail "could not read back $side probe filter pref $pref"
-  fi
-  if ! python3 - "$output" "$pref" "$client_ip" "$client_port" "$server_ip" "$SMBEE_E2E_PORT" "$side" "$HOST_IFB" "$SERVER_IFB" <<'PY'
+check_probe_filters() {
+  local client_ip="$1" host_filters server_filters
+  shift
+  local -a ports=("$@")
+  host_filters="$(capture_required sudo -n tc -j filter show dev "$host_veth" parent ffff:)"
+  server_filters="$(capture_required namespace tc -j filter show dev eth0 parent ffff:)"
+  if ! python3 - "$host_filters" "$server_filters" "$client_ip" "$server_ip" \
+    "$SMBEE_E2E_BACKEND_PORT" "${ports[@]}" <<'PY'
+import json
 import sys
 
-output, pref, client_ip, client_port, server_ip, server_port, side, host_ifb, server_ifb = sys.argv[1:]
-blocks = []
-current = []
-for line in output.splitlines():
-    if line.startswith("filter "):
-        if current:
-            blocks.append("\n".join(current))
-        current = [line]
-    elif current:
-        current.append(line)
-if current:
-    blocks.append("\n".join(current))
-matches = [block.lower() for block in blocks if f"pref {pref}" in block.lower()]
-if len(matches) != 1:
-    raise SystemExit(f"expected exactly one probe filter at pref {pref}")
-block = matches[0]
-target = host_ifb if side == "host" else server_ifb
-fields = ["flower", "ip_proto tcp", client_ip, client_port, server_ip, server_port, "mirred",
-          "redirect to device " + target.lower()]
-if side == "host":
-    fields.extend(["src_ip " + server_ip, "src_port 445", "dst_ip " + client_ip, "dst_port " + client_port])
-else:
-    fields.extend(["src_ip " + client_ip, "src_port " + client_port, "dst_ip " + server_ip, "dst_port " + server_port])
-missing = [field for field in fields if field.lower() not in block]
-if missing:
-    raise SystemExit(f"probe filter pref {pref} does not match/redirect the exact flow: {missing}")
+host_output, server_output, client_ip, server_ip, server_port, *ports = sys.argv[1:]
+
+def rows_for(output, side):
+    try:
+        rows = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"{side} tc flower dump is not valid JSON: {error}") from error
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise SystemExit(f"{side} tc flower dump is not a JSON row array")
+    return rows
+
+def check_side(rows, side):
+    for index, client_port in enumerate(ports, start=1):
+        pref = 100 + index
+        # Classifier dumps may include a summary row. Select only the handle-bearing node.
+        nodes = [row for row in rows if row.get("pref") == pref and row.get("kind") == "flower" and
+                 isinstance(row.get("options"), dict) and
+                 row["options"].get("handle") not in (None, "", 0)]
+        if len(nodes) != 1:
+            raise SystemExit(f"expected exactly one handle-bearing probe flower node at pref {pref}")
+        node = nodes[0]
+        if node.get("protocol") != "ip" or node.get("chain", 0) != 0:
+            raise SystemExit(f"probe flower node at pref {pref} must use protocol ip and chain 0")
+        keys = node["options"].get("keys")
+        if not isinstance(keys, dict):
+            raise SystemExit(f"probe flower node at pref {pref} has no structured keys")
+        expected = {
+            "ip_proto": "tcp",
+            "src_ip": server_ip if side == "host" else client_ip,
+            "src_port": int(server_port) if side == "host" else int(client_port),
+            "dst_ip": client_ip if side == "host" else server_ip,
+            "dst_port": int(client_port) if side == "host" else int(server_port),
+        }
+        missing = [key for key, value in expected.items() if str(keys.get(key)) != str(value)]
+        if missing:
+            raise SystemExit(f"probe flower node at pref {pref} does not match the exact flow: {missing}")
+        actions = node["options"].get("actions")
+        if not isinstance(actions, list) or len(actions) != 1 or actions[0].get("kind") != "gact" or \
+                actions[0].get("control_action", {}).get("type") != "continue":
+            raise SystemExit(f"probe flower node at pref {pref} must count and continue classification")
+
+check_side(rows_for(host_output, "host"), "host")
+check_side(rows_for(server_output, "Samba"), "Samba")
 PY
   then
-    fail "tc readback does not match the exact probe flow or redirect target for $side pref $pref"
+    fail 'tc readback does not match the exact probe flows or continuation action'
   fi
 }
 
@@ -552,14 +635,13 @@ install_probe_filter() {
   local side="$1" pref="$2" client_ip="$3" client_port="$4"
   if [ "$side" = host ]; then
     run_required sudo -n tc filter replace dev "$host_veth" parent ffff: protocol ip pref "$pref" flower \
-      ip_proto tcp src_ip "$server_ip" src_port "$SMBEE_E2E_PORT" dst_ip "$client_ip" dst_port "$client_port" \
-      action mirred egress redirect dev "$HOST_IFB"
+      ip_proto tcp src_ip "$server_ip" src_port "$SMBEE_E2E_BACKEND_PORT" dst_ip "$client_ip" dst_port "$client_port" \
+      action gact continue
   else
     namespace tc filter replace dev eth0 parent ffff: protocol ip pref "$pref" flower \
-      ip_proto tcp src_ip "$client_ip" src_port "$client_port" dst_ip "$server_ip" dst_port "$SMBEE_E2E_PORT" \
-      action mirred egress redirect dev "$SERVER_IFB"
+      ip_proto tcp src_ip "$client_ip" src_port "$client_port" dst_ip "$server_ip" dst_port "$SMBEE_E2E_BACKEND_PORT" \
+      action gact continue
   fi
-  check_probe_filter "$side" "$pref" "$client_ip" "$client_port"
 }
 
 cleanup_command() {
@@ -589,11 +671,11 @@ delete_probe_filters() {
 }
 
 run_targeted_probe() {
-  local probe_dir client_ip i pref port after_host after_server output measured
+  local probe_dir client_ip i pref port before_server_counts before_host_counts after_server_counts after_host_counts output measured
   local -a before_host=() before_server=() probe_info=()
   probe_dir="$(mktemp -d)"
   probe_workdir="$probe_dir"
-  python3 "$SCRIPT_DIR/network-performance-study-rtt-probe.py" hold "$server_ip" "$SMBEE_E2E_PORT" "$probe_dir" \
+  python3 "$SCRIPT_DIR/network-performance-study-rtt-probe.py" hold "$server_ip" "$SMBEE_E2E_BACKEND_PORT" "$probe_dir" \
     >"$probe_dir/worker.out" 2>"$probe_dir/worker.err" &
   probe_pid=$!
   for _ in $(seq 1 300); do
@@ -608,16 +690,25 @@ run_targeted_probe() {
   [ -s "$probe_dir/ready" ] || fail 'timed out waiting for direct SMB2 RTT probe sessions'
   while IFS= read -r port; do probe_info+=("$port"); done <"$probe_dir/ready"
   client_ip="${probe_info[0]:-}"
-  [ "${#probe_info[@]}" -eq 16 ] || fail 'SMB2 RTT probe did not open exactly 15 sessions'
+  [ "${#probe_info[@]}" -eq 16 ] || fail "SMB2 RTT probe did not open exactly 15 sessions (read ${#probe_info[@]} fields)"
   for ((i = 1; i <= 15; i++)); do
     port="${probe_info[i]:-}"
     [[ "$port" =~ ^[0-9]{1,5}$ ]] && [ "$port" -gt 0 ] || fail "invalid SMB2 probe source port: $port"
     pref=$((100 + i))
     install_probe_filter server "$pref" "$client_ip" "$port"
     install_probe_filter host "$pref" "$client_ip" "$port"
-    before_server[i]="$(read_filter_count server "$pref")" || fail "could not read initial Samba probe counter for pref $pref"
-    before_host[i]="$(read_filter_count host "$pref")" || fail "could not read initial host probe counter for pref $pref"
   done
+  check_probe_filters "$client_ip" "${probe_info[@]:1}"
+  before_server_counts="$(read_filter_counts server)"
+  before_host_counts="$(read_filter_counts host)"
+  while IFS=$'\t' read -r pref port; do
+    i=$((pref - 100))
+    before_server[i]="$port"
+  done <<<"$before_server_counts"
+  while IFS=$'\t' read -r pref port; do
+    i=$((pref - 100))
+    before_host[i]="$port"
+  done <<<"$before_host_counts"
   touch "$probe_dir/go"
   if wait "$probe_pid"; then
     probe_pid=""
@@ -632,17 +723,26 @@ run_targeted_probe() {
   fi
   measured="$(cat "$probe_dir/result")"
   valid_milliseconds "$measured" || fail "TCP RTT probe returned an invalid median: $measured"
+  after_server_counts="$(read_filter_counts server)"
+  after_host_counts="$(read_filter_counts host)"
+  local -a after_server=() after_host=()
+  while IFS=$'\t' read -r pref port; do
+    i=$((pref - 100))
+    after_server[i]="$port"
+  done <<<"$after_server_counts"
+  while IFS=$'\t' read -r pref port; do
+    i=$((pref - 100))
+    after_host[i]="$port"
+  done <<<"$after_host_counts"
   for ((i = 1; i <= 15; i++)); do
     pref=$((100 + i))
-    after_server="$(read_filter_count server "$pref")" || fail "could not read final Samba probe counter for pref $pref"
-    after_host="$(read_filter_count host "$pref")" || fail "could not read final host probe counter for pref $pref"
     # Each already-connected session sends a request and receives a response. Requiring every
     # unique four-tuple on both ingress filters prevents unrelated traffic from satisfying a probe.
-    if [ "$((after_server - before_server[i]))" -lt 1 ]; then
-      fail "Samba-side exact-flow filter pref $pref did not count its SMB probe request"
+    if [ "$((after_server[i] - before_server[i]))" -lt 1 ]; then
+      fail "Samba-side exact-flow filter pref $pref did not count its SMB probe request (counter ${before_server[i]} -> ${after_server[i]})"
     fi
-    if [ "$((after_host - before_host[i]))" -lt 1 ]; then
-      fail "host-side exact-flow filter pref $pref did not count its SMB probe response"
+    if [ "$((after_host[i] - before_host[i]))" -lt 1 ]; then
+      fail "host-side exact-flow filter pref $pref did not count its SMB probe response (counter ${before_host[i]} -> ${after_host[i]})"
     fi
   done
   delete_probe_filters host || fail 'could not remove the host probe filters after measurement'

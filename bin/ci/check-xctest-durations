@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Fail a completed XCTest run when any individual test case exceeds its wall-time budget.
+set -euo pipefail
+unset CDPATH
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "usage: $0 <swift-test-log> [max-seconds]" >&2
+  exit 2
+fi
+
+log="$1"
+max_seconds="${2:-3}"
+if [[ ! -f "$log" ]]; then
+  echo "swift test log not found: $log" >&2
+  exit 2
+fi
+if [[ ! "$max_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v value="$max_seconds" 'BEGIN { exit !(value > 0) }'; then
+  echo "max-seconds must be a positive number" >&2
+  exit 2
+fi
+
+awk -v limit="$max_seconds" '
+  /^Test Case / && / passed \([0-9]+([.][0-9]+)? seconds\)/ {
+    duration = $0
+    sub(/^.* passed \(/, "", duration)
+    sub(/ seconds\).*$/, "", duration)
+    case_name = $0
+    sub(/^Test Case /, "", case_name)
+    sub(/ passed.*$/, "", case_name)
+    count++
+    if (duration + 0 > limit) {
+      printf "slow XCTest case: %s took %s seconds (limit %s seconds)\n", case_name, duration, limit
+      failed = 1
+    }
+    if (duration + 0 > maximum_duration) maximum_duration = duration + 0
+  }
+  END {
+    if (count == 0) {
+      print "swift test duration guard: no passed XCTest case durations found" > "/dev/stderr"
+      exit 2
+    }
+    printf "swift test duration guard: %d passed cases; max %.3fs (limit %ss)\n", count, maximum_duration, limit
+    if (failed) exit 1
+  }
+' "$log"

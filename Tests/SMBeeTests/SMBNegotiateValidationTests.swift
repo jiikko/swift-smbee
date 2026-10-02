@@ -305,7 +305,16 @@ final class SMBNegotiateValidationTests: XCTestCase {
             ),
             validationResponse
         ])
-        let transport = InMemoryTransport(inbound: inbound)
+        let transport = InMemoryTransport(
+            inbound: inbound,
+            mode: .sendGatedWaitUntilClosed,
+            responseIdentityOverrides: [
+                SMBWireRequestIdentity(messageId: 0, command: SMB2Commands.treeConnect),
+                SMBWireRequestIdentity(messageId: 1, command: SMB2Commands.ioctl)
+            ],
+            allowedUnansweredRequests: [],
+            requestDecoder: smbEncryptedRequestDecoder(key: signingKey)
+        )
         let session = SMBSession(
             host: "server",
             port: 445,
@@ -398,7 +407,30 @@ final class SMBNegotiateValidationTests: XCTestCase {
                 ),
                 response
             ])
-            let transport = InMemoryTransport(inbound: responses)
+            let requestEncryptionKey = signingKey
+            let transport = InMemoryTransport(
+                inbound: responses,
+                mode: .sendGatedWaitUntilClosed,
+                responseIdentityOverrides: [
+                    SMBWireRequestIdentity(messageId: 0, command: SMB2Commands.treeConnect),
+                    SMBWireRequestIdentity(messageId: 1, command: SMB2Commands.ioctl)
+                ],
+                allowedUnansweredRequests: [],
+                requestDecoder: { packet in
+                    guard packet.starts(with: SMB3TransformHeader.protocolId) else {
+                        return try SMBWireRequestDescriptor(packet: packet)
+                    }
+                    let transform = try SMB3TransformHeader.decode(packet)
+                    let plaintext = try AESCCM.open(
+                        key: requestEncryptionKey,
+                        nonce: Array(transform.nonce.prefix(11)),
+                        ciphertext: Array(packet.dropFirst(SMB3TransformHeader.encodedSize)),
+                        authenticatedData: transform.authenticatedData(),
+                        tag: transform.signature
+                    )
+                    return try SMBWireRequestDescriptor(packet: plaintext)
+                }
+            )
             let session = SMBSession(
                 host: "server",
                 port: 445,
@@ -419,7 +451,9 @@ final class SMBNegotiateValidationTests: XCTestCase {
             var tree: UInt32?
             var errorDescription: String?
             do {
-                tree = try await session.treeConnect(share: "share")
+                tree = try await SMBValidationHangGuard.run(label: "TREE_CONNECT and VNI transaction") {
+                    try await session.treeConnect(share: "share")
+                }
             } catch {
                 errorDescription = String(describing: error)
             }

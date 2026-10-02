@@ -15,6 +15,47 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
     private let treeId: UInt32 = 0x3344
     private let signingKey = Array(repeating: UInt8(0x11), count: 16)
 
+    func testPerformanceTransportMatchesResponsesByMessageIdAndCommand() async throws {
+        func response(_ messageId: UInt64) throws -> [UInt8] {
+            var packet = try SMB2Header(command: SMB2Commands.echo, messageId: messageId).encode()
+            packet.append(contentsOf: [4, 0, 0, 0])
+            return packet
+        }
+
+        let transport = PerformanceInMemoryTransport(inbound: try framed([
+            response(1),
+            response(0)
+        ]))
+        for messageId in [UInt64(0), 1] {
+            let request = try SMB2Header(command: SMB2Commands.echo, messageId: messageId).encode()
+            try await transport.send(try DirectTCPFraming.frame(request))
+            let framedResponse = try await transport.receive(maxLength: 4096)
+            XCTAssertEqual(try SMB2Header.decode(Array(framedResponse.dropFirst(4))).messageId, messageId)
+        }
+
+        do {
+            let extraRequest = try SMB2Header(command: SMB2Commands.echo, messageId: 2).encode()
+            try await transport.send(try DirectTCPFraming.frame(extraRequest))
+            XCTFail("the performance fixture must reject an unconfigured extra request")
+        } catch SMBCodecError.invalidValue(let message) {
+            XCTAssertTrue(message.contains("unexpected SMB request"), message)
+        }
+        transport.close()
+
+        let commandTransport = PerformanceInMemoryTransport(inbound: try framed([
+            try response(10)
+        ]))
+        do {
+            let wrongCommand = try SMB2Header(command: SMB2Commands.read, messageId: 10).encode()
+            try await commandTransport.send(try DirectTCPFraming.frame(wrongCommand))
+            XCTFail("the performance fixture must match both command and MessageId")
+        } catch SMBCodecError.invalidValue(let message) {
+            XCTAssertTrue(message.contains("unexpected SMB request"), message)
+        }
+        XCTAssertTrue(commandTransport.outbound.isEmpty)
+        commandTransport.close()
+    }
+
     func testReadStreamingUsesExpectedReadCommandChunkAndByteCounts() async throws {
         let fileSize = 64 * 1024 * 2 + 123
         let effectiveReadChunkSize = SMBTransferLimits.negotiatedChunkSize(
@@ -23,11 +64,21 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
             transformOverhead: 0
         )
         let expectedChunks = ceilDiv(fileSize, effectiveReadChunkSize)
+        let readResponses = try readResponses(
+            fileSize: fileSize,
+            chunkSize: effectiveReadChunkSize,
+            firstMessageId: 2
+        )
         let inbound = try framed(
             [try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId),
              try smb2QueryInfoResponse(size: UInt64(fileSize), messageId: 1, treeId: treeId)]
-                + readResponses(fileSize: fileSize, chunkSize: effectiveReadChunkSize, firstMessageId: 2)
-                + [try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: UInt64(2 + expectedChunks), treeId: treeId)]
+                + readResponses.packets
+                + [try smb2StatusResponse(
+                    status: SMB2Status.success,
+                    command: SMB2Commands.close,
+                    messageId: readResponses.nextMessageId,
+                    treeId: treeId
+                )]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound)
         let clientSession = makeClientSession(transport: transport, initialCredits: negotiatedServerCredits)
@@ -165,7 +216,9 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
                 + writeResponses(fileSize: fileSize, chunkSize: effectiveWriteChunkSize, firstMessageId: 5)
                 + [
                     try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.flush, messageId: UInt64(5 + expectedChunks), treeId: treeId),
-                    try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: UInt64(6 + expectedChunks), treeId: treeId)
+                    try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: UInt64(6 + expectedChunks), treeId: treeId),
+                    try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: UInt64(7 + expectedChunks), treeId: treeId),
+                    try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: UInt64(8 + expectedChunks), treeId: 0)
                 ]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound)
@@ -270,10 +323,21 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         return SMBClientSession(session: session, treeId: treeId)
     }
 
-    private func readResponses(fileSize: Int, chunkSize: Int, firstMessageId: UInt64) throws -> [[UInt8]] {
-        try chunkLengths(fileSize: fileSize, chunkSize: chunkSize).enumerated().map { index, length in
-            try smb2ReadResponse(Array(repeating: UInt8(index & 0xff), count: length), messageId: firstMessageId + UInt64(index), treeId: treeId)
+    private func readResponses(
+        fileSize: Int,
+        chunkSize: Int,
+        firstMessageId: UInt64
+    ) throws -> (packets: [[UInt8]], nextMessageId: UInt64) {
+        var nextMessageId = firstMessageId
+        let packets = try chunkLengths(fileSize: fileSize, chunkSize: chunkSize).enumerated().map { index, length in
+            defer { nextMessageId += UInt64(SMB2Credit.charge(forPayloadLength: UInt64(length))) }
+            return try smb2ReadResponse(
+                Array(repeating: UInt8(index & 0xff), count: length),
+                messageId: nextMessageId,
+                treeId: treeId
+            )
         }
+        return (packets, nextMessageId)
     }
 
     private func writeResponses(fileSize: Int, chunkSize: Int, firstMessageId: UInt64) throws -> [[UInt8]] {
@@ -723,12 +787,26 @@ private extension Duration {
 }
 
 private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Sendable {
+    private struct PendingReceive {
+        let id: UUID
+        let maxLength: Int
+        let continuation: CheckedContinuation<[UInt8], Error>
+    }
+
     private let lock = NSLock()
-    private var inbound: [UInt8]
-    private var inboundOffset = 0
+    private var responsesByRequest: [SMBWireRequestIdentity: [[UInt8]]] = [:]
+    private var responsePreparationError: Error?
+    private var sentRequestIds: Set<UInt64> = []
+    private var releasedFrames: [[UInt8]] = []
+    private var nextFrameIndex = 0
+    private var currentFrame: [UInt8] = []
+    private var currentFrameOffset = 0
+    private var pendingReceive: PendingReceive?
+    private var isClosed = false
     private var outboundStorage: [UInt8] = []
     private var sentBytes = 0
     private let retainOutbound: Bool
+    private let requestDecoder: SMBWireRequestDecoder?
 
     var outbound: [UInt8] {
         lock.lock()
@@ -740,51 +818,164 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
         lock.withLock { sentBytes }
     }
 
-    init(inbound: [UInt8], retainOutbound: Bool = true) {
-        self.inbound = inbound
+    init(
+        inbound: [UInt8],
+        retainOutbound: Bool = true,
+        responseIdentityOverrides: [SMBWireRequestIdentity]? = nil,
+        requestDecoder: SMBWireRequestDecoder? = nil
+    ) {
         self.retainOutbound = retainOutbound
+        self.requestDecoder = requestDecoder
+        do {
+            let frames = try Self.unframe(inbound)
+            if let responseIdentityOverrides, responseIdentityOverrides.count != frames.count {
+                throw SMBCodecError.invalidValue("response identity override count does not match inbound frames")
+            }
+            for (index, frame) in frames.enumerated() {
+                let identity: SMBWireRequestIdentity
+                if let responseIdentityOverrides {
+                    identity = responseIdentityOverrides[index]
+                } else {
+                    let descriptor = try SMBWireRequestDescriptor(packet: Array(frame.dropFirst(4)))
+                    identity = descriptor.identity
+                }
+                responsesByRequest[identity, default: []].append(frame)
+            }
+        } catch {
+            responsePreparationError = error
+        }
     }
 
     func connect(host: String, port: UInt16) async throws {
         try Task.checkCancellation()
         _ = host
         _ = port
+        try lock.withLock {
+            guard !isClosed else { throw SMBTransportError.connectionClosed }
+        }
     }
 
     func send(_ bytes: [UInt8]) async throws {
         try Task.checkCancellation()
-        lock.withLock {
-            sentBytes += bytes.count
-            if retainOutbound {
-                outboundStorage.append(contentsOf: bytes)
-            }
-        }
+        try recordSend(bytes, sentLength: bytes.count)
     }
 
     func send(_ segments: [[UInt8]]) async throws {
         try Task.checkCancellation()
-        lock.withLock {
-            sentBytes += segments.reduce(0) { $0 + $1.count }
-            if retainOutbound {
-                for segment in segments {
-                    outboundStorage.append(contentsOf: segment)
-                }
-            }
-        }
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(segments.reduce(0) { $0 + $1.count })
+        segments.forEach { bytes.append(contentsOf: $0) }
+        try recordSend(bytes, sentLength: bytes.count)
     }
 
     func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
-        return try lock.withLock {
-            guard inboundOffset < inbound.count else { throw SMBTransportError.connectionClosed }
-            let count = min(maxLength, inbound.count - inboundOffset)
-            let chunk = Array(inbound[inboundOffset..<(inboundOffset + count)])
-            inboundOffset += count
-            return chunk
+        let id = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let immediate: Result<[UInt8], Error>? = lock.withLock {
+                    if Task.isCancelled { return .failure(CancellationError()) }
+                    if isClosed { return .failure(SMBTransportError.connectionClosed) }
+                    if let chunk = consumeReleasedFrame(maxLength: maxLength) { return .success(chunk) }
+                    guard pendingReceive == nil else {
+                        return .failure(SMBCodecError.invalidValue("concurrent receive on performance fixture"))
+                    }
+                    pendingReceive = PendingReceive(id: id, maxLength: maxLength, continuation: continuation)
+                    return nil
+                }
+                if let immediate { continuation.resume(with: immediate) }
+            }
+        } onCancel: {
+            self.cancelReceive(id: id)
         }
     }
 
-    func close() {}
+    func close() {
+        let waiter = lock.withLock { () -> PendingReceive? in
+            isClosed = true
+            defer { pendingReceive = nil }
+            return pendingReceive
+        }
+        waiter?.continuation.resume(throwing: SMBTransportError.connectionClosed)
+    }
+
+    private func recordSend(_ bytes: [UInt8], sentLength: Int) throws {
+        guard bytes.count >= 4,
+              bytes[0] == 0,
+              bytes.count == ((Int(bytes[1]) << 16) | (Int(bytes[2]) << 8) | Int(bytes[3])) + 4 else {
+            throw SMBCodecError.truncated
+        }
+        let requestPacket = Array(bytes.dropFirst(4))
+        let request = try requestDecoder?(requestPacket) ?? SMBWireRequestDescriptor(packet: requestPacket)
+        let waiterAndBytes = try lock.withLock { () throws -> (PendingReceive, [UInt8])? in
+            guard !isClosed else { throw SMBTransportError.connectionClosed }
+            if let responsePreparationError { throw responsePreparationError }
+            let identity = request.identity
+            if identity.command == SMB2Commands.cancel {
+                guard sentRequestIds.contains(identity.messageId) else {
+                    throw SMBCodecError.invalidValue("CANCEL does not identify a previously sent request")
+                }
+                sentBytes += sentLength
+                if retainOutbound { outboundStorage.append(contentsOf: bytes) }
+                return nil
+            }
+            guard !sentRequestIds.contains(identity.messageId) else {
+                throw SMBCodecError.invalidValue("duplicate SMB request MessageId \(identity.messageId)")
+            }
+            guard let frames = responsesByRequest.removeValue(forKey: identity) else {
+                throw SMBCodecError.invalidValue(
+                    "unexpected SMB request command=\(identity.command) messageId=\(identity.messageId)"
+                )
+            }
+            sentRequestIds.insert(identity.messageId)
+            sentBytes += sentLength
+            if retainOutbound { outboundStorage.append(contentsOf: bytes) }
+            releasedFrames.append(contentsOf: frames)
+            guard let waiter = pendingReceive,
+                  let readyBytes = consumeReleasedFrame(maxLength: waiter.maxLength) else { return nil }
+            pendingReceive = nil
+            return (waiter, readyBytes)
+        }
+        if let (waiter, readyBytes) = waiterAndBytes {
+            waiter.continuation.resume(returning: readyBytes)
+        }
+    }
+
+    private func consumeReleasedFrame(maxLength: Int) -> [UInt8]? {
+        if currentFrameOffset >= currentFrame.count {
+            guard nextFrameIndex < releasedFrames.count else { return nil }
+            currentFrame = releasedFrames[nextFrameIndex]
+            nextFrameIndex += 1
+            currentFrameOffset = 0
+        }
+        let count = min(maxLength, currentFrame.count - currentFrameOffset)
+        let chunk = Array(currentFrame[currentFrameOffset..<(currentFrameOffset + count)])
+        currentFrameOffset += count
+        return chunk
+    }
+
+    private func cancelReceive(id: UUID) {
+        let waiter = lock.withLock { () -> PendingReceive? in
+            guard pendingReceive?.id == id else { return nil }
+            defer { pendingReceive = nil }
+            return pendingReceive
+        }
+        waiter?.continuation.resume(throwing: CancellationError())
+    }
+
+    private static func unframe(_ bytes: [UInt8]) throws -> [[UInt8]] {
+        var frames: [[UInt8]] = []
+        var offset = 0
+        while offset < bytes.count {
+            guard offset + 4 <= bytes.count, bytes[offset] == 0 else { throw SMBCodecError.truncated }
+            let length = (Int(bytes[offset + 1]) << 16) | (Int(bytes[offset + 2]) << 8) | Int(bytes[offset + 3])
+            let end = offset + 4 + length
+            guard end <= bytes.count else { throw SMBCodecError.truncated }
+            frames.append(Array(bytes[offset..<end]))
+            offset = end
+        }
+        return frames
+    }
 }
 
 private struct SMBCommandCounter {

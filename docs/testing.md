@@ -18,6 +18,19 @@ SMBee のテストは 3 tier。**ⓥ = 実装/運用前に要確認**。
 計算量 proxy として固定する。ログは `PERF_METRIC <name> actual=.. expected=..` 形式にし、時間を出す場合も
 補助情報 `PERF_INFO` に留める。
 
+issue 010 M3 の reader / send-gate unit は `ControlledReceiveTransport` と
+`InMemoryTransportMode.sendGatedWaitUntilClosed` を使う。受信件数・送信完了・scripted frame の到着など
+具体的な event を待ち、test-only barrier は注入した sleeper で timeout して欠落 event を red にする。
+barrier の cancel と reset は保留中の continuation を drain する。これらの回帰テストでは実時間の
+polling や protocol deadline を使わない。`awaitWithTimeout` は test 自体の hang guard としてのみ使う。
+
+SMBSession の reader は最初の full-send success 後にだけ起動し、idle 中も同じ一つの receive を保持する。
+test transport は同時 receive 数、full-send gate、close 後の receive 解放を計測する。Performance fixture も
+1 回の成功した request send ごとに response frame を一つずつ解放し、未送信 request の将来応答を先読みさせない。
+credit regression は READ を同時に発行して1 credit の grant だけで後続 request が1 credit charge / 64 KiB
+payload に縮んで送信されることを wire bytes で確認する。送信後 cancel の tombstone は64件まで相関に残り、
+65件目では session close と pending / credit waiter drain が起きることを確認する。
+
 ## Tier 2: E2E（コンテナ上の SMB サーバ）— 本 repo のテスト範囲の主役
 
 SMB サーバ（Samba）をコンテナで起動し、SMBee/`smbcli` でゴールデンパスを通す。

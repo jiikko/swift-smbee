@@ -42,7 +42,7 @@ final class SMBVerifySignedConstantTimeTests: XCTestCase {
             encoding: .utf8
         )
         let verifierStart = try XCTUnwrap(source.range(of: "private func verifySigned(_ frame:"))
-        let verifierEnd = try XCTUnwrap(source.range(of: "private func receiveDecryptedFrame", range: verifierStart.upperBound..<source.endIndex))
+        let verifierEnd = try XCTUnwrap(source.range(of: "func verifySignedForTesting", range: verifierStart.upperBound..<source.endIndex))
         let verifier = source[verifierStart.lowerBound..<verifierEnd.lowerBound]
 
         XCTAssertTrue(verifier.contains("AESCCM.constantTimeEqual(expected, header.signature)"))

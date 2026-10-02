@@ -1418,7 +1418,7 @@ private final class LockedCounter: @unchecked Sendable {
 }
 
 #if canImport(Network)
-private final class LoopbackNWServer: @unchecked Sendable {
+final class LoopbackNWServer: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "dev.smbee.tests.nwserver")
     private let state = LoopbackNWServerState()
@@ -1462,6 +1462,18 @@ private final class LoopbackNWServer: @unchecked Sendable {
         await state.waitForConnection()
     }
 
+    func waitForReceivedBytes(atLeast count: Int) async -> [UInt8] {
+        await state.waitForReceivedBytes(atLeast: count)
+    }
+
+    func receivedBytes() async -> [UInt8] {
+        await state.receivedBytes()
+    }
+
+    func didPeerCloseSendDirection() async -> Bool {
+        await state.didPeerCloseSendDirection()
+    }
+
     func stop() {
         listener.cancel()
         Task { await state.cancelConnections() }
@@ -1470,18 +1482,36 @@ private final class LoopbackNWServer: @unchecked Sendable {
     private func accept(_ connection: NWConnection) {
         Task { await state.accept(connection) }
         connection.start(queue: queue)
-        if echo {
-            receiveAndEcho(connection)
-        }
+        receiveAndEcho(connection)
     }
 
     private func receiveAndEcho(_ connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
-            guard let self, error == nil, !isComplete else { return }
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, context, isComplete, error in
+            guard let self else { return }
+            guard error == nil else {
+                Task { await self.state.markPeerClosed() }
+                return
+            }
+            let peerSendDirectionClosed = isComplete && (context?.isFinal ?? false)
             if let data, !data.isEmpty {
-                connection.send(content: data, completion: .contentProcessed { _ in
-                    self.receiveAndEcho(connection)
-                })
+                Task {
+                    await self.state.recordReceived(data)
+                    if self.echo {
+                        connection.send(content: data, completion: .contentProcessed { sendError in
+                            if sendError != nil || peerSendDirectionClosed {
+                                Task { await self.state.markPeerClosed() }
+                            } else {
+                                self.receiveAndEcho(connection)
+                            }
+                        })
+                    } else if peerSendDirectionClosed {
+                        await self.state.markPeerClosed()
+                    } else {
+                        self.receiveAndEcho(connection)
+                    }
+                }
+            } else if peerSendDirectionClosed {
+                Task { await self.state.markPeerClosed() }
             } else {
                 self.receiveAndEcho(connection)
             }
@@ -1490,8 +1520,16 @@ private final class LoopbackNWServer: @unchecked Sendable {
 }
 
 private actor LoopbackNWServerState {
+    private struct ByteWaiter {
+        let target: Int
+        let continuation: CheckedContinuation<[UInt8], Never>
+    }
+
     private var connections: [NWConnection] = []
     private var pendingConnectionWaiter: CheckedContinuation<NWConnection, Never>?
+    private var received = Data()
+    private var byteWaiters: [ByteWaiter] = []
+    private var peerClosedSendDirection = false
 
     func accept(_ connection: NWConnection) {
         connections.append(connection)
@@ -1508,6 +1546,35 @@ private actor LoopbackNWServerState {
             pendingConnectionWaiter = continuation
         }
     }
+
+    func recordReceived(_ data: Data) {
+        received.append(data)
+        let ready = byteWaiters.filter { received.count >= $0.target }
+        byteWaiters.removeAll { received.count >= $0.target }
+        for waiter in ready {
+            waiter.continuation.resume(returning: Array(received.prefix(waiter.target)))
+        }
+    }
+
+    func waitForReceivedBytes(atLeast count: Int) async -> [UInt8] {
+        if received.count >= count || peerClosedSendDirection { return Array(received.prefix(count)) }
+        return await withCheckedContinuation { continuation in
+            byteWaiters.append(ByteWaiter(target: count, continuation: continuation))
+        }
+    }
+
+    func receivedBytes() -> [UInt8] { Array(received) }
+
+    func markPeerClosed() {
+        peerClosedSendDirection = true
+        let waiters = byteWaiters
+        byteWaiters.removeAll()
+        for waiter in waiters {
+            waiter.continuation.resume(returning: Array(received.prefix(waiter.target)))
+        }
+    }
+
+    func didPeerCloseSendDirection() -> Bool { peerClosedSendDirection }
 
     func cancelConnections() {
         let currentConnections = connections

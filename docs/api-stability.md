@@ -72,8 +72,9 @@ over errors and should not parse human-readable associated strings.
 ## Network transport implementation note
 
 `NWConnectionTransport` currently turns each nonempty segment into its own `Data`, then
-enqueues the frame's segments in one Network.framework batch under a per-frame content
-context. `NWConnection.send` also accepts `DispatchData`; per-segment `Data` is used here
+enqueues the frame's segments in one Network.framework batch on the shared, non-final
+default message context (a separate context per frame stalled the following frame on a real
+TCP loopback). Frames are serialized by a FIFO gate. `NWConnection.send` also accepts `DispatchData`; per-segment `Data` is used here
 because it keeps ownership and buffer lifetime explicit for Swift `[UInt8]` inputs without
 adding discontiguous-storage conversion and retention machinery. The performance effect of
 this implementation has not been measured. A send returns after all of its

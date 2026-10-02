@@ -121,7 +121,7 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
 
     public func send(_ segments: [[UInt8]]) async throws {
         try Task.checkCancellation()
-        guard connection != nil else { throw SMBTransportError.connectionClosed }
+        guard let capturedConnection = connection else { throw SMBTransportError.connectionClosed }
 
         // DataProtocol also accepts DispatchData, but per-segment Data keeps each
         // Swift-owned buffer's lifetime explicit while retaining segment-level enqueue.
@@ -133,12 +133,15 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
         try await sendGate.acquire()
         do {
             try Task.checkCancellation()
-            guard let connection else { throw SMBTransportError.connectionClosed }
-            try await sendFrame(buffers, on: connection)
+            guard let currentConnection = connection, currentConnection === capturedConnection else {
+                throw SMBTransportError.connectionClosed
+            }
+            try await sendFrame(buffers, on: currentConnection)
             try Task.checkCancellation()
             await sendGate.release()
         } catch {
             await sendGate.release()
+            if Task.isCancelled { throw CancellationError() }
             throw error
         }
     }
@@ -147,10 +150,8 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
         _ buffers: [Data],
         on connection: any NWConnectionTransportConnection
     ) async throws {
-        let context = NWConnection.ContentContext(
-            identifier: UUID().uuidString,
-            isFinal: false
-        )
+        // Reuse the non-final message context so a TCP stream can accept later SMB frames.
+        let context = NWConnection.ContentContext.defaultMessage
 
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in

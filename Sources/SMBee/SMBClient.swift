@@ -94,11 +94,15 @@ func makeSMBDownloadTemporaryFile(
             }
         }
 
-        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
+        // 0o666 & ~umask keeps the installed destination's mode the same as the previous
+        // FileManager.createFile path (typically 0644); a fixed 0o600 hid downloads from
+        // group/other readers.
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o666))
         guard descriptor >= 0 else {
             let openError = errno
             if openError == EEXIST { continue }
-            try? fileManager.removeItem(at: url)
+            // A failed open does not prove this call created the pathname (EMFILE can win over
+            // EEXIST), so it must not unlink it.
             throw POSIXError(POSIXErrorCode(rawValue: openError) ?? .EIO)
         }
         return (url, FileHandle(fileDescriptor: descriptor, closeOnDealloc: true))

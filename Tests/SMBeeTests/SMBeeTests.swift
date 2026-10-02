@@ -8306,6 +8306,26 @@ final class SMBeeTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: second.url.path))
     }
 
+    func testDownloadTemporaryFileHonorsUmaskLikeFileManagerCreateFile() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let previousMask = umask(0o022)
+        defer { umask(previousMask) }
+
+        let temporary = try makeSMBDownloadTemporaryFile(in: directory)
+        try temporary.handle.close()
+        let reference = directory.appendingPathComponent("reference")
+        XCTAssertTrue(FileManager.default.createFile(atPath: reference.path, contents: nil))
+
+        let mode = { (url: URL) throws -> Int in
+            let permissions = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions]
+            return try XCTUnwrap(permissions as? Int)
+        }
+        XCTAssertEqual(try mode(temporary.url), 0o644)
+        XCTAssertEqual(try mode(temporary.url), try mode(reference))
+    }
+
     func testSetInfoRejectsOutOfRangeFiletimeWithoutTrapping() {
         let fileId = Array(repeating: UInt8(0), count: 16)
         XCTAssertThrowsError(try SMB2SetInfo.encodeBasicInfoRequest(

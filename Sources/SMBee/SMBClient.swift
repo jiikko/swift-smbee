@@ -8,8 +8,14 @@ import Darwin
 enum SMBDownloadTestSeams {
     /// Lets deterministic tests hold resume-prefix validation at an async boundary.
     @TaskLocal static var beforeResumePrefixComparison: (@Sendable () async throws -> Void)?
+    /// Lets deterministic tests hold after prefix equality has been computed and before it is acted on.
+    @TaskLocal static var afterResumePrefixComparison: (@Sendable () async throws -> Void)?
+    /// Marks the point at which a validated resume is about to start its append stream.
+    @TaskLocal static var beforeResumeAppendConnection: (@Sendable () async throws -> Void)?
     /// Lets deterministic tests exercise cancellation immediately before destination installation.
     @TaskLocal static var beforeDestinationInstall: (@Sendable () async throws -> Void)?
+    /// Replaces exclusive temporary-file creation in tests, including partial-create failures.
+    @TaskLocal static var createTemporaryFile: (@Sendable (URL) throws -> FileHandle)?
 }
 
 /// Extracts the `.size` file attribute as `UInt64`. On Darwin the value bridges to `NSNumber`, but on
@@ -71,12 +77,31 @@ private func smbReplaceItem(at destination: URL, with source: URL, fileManager: 
 #endif
 }
 
-func makeSMBDownloadTemporaryFile(in directory: URL) throws -> (url: URL, handle: FileHandle) {
+func makeSMBDownloadTemporaryFile(
+    in directory: URL,
+    prefix: String = ".smbee-",
+    suffix: String = ".part"
+) throws -> (url: URL, handle: FileHandle) {
     let fileManager = FileManager.default
     for _ in 0..<8 {
-        let url = directory.appendingPathComponent(".smbee-\(UUID().uuidString).part")
-        guard !fileManager.fileExists(atPath: url.path), fileManager.createFile(atPath: url.path, contents: nil) else { continue }
-        return (url, try FileHandle(forWritingTo: url))
+        let url = directory.appendingPathComponent("\(prefix)\(UUID().uuidString)\(suffix)")
+        if let createTemporaryFile = SMBDownloadTestSeams.createTemporaryFile {
+            do {
+                return (url, try createTemporaryFile(url))
+            } catch {
+                try? fileManager.removeItem(at: url)
+                throw error
+            }
+        }
+
+        let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
+        guard descriptor >= 0 else {
+            let openError = errno
+            if openError == EEXIST { continue }
+            try? fileManager.removeItem(at: url)
+            throw POSIXError(POSIXErrorCode(rawValue: openError) ?? .EIO)
+        }
+        return (url, FileHandle(fileDescriptor: descriptor, closeOnDealloc: true))
     }
     throw SMBCodecError.invalidValue("unable to create unique temporary download file")
 }
@@ -1489,7 +1514,7 @@ public actor SMBClientSession {
     ///   (`issues/067` の「動画 range read profile」)。値が実サイズより大きい場合は
     ///   short read として loud に失敗する (`resolvedSize` の doc 参照)。
     /// - Parameter operationTimeout: Deadline from CREATE through all READs and CLOSE.
-    public func withReadStream(
+    public nonisolated func withReadStream(
         path: String,
         range: SMBReadRange? = nil,
         knownSize: UInt64? = nil,
@@ -1687,7 +1712,7 @@ public actor SMBClientSession {
 
     /// Download a file using this already-connected session.
     /// - Parameter operationTimeout: Deadline from temporary-file creation through stream cleanup and installation.
-    public func download(
+    public nonisolated func download(
         path: String,
         localFile: URL,
         overwrite: Bool = true,
@@ -3145,8 +3170,6 @@ public enum SMBClient {
         let fileManager = FileManager.default
         let destination = localFile.standardizedFileURL
         let directory = destination.deletingLastPathComponent()
-        let temporary = directory.appendingPathComponent(".\(destination.lastPathComponent).smbee-\(UUID().uuidString).tmp")
-
         guard overwrite || resume || !fileManager.fileExists(atPath: destination.path) else {
             throw SMBCodecError.invalidValue("local destination already exists")
         }
@@ -3165,7 +3188,9 @@ public enum SMBClient {
                 try localHandle.close()
                 try await SMBDownloadTestSeams.beforeResumePrefixComparison?()
                 try Task.checkCancellation()
-                guard Data(remotePrefix) == localPrefix else {
+                let prefixMatches = Data(remotePrefix) == localPrefix
+                try await SMBDownloadTestSeams.afterResumePrefixComparison?()
+                guard prefixMatches else {
                     throw SMBCodecError.invalidValue("local resume prefix does not match remote file")
                 }
                 try Task.checkCancellation()
@@ -3173,6 +3198,7 @@ public enum SMBClient {
             let handle = try FileHandle(forWritingTo: destination)
             do {
                 try handle.seekToEnd()
+                try await SMBDownloadTestSeams.beforeResumeAppendConnection?()
                 try await withReadStream(
                     host: host,
                     port: port,
@@ -3194,8 +3220,13 @@ public enum SMBClient {
             }
             return
         }
-        fileManager.createFile(atPath: temporary.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: temporary)
+        let temporaryFile = try makeSMBDownloadTemporaryFile(
+            in: directory,
+            prefix: ".\(destination.lastPathComponent).smbee-",
+            suffix: ".tmp"
+        )
+        let temporary = temporaryFile.url
+        let handle = temporaryFile.handle
         do {
             try await withReadStream(
                 host: host,

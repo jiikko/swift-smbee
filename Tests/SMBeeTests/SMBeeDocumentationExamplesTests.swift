@@ -5,6 +5,7 @@ final class SMBeeDocumentationExamplesTests: XCTestCase {
     func testDocumentedExamplesCompileAgainstPublicAPI() {
         _ = documentedSessionExample
         _ = documentedDeadlineExample
+        _ = documentedTransportInjectionExamples
     }
 }
 
@@ -50,4 +51,64 @@ private func documentedDeadlineExample(
     } catch let error as SMBCodecError {
         throw error
     }
+}
+
+private func documentedTransportInjectionExamples(
+    host: String,
+    credential: SMBCredential,
+    credentialProvider: @escaping SMBCredentialProvider,
+    destination: URL
+) async throws {
+    let makeTransport: @Sendable () -> SMBTransport = { InMemoryTransport() }
+
+    let credentialSession = try await SMBClient.connect(
+        host: host,
+        share: "public",
+        credential: credential,
+        makeTransport: makeTransport
+    )
+    await credentialSession.close()
+
+    let providerSession = try await SMBClient.connect(
+        host: host,
+        share: "public",
+        credentialProvider: credentialProvider,
+        makeTransport: makeTransport
+    )
+    await providerSession.close()
+
+    try await SMBClient.withReadStream(
+        host: host,
+        share: "public",
+        path: "incoming/report.txt",
+        credential: credential,
+        makeTransport: makeTransport,
+        onChunk: { _ in }
+    )
+
+    try await SMBClient.withReadStream(
+        host: host,
+        share: "public",
+        path: "incoming/report.txt",
+        credentialProvider: credentialProvider,
+        makeTransport: makeTransport,
+        onChunk: { _ in }
+    )
+
+    _ = try await SMBClient.list(
+        host: host,
+        share: "public",
+        path: "incoming",
+        credentialProvider: credentialProvider,
+        makeTransport: makeTransport
+    )
+
+    try await SMBClient.download(
+        host: host,
+        share: "public",
+        path: "incoming/report.txt",
+        localFile: destination,
+        credential: credential,
+        makeTransport: makeTransport
+    )
 }

@@ -8,6 +8,7 @@ together with their application. This document is the public API freeze note for
 The supported high-level surface consists of:
 
 - the `SMBee` facade;
+- the public high-level static APIs on `SMBClient`;
 - `SMBClientSession` and its scoped `SMBClientTreeSession`;
 - credentials, transfer options, callbacks, and returned model values;
 - `SMBError`, `SMBTransportError`, and `SMBCodecError`;
@@ -22,12 +23,31 @@ Deadline-enabled provider overloads require an explicit `operationTimeout` argum
 the legacy overload remains selectable. Adding a defaulted parameter does not guarantee
 compatibility for references to overloaded methods as function values.
 
+`SMBClient` is a supported high-level entry point alongside `SMBee`. Its public static
+connection, session, share/tree/file, transfer, and DFS operations are covered by the 0.x
+source-compatibility contract. The facade and the lower-level client do not expose identical
+overloads. In particular, custom transports can be supplied only to `SMBClient` overloads
+whose signatures include `makeTransport`; `SMBee` does not promise transport injection.
+Credential and credential-provider overloads may differ in whether `makeTransport` is
+optional, defaulted, or required. The declared signature of each overload is the contract;
+do not infer that every overload accepts the same arguments.
+
+| Public entry family | Example calls | Custom transport |
+| --- | --- | --- |
+| `SMBee` facade | `SMBee.connect`, `SMBee.upload`, `SMBee.download` | Not exposed by the facade |
+| `SMBClient.connect` | Credential and credential-provider overloads | Both overloads accept optional `makeTransport` |
+| `SMBClient` one-shot high-level operations | `list`, `withReadStream`, `download`, `upload`, `stat`, and other declared operations | Available only on overloads whose signature declares `makeTransport`; defaults vary by overload |
+| `SMBClientSession` / `SMBClientTreeSession` | Operations on an established session or tree | Chosen when the session is connected; not replaced per operation |
+
 ## Concurrency and cancellation contract
 
 - Public value models and errors crossing concurrency boundaries are `Sendable`.
-- `SMBClientSession` and `SMBClientTreeSession` are actors. Calls are serialized through
-  actor isolation; callbacks accepted by them are `@Sendable` and may run away from the
-  caller's executor.
+- `SMBClientSession` and `SMBClientTreeSession` are actors. Actor isolation protects
+  actor-isolated state, but an async call can suspend at `await`, allowing another call to
+  the same actor to make progress before the first call returns. Multi-request high-level
+  operations are not atomic and have no overall ordering guarantee; callers must coordinate
+  competing operations such as writes to the same path. Callbacks accepted by the actors are
+  `@Sendable` and may run away from the caller's executor.
 - Cancelling a task requests cooperative cancellation. An in-flight SMB request may send
   SMB2 CANCEL or drain its response to preserve session correlation before returning.
 - `operationTimeout` is also cooperative. It reports `SMBTransportError.timedOut` only

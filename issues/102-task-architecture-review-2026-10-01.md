@@ -93,3 +93,17 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 | 19 | 本物 | P3 | `SMBEE_DEBUG=1` + `SMBEE_TRACE_WIRE=1` + `SMBEE_TRACE_WIRE_FULL=1` で、暗号化 session でも平文のファイル内容が stderr に出る（3 つとも明示的に有効にしたときだけ） |
 | 20 | 本物 | P3 | NWConnection の transport は segment 版の send を持たず、protocol の既定実装が frame 全体を連結する（性能への影響は未実測） |
 | 21 | 本物 | P3 | NWConnection の経路で TCP_NODELAY を明示していない（実効値・遅延差は未実測） |
+
+## 裏取り済みの残り 6 件の対応（2026-10-02、codex-drive の軽量パス）
+
+| # | 結果 | commit |
+|---|---|---|
+| 7 | 対応済み。再接続を 1 本の共有処理にまとめ、close で全 waiter を解放して候補 session を閉じる。watch は毎周回・通知のたびに close を確かめる。cancel は伝え、CancellationError は吸収しない | `fix(client): close と並行する再接続が session を開き直さない …` と追補 `fix(client): close が共有の再接続の待ちを解放し …` |
+| 8 | 対応済み。SESSION_SETUP#1 も throwIfFailure を通し、STATUS_CANCELLED は CancellationError | `fix(session): SESSION_SETUP#1 の失敗 status も throwIfFailure に通し …` |
+| 11 | ユーザーの判断で挙動は変えず、`credential:` 版が再接続のために資格情報を保持することを docs/api-stability.md に明記 | `docs(api): credential: で接続した session は …` |
+| 12 | 対応済み。reserveCapacity を min(aceCount, (aclSize - 8) / 4) で抑える | `fix(acl): ACE の件数で過大に確保しない …` |
+| 13 | 対応済み。署名の比較を constant-time に | `fix(signing): SMB 署名の比較を constant-time にする` |
+| 16 | issue 010 M3（常駐の受信ループ）で受信経路を作り直すので、READ/WRITE パイプライン化と一緒に計測つきで扱う（未着手） | — |
+
+不採用（記録）: 匿名 session でサーバが署名必須を示しても、匿名には署名鍵が無いので署名なしの応答を受け入れる（MS-SMB2 の匿名 session の扱い。
+VALIDATE_NEGOTIATE_INFO の匿名の例外と同じ方針）。#7 の設計・実装は sol の敵対レビューを計 3 周（設計 1・実装 2）通し、最後の周は指摘 0 件。

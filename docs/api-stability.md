@@ -56,7 +56,10 @@ writes are not intended for the 1.0 API. The staged replacement and deprecation 
 tracked in [`issues/063-api-credential-password-deprecation.md`](../issues/063-api-credential-password-deprecation.md).
 No deprecation attribute will be added until a non-readable replacement credential API
 exists. Continue supplying secrets through `SMBCredential(username:password:domain:)` or
-an `SMBCredentialProvider`, and do not retain credentials after connecting.
+an `SMBCredentialProvider`. `SMBClient.connect(..., credential:)` retains a reconnect closure that
+captures the supplied credential for the session lifetime. Use the `credentialProvider:` overload
+if you do not want a fixed credential captured; its provider closure is retained for the session and
+called whenever credentials are needed, so it can return a fresh credential for each reconnect.
 
 ## Not currently guaranteed
 

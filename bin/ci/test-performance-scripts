@@ -237,6 +237,7 @@ test_syntax_checks() {
     "${SCRIPT_DIR}/publish-network-performance-summary" \
     "${SCRIPT_DIR}/summarize-network-performance-study" \
     "${SCRIPT_DIR}/network-performance-study-arm" \
+    "${SCRIPT_DIR}/network-performance-study-rtt" \
     "${SCRIPT_DIR}/network-performance-study-run" \
     "${SCRIPT_DIR}/publish-resource-performance-summary" \
     "${SCRIPT_DIR}/write-resource-performance-artifact" \
@@ -253,6 +254,13 @@ test_syntax_checks() {
   done
   bash -n "${REPO_ROOT}/bin/e2e/smoke-agent"
   PYTHONDONTWRITEBYTECODE=1 python3 - "${SCRIPT_DIR}/parse-resource-performance" <<'PY'
+import ast
+import pathlib
+import sys
+
+ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+PY
+  PYTHONDONTWRITEBYTECODE=1 python3 - "${SCRIPT_DIR}/network-performance-study-rtt-probe.py" <<'PY'
 import ast
 import pathlib
 import sys
@@ -596,13 +604,14 @@ import json
 import sys
 
 rows = []
-def add(profile, arm, operation, invocation, throughput, samba="4.19.5"):
+def add(profile, arm, operation, invocation, throughput, samba="4.19.5", rtt_target=5):
     for iteration in (1, 2):
         rows.append({
             "profile": profile, "arm": arm, "invocation": invocation, "operation": operation,
             "iteration": iteration, "size_bytes": 1048576, "wall_ms": 1000 / throughput,
             "throughput_mib_s": throughput, "client_user_cpu_ms": 3.0, "client_system_cpu_ms": 1.0,
             "size_matches": True, "sha256_matches": True if iteration == 1 else None,
+            "rtt_target_ms": rtt_target,
             "runner_cpu_model": "cpu", "swift_image_digest": "swift@sha256:x", "samba_version": samba,
             "negotiated_dialect": "0x0302", "negotiated_signing": "cmac", "negotiated_cipher": "none",
         })
@@ -618,18 +627,23 @@ for invocation in (1, 2, 3):
 # One invocation per arm: MAD is 0, so a 6% change must not be called a difference.
 add("R", "before", "read", 1, 100)
 add("R", "after", "read", 1, 106)
+# RTT is part of the aggregation key; distinct conditions remain separate even without a paired arm.
+add("S", "before", "read", 1, 100, rtt_target=0)
+add("S", "after", "read", 1, 100, rtt_target=20)
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     for row in rows:
         handle.write(json.dumps(row) + "\n")
 PY
   "${SCRIPT_DIR}/summarize-network-performance-study" --compare before:after "${jsonl}" >"${summary}"
   expect_contains "${summary}" \
-    '40 samples; all sizes matched; 20 SHA-256 verifications passed.' \
-    '| P | before | 1 MiB | read | throughput_mib_s (MiB/s) | 3 | 100.000 | 99.000 | 101.000 | 1.000 | 99.000 | 101.000 |' \
-    '| P | 1 MiB | read throughput_mib_s (MiB/s) | 100.000 / 1.000 | 120.000 / 1.000 | +20.0% | difference |' \
-    '| P | 1 MiB | write throughput_mib_s (MiB/s) | 100.000 / 1.000 | 101.000 / 1.000 | +1.0% | within noise |' \
-    '| Q | 1 MiB | read throughput_mib_s (MiB/s) | 100.000 / 0.000 | 100.000 / 0.000 | — | incomparable (samba_version) |' \
-    '| R | 1 MiB | read throughput_mib_s (MiB/s) | 100.000 / 0.000 | 106.000 / 0.000 | — | insufficient invocations (1 vs 1; need equal and >= 3) |'
+    '44 samples; all sizes matched; 22 SHA-256 verifications passed.' \
+    '| P | before | 5 ms | 1 MiB | read | throughput_mib_s (MiB/s) | 3 | 100.000 | 99.000 | 101.000 | 1.000 | 99.000 | 101.000 |' \
+    '| P | 5 ms | 1 MiB | read throughput_mib_s (MiB/s) | 100.000 / 1.000 | 120.000 / 1.000 | +20.0% | difference |' \
+    '| P | 5 ms | 1 MiB | write throughput_mib_s (MiB/s) | 100.000 / 1.000 | 101.000 / 1.000 | +1.0% | within noise |' \
+    '| Q | 5 ms | 1 MiB | read throughput_mib_s (MiB/s) | 100.000 / 0.000 | 100.000 / 0.000 | — | incomparable (samba_version) |' \
+    '| R | 5 ms | 1 MiB | read throughput_mib_s (MiB/s) | 100.000 / 0.000 | 106.000 / 0.000 | — | insufficient invocations (1 vs 1; need equal and >= 3) |' \
+    '| S | before | 0 ms | 1 MiB | read | throughput_mib_s (MiB/s) | 1 | 100.000 | 100.000 | 100.000 | 0.000 | 100.000 | 100.000 |' \
+    '| S | after | 20 ms | 1 MiB | read | throughput_mib_s (MiB/s) | 1 | 100.000 | 100.000 | 100.000 | 0.000 | 100.000 | 100.000 |'
 
   # A partial run (R stopped after invocation 1) must not be summarized as a complete one.
   if "${SCRIPT_DIR}/summarize-network-performance-study" --expect-invocations 3 "${jsonl}" \
@@ -639,7 +653,7 @@ PY
   fi
   expect_contains "${scenario_dir}/partial.err" \
     'incomplete study data:' \
-    "('R', 'after', 1048576, 'read'): invocations [1] != 1..3"
+    "('R', 'after', 5, 1048576, 'read'): invocations [1] != 1..3"
 
   PYTHONDONTWRITEBYTECODE=1 python3 - "${jsonl}" "${scenario_dir}/bad.jsonl" <<'PY'
 import sys
@@ -656,6 +670,357 @@ PY
   fi
   expect_contains "${scenario_dir}/bad.err" '1 sample(s) failed size/SHA-256 verification'
 }
+
+test_network_performance_study_rtt_shaping() (
+  local scenario_dir state_file jsonl_file base_ms tc_log
+  scenario_dir="$(new_scenario_dir)"
+  mkdir -p "$scenario_dir/bin"
+  state_file="$scenario_dir/network-shape-state"
+  jsonl_file="$scenario_dir/network-shape.jsonl"
+  tc_log="$scenario_dir/tools.log"
+
+  if STUDY_PROFILE=P STUDY_ARMS=current STUDY_INVOCATIONS=1 STUDY_OUTPUT_DIR="$scenario_dir/invalid-run" \
+    SAMBA_CONTAINER=smbee-samba-study SWIFT_VERSION=6.2 STUDY_RTT_LEVELS=0,05 \
+    "$SCRIPT_DIR/network-performance-study-run" >"$scenario_dir/invalid-run.out" 2>&1; then
+    echo 'network study unexpectedly accepted an invalid RTT input' >&2
+    return 1
+  fi
+  expect_contains "$scenario_dir/invalid-run.out" 'STUDY_RTT_LEVELS values must be one of 0,5,20: 05'
+  if sed -n '/trap cleanup_rtt_shaping EXIT/,/run_in_swift()/p' "$SCRIPT_DIR/network-performance-study-run" \
+    | grep -F 'run_rtt_shaper setup'; then
+    echo 'network study initializes the RTT shaper before selecting a nonzero level' >&2
+    return 1
+  fi
+  test "$(grep -Fc 'run_rtt_shaper guard "${rtt_target}" >/dev/null' "$SCRIPT_DIR/network-performance-study-run")" -eq 2
+
+  cat >"$scenario_dir/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" = -n ]; then shift; fi
+exec "$@"
+EOF
+  cat >"$scenario_dir/bin/docker" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" = inspect ]; then
+  printf '%s\n%s\n%s\n%s\n' \
+    "${FAKE_DOCKER_ID:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+    "${FAKE_DOCKER_STARTED:-2026-10-02T00:00:00.000000000Z}" \
+    "${FAKE_DOCKER_PID:-4321}" "${FAKE_DOCKER_IP:-172.18.0.2}"
+  exit 0
+fi
+exit 0
+EOF
+  cat >"$scenario_dir/bin/nsenter" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+[ "$#" -gt 0 ] && shift
+export FAKE_TC_SCOPE=server
+exec "$@"
+EOF
+  cat >"$scenario_dir/bin/ip" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'ip %s\n' "$*" >>"${FAKE_TOOL_LOG}"
+if [ "${FAKE_TC_SCOPE:-host}" = server ] && [ "$1" = -j ]; then
+  printf '%s\n' '[{"ifindex":2,"ifname":"eth0","link_index":44,"linkinfo":{"info_kind":"veth"}}]'
+elif [ "${FAKE_TC_SCOPE:-host}" = host ] && [ "$1" = -j ]; then
+  peer=2
+  [ "${FAKE_PEER_MISMATCH:-0}" = 1 ] && peer=99
+  printf '[{"ifindex":44,"ifname":"veth-study","link_index":%s,"linkinfo":{"info_kind":"veth"}}]\n' "$peer"
+fi
+EOF
+  cat >"$scenario_dir/fake-tc.py" <<'EOF'
+import json, os, sys
+state_path = os.path.join(os.environ["FAKE_TC_STATE_DIR"], "state.json")
+os.makedirs(os.path.dirname(state_path), exist_ok=True)
+try:
+    state = json.load(open(state_path, encoding="utf-8"))
+except FileNotFoundError:
+    state = {"qdiscs": {}, "filters": {}}
+def save():
+    json.dump(state, open(state_path, "w", encoding="utf-8"))
+def val(args, name, default=""):
+    try: return args[args.index(name) + 1]
+    except (ValueError, IndexError): return default
+if sys.argv[1] == "bump":
+    _, _, scope, device, pref, count = sys.argv
+    entry = state["filters"].setdefault(f"{scope}|{device}|{pref}", {})
+    entry["packets"] = entry.get("packets", 0) + int(count)
+    save()
+    raise SystemExit(0)
+args = sys.argv[1:]
+stats = bool(args and args[0] == "-s")
+if stats: args = args[1:]
+scope = os.environ.get("FAKE_TC_SCOPE", "host")
+with open(os.environ["FAKE_TOOL_LOG"], "a", encoding="utf-8") as log:
+    log.write(f"tc {scope} {' '.join(args)}\n")
+if args[0] == "qdisc":
+    op, dev = args[1], val(args, "dev")
+    key = f"{scope}|{dev}"
+    if op == "replace":
+        state["qdiscs"][key] = val(args, "delay"); save()
+    elif op == "show":
+        delay = state["qdiscs"].get(key, "")
+        if scope == "host" and dev == "ifb-study-host":
+            delay = os.environ.get("FAKE_TC_HOST_DELAY_OVERRIDE", delay)
+        if scope == "server" and dev == "ifb-study":
+            delay = os.environ.get("FAKE_TC_SERVER_DELAY_OVERRIDE", delay)
+        if delay:
+            print(f"qdisc netem 8001: root refcnt 2 limit 1000 delay {delay}")
+            if stats: print(" Sent 1000 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)")
+    elif op == "del":
+        if "ingress" in args:
+            state["filters"] = {k:v for k,v in state["filters"].items() if not k.startswith(f"{scope}|{dev}|")}
+        else: state["qdiscs"].pop(key, None)
+        save()
+    raise SystemExit(0)
+if args[0] != "filter": raise SystemExit(2)
+op, dev = args[1], val(args, "dev")
+if op == "show":
+    if stats and os.environ.get("FAKE_TC_FILTER_READ_FAIL") == "1": raise SystemExit(48)
+    for key, entry in sorted(state["filters"].items(), key=lambda row: int(row[0].rsplit("|", 1)[1])):
+        sc, dv, pref = key.split("|")
+        if sc != scope or dv != dev: continue
+        kind = entry["kind"]
+        print(f"filter protocol {'ip' if kind == 'flower' else 'all'} pref {pref} {kind} chain 0")
+        if kind == "flower":
+            print("  ip_proto {proto} src_ip {src_ip} src_port {src_port} dst_ip {dst_ip} dst_port {dst_port}".format(**entry))
+        target = entry["target"]
+        if pref == "1000":
+            target = os.environ.get(f"FAKE_TC_{scope.upper()}_REDIRECT_OVERRIDE", target)
+        print(f"  action order 1: mirred (Egress Redirect to device {target}) stolen")
+        if stats:
+            packets = entry.get("packets", 0)
+            if os.environ.get("FAKE_TC_BAD_COUNTER") == "1" and int(pref) >= 101: packets = "NaN"
+            print(f"    Sent 100 bytes {packets} pkt (dropped 0, overlimits 0 requeues 0)")
+    raise SystemExit(0)
+if op == "replace" and os.environ.get("FAKE_FAIL_TC_FILTER") == "1": raise SystemExit(47)
+pref = val(args, "pref", "49152")
+key = f"{scope}|{dev}|{pref}"
+if op == "del":
+    state["filters"].pop(key, None); save(); raise SystemExit(0)
+target_args = args[args.index("redirect"):] if "redirect" in args else []
+state["filters"][key] = {
+    "kind": "flower" if "flower" in args else "matchall",
+    "target": val(target_args, "dev"),
+    "src_ip": val(args, "src_ip"), "src_port": val(args, "src_port"),
+    "dst_ip": val(args, "dst_ip"), "dst_port": val(args, "dst_port"),
+    "proto": val(args, "ip_proto"), "packets": 0,
+}
+save()
+EOF
+  cat >"$scenario_dir/bin/tc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$FAKE_REAL_PYTHON" "$FAKE_TC_PY" "$@"
+EOF
+  cat >"$scenario_dir/bin/modprobe" <<'EOF'
+#!/usr/bin/env bash
+printf 'modprobe %s\n' "$*" >>"${FAKE_TOOL_LOG}"
+EOF
+  cat >"$scenario_dir/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${FAKE_NETNS_INODE:-9001}"
+EOF
+  cat >"$scenario_dir/bin/python3" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" = "$FAKE_RTT_PROBE_SCRIPT" ]; then
+  mode="$2"
+  printf '%s\n' "$3" >>"$FAKE_PROBE_TARGETS"
+  if [ "$mode" = direct ]; then
+    [ "${FAKE_PROBE_FAIL_DIRECT:-0}" = 1 ] && exit 42
+    printf '%s\n' "${FAKE_TCP_MEDIAN_MS:-10.000}"
+    exit 0
+  fi
+  workdir="$5"
+  { printf '%s\n' 172.18.0.1; for port in $(seq 50001 50015); do printf '%s\n' "$port"; done; } >"$workdir/ready"
+  for _ in $(seq 1 500); do [ -f "$workdir/go" ] && break; sleep 0.01; done
+  bump() { "$FAKE_REAL_PYTHON" "$FAKE_TC_PY" bump "$1" "$2" "$3" "$4"; }
+  if [ "${FAKE_PROBE_UNRELATED_ONLY:-0}" = 1 ]; then
+    bump host veth-study 1000 15; bump server eth0 1000 15
+  else
+    for pref in $(seq 101 115); do
+      [ "${FAKE_PROBE_SERVER_PACKETS:-1}" = 0 ] || bump server eth0 "$pref" 1
+      [ "${FAKE_PROBE_HOST_PACKETS:-1}" = 0 ] || bump host veth-study "$pref" 1
+    done
+  fi
+  printf '%s\n' "${FAKE_TCP_MEDIAN_MS:-10.000}" >"$workdir/result"
+else
+  exec "$FAKE_REAL_PYTHON" "$@"
+fi
+EOF
+  chmod +x "$scenario_dir/bin/"*
+  : >"$tc_log"
+  : >"$scenario_dir/probe-targets.log"
+  export FAKE_TOOL_LOG="$tc_log" FAKE_TC_STATE_DIR="$scenario_dir/tc-state"
+  export FAKE_TC_PY="$scenario_dir/fake-tc.py" FAKE_PROBE_TARGETS="$scenario_dir/probe-targets.log"
+  export FAKE_RTT_PROBE_SCRIPT="$SCRIPT_DIR/network-performance-study-rtt-probe.py"
+  FAKE_REAL_PYTHON="$(command -v python3)"; export FAKE_REAL_PYTHON
+  export PATH="$scenario_dir/bin:$PATH"
+  export STUDY_RTT_STATE_FILE="$state_file" STUDY_RTT_JSONL="$jsonl_file"
+  export SAMBA_CONTAINER=smbee-samba-study SMBEE_E2E_HOST=127.0.0.1 SMBEE_E2E_PORT=445
+
+  # The default zero RTT path runs calibration without tc, ip, or modprobe.
+  base_ms="$(FAKE_TCP_MEDIAN_MS=10.000 "$SCRIPT_DIR/network-performance-study-rtt" calibrate)"
+  test "$base_ms" = 10.000
+  FAKE_TCP_MEDIAN_MS=10.500 "$SCRIPT_DIR/network-performance-study-rtt" verify 0 "$base_ms" >"$scenario_dir/verify-0.out"
+  "$SCRIPT_DIR/network-performance-study-rtt" set 0 >"$scenario_dir/set-0.out"
+  test ! -s "$tc_log"
+  if FAKE_PROBE_FAIL_DIRECT=1 "$SCRIPT_DIR/network-performance-study-rtt" calibrate >"$scenario_dir/zero-failed.out" 2>&1; then
+    echo 'RTT 0 probe unexpectedly survived a fake network failure' >&2; return 1
+  fi
+  test ! -s "$tc_log"
+  if ! grep -Fq '172.18.0.2' "$scenario_dir/probe-targets.log"; then
+    echo 'RTT calibration did not connect to the Samba container IP directly' >&2; return 1
+  fi
+
+  # Reject a host link that advertises an index but is not the reciprocal veth peer.
+  export STUDY_RTT_STATE_FILE="$scenario_dir/bad-peer-state" STUDY_RTT_JSONL="$scenario_dir/bad-peer.jsonl"
+  : >"$tc_log"
+  if FAKE_PEER_MISMATCH=1 "$SCRIPT_DIR/network-performance-study-rtt" setup >"$scenario_dir/bad-peer.out" 2>&1; then
+    echo 'RTT shaper accepted a non-reciprocal host veth peer' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/bad-peer.out" 'could not prove the Samba eth0 and host veth are reciprocal peers'
+  if grep -F 'tc host qdisc replace' "$tc_log"; then
+    echo 'RTT shaper configured before validating the reciprocal peer' >&2; return 1
+  fi
+
+  export STUDY_RTT_STATE_FILE="$state_file" STUDY_RTT_JSONL="$jsonl_file"
+  "$SCRIPT_DIR/network-performance-study-rtt" setup >"$scenario_dir/setup.out"
+  expect_contains "$tc_log" \
+    'ip -j -d link show dev eth0' \
+    'ip -j -d link show' \
+    'tc host qdisc replace dev ifb-study-host root netem delay 0ms' \
+    'tc host filter replace dev veth-study parent ffff: protocol all pref 1000 matchall action mirred egress redirect dev ifb-study-host' \
+    'tc server qdisc replace dev ifb-study root netem delay 0ms' \
+    'tc server filter replace dev eth0 parent ffff: protocol all pref 1000 matchall action mirred egress redirect dev ifb-study'
+  if grep -F '/sys/class/net/eth0/iflink' "$tc_log"; then
+    echo 'RTT shaper used sysfs instead of netlink' >&2; return 1
+  fi
+
+  "$SCRIPT_DIR/network-performance-study-rtt" set 5 >"$scenario_dir/set-5.out"
+  if FAKE_DOCKER_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    "$SCRIPT_DIR/network-performance-study-rtt" guard 5 >"$scenario_dir/restart.out" 2>&1; then
+    echo 'RTT guard accepted a changed container generation' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/restart.out" 'Samba container generation changed'
+  if FAKE_DOCKER_STARTED=2026-10-02T00:01:00.000000000Z \
+    "$SCRIPT_DIR/network-performance-study-rtt" guard 5 >"$scenario_dir/restarted-at.out" 2>&1; then
+    echo 'RTT guard accepted a changed container start time' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/restarted-at.out" 'Samba container generation changed'
+  if FAKE_NETNS_INODE=9002 "$SCRIPT_DIR/network-performance-study-rtt" guard 5 >"$scenario_dir/netns-changed.out" 2>&1; then
+    echo 'RTT guard accepted a changed network namespace inode' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/netns-changed.out" 'Samba network namespace inode changed'
+  if FAKE_PEER_MISMATCH=1 "$SCRIPT_DIR/network-performance-study-rtt" guard 5 >"$scenario_dir/peer-changed.out" 2>&1; then
+    echo 'RTT guard accepted a changed/non-reciprocal veth peer' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/peer-changed.out" 'could not prove the Samba eth0 and host veth are reciprocal peers'
+  "$SCRIPT_DIR/network-performance-study-rtt" guard 5 >"$scenario_dir/guard.out"
+  "$SCRIPT_DIR/network-performance-study-rtt" set 0 >"$scenario_dir/reset-0.out"
+  base_ms="$(FAKE_TCP_MEDIAN_MS=10.000 "$SCRIPT_DIR/network-performance-study-rtt" calibrate)"
+  test "$base_ms" = 10.000
+  "$SCRIPT_DIR/network-performance-study-rtt" set 5 >"$scenario_dir/set-5-again.out"
+  FAKE_TCP_MEDIAN_MS=15.000 "$SCRIPT_DIR/network-performance-study-rtt" verify 5 "$base_ms" >"$scenario_dir/verify-5.out"
+  "$SCRIPT_DIR/network-performance-study-rtt" set 20 >"$scenario_dir/set-20.out"
+  FAKE_TCP_MEDIAN_MS=30.000 "$SCRIPT_DIR/network-performance-study-rtt" verify 20 "$base_ms" >"$scenario_dir/verify-20.out"
+  expect_contains "$tc_log" \
+    'tc host qdisc replace dev ifb-study-host root netem delay 2.5ms' \
+    'tc server qdisc replace dev ifb-study root netem delay 2.5ms' \
+    'tc host qdisc replace dev ifb-study-host root netem delay 10ms' \
+    'tc server qdisc replace dev ifb-study root netem delay 10ms' \
+    'tc server filter replace dev eth0 parent ffff: protocol ip pref 101 flower ip_proto tcp src_ip 172.18.0.1 src_port 50001 dst_ip 172.18.0.2 dst_port 445 action mirred egress redirect dev ifb-study'
+  expect_contains "$jsonl_file" \
+    '"requested_rtt_ms": 0' \
+    '"requested_rtt_ms": 5' \
+    '"observed_delta_ms": 5.0' \
+    '"requested_rtt_ms": 20' \
+    '"observed_delta_ms": 20.0' \
+    '"container_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    '"peer_ifindex": 44'
+
+  # Read the configured state back; a silent host-side delay mismatch must fail.
+  if FAKE_TC_HOST_DELAY_OVERRIDE=0ms "$SCRIPT_DIR/network-performance-study-rtt" guard 20 \
+    >"$scenario_dir/delay-mismatch.out" 2>&1; then
+    echo 'RTT guard accepted a qdisc delay mismatch' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/delay-mismatch.out" 'tc readback does not match requested RTT 20 ms'
+  if FAKE_TC_SERVER_DELAY_OVERRIDE=0ms "$SCRIPT_DIR/network-performance-study-rtt" guard 20 \
+    >"$scenario_dir/server-delay-mismatch.out" 2>&1; then
+    echo 'RTT guard accepted a mismatched Samba IFB delay' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/server-delay-mismatch.out" 'tc readback does not match requested RTT 20 ms'
+  if FAKE_TC_SERVER_REDIRECT_OVERRIDE=ifb-unrelated "$SCRIPT_DIR/network-performance-study-rtt" guard 20 \
+    >"$scenario_dir/redirect-mismatch.out" 2>&1; then
+    echo 'RTT guard accepted a server ingress redirect to the wrong IFB' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/redirect-mismatch.out" 'tc readback does not match requested RTT 20 ms'
+
+  # Every probe tuple must count in both directions; unrelated counters cannot substitute.
+  "$SCRIPT_DIR/network-performance-study-rtt" set 5 >"$scenario_dir/set-5-negative-cases.out"
+  if FAKE_PROBE_SERVER_PACKETS=0 FAKE_TCP_MEDIAN_MS=15.000 \
+    "$SCRIPT_DIR/network-performance-study-rtt" verify 5 "$base_ms" >"$scenario_dir/one-sided.out" 2>&1; then
+    echo 'RTT verifier accepted one-sided packet counters' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/one-sided.out" 'Samba-side exact-flow filter pref 101 did not count'
+  if FAKE_PROBE_UNRELATED_ONLY=1 FAKE_TCP_MEDIAN_MS=15.000 \
+    "$SCRIPT_DIR/network-performance-study-rtt" verify 5 "$base_ms" >"$scenario_dir/unrelated-only.out" 2>&1; then
+    echo 'RTT verifier accepted unrelated-only packet counters' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/unrelated-only.out" 'exact-flow filter pref 101 did not count'
+  if FAKE_TC_FILTER_READ_FAIL=1 "$SCRIPT_DIR/network-performance-study-rtt" verify 5 "$base_ms" \
+    >"$scenario_dir/counter-read-failed.out" 2>&1; then
+    echo 'RTT verifier accepted a failed counter query' >&2; return 1
+  fi
+  if ! grep -Fq 'command failed (exit 48)' "$scenario_dir/counter-read-failed.out"; then
+    echo 'RTT verifier did not explicitly propagate the failed counter query' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/counter-read-failed.out" 'could not read'
+  if FAKE_TC_BAD_COUNTER=1 "$SCRIPT_DIR/network-performance-study-rtt" verify 5 "$base_ms" \
+    >"$scenario_dir/counter-not-integer.out" 2>&1; then
+    echo 'RTT verifier accepted a non-integer packet counter' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/counter-not-integer.out" 'counter is missing or non-integer'
+
+  "$SCRIPT_DIR/network-performance-study-rtt" set 5 >/dev/null
+  if FAKE_TCP_MEDIAN_MS=10.500 "$SCRIPT_DIR/network-performance-study-rtt" verify 5 "$base_ms" \
+    >"$scenario_dir/ineffective.out" 2>&1; then
+    echo 'RTT verifier accepted an ineffective shaper' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/ineffective.out" \
+    'SHAPING FAILED' 'RTT injection ineffective: requested 5 ms' 'arm is measurement unavailable' 'qdisc state on host'
+  expect_contains "$jsonl_file" \
+    '"event": "failure"' \
+    '"status": "measurement-unavailable"' \
+    '"failed_command": "TCP SMB2 NEGOTIATE RTT calibration comparison"'
+
+  if "$SCRIPT_DIR/network-performance-study-rtt" set 05 >"$scenario_dir/invalid.out" 2>&1; then
+    echo 'RTT shaper accepted a non-canonical level' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/invalid.out" 'RTT must be one of 0, 5, or 20 ms'
+  "$SCRIPT_DIR/network-performance-study-rtt" clear >"$scenario_dir/clear.out"
+  expect_contains "$tc_log" \
+    'tc server qdisc del dev eth0 ingress' \
+    'tc host qdisc del dev veth-study ingress' \
+    'ip link del dev ifb-study-host'
+  test ! -e "$state_file"
+
+  export STUDY_RTT_STATE_FILE="$scenario_dir/failed-setup-state"
+  export STUDY_RTT_JSONL="$scenario_dir/failed-setup.jsonl"
+  if FAKE_FAIL_TC_FILTER=1 "$SCRIPT_DIR/network-performance-study-rtt" setup >"$scenario_dir/failed-setup.out" 2>&1; then
+    echo 'RTT shaper accepted a failed tc filter command' >&2; return 1
+  fi
+  expect_contains "$scenario_dir/failed-setup.jsonl" \
+    '"event": "failure"' \
+    '"failed_command": "sudo -n tc filter replace' \
+    '"requested_rtt_ms": 0' \
+    '"status": "measurement-unavailable"'
+  "$SCRIPT_DIR/network-performance-study-rtt" clear >"$scenario_dir/failed-clear.out"
+)
 
 test_agent_verifiers() {
   "${SCRIPT_DIR}/test-agent-verifiers"
@@ -1414,6 +1779,7 @@ run_scenario test_syntax_checks
 run_scenario test_agent_verifiers
 run_scenario test_network_performance_summary
 run_scenario test_network_performance_study_summary
+run_scenario test_network_performance_study_rtt_shaping
 run_scenario test_swift_image
 run_scenario test_run_resource_performance_log_path
 run_scenario test_run_resource_performance_default_cache_mount
@@ -1438,7 +1804,7 @@ run_scenario test_prewarm_handles_path_with_space
 run_scenario test_resource_performance_container_prewarm_branch
 run_scenario test_prewarm_has_no_array_expansions
 
-expected_scenario_count=27
+expected_scenario_count=28
 printf 'ran %s scenarios\n' "${scenario_count}"
 if [ "${scenario_count}" -ne "${expected_scenario_count}" ]; then
   printf 'expected %s scenarios, ran %s\n' \

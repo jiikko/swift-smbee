@@ -48,6 +48,11 @@ on:
         description: Optional space-separated subset of the experiment's profiles (e.g. to leave out one that cannot fit the time budget)
         required: false
         default: ""
+      rtt_levels:
+        description: Comma-separated added RTT levels in ms (subset of 0,5,20)
+        required: false
+        default: "0"
+        type: string
 
 permissions:
   contents: read
@@ -114,6 +119,7 @@ jobs:
       STUDY_SIZES_MIB: ${{ inputs.sizes_mib }}
       STUDY_SAMPLES: ${{ inputs.samples }}
       STUDY_WARMUP: ${{ inputs.warmup }}
+      STUDY_RTT_LEVELS: ${{ inputs.rtt_levels }}
       STUDY_OUTPUT_DIR: ${{ github.workspace }}/.build/network-study
       STUDY_BASELINE_REF: ${{ inputs.baseline_ref }}
     steps:
@@ -128,12 +134,16 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          shape_jsonl="${STUDY_OUTPUT_DIR}/network-shape.jsonl"
           compare=()
           read -r -a arms <<<"${STUDY_ARMS}"
           if [ "${#arms[@]}" -eq 2 ]; then
             compare=(--compare "${arms[0]}:${arms[1]}")
           fi
-          if [ -s "${STUDY_OUTPUT_DIR}/samples.jsonl" ]; then
+          if [ -s "${shape_jsonl}" ] && grep -Fq '"status": "measurement-unavailable"' "${shape_jsonl}"; then
+            echo "SHAPING FAILED — samples invalid. See network-shape.jsonl and network-shape.log in the artifact." \
+              >> "${GITHUB_STEP_SUMMARY}"
+          elif [ -s "${STUDY_OUTPUT_DIR}/samples.jsonl" ]; then
             bin/ci/summarize-network-performance-study --expect-invocations "${STUDY_INVOCATIONS}" \
               "${compare[@]}" "${STUDY_OUTPUT_DIR}/samples.jsonl" \
               >> "${GITHUB_STEP_SUMMARY}"
@@ -151,6 +161,9 @@ jobs:
             .build/network-study/*.json
             .build/network-study/*.log
           if-no-files-found: warn
+      - name: Clear RTT shaping
+        if: always()
+        run: bin/ci/network-performance-study-rtt clear
       - name: Samba logs and teardown
         if: always()
         uses: ./.github/actions/samba-teardown

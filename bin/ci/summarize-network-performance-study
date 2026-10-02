@@ -6,7 +6,7 @@ workflow's metadata merged in) and prints a Markdown report:
 
 - correctness: every sample must have size_matches=true, and every verified sample sha256_matches=true;
   otherwise the script exits 1 (a wrong transfer must not be summarized as a fast one)
-- per (profile, arm, size, operation): take the median of each invocation first, then report
+- per (profile, arm, RTT target, size, operation): take the median of each invocation first, then report
   median / p10 / p90 / MAD / min / max over those invocation medians (raw samples are never pooled)
 - --compare BEFORE:AFTER: before/after tables for two arms. A difference counts only when it exceeds
   both 3 x noise and 5% of the before median, where noise is the larger of the two arms' MADs
@@ -36,6 +36,7 @@ FIXED_METADATA = [
     "runner_cpu_model",
     "runner_cpu_count",
     "runner_image",
+    "kernel",
     "docker_version",
     "swift_image_digest",
     "samba_base",
@@ -45,11 +46,12 @@ FIXED_METADATA = [
     "negotiated_signing_required",
     "negotiated_cipher",
     "harness_commit",
+    "rtt_target_ms",
 ]
 # Below this many invocations per arm there is no usable noise estimate (MAD of one value is 0).
 MIN_COMPARABLE_INVOCATIONS = 3
 REQUIRED = ["profile", "arm", "invocation", "operation", "size_bytes", "wall_ms", "throughput_mib_s",
-            "client_user_cpu_ms", "client_system_cpu_ms", "size_matches"]
+            "client_user_cpu_ms", "client_system_cpu_ms", "size_matches", "rtt_target_ms"]
 
 
 def nearest_rank(values, quantile):
@@ -77,6 +79,8 @@ def load(paths):
                 missing = [key for key in REQUIRED if key not in sample]
                 if missing:
                     raise SystemExit(f"{path}:{number}: missing {', '.join(missing)}")
+                if type(sample["rtt_target_ms"]) is not int or sample["rtt_target_ms"] not in (0, 5, 20):
+                    raise SystemExit(f"{path}:{number}: rtt_target_ms must be one of 0, 5, or 20")
                 sample["client_cpu_ms"] = sample["client_user_cpu_ms"] + sample["client_system_cpu_ms"]
                 samples.append(sample)
     if not samples:
@@ -120,7 +124,7 @@ def check_completeness(samples, expected_invocations):
 
 
 def group_key(sample):
-    return (sample["profile"], sample["arm"], sample["size_bytes"], sample["operation"])
+    return (sample["profile"], sample["arm"], sample["rtt_target_ms"], sample["size_bytes"], sample["operation"])
 
 
 def invocation_medians(samples):
@@ -160,14 +164,14 @@ def size_label(size_bytes):
 def print_distribution(medians):
     print("### Invocation medians")
     print()
-    print("| Profile | Arm | Size | Operation | Metric | Invocations | Median | p10 | p90 | MAD | Min | Max |")
-    print("|---|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    print("| Profile | Arm | Added RTT | Size | Operation | Metric | Invocations | Median | p10 | p90 | MAD | Min | Max |")
+    print("|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|")
     for key in sorted(medians):
-        profile, arm, size_bytes, operation = key
+        profile, arm, rtt_target_ms, size_bytes, operation = key
         for metric, unit in METRICS:
             s = stats(medians[key][metric])
             print(
-                f"| {profile} | {arm} | {size_label(size_bytes)} | {operation} | {metric} ({unit}) | {s['n']} | "
+                f"| {profile} | {arm} | {rtt_target_ms} ms | {size_label(size_bytes)} | {operation} | {metric} ({unit}) | {s['n']} | "
                 f"{s['median']:.3f} | {s['p10']:.3f} | {s['p90']:.3f} | {s['mad']:.3f} | "
                 f"{s['min']:.3f} | {s['max']:.3f} |"
             )
@@ -186,13 +190,13 @@ def decide(before, after):
 def print_comparison(medians, metadata, before_arm, after_arm):
     print(f"### {before_arm} → {after_arm}")
     print()
-    print("| Profile | Size | Metric | Before median / MAD | After median / MAD | Change | Decision |")
-    print("|---|---:|---|---:|---:|---:|---|")
+    print("| Profile | Added RTT | Size | Metric | Before median / MAD | After median / MAD | Change | Decision |")
+    print("|---|---:|---:|---|---:|---:|---:|---|")
     rows = 0
-    targets = sorted({(p, s, o) for (p, a, s, o) in medians if a in (before_arm, after_arm)})
-    for profile, size_bytes, operation in targets:
-        before_key = (profile, before_arm, size_bytes, operation)
-        after_key = (profile, after_arm, size_bytes, operation)
+    targets = sorted({(p, r, s, o) for (p, a, r, s, o) in medians if a in (before_arm, after_arm)})
+    for profile, rtt_target_ms, size_bytes, operation in targets:
+        before_key = (profile, before_arm, rtt_target_ms, size_bytes, operation)
+        after_key = (profile, after_arm, rtt_target_ms, size_bytes, operation)
         if before_key not in medians or after_key not in medians:
             continue
         differing = [
@@ -213,7 +217,7 @@ def print_comparison(medians, metadata, before_arm, after_arm):
                 relative, decision = decide(before, after)
                 change = f"{relative * 100:+.1f}%"
             print(
-                f"| {profile} | {size_label(size_bytes)} | {label} | "
+                f"| {profile} | {rtt_target_ms} ms | {size_label(size_bytes)} | {label} | "
                 f"{before['median']:.3f} / {before['mad']:.3f} | {after['median']:.3f} / {after['mad']:.3f} | "
                 f"{change} | {decision} |"
             )

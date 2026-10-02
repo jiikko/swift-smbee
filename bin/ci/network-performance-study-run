@@ -11,6 +11,7 @@ unset CDPATH
 #   STUDY_ARMS           one or two arms for bin/ci/network-performance-study-arm (e.g. "cmac-before cmac-after")
 #   STUDY_INVOCATIONS    invocations per arm; with two arms they run in ABBA order (A B, B A, A B, ...)
 #   STUDY_SIZES_MIB / STUDY_WARMUP / STUDY_SAMPLES   forwarded to the harness
+#   STUDY_RTT_LEVELS     comma-separated subset of 0,5,20 (default: 0)
 #   STUDY_OUTPUT_DIR     receives samples.jsonl, server-cpu.jsonl, metadata.json and logs
 #   SAMBA_CONTAINER / SAMBA_BASE_IMAGE / SWIFT_VERSION
 #
@@ -27,6 +28,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 STUDY_SIZES_MIB="${STUDY_SIZES_MIB:-1}"
 STUDY_WARMUP="${STUDY_WARMUP:-5}"
 STUDY_SAMPLES="${STUDY_SAMPLES:-5}"
+STUDY_RTT_LEVELS="${STUDY_RTT_LEVELS:-0}"
 export STUDY_PROFILE STUDY_WARMUP
 case "${STUDY_INVOCATIONS}" in
   ''|*[!0123456789]*) echo "STUDY_INVOCATIONS must be an integer" >&2; exit 2 ;;
@@ -35,6 +37,31 @@ if [ "${#STUDY_INVOCATIONS}" -gt 3 ] || [ "${STUDY_INVOCATIONS}" -lt 1 ]; then
   echo "STUDY_INVOCATIONS must be from 1 through 999" >&2
   exit 2
 fi
+IFS=',' read -r -a rtt_levels <<<"${STUDY_RTT_LEVELS}"
+if [ "${#rtt_levels[@]}" -lt 1 ] || [ "${#rtt_levels[@]}" -gt 3 ]; then
+  echo "STUDY_RTT_LEVELS must be a comma-separated subset of 0,5,20" >&2
+  exit 2
+fi
+declare -a seen_rtt_levels=()
+seen_rtt_count=0
+for rtt_level in "${rtt_levels[@]}"; do
+  if [ "${#rtt_level}" -gt 2 ]; then
+    echo "STUDY_RTT_LEVELS values must be one of 0,5,20: ${rtt_level}" >&2
+    exit 2
+  fi
+  case "${rtt_level}" in
+    0|5|20) ;;
+    *) echo "STUDY_RTT_LEVELS values must be one of 0,5,20: ${rtt_level}" >&2; exit 2 ;;
+  esac
+  for ((seen_rtt_index = 0; seen_rtt_index < seen_rtt_count; seen_rtt_index++)); do
+    if [ "${seen_rtt_levels[seen_rtt_index]}" = "${rtt_level}" ]; then
+      echo "STUDY_RTT_LEVELS must not repeat a level: ${rtt_level}" >&2
+      exit 2
+    fi
+  done
+  seen_rtt_levels[seen_rtt_count]="${rtt_level}"
+  seen_rtt_count=$((seen_rtt_count + 1))
+done
 read -r -a arms <<<"${STUDY_ARMS}"
 if [ "${#arms[@]}" -lt 1 ] || [ "${#arms[@]}" -gt 2 ]; then
   echo "STUDY_ARMS must name one or two arms" >&2
@@ -45,8 +72,55 @@ mkdir -p "${STUDY_OUTPUT_DIR}"
 output_dir="$(cd "${STUDY_OUTPUT_DIR}" && pwd)"
 samples="${output_dir}/samples.jsonl"
 server_cpu="${output_dir}/server-cpu.jsonl"
+rtt_shaper="${SCRIPT_DIR}/network-performance-study-rtt"
+rtt_log="${output_dir}/network-shape.log"
+rtt_jsonl="${output_dir}/network-shape.jsonl"
+rtt_state="${output_dir}/network-shape-state"
+zero_rtt_only=1
+for rtt_level in "${rtt_levels[@]}"; do
+  [ "${rtt_level}" = 0 ] || zero_rtt_only=0
+done
+if [ "${zero_rtt_only}" -eq 1 ]; then
+  # A reused output directory must not make the default 0 ms path inspect or clean
+  # old shaping state. The CI Samba launcher creates a fresh container/veth per run.
+  python3 - "${rtt_state}" <<'PY'
+import os
+import sys
+
+try:
+    os.unlink(sys.argv[1])
+except FileNotFoundError:
+    pass
+PY
+fi
 : > "${samples}"
 : > "${server_cpu}"
+: > "${rtt_log}"
+: > "${rtt_jsonl}"
+export STUDY_RTT_STATE_FILE="${rtt_state}" STUDY_RTT_JSONL="${rtt_jsonl}"
+rtt_shaper_active=0
+run_rtt_shaper() {
+  local output rc
+  if output="$("${rtt_shaper}" "$@" 2>&1)"; then
+    printf '%s\n' "${output}" >>"${rtt_log}"
+    printf '%s\n' "${output}"
+  else
+    rc=$?
+    printf '%s\n' "${output}" >>"${rtt_log}"
+    printf '%s\n' "${output}" | tail -40 >&2
+    return "${rc}"
+  fi
+}
+cleanup_rtt_shaping() {
+  local status=$?
+  trap - EXIT
+  if [ "${rtt_shaper_active}" -eq 1 ] && ! run_rtt_shaper clear >/dev/null; then
+    echo "RTT shaping cleanup failed; see network-shape.log" >&2
+    status=1
+  fi
+  exit "${status}"
+}
+trap cleanup_rtt_shaping EXIT
 run_in_swift() {
   bash "${REPO_ROOT}/test/e2e/run-swift-in-container.sh" "$1"
 }
@@ -55,6 +129,7 @@ run_in_swift() {
 DOCKER_PULL_RETRY_FORCE=1 "${SCRIPT_DIR}/docker-pull-retry" "swift:${SWIFT_VERSION}"
 swift_image_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "swift:${SWIFT_VERSION}")"
 samba_version="$(docker exec "${SAMBA_CONTAINER}" smbd --version | tr -d '\r')"
+runner_kernel="$(uname -r)"
 runner_cpu_model="$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' || true)"
 runner_cpu_count="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)"
 docker_version="$(docker version --format '{{.Server.Version}}')"
@@ -77,6 +152,7 @@ STUDY_META_RUNNER_CPU_MODEL="${runner_cpu_model}" STUDY_META_RUNNER_CPU_COUNT="$
 STUDY_META_DOCKER_VERSION="${docker_version}" STUDY_META_DIALECT="${negotiated_dialect}" \
 STUDY_META_SIGNING="${negotiated_signing}" STUDY_META_SIGNING_REQUIRED="${negotiated_signing_required}" \
 STUDY_META_CIPHER="${negotiated_cipher}" STUDY_META_HARNESS_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)" \
+STUDY_META_RTT_LEVELS="${STUDY_RTT_LEVELS}" STUDY_META_RUNNER_KERNEL="${runner_kernel}" \
 python3 - "${output_dir}/metadata.json" <<'PY'
 import json
 import os
@@ -97,6 +173,9 @@ json.dump({
     "negotiated_signing_required": environment["STUDY_META_SIGNING_REQUIRED"],
     "negotiated_cipher": environment["STUDY_META_CIPHER"],
     "harness_commit": environment["STUDY_META_HARNESS_COMMIT"],
+    "kernel": environment["STUDY_META_RUNNER_KERNEL"],
+    "rtt_levels_ms": [int(value) for value in environment["STUDY_META_RTT_LEVELS"].split(",")],
+    "rtt_shaping": "nonzero-ifb-tc-netem-on-reciprocal-veth; zero-unshaped",
     "page_cache": f"warm (server files rewritten per invocation, then {environment.get('STUDY_WARMUP', '5')} warm-up transfers)",
 }, open(sys.argv[1], "w"), indent=2, sort_keys=True)
 PY
@@ -108,6 +187,7 @@ for arm in "${arms[@]}"; do
   "${SCRIPT_DIR}/network-performance-study-arm" "${arm}" "${output_dir}/arms/${arm}" >/dev/null
   # shellcheck disable=SC1090
   source "${output_dir}/arms/${arm}/arm.env"
+  # shellcheck disable=SC2153 # ARM_DIR is assigned by the sourced arm.env file.
   arm_dir["${arm}"]="${ARM_DIR}"
   arm_commit["${arm}"]="${ARM_BASE_COMMIT}"
   arm_flags["${arm}"]="${ARM_SWIFT_FLAGS}"
@@ -128,10 +208,13 @@ server_cpu_usec() {
 }
 
 run_invocation() {
-  local arm="$1" invocation="$2" jsonl_name metadata start_cpu end_cpu start_ns end_ns
-  jsonl_name=".build/network-study-${arm}-${invocation}.jsonl"
+  local arm="$1" invocation="$2" rtt_target="$3" baseline_ms="$4" measured_ms="$5"
+  local delta_ms jsonl_name metadata start_cpu end_cpu start_ns end_ns
+  delta_ms="$(awk -v measured="${measured_ms}" -v baseline="${baseline_ms}" 'BEGIN { printf "%.3f", measured - baseline }')"
+  jsonl_name=".build/network-study-${arm}-${invocation}-rtt-${rtt_target}.jsonl"
   rm -f "${arm_dir[${arm}]}/${jsonl_name}"
-  metadata="$(python3 - "${output_dir}/metadata.json" "${arm}" "${invocation}" "${arm_commit[${arm}]}" <<'PY'
+  metadata="$(python3 - "${output_dir}/metadata.json" "${arm}" "${invocation}" "${arm_commit[${arm}]}" \
+    "${rtt_target}" "${baseline_ms}" "${measured_ms}" "${delta_ms}" <<'PY'
 import json, sys
 metadata = json.load(open(sys.argv[1]))
 metadata.update({
@@ -139,10 +222,17 @@ metadata.update({
     "invocation": int(sys.argv[3]),
     "base_commit": sys.argv[4],
     "tcp_nodelay": sys.argv[2] == "nodelay",
+    "rtt_target_ms": int(sys.argv[5]),
+    "rtt_tcp_roundtrip_baseline_ms": float(sys.argv[6]),
+    "rtt_tcp_roundtrip_median_ms": float(sys.argv[7]),
+    "rtt_observed_delta_ms": float(sys.argv[8]),
 })
 print(json.dumps(metadata, sort_keys=True))
 PY
 )"
+  if [ "${rtt_target}" != 0 ]; then
+    run_rtt_shaper guard "${rtt_target}" >/dev/null
+  fi
   echo "== ${STUDY_PROFILE} ${arm} invocation ${invocation}"
   start_cpu="$(server_cpu_usec)"
   start_ns="$(date +%s%N)"
@@ -156,30 +246,60 @@ PY
   ) >>"${output_dir}/run-${arm}.log" 2>&1
   end_ns="$(date +%s%N)"
   end_cpu="$(server_cpu_usec)"
+  # A restart or changed veth after the arm invalidates this invocation. Do this
+  # before appending the harness JSONL so a stale-shaper sample cannot be adopted.
+  if [ "${rtt_target}" != 0 ]; then
+    run_rtt_shaper guard "${rtt_target}" >/dev/null
+  fi
   cat "${arm_dir[${arm}]}/${jsonl_name}" >>"${samples}"
-  python3 - "${server_cpu}" "${STUDY_PROFILE}" "${arm}" "${invocation}" "${start_cpu}" "${end_cpu}" "${start_ns}" "${end_ns}" <<'PY'
+  python3 - "${server_cpu}" "${STUDY_PROFILE}" "${arm}" "${invocation}" "${start_cpu}" "${end_cpu}" \
+    "${start_ns}" "${end_ns}" "${rtt_target}" <<'PY'
 import json, sys
-path, profile, arm, invocation, start_cpu, end_cpu, start_ns, end_ns = sys.argv[1:]
+path, profile, arm, invocation, start_cpu, end_cpu, start_ns, end_ns, rtt_target = sys.argv[1:]
 with open(path, "a") as handle:
     handle.write(json.dumps({
         "profile": profile, "arm": arm, "invocation": int(invocation),
+        "rtt_target_ms": int(rtt_target),
         "server_cpu_ms": (int(end_cpu) - int(start_cpu)) / 1000,
         "invocation_wall_ms": (int(end_ns) - int(start_ns)) / 1e6,
     }) + "\n")
 PY
 }
 
-# --- measure: ABBA for two arms ------------------------------------------------------------------------
+# --- measure: rotate RTT levels; retain the ABBA arm order within each level ----------------------------
 for invocation in $(seq 1 "${STUDY_INVOCATIONS}"); do
-  if [ "${#arms[@]}" -eq 1 ]; then
-    run_invocation "${arms[0]}" "${invocation}"
-  elif [ $((invocation % 2)) -eq 1 ]; then
-    run_invocation "${arms[0]}" "${invocation}"
-    run_invocation "${arms[1]}" "${invocation}"
-  else
-    run_invocation "${arms[1]}" "${invocation}"
-    run_invocation "${arms[0]}" "${invocation}"
-  fi
+  rtt_start_index=$(((invocation - 1) % ${#rtt_levels[@]}))
+  for rtt_offset in $(seq 0 "$(( ${#rtt_levels[@]} - 1 ))"); do
+    rtt_index=$(((rtt_start_index + rtt_offset) % ${#rtt_levels[@]}))
+    rtt_target="${rtt_levels[${rtt_index}]}"
+    # Zero-only is the default path and never invokes tc, ip, or modprobe. For a
+    # mixed run, clear a prior nonzero shaper before entering the unshaped condition.
+    if [ "${rtt_target}" = 0 ]; then
+      if [ "${rtt_shaper_active}" -eq 1 ]; then
+        run_rtt_shaper clear >/dev/null
+        rtt_shaper_active=0
+      fi
+      rtt_baseline_ms="$(run_rtt_shaper calibrate)"
+    else
+      if [ "${rtt_shaper_active}" -eq 0 ]; then
+        rtt_shaper_active=1
+        run_rtt_shaper setup >/dev/null
+      fi
+      run_rtt_shaper set 0 >/dev/null
+      rtt_baseline_ms="$(run_rtt_shaper calibrate)"
+      run_rtt_shaper set "${rtt_target}" >/dev/null
+    fi
+    rtt_measured_ms="$(run_rtt_shaper verify "${rtt_target}" "${rtt_baseline_ms}")"
+    if [ "${#arms[@]}" -eq 1 ]; then
+      run_invocation "${arms[0]}" "${invocation}" "${rtt_target}" "${rtt_baseline_ms}" "${rtt_measured_ms}"
+    elif [ $((invocation % 2)) -eq 1 ]; then
+      run_invocation "${arms[0]}" "${invocation}" "${rtt_target}" "${rtt_baseline_ms}" "${rtt_measured_ms}"
+      run_invocation "${arms[1]}" "${invocation}" "${rtt_target}" "${rtt_baseline_ms}" "${rtt_measured_ms}"
+    else
+      run_invocation "${arms[1]}" "${invocation}" "${rtt_target}" "${rtt_baseline_ms}" "${rtt_measured_ms}"
+      run_invocation "${arms[0]}" "${invocation}" "${rtt_target}" "${rtt_baseline_ms}" "${rtt_measured_ms}"
+    fi
+  done
 done
 
 echo "samples: $(wc -l <"${samples}")"

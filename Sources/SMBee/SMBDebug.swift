@@ -68,10 +68,6 @@ struct SMBSessionDebugLogger: Sendable {
         sink("\(label) (\(bytes.count) bytes): \(summary)")
     }
 
-    /// Lets hot paths skip building dump inputs (for example a re-created frame header) when
-    /// debugging is off.
-    var isEnabled: Bool { configurationProvider().enabled }
-
     func line(_ message: String) {
         guard configurationProvider().enabled else { return }
         sink(message)

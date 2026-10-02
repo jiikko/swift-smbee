@@ -48,31 +48,6 @@ protocol SMBTransport            // TCP 445 上の双方向バイトストリー
   POSIX の writer / reader / lifecycle hook は internal injection seam を持ち、送信交錯・
   lease・poison の決定論的テストに使う。
 
-### session の常駐 reader（issue 010 M3）
-
-- `SMBSession` は一つの transport lifetime に一つの generation と reader handle を所有する。
-  同一 session の再接続はしない。再接続は `SMBClient` が新しい session / transport を作る。
-- reader は最初の request の `transport.send` が全量成功してから起動する。以後、pending が
-  0 件でも受信を継続する。raw reader は direct-TCP の framing だけを担当し、各 frame を
-  actor に一つずつ渡す。復号、credit grant、generation 確認、demux は session actor 内で行う。
-- close は generation を terminal にしてから transport を閉じ、reader、通常 send、CANCEL send、
-  connect と credit waiter の終了を待つ。graceful disconnect は TREE_DISCONNECT / LOGOFF の
-  response を受け取ってから close する。reader fault / idle EOF は pending 件数に関係なく wire
-  を terminal にし、transport を閉じる。
-- `SMBTransport.close()` は未完了 connect / send / receive を相手側の応答待ちなしで終了させ、
-  以後の I/O を拒否する契約を持つ。外部 conformer がこの要件を守らない場合、session teardown
-  の join はその conformer の operation 完了に依存する。
-- 応答が full-send 完了通知より先に届いた場合は MessageId ごとの順序付き FIFO に退避し、`.sent`
-  後に replay する。orphan は unknown 応答を優先して退避し、総 frame 数を 64 に制限する。
-  required 応答を保持できない場合は session を閉じて黙った応答欠落を避ける。
-- 可変長の READ / WRITE は残高 snapshot から長さと charge を決めず、credit window が実際に予約した
-  charge を受け取ってから payload 長と MessageId 範囲を確定する。credit が0なら待ち、1〜N 個あれば
-  その範囲に request を縮めて送るため、並行要求の stale な multi-credit 見積もりで waiter が止まらない。
-  固定長コマンドは従来どおり要求 charge 全量を予約する。
-- 通常 request の cancel tombstone は遅着応答との相関に残すが、件数は64を上限とする。上限を超えたら
-  共有 wire を terminal にして全 pending / credit waiter を解放する。close は通常 send と SMB CANCEL send
-  の双方を cancel して join し、close 後に遅れて戻る connect が transport candidate を公開しても再 close する。
-
 ### プラットフォーム条件
 
 - `SMBSession` / protocol / crypto / auth は **Linux でもビルド可能**に保つ（swift-crypto は

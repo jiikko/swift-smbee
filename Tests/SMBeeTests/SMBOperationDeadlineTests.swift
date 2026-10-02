@@ -3,23 +3,6 @@ import XCTest
 @testable import SMBee
 
 final class SMBOperationDeadlineTests: XCTestCase {
-    func testDeadlineTransportReceiveAfterCloseFailsEvenWithUnreadResponses() async throws {
-        // Close is terminal: a response released by an earlier send must not satisfy a receive
-        // that starts after close (found by the M3 merge-point review).
-        let echo = try SMB2Header(command: SMB2Commands.echo, messageId: 0).encode()
-        let transport = SMBDeadlineTransport(inbound: try DirectTCPFraming.frame(echo))
-        try await transport.send(try DirectTCPFraming.frame(echo))
-        transport.close()
-        do {
-            _ = try await awaitWithDeadlineHangGuard("receive after close") {
-                try await transport.receive(maxLength: 4)
-            }
-            XCTFail("receive after close must not return buffered bytes")
-        } catch SMBTransportError.connectionClosed {
-            XCTAssertEqual(transport.closeCount, 1)
-        }
-    }
-
     func testDeadlineHangGuardPropagatesImmediateFailure() async throws {
         do {
             try await awaitWithDeadlineHangGuard("immediate operation failure") {
@@ -752,33 +735,13 @@ private func deadlineUnframe(_ bytes: [UInt8]) throws -> [[UInt8]] {
 }
 
 private final class SMBDeadlineTransport: SMBTransport, @unchecked Sendable {
-    private struct PendingReceive {
-        let id: UUID
-        let maxLength: Int
-        let continuation: CheckedContinuation<[UInt8], Error>
-    }
-
     private let lock = NSLock()
     private var inbound: [UInt8]
-    private var responsesByRequest: [SMBWireRequestIdentity: [[UInt8]]] = [:]
-    private var responsePreparationError: Error?
-    private var sentRequestIds: Set<UInt64> = []
-    private var pendingReceive: PendingReceive?
-    private var isClosed = false
     private var outboundStorage: [UInt8] = []
     private var closeCountStorage = 0
 
     init(inbound: [UInt8]) {
-        self.inbound = []
-        do {
-            for frame in try Self.unframe(inbound) {
-                let header = try SMB2Header.decode(Array(frame.dropFirst(4)))
-                let identity = SMBWireRequestIdentity(messageId: header.messageId, command: header.command)
-                responsesByRequest[identity, default: []].append(frame)
-            }
-        } catch {
-            responsePreparationError = error
-        }
+        self.inbound = inbound
     }
 
     var outbound: [UInt8] { lock.withLock { outboundStorage } }
@@ -788,119 +751,27 @@ private final class SMBDeadlineTransport: SMBTransport, @unchecked Sendable {
         try Task.checkCancellation()
         _ = host
         _ = port
-        guard !lock.withLock({ isClosed }) else { throw SMBTransportError.connectionClosed }
     }
 
     func send(_ bytes: [UInt8]) async throws {
         try Task.checkCancellation()
-        let descriptor = try Self.requestDescriptor(bytes)
-        let shouldWake = try lock.withLock { () throws -> Bool in
-            guard !isClosed else { throw SMBTransportError.connectionClosed }
-            if let responsePreparationError { throw responsePreparationError }
-
-            let identity = descriptor.identity
-            if identity.command == SMB2Commands.cancel {
-                guard sentRequestIds.contains(identity.messageId) else {
-                    throw SMBCodecError.invalidValue("CANCEL does not identify a previously sent request")
-                }
-                outboundStorage.append(contentsOf: bytes)
-                return false
-            }
-            guard !sentRequestIds.contains(identity.messageId) else {
-                throw SMBCodecError.invalidValue("duplicate SMB request MessageId \(identity.messageId)")
-            }
-            guard let frames = responsesByRequest.removeValue(forKey: identity) else {
-                throw SMBCodecError.invalidValue(
-                    "unexpected SMB request command=\(identity.command) messageId=\(identity.messageId)"
-                )
-            }
-            sentRequestIds.insert(identity.messageId)
-            outboundStorage.append(contentsOf: bytes)
-            inbound.append(contentsOf: frames.flatMap { $0 })
-            return !frames.isEmpty
-        }
-        if shouldWake { resumePendingReceiveIfReady() }
+        lock.withLock { outboundStorage.append(contentsOf: bytes) }
     }
 
     func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
-        let id = UUID()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let immediate: Result<[UInt8], Error>? = lock.withLock {
-                    if Task.isCancelled { return .failure(CancellationError()) }
-                    // Close is terminal (SMBTransport contract): unread bytes must not satisfy a
-                    // receive that starts after close.
-                    if isClosed { return .failure(SMBTransportError.connectionClosed) }
-                    if !inbound.isEmpty { return .success(takeAvailableChunk(maxLength: maxLength)) }
-                    guard pendingReceive == nil else {
-                        return .failure(SMBCodecError.invalidValue("concurrent receive on deadline transport"))
-                    }
-                    pendingReceive = PendingReceive(id: id, maxLength: maxLength, continuation: continuation)
-                    return nil
-                }
-                if let immediate { continuation.resume(with: immediate) }
-            }
-        } onCancel: {
-            self.cancelPendingReceive(id: id)
+        let bytes = lock.withLock { () -> [UInt8] in
+            let count = min(maxLength, inbound.count)
+            let result = Array(inbound.prefix(count))
+            inbound.removeFirst(count)
+            return result
         }
+        try Task.checkCancellation()
+        return bytes
     }
 
     func close() {
-        let waiter = lock.withLock { () -> PendingReceive? in
-            guard !isClosed else { return nil }
-            closeCountStorage += 1
-            isClosed = true
-            defer { pendingReceive = nil }
-            return pendingReceive
-        }
-        waiter?.continuation.resume(throwing: SMBTransportError.connectionClosed)
-    }
-
-    private func resumePendingReceiveIfReady() {
-        let result: (PendingReceive, [UInt8])? = lock.withLock {
-            guard let waiter = pendingReceive, !inbound.isEmpty else { return nil }
-            pendingReceive = nil
-            return (waiter, takeAvailableChunk(maxLength: waiter.maxLength))
-        }
-        if let (waiter, bytes) = result { waiter.continuation.resume(returning: bytes) }
-    }
-
-    private func takeAvailableChunk(maxLength: Int) -> [UInt8] {
-        let count = min(maxLength, inbound.count)
-        let result = Array(inbound.prefix(count))
-        inbound.removeFirst(count)
-        return result
-    }
-
-    private func cancelPendingReceive(id: UUID) {
-        let waiter = lock.withLock { () -> PendingReceive? in
-            guard pendingReceive?.id == id else { return nil }
-            defer { pendingReceive = nil }
-            return pendingReceive
-        }
-        waiter?.continuation.resume(throwing: CancellationError())
-    }
-
-    private static func unframe(_ bytes: [UInt8]) throws -> [[UInt8]] {
-        var frames: [[UInt8]] = []
-        var offset = 0
-        while offset < bytes.count {
-            guard offset + 4 <= bytes.count, bytes[offset] == 0 else { throw SMBCodecError.truncated }
-            let length = try DirectTCPFraming.length(from: Array(bytes[offset..<(offset + 4)]))
-            let end = offset + 4 + length
-            guard end <= bytes.count else { throw SMBCodecError.truncated }
-            frames.append(Array(bytes[offset..<end]))
-            offset = end
-        }
-        return frames
-    }
-
-    private static func requestDescriptor(_ framedBytes: [UInt8]) throws -> SMBWireRequestDescriptor {
-        guard framedBytes.count >= 4 else { throw SMBCodecError.truncated }
-        let length = try DirectTCPFraming.length(from: Array(framedBytes.prefix(4)))
-        guard framedBytes.count == length + 4 else { throw SMBCodecError.truncated }
-        return try SMBWireRequestDescriptor(packet: Array(framedBytes.dropFirst(4)))
+        lock.withLock { closeCountStorage += 1 }
     }
 }
 

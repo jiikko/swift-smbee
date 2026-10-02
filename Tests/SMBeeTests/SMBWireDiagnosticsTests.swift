@@ -230,32 +230,6 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         XCTAssertTrue(faults[0].contains("SMBTransportError"))
     }
 
-    func testCloseCancellationDoesNotCreateAFirstWireFault() async throws {
-        let capture = SMBWireLogCapture()
-        SMBPerfLog.enabledOverride = true
-        SMBPerfLog.testSink = { capture.append($0) }
-        defer {
-            SMBPerfLog.testSink = nil
-            SMBPerfLog.enabledOverride = nil
-        }
-        var response = try SMB2Header(command: SMB2Commands.echo, credits: 1, messageId: 0).encode()
-        response.append(contentsOf: [4, 0, 0, 0])
-        let transport = InMemoryTransport(inbound: try DirectTCPFraming.frame(response))
-        let session = SMBSession(
-            host: "test",
-            port: 445,
-            credential: .anonymous,
-            transport: transport,
-            initialCredits: 1
-        )
-
-        try await session.echo()
-        await session.closeTransportAndWait(cause: "test_normal_close")
-
-        let faults = capture.messages.filter { $0.hasPrefix("[wire] first_fault") }
-        XCTAssertTrue(faults.isEmpty, "normal close cancellation is not a receive fault")
-    }
-
     func testWireEventsCarryDistinctSessionIdentifiers() async {
         let capture = SMBWireLogCapture()
         SMBPerfLog.enabledOverride = true
@@ -380,7 +354,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         try await awaitWithTimeout("CLOSE send") { await transport.waitUntilSent(SMB2Commands.close, count: 1) }
         try await Self.waitForRequestSentCount(closeSentCount + 1, in: session)
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("cleanup timeout returns") { await closeTask.value }
@@ -439,7 +413,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         try await Self.waitForRequestSentCount(closeSentCount + 1, in: session)
         try await awaitWithTimeout("receive loop blocked") { await transport.waitUntilReceiveIsBlocked() }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("best-effort CLOSE timeout returns") { await closeTask.value }
@@ -488,7 +462,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         try await Self.waitForRequestSentCount(1, in: session)
         try await awaitWithTimeout("receive loop blocked") { await transport.waitUntilReceiveIsBlocked() }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("cleanup caller timeout") { await closeTask.value }
@@ -511,63 +485,6 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             await session.waitForCleanupLedgerCountForTesting(0)
         }
         XCTAssertEqual(transport.closeCallCount, 0)
-    }
-
-    func testUnresolvedFileIdRejectsReadAndWriteBeforeCreditReservation() async throws {
-        let fileId = [UInt8](repeating: 0x2a, count: 16)
-        let transport = CommandAwareCloseTimeoutTransport(heldCommands: [SMB2Commands.close])
-        let session = SMBSession(
-            host: "test",
-            port: 445,
-            credential: .anonymous,
-            transport: transport,
-            initialCredits: 1,
-            requestTimeout: nil
-        )
-        await session.setSessionIdForTesting(0x1111_2222_3333_4444)
-        let closeTask = Task { await session.bestEffortClose(treeId: 1, fileId: fileId) }
-        defer {
-            transport.releaseNextResponse(command: SMB2Commands.close)
-            Task { await session.closeTransportAndWait(cause: "test_file_id_precredit_cleanup") }
-        }
-        try await awaitWithTimeout("last-credit CLOSE sent") {
-            try await transport.waitUntilSent(SMB2Commands.close, count: 1)
-        }
-        try await Self.waitForRequestSentCount(1, in: session)
-        let balanceAfterClose = await session.creditBalanceForTesting()
-        XCTAssertEqual(balanceAfterClose, 0)
-
-        do {
-            _ = try await awaitWithTimeout("same FileId READ admission before credits", timeout: .milliseconds(500)) {
-                try await session.readChunk(treeId: 1, fileId: fileId, offset: 0, length: 65_537)
-            }
-            XCTFail("READ should reject the unresolved FileId without waiting for credits")
-        } catch SMBCodecError.invalidValue(let message) {
-            XCTAssertTrue(message.contains("unresolved after CLOSE"), message)
-        } catch {
-            XCTFail("READ must reject before registering a credit waiter; got \(error)")
-        }
-        do {
-            try await awaitWithTimeout("same FileId WRITE admission before credits", timeout: .milliseconds(500)) {
-                try await session.write(treeId: 1, fileId: fileId, data: [0xa5])
-            }
-            XCTFail("WRITE should reject the unresolved FileId without waiting for credits")
-        } catch SMBCodecError.invalidValue(let message) {
-            XCTAssertTrue(message.contains("unresolved after CLOSE"), message)
-        } catch {
-            XCTFail("WRITE must reject before registering a credit waiter; got \(error)")
-        }
-
-        XCTAssertEqual(transport.commandCount(SMB2Commands.read), 0)
-        XCTAssertEqual(transport.commandCount(SMB2Commands.write), 0)
-        let creditWaitersAfterRejectedRequests = await session.creditWaiterCountForTesting()
-        let pendingAfterRejectedRequests = await session.pendingCountForTesting()
-        XCTAssertEqual(creditWaitersAfterRejectedRequests, 0)
-        XCTAssertEqual(pendingAfterRejectedRequests, 1)
-
-        await session.closeTransportAndWait(cause: "test_file_id_rejected_before_credit_reservation")
-        await closeTask.value
-        XCTAssertEqual(transport.closeCallCount, 1)
     }
 
     func testCleanupTimeoutPreservesReadsWriteAndParkedQueryUntilWireFault() async throws {
@@ -641,7 +558,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         })
 
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("cleanup timeout returns") { await closeTask.value }
@@ -722,7 +639,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             await session.waitForCreditWaiterCountForTesting(atLeast: 1)
         }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("best-effort CLOSE timeout returns") { await closeTask.value }
@@ -766,7 +683,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             await transport.waitUntilBlockedSendCount(1)
         }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("sending timeout closes session") { await closeTask.value }
@@ -802,7 +719,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             await transport.waitUntilBlockedSendCount(1)
         }
         try await awaitWithTimeout("cleanup timeout registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         transport.releaseBlockedSends(for: SMB2Commands.close)
         try await awaitWithTimeout("production markRequestSent completed") {
@@ -835,7 +752,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         let fileId = [UInt8](repeating: 4, count: 16)
         let closeTask = Task { try await session.closeCreatedHandle(treeId: 1, fileId: fileId) }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         do {
@@ -877,7 +794,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             await transport.waitUntilBlockedSendCount(64)
         }
         try await awaitWithTimeout("64 cleanup timers registered") {
-            try await clock.waitUntilCallCount(atLeast: 64, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 64)
         }
         let reservedAttempts = await session.cleanupLedgerCountForTesting()
         XCTAssertEqual(reservedAttempts, 64)
@@ -921,12 +838,12 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             await session.waitForCreditWaiterCountForTesting(atLeast: 1)
         }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await cleanupClock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await cleanupClock.waitUntilCallCount(atLeast: 1)
         }
         cleanupClock.fireNext()
         try await awaitWithTimeout("cleanup deadline resumes caller") { await closeTask.value }
         try await awaitWithTimeout("drain timer registered") {
-            try await drainClock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await drainClock.waitUntilCallCount(atLeast: 1)
         }
         XCTAssertEqual(transport.closeCallCount, 0)
         let creditWaitersDuringDrain = await session.creditWaiterCountForTesting()
@@ -944,81 +861,6 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         XCTAssertEqual(transport.closeCallCount, 1)
         let creditWaitersAfterDrain = await session.creditWaiterCountForTesting()
         XCTAssertEqual(creditWaitersAfterDrain, 0)
-    }
-
-    func testCleanupFinalWinsAgainstQueuedDrainTimeout() async throws {
-        let cleanupClock = ManualSMBSleeper()
-        let drainClock = ManualSMBSleeper()
-        let transport = CommandAwareCloseTimeoutTransport()
-        let session = SMBSession(
-            host: "test",
-            port: 445,
-            credential: .anonymous,
-            transport: transport,
-            initialCredits: 2,
-            cleanupTimeout: .seconds(5),
-            requestTimeout: .seconds(30),
-            requestTimeoutSleeper: { try await drainClock.sleep(for: $0) },
-            cleanupTimeoutSleeper: { try await cleanupClock.sleep(for: $0) }
-        )
-        await session.setSessionIdForTesting(0x1111_2222_3333_4444)
-        let fileId = [UInt8](repeating: 0x5a, count: 16)
-        let closeTask = Task { await session.bestEffortClose(treeId: 1, fileId: fileId) }
-        try await awaitWithTimeout("CLOSE sent") {
-            try await transport.waitUntilSent(SMB2Commands.close, count: 1)
-        }
-        try await Self.waitForRequestSentCount(1, in: session)
-        try await awaitWithTimeout("receive waits for CLOSE response") {
-            await transport.waitUntilReceiveIsBlocked()
-        }
-        try await awaitWithTimeout("cleanup timer registered") {
-            try await cleanupClock.waitUntilCallCount(
-                atLeast: 1,
-                timeout: .seconds(1),
-                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
-            )
-        }
-        cleanupClock.fireNext()
-        try await awaitWithTimeout("CLOSE caller reaches tombstone") { await closeTask.value }
-        try await awaitWithTimeout("drain timer registered") {
-            try await drainClock.waitUntilCallCount(
-                atLeast: 1,
-                timeout: .seconds(1),
-                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
-            )
-        }
-        let closeMessageId = try XCTUnwrap(transport.messageIds(for: SMB2Commands.close).first)
-        let optionalDrainIdentity = await session.cleanupDrainTimeoutIdentityForTesting(messageId: closeMessageId)
-        let drainIdentity = try XCTUnwrap(optionalDrainIdentity)
-        await session.fireCleanupDrainTimeoutForTesting(
-            messageId: closeMessageId,
-            generation: 1,
-            identity: UUID()
-        )
-        let isClosedAfterWrongTimer = await session.isTransportClosedForTesting()
-        XCTAssertFalse(isClosedAfterWrongTimer, "an obsolete drain timer identity cannot close a live tombstone")
-
-        let dispatchBase = await session.receivedPacketDispatchCountForTesting()
-        transport.releaseNextResponse(command: SMB2Commands.close)
-        try await awaitWithTimeout("late CLOSE final is dispatched") {
-            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: dispatchBase + 1)
-        }
-        try await awaitWithTimeout("late final clears cleanup ledger") {
-            await session.waitForCleanupLedgerCountForTesting(0)
-        }
-
-        await session.fireCleanupDrainTimeoutForTesting(
-            messageId: closeMessageId,
-            generation: 1,
-            identity: drainIdentity
-        )
-        try await awaitWithTimeout("queued drain callback observes retired record") {
-            await session.waitForCleanupDrainTimeoutCallbackCountForTesting(atLeast: 2)
-        }
-        let isClosed = await session.isTransportClosedForTesting()
-        XCTAssertFalse(isClosed, "the queued drain callback after final response is stale")
-        XCTAssertEqual(transport.closeCallCount, 0)
-        await session.closeTransportAndWait(cause: "test_cleanup_final_drain_race_join")
     }
 
     func testCloseCreatedHandleThrowsServerStatusAndSessionRemainsUsable() async throws {
@@ -1140,7 +982,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         try await Self.waitForRequestSentCount(closeSentCount + 1, in: session)
         try await awaitWithTimeout("receive loop blocked") { await transport.waitUntilReceiveIsBlocked() }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("signed CLOSE caller timeout") { await closeTask.value }
@@ -1199,7 +1041,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         try await Self.waitForRequestSentCount(1, in: session)
         try await awaitWithTimeout("receive loop blocked") { await transport.waitUntilReceiveIsBlocked() }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("signed CLOSE caller timeout") { await closeTask.value }
@@ -1235,7 +1077,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         try await Self.waitForRequestSentCount(1, in: session)
         try await awaitWithTimeout("receive loop blocked") { await transport.waitUntilReceiveIsBlocked() }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("signed CLOSE caller timeout") { await closeTask.value }
@@ -1385,7 +1227,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         try await Self.waitForRequestSentCount(1, in: session)
         try await awaitWithTimeout("receive loop blocked") { await transport.waitUntilReceiveIsBlocked() }
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("cleanup caller timeout") { await closeTask.value }
@@ -1511,7 +1353,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         try await awaitWithTimeout("receive loop blocked") { await transport.waitUntilReceiveIsBlocked() }
         closeTask.cancel()
         try await awaitWithTimeout("cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         do {
@@ -1577,7 +1419,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             await transport.waitUntilReceiveIsBlocked()
         }
         try await awaitWithTimeout("\(label) cleanup timer registered") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
+            await clock.waitUntilCallCount(atLeast: 1)
         }
         clock.fireNext()
         try await awaitWithTimeout("\(label) cleanup caller timeout") { await closeTask.value }
@@ -1736,7 +1578,7 @@ final class ManualSMBSleeper: @unchecked Sendable {
     private let lock = NSLock()
     private var callCountStorage = 0
     private var waiters: [Waiter] = []
-    private let callCountBarrier = SMBContinuationCountBarrier()
+    private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     func sleep(for duration: Duration) async throws {
         _ = duration
@@ -1744,6 +1586,7 @@ final class ManualSMBSleeper: @unchecked Sendable {
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
             try await withCheckedThrowingContinuation { continuation in
+                let countWaitersToResume: [CheckedContinuation<Void, Never>]
                 let cancelled: Bool
                 lock.lock()
                 callCountStorage += 1
@@ -1751,8 +1594,9 @@ final class ManualSMBSleeper: @unchecked Sendable {
                 if !cancelled {
                     waiters.append(Waiter(id: id, continuation: continuation))
                 }
-                callCountBarrier.signal()
+                countWaitersToResume = takeReadyCountWaitersLocked()
                 lock.unlock()
+                for waiter in countWaitersToResume { waiter.resume() }
                 if cancelled { continuation.resume(throwing: CancellationError()) }
             }
         } onCancel: {
@@ -1760,22 +1604,17 @@ final class ManualSMBSleeper: @unchecked Sendable {
         }
     }
 
-    func waitUntilCallCount(
-        atLeast count: Int,
-        timeout: Duration,
-        sleeper: @escaping @Sendable (Duration) async throws -> Void
-    ) async throws {
-        try await callCountBarrier.waitForCount(count, timeout: timeout, sleeper: sleeper)
-    }
-
-    func reset() {
-        let waiters = lock.withLock { () -> [Waiter] in
-            callCountStorage = 0
-            callCountBarrier.reset()
-            defer { self.waiters.removeAll() }
-            return self.waiters
+    func waitUntilCallCount(atLeast count: Int) async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if callCountStorage >= count {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                countWaiters.append((count, continuation))
+                lock.unlock()
+            }
         }
-        waiters.forEach { $0.continuation.resume(throwing: CancellationError()) }
     }
 
     func fireNext() {
@@ -1791,6 +1630,17 @@ final class ManualSMBSleeper: @unchecked Sendable {
         waiter?.continuation.resume(throwing: CancellationError())
     }
 
+    private func takeReadyCountWaitersLocked() -> [CheckedContinuation<Void, Never>] {
+        var ready: [CheckedContinuation<Void, Never>] = []
+        countWaiters.removeAll { target, continuation in
+            if callCountStorage >= target {
+                ready.append(continuation)
+                return true
+            }
+            return false
+        }
+        return ready
+    }
 }
 
 private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked Sendable {

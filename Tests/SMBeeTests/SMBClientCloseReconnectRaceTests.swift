@@ -4,66 +4,14 @@ import XCTest
 final class SMBClientCloseReconnectRaceTests: XCTestCase {
     func testRaceWaitTimeoutIsReportedAndUnregistersTheWaiter() async throws {
         let barrier = SMBContinuationCountBarrier()
-        let clock = ManualSMBSleeper()
-        let waiter = Task {
-            try await barrier.waitForCount(
-                1,
-                timeout: .seconds(1),
-                sleeper: { try await clock.sleep(for: $0) }
-            )
-        }
-        try await smbIssue102AwaitWithTimeout("barrier timeout sleeper started") {
-            try await clock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
-        }
-        clock.fireNext()
         do {
-            try await waiter.value
+            try await smbIssue102AwaitWithTimeout("missing race signal", timeout: .milliseconds(10)) {
+                try await barrier.waitForCount(1)
+            }
             XCTFail("expected the deadline to fail the parked wait")
-        } catch is SMBContinuationWaitTimedOut {
+        } catch let error as SMBIssue102WaitTimeout {
+            XCTAssertEqual(error.label, "missing race signal")
         }
-        XCTAssertEqual(barrier.waiterCount, 0)
-    }
-
-    func testBarrierWaitersDrainOnCancelAndReset() async throws {
-        let cancelledBarrier = SMBContinuationCountBarrier()
-        let cancelledClock = ManualSMBSleeper()
-        let cancelledWait = Task {
-            try await cancelledBarrier.waitForCount(
-                1,
-                timeout: .seconds(1),
-                sleeper: { try await cancelledClock.sleep(for: $0) }
-            )
-        }
-        try await smbIssue102AwaitWithTimeout("cancelled barrier timer started") {
-            try await cancelledClock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
-        }
-        cancelledWait.cancel()
-        do {
-            try await cancelledWait.value
-            XCTFail("expected barrier cancellation")
-        } catch is CancellationError {
-        }
-        XCTAssertEqual(cancelledBarrier.waiterCount, 0)
-
-        let resetBarrier = SMBContinuationCountBarrier()
-        let resetClock = ManualSMBSleeper()
-        let resetWait = Task {
-            try await resetBarrier.waitForCount(
-                1,
-                timeout: .seconds(1),
-                sleeper: { try await resetClock.sleep(for: $0) }
-            )
-        }
-        try await smbIssue102AwaitWithTimeout("reset barrier timer started") {
-            try await resetClock.waitUntilCallCount(atLeast: 1, timeout: .seconds(1), sleeper: { try await ManualSMBSleeper().sleep(for: $0) })
-        }
-        resetBarrier.reset()
-        do {
-            try await resetWait.value
-            XCTFail("expected reset to drain barrier waiters")
-        } catch is CancellationError {
-        }
-        XCTAssertEqual(resetBarrier.waiterCount, 0)
     }
 
     func testConcurrentSessionCloseWaitsForFirstCleanup() async throws {
@@ -454,7 +402,6 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
     func testConcurrentReconnectRequestsShareOneCandidateSession() async throws {
         let providerGate = SMBContinuationCredentialGate(credential: .anonymous)
         let requestBarrier = SMBContinuationCountBarrier()
-        let requestBarrierClock = ManualSMBSleeper()
         let transports = SMBContinuationTransportFactory(
             transports: try (0..<3).map { _ in
                 SMBValidateNegotiateScriptTransport(
@@ -477,11 +424,7 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
             try await client.reconnectForTesting(onRequest: { requestBarrier.signal() })
         }
         try await smbIssue102AwaitWithTimeout("both reconnect requests") {
-            try await requestBarrier.waitForCount(
-                2,
-                timeout: .seconds(1),
-                sleeper: { try await requestBarrierClock.sleep(for: $0) }
-            )
+            try await requestBarrier.waitForCount(2)
         }
         try await smbIssue102AwaitWithTimeout("shared credential provider") {
             try await providerGate.waitForCallCount(1)
@@ -500,7 +443,6 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
         let providerCancellation = SMBContinuationCountBarrier()
         let providerReturned = SMBContinuationCountBarrier()
         let requestBarrier = SMBContinuationCountBarrier()
-        let requestBarrierClock = ManualSMBSleeper()
         let candidate = SMBValidateNegotiateScriptTransport(
             inbound: try SMBIssue102WireFixtures.framed(SMBIssue102WireFixtures.anonymousSessionResponses()),
             credential: .anonymous
@@ -535,11 +477,7 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
 
         defer { providerGate.release() }
         try await smbIssue102AwaitWithTimeout("both reconnect waiters before close") {
-            try await requestBarrier.waitForCount(
-                2,
-                timeout: .seconds(1),
-                sleeper: { try await requestBarrierClock.sleep(for: $0) }
-            )
+            try await requestBarrier.waitForCount(2)
         }
         try await smbIssue102AwaitWithTimeout("credential provider before close") {
             try await providerGate.waitForCallCount(1)
@@ -718,22 +656,10 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
     func testCloseAfterWatchCreateStopsBeforeChangeNotify() async throws {
         let transport = SMBContinuationWatchTransport(autoRespondChangeNotify: true)
         let createSendGate = SMBContinuationAsyncGate()
-        let createSendGateClock = ManualSMBSleeper()
         let disconnectSendGate = SMBContinuationAsyncGate()
-        let disconnectSendGateClock = ManualSMBSleeper()
         transport.installAfterCommandSignalHook { command in
-            if command == SMB2Commands.create {
-                try? await createSendGate.suspend(
-                    timeout: .seconds(3),
-                    sleeper: { try await createSendGateClock.sleep(for: $0) }
-                )
-            }
-            if command == SMB2Commands.treeDisconnect {
-                try? await disconnectSendGate.suspend(
-                    timeout: .seconds(3),
-                    sleeper: { try await disconnectSendGateClock.sleep(for: $0) }
-                )
-            }
+            if command == SMB2Commands.create { await createSendGate.suspend() }
+            if command == SMB2Commands.treeDisconnect { await disconnectSendGate.suspend() }
         }
         defer {
             createSendGate.release()
@@ -778,14 +704,8 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
     func testTreeDisconnectRequestIsSavedBeforeItsReachedSignal() async throws {
         let transport = SMBContinuationWatchTransport(autoRespondChangeNotify: true)
         let disconnectSendGate = SMBContinuationAsyncGate()
-        let disconnectSendGateClock = ManualSMBSleeper()
         transport.installAfterCommandSignalHook { command in
-            if command == SMB2Commands.treeDisconnect {
-                try? await disconnectSendGate.suspend(
-                    timeout: .seconds(3),
-                    sleeper: { try await disconnectSendGateClock.sleep(for: $0) }
-                )
-            }
+            if command == SMB2Commands.treeDisconnect { await disconnectSendGate.suspend() }
         }
         defer {
             disconnectSendGate.release()
@@ -833,14 +753,8 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
     func testFakeTreeDisconnectStateIsAvailableWhenReachedWaiterResumes() async throws {
         let transport = SMBContinuationWatchTransport()
         let sendGate = SMBContinuationAsyncGate()
-        let sendGateClock = ManualSMBSleeper()
         transport.installAfterCommandSignalHook { command in
-            if command == SMB2Commands.treeDisconnect {
-                try? await sendGate.suspend(
-                    timeout: .seconds(3),
-                    sleeper: { try await sendGateClock.sleep(for: $0) }
-                )
-            }
+            if command == SMB2Commands.treeDisconnect { await sendGate.suspend() }
         }
         defer {
             sendGate.release()
@@ -969,9 +883,7 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
     func testCloseDuringBlockedChangeNotifyCallbackDoesNotResubscribe() async throws {
         let transport = SMBContinuationWatchTransport()
         let callbackReached = SMBContinuationCountBarrier()
-        let callbackReachedClock = ManualSMBSleeper()
         let callbackGate = SMBContinuationAsyncGate()
-        let callbackGateClock = ManualSMBSleeper()
         defer {
             callbackGate.release()
             transport.failConnection()
@@ -988,10 +900,7 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
             try await client.withChangeNotifications(path: "dir") { event in
                 XCTAssertEqual(event, .overflow)
                 callbackReached.signal()
-                try? await callbackGate.suspend(
-                    timeout: .seconds(3),
-                    sleeper: { try await callbackGateClock.sleep(for: $0) }
-                )
+                await callbackGate.suspend()
             }
         }
 
@@ -1004,11 +913,7 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
         }
         try transport.completeChangeNotify()
         try await smbIssue102AwaitWithTimeout("overflow callback is blocked") {
-            try await callbackReached.waitForCount(
-                1,
-                timeout: .seconds(1),
-                sleeper: { try await callbackReachedClock.sleep(for: $0) }
-            )
+            try await callbackReached.waitForCount(1)
         }
 
         let closeTask = Task { await client.close() }
@@ -1046,8 +951,7 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
             share: "share",
             credentialProvider: credentialProvider,
             makeTransport: makeTransport,
-            requestTimeout: nil,
-            requestTimeoutSleeper: { try await Task.sleep(for: $0) }
+            requestTimeout: nil
         )
         return SMBClientSession(session: oldSession, treeId: 0x3344, reconnectInfo: reconnectInfo)
     }

@@ -29,12 +29,32 @@ typealias NWConnectionTransportFactory = @Sendable (
 ) -> any NWConnectionTransportConnection
 
 public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
-    // One connection per transport: close is terminal and a later connect is rejected
-    // (issue 010 M3), so a frame queued for the old connection can never reach a new one.
-    private let connectionSlot = SMBTransportConnectionSlot<any NWConnectionTransportConnection>()
+    private let connectionLock = NSLock()
+    private var connectionStorage: (any NWConnectionTransportConnection)?
     private let connectionFactory: NWConnectionTransportFactory
     private let queue = DispatchQueue(label: "dev.smbee.nwconnection")
     private let sendGate: NWConnectionSendGate
+
+    private var connection: (any NWConnectionTransportConnection)? {
+        get {
+            connectionLock.lock()
+            defer { connectionLock.unlock() }
+            return connectionStorage
+        }
+        set {
+            connectionLock.lock()
+            connectionStorage = newValue
+            connectionLock.unlock()
+        }
+    }
+
+    private func takeConnection() -> (any NWConnectionTransportConnection)? {
+        connectionLock.lock()
+        let connection = connectionStorage
+        connectionStorage = nil
+        connectionLock.unlock()
+        return connection
+    }
 
     public convenience init() {
         self.init(
@@ -63,10 +83,7 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
         let parameters = NWParameters(tls: nil, tcp: tcpOptions)
         let endpointPort = NWEndpoint.Port(rawValue: port)!
         let connection = connectionFactory(NWEndpoint.Host(host), endpointPort, parameters)
-        guard connectionSlot.install(connection) else {
-            connection.cancel()
-            throw SMBTransportError.connectionClosed
-        }
+        self.connection = connection
 
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -104,7 +121,7 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
 
     public func send(_ segments: [[UInt8]]) async throws {
         try Task.checkCancellation()
-        guard let capturedConnection = connectionSlot.value else { throw SMBTransportError.connectionClosed }
+        guard let capturedConnection = connection else { throw SMBTransportError.connectionClosed }
 
         // DataProtocol also accepts DispatchData, but per-segment Data keeps each
         // Swift-owned buffer's lifetime explicit while retaining segment-level enqueue.
@@ -116,7 +133,7 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
         try await sendGate.acquire()
         do {
             try Task.checkCancellation()
-            guard let currentConnection = connectionSlot.value, currentConnection === capturedConnection else {
+            guard let currentConnection = connection, currentConnection === capturedConnection else {
                 throw SMBTransportError.connectionClosed
             }
             try await sendFrame(buffers, on: currentConnection)
@@ -161,7 +178,7 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
 
     public func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
-        guard let connection = connectionSlot.value else { throw SMBTransportError.connectionClosed }
+        guard let connection else { throw SMBTransportError.connectionClosed }
 
         let bytes: [UInt8] = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -187,7 +204,7 @@ public final class NWConnectionTransport: SMBTransport, @unchecked Sendable {
     }
 
     public func close() {
-        connectionSlot.close()?.cancel()
+        takeConnection()?.cancel()
     }
 }
 

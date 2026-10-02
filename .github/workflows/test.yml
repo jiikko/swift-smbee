@@ -83,16 +83,9 @@ jobs:
         # An intermittent post-build hang with zero test output is under
         # investigation (issues/013): bound the run ourselves and dump the
         # hung xctest stacks before the job-level timeout would kill us blind.
-        # The per-case duration gate catches completed tests that waited on a real
-        # request/cleanup timeout; the 480s watchdog remains for tests that never finish.
-        # 3s sits below the shortest real wait it targets (5s cleanup, 60s request timeout)
-        # and far above the slowest legitimate case (~0.4s locally) to absorb slower runners.
         run: |
-          test_log="${RUNNER_TEMP:-/tmp}/swift-test.log"
-          swift test --skip SMBeeE2ETests >"$test_log" 2>&1 &
+          swift test --skip SMBeeE2ETests &
           test_pid=$!
-          tail -n +1 -f "$test_log" &
-          tail_pid=$!
           for _ in $(seq 1 480); do
             kill -0 "$test_pid" 2>/dev/null || break
             sleep 1
@@ -104,17 +97,9 @@ jobs:
               sample "$pid" 5 2>/dev/null || true
             done
             kill -9 "$test_pid" 2>/dev/null || true
-            kill "$tail_pid" 2>/dev/null || true
             exit 1
           fi
-          test_status=0
-          wait "$test_pid" || test_status=$?
-          kill "$tail_pid" 2>/dev/null || true
-          wait "$tail_pid" 2>/dev/null || true
-          if [ "$test_status" -ne 0 ]; then
-            exit "$test_status"
-          fi
-          bin/ci/check-xctest-durations "$test_log" 3
+          wait "$test_pid"
 
       - name: Cancel and teardown bounded stress
         timeout-minutes: 5

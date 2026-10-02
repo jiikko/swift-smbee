@@ -4,6 +4,14 @@ import Glibc
 #else
 import Darwin
 #endif
+
+enum SMBDownloadTestSeams {
+    /// Lets deterministic tests hold resume-prefix validation at an async boundary.
+    @TaskLocal static var beforeResumePrefixComparison: (@Sendable () async throws -> Void)?
+    /// Lets deterministic tests exercise cancellation immediately before destination installation.
+    @TaskLocal static var beforeDestinationInstall: (@Sendable () async throws -> Void)?
+}
+
 /// Extracts the `.size` file attribute as `UInt64`. On Darwin the value bridges to `NSNumber`, but on
 /// Linux swift-corelibs-foundation it is a plain `Int`, so `as? NSNumber` alone fails there. Handle both.
 private func smbFileSizeValue(from attributes: [FileAttributeKey: Any]) -> UInt64? {
@@ -1480,14 +1488,35 @@ public actor SMBClientSession {
     ///   得ている consumer が、同一ファイルを複数の range に分けて読むときに効く
     ///   (`issues/067` の「動画 range read profile」)。値が実サイズより大きい場合は
     ///   short read として loud に失敗する (`resolvedSize` の doc 参照)。
+    /// - Parameter operationTimeout: Deadline from CREATE through all READs and CLOSE.
     public func withReadStream(
         path: String,
         range: SMBReadRange? = nil,
         knownSize: UInt64? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
+        operationTimeout: Duration? = nil,
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await self.withReadStreamCore(
+                path: path,
+                range: range,
+                knownSize: knownSize,
+                onProgress: onProgress,
+                onChunk: onChunk
+            )
+        }
+    }
+
+    private func withReadStreamCore(
+        path: String,
+        range: SMBReadRange?,
+        knownSize: UInt64?,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)?,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         try ensureOpen()
+        try Task.checkCancellation()
         let progress = SMBReadStreamProgress()
         let fileId = try await session.create(treeId: treeId, path: path, directory: false)
         do {
@@ -1657,9 +1686,32 @@ public actor SMBClientSession {
     }
 
     /// Download a file using this already-connected session.
-    public func download(path: String, localFile: URL, overwrite: Bool = true,
-                         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil) async throws {
+    /// - Parameter operationTimeout: Deadline from temporary-file creation through stream cleanup and installation.
+    public func download(
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true,
+        operationTimeout: Duration? = nil,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
+    ) async throws {
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await self.downloadCore(
+                path: path,
+                localFile: localFile,
+                overwrite: overwrite,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    private func downloadCore(
+        path: String,
+        localFile: URL,
+        overwrite: Bool,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)?
+    ) async throws {
         try ensureOpen()
+        try Task.checkCancellation()
         if !overwrite && FileManager.default.fileExists(atPath: localFile.path) {
             throw SMBCodecError.invalidValue("local destination already exists")
         }
@@ -1677,6 +1729,8 @@ public actor SMBClientSession {
             sink.onProgress?(SMBTransferProgress(bytesTransferred: sink.total, totalBytes: nil, bytesPerSecond: 0))
         }
         try handle.close()
+        try await SMBDownloadTestSeams.beforeDestinationInstall?()
+        try Task.checkCancellation()
         if fileManager.fileExists(atPath: localFile.path) {
             try smbReplaceItem(at: localFile, with: temporaryURL, fileManager: fileManager)
         } else {
@@ -2899,6 +2953,7 @@ public enum SMBClient {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter operationTimeout: Deadline for connection setup, the complete stream, CLOSE, and session teardown.
     public static func withReadStream(
         host: String,
         port: UInt16 = 445,
@@ -2907,10 +2962,40 @@ public enum SMBClient {
         range: SMBReadRange? = nil,
         credential: SMBCredential,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await withReadStreamCore(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                range: range,
+                credential: credential,
+                timeout: timeout,
+                makeTransport: makeTransport,
+                onProgress: onProgress,
+                onChunk: onChunk
+            )
+        }
+    }
+
+    private static func withReadStreamCore(
+        host: String,
+        port: UInt16,
+        share: String,
+        path: String,
+        range: SMBReadRange?,
+        credential: SMBCredential,
+        timeout: Duration?,
+        makeTransport: (@Sendable () -> SMBTransport)?,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)?,
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        try Task.checkCancellation()
         let progress = SMBReadStreamProgress()
         try await withSession(host: host, port: port, share: share, credential: credential, timeout: timeout, makeTransport: makeTransport, idempotent: true, operationName: "READ") { session, treeId in
             let fileId = try await session.create(treeId: treeId, path: path, directory: false)
@@ -2981,7 +3066,37 @@ public enum SMBClient {
         )
     }
 
+    /// - Parameter operationTimeout: Deadline for connection setup, the complete stream, CLOSE, and session teardown.
+    public static func withReadStream(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        range: SMBReadRange? = nil,
+        credentialProvider: @escaping SMBCredentialProvider,
+        operationTimeout: Duration?,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() },
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            let credential = try await credentialProvider()
+            try await withReadStreamCore(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                range: range,
+                credential: credential,
+                timeout: nil,
+                makeTransport: makeTransport,
+                onProgress: nil,
+                onChunk: onChunk
+            )
+        }
+    }
+
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter operationTimeout: Deadline for connection, resume-prefix validation, transfer, local file work, and install.
     public static func download(
         host: String,
         port: UInt16 = 445,
@@ -2992,9 +3107,41 @@ public enum SMBClient {
         resume: Bool = false,
         credential: SMBCredential,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         makeTransport: (@Sendable () -> SMBTransport)? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await downloadCore(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localFile: localFile,
+                overwrite: overwrite,
+                resume: resume,
+                credential: credential,
+                timeout: timeout,
+                makeTransport: makeTransport,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    private static func downloadCore(
+        host: String,
+        port: UInt16,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool,
+        resume: Bool,
+        credential: SMBCredential,
+        timeout: Duration?,
+        makeTransport: (@Sendable () -> SMBTransport)?,
+        onProgress: (@Sendable (SMBTransferProgress) -> Void)?
+    ) async throws {
+        try Task.checkCancellation()
         let fileManager = FileManager.default
         let destination = localFile.standardizedFileURL
         let directory = destination.deletingLastPathComponent()
@@ -3016,9 +3163,12 @@ public enum SMBClient {
                 let localHandle = try FileHandle(forReadingFrom: destination)
                 let localPrefix = try localHandle.read(upToCount: Int(overlap)) ?? Data()
                 try localHandle.close()
+                try await SMBDownloadTestSeams.beforeResumePrefixComparison?()
+                try Task.checkCancellation()
                 guard Data(remotePrefix) == localPrefix else {
                     throw SMBCodecError.invalidValue("local resume prefix does not match remote file")
                 }
+                try Task.checkCancellation()
             }
             let handle = try FileHandle(forWritingTo: destination)
             do {
@@ -3036,6 +3186,7 @@ public enum SMBClient {
                 ) { chunk in
                     try handle.write(contentsOf: Data(chunk))
                 }
+                try Task.checkCancellation()
                 try handle.close()
             } catch {
                 try? handle.close()
@@ -3058,6 +3209,8 @@ public enum SMBClient {
             ) { chunk in
                 try handle.write(contentsOf: Data(chunk))
             }
+            try await SMBDownloadTestSeams.beforeDestinationInstall?()
+            try Task.checkCancellation()
             try handle.close()
             if overwrite, fileManager.fileExists(atPath: destination.path) {
                 try smbReplaceItem(at: destination, with: temporary, fileManager: fileManager)
@@ -3093,6 +3246,37 @@ public enum SMBClient {
             credential: try await credentialProvider(),
             makeTransport: makeTransport
         )
+    }
+
+    /// - Parameter operationTimeout: Deadline for credential resolution, connection, resume validation,
+    ///   transfer, local file work, temporary cleanup, and destination installation.
+    public static func download(
+        host: String,
+        port: UInt16 = 445,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true,
+        resume: Bool = false,
+        credentialProvider: @escaping SMBCredentialProvider,
+        operationTimeout: Duration?,
+        makeTransport: @Sendable @escaping () -> SMBTransport = { SMBTransportTestOverride.factory?() ?? POSIXSocketTransport() }
+    ) async throws {
+        try await SMBOperationDeadline.run(timeout: operationTimeout) {
+            try await downloadCore(
+                host: host,
+                port: port,
+                share: share,
+                path: path,
+                localFile: localFile,
+                overwrite: overwrite,
+                resume: resume,
+                credential: try await credentialProvider(),
+                timeout: nil,
+                makeTransport: makeTransport,
+                onProgress: nil
+            )
+        }
     }
 
     /// - Parameter atomic: When true, downloads into a hidden sibling staging directory and moves/replaces the

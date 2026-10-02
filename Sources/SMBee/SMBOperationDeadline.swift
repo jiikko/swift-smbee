@@ -6,13 +6,22 @@
 /// back local or remote side effects that already completed.
 /// Callers should inspect or reconcile destination state before retrying mutating operations.
 public enum SMBOperationDeadline {
+    /// Per-task clock seam used by deterministic tests. Child tasks inherit the value, so
+    /// callers can exercise a public API's deadline without changing production behavior.
+    @TaskLocal static var sleeperForTesting: (@Sendable (Duration) async throws -> Void)?
+
     public static func run<T: Sendable>(
         timeout: Duration?,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await run(timeout: timeout, sleeper: { try await Task.sleep(for: $0) }, operation: operation)
+        let sleeper: @Sendable (Duration) async throws -> Void = sleeperForTesting ?? { duration in
+            try await Task.sleep(for: duration)
+        }
+        return try await run(timeout: timeout, sleeper: sleeper, operation: operation)
     }
 
+    /// Internal callers that own their clock (session cleanup) pass it explicitly; the public
+    /// entry above resolves the per-task test sleeper, so exactly one place picks the clock.
     static func run<T: Sendable>(
         timeout: Duration?,
         sleeper: @escaping @Sendable (Duration) async throws -> Void,

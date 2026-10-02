@@ -73,7 +73,10 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 - **#10（対応済み、2026-10-01）**: `e2e.yml` の 6 profile と `samba-compat.yml` の 7 profile すべてで、その profile のための test が 1 回 pass したことを必須にした。
   commit `ci: profile 別の E2E は、その profile のための test が 1 回 pass したことを必須にする (issue 102 #10)`。e2e.yml は CI のログで 6 profile 分の `passed once` を確認。
   samba-compat.yml は週次の定期 run で確認する（手動起動は費用のため見送り）
-- 残り: 裏取り済みの #7（close 後の再接続）・#8・#11（credential の保持）・#12（ACL の過大確保）・#13・#16 と、未検証の 13 件
+- **#18（対応済み、2026-10-02）**: `SMBClientSession` と `SMBClient` / `SMBee` の one-shot `withReadStream`・単一ファイル `download` に `operationTimeout` を追加。
+  deadline は credential provider、接続、resume prefix の照合、転送、CLOSE、session teardown、download の一時ファイル cleanup / install を覆う。
+  provider API は既存 overload を保ち、deadline を必須引数とする overload を追加。deadline timer の sleeper をテストから注入可能にし、CLOSE の完了・tombstone drain、resume の two one-shot connections を unit test で確認する。
+- 残り: 裏取り済みの #7（close 後の再接続）・#8・#11（credential の保持）・#12（ACL の過大確保）・#13・#16 と、未検証の 12 件
 
 ## 未検証 13 件の裏取り（2026-10-02、codex luna 5 本 + merger。#3 は 069 そのものなので除外）
 

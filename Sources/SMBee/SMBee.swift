@@ -558,6 +558,7 @@ public enum SMBee {
         path: String,
         range: SMBReadRange? = nil,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
@@ -569,6 +570,7 @@ public enum SMBee {
             range: range,
             credential: credential,
             timeout: timeout,
+            operationTimeout: operationTimeout,
             onProgress: onProgress,
             onChunk: onChunk
         )
@@ -594,6 +596,29 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter operationTimeout: Deadline for credential resolution, connection, the complete stream, CLOSE, and teardown.
+    public static func withReadStream(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: @escaping SMBCredentialProvider,
+        share: String,
+        path: String,
+        range: SMBReadRange? = nil,
+        operationTimeout: Duration?,
+        onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
+    ) async throws {
+        try await SMBClient.withReadStream(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            range: range,
+            credentialProvider: credentialProvider,
+            operationTimeout: operationTimeout,
+            onChunk: onChunk
+        )
+    }
+
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     public static func download(
         host: String,
@@ -605,6 +630,7 @@ public enum SMBee {
         overwrite: Bool = true,
         resume: Bool = false,
         timeout: Duration? = nil,
+        operationTimeout: Duration? = nil,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         try await SMBClient.download(
@@ -617,6 +643,7 @@ public enum SMBee {
             resume: resume,
             credential: credential,
             timeout: timeout,
+            operationTimeout: operationTimeout,
             onProgress: onProgress
         )
     }
@@ -640,6 +667,32 @@ public enum SMBee {
             overwrite: overwrite,
             resume: resume,
             credentialProvider: credentialProvider
+        )
+    }
+
+    /// - Parameter operationTimeout: Deadline for credential resolution, connection, resume validation,
+    ///   transfer, local file work, and destination installation.
+    public static func download(
+        host: String,
+        port: UInt16 = 445,
+        credentialProvider: @escaping SMBCredentialProvider,
+        share: String,
+        path: String,
+        localFile: URL,
+        overwrite: Bool = true,
+        resume: Bool = false,
+        operationTimeout: Duration?
+    ) async throws {
+        try await SMBClient.download(
+            host: host,
+            port: port,
+            share: share,
+            path: path,
+            localFile: localFile,
+            overwrite: overwrite,
+            resume: resume,
+            credentialProvider: credentialProvider,
+            operationTimeout: operationTimeout
         )
     }
 

@@ -38,6 +38,21 @@ do not infer that every overload accepts the same arguments.
 | `SMBClient.connect` | Credential and credential-provider overloads | Both overloads accept optional `makeTransport` |
 | `SMBClient` one-shot high-level operations | `list`, `withReadStream`, `download`, `upload`, `stat`, and other declared operations | Available only on overloads whose signature declares `makeTransport`; defaults vary by overload |
 | `SMBClientSession` / `SMBClientTreeSession` | Operations on an established session or tree | Chosen when the session is connected; not replaced per operation |
+The single-file `withReadStream` and `download` APIs on `SMBClient` and `SMBee`: their
+credential overloads accept an optional
+`operationTimeout` (default `nil`); provider overloads with a deadline use a separate
+overload that requires the `operationTimeout` argument, while the existing provider
+overload remains available. The same optional deadline is available on
+`SMBClientSession.withReadStream` and `SMBClientSession.download`.
+
+`operationTimeout` covers one complete cooperative operation. One-shot calls include
+credential resolution, connection setup, transfer cleanup, and session teardown. Calls on
+an existing `SMBClientSession` begin at the API call and include CREATE through CLOSE plus
+download temporary-file cleanup or installation. A resumed download includes remote-prefix
+validation and the subsequent append transfer. The deadline reports
+`SMBTransportError.timedOut` after cancellation cleanup finishes; callbacks that ignore
+cancellation and synchronous local file work can make the call return after the requested
+duration. Work already appended to a resume destination is not rolled back.
 
 ## Concurrency and cancellation contract
 

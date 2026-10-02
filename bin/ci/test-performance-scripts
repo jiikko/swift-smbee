@@ -911,7 +911,9 @@ if args[0] == "qdisc":
         if json_output:
             options = {"limit": 1000}
             if delay and delay != "0ms":
-                options["delay"] = {"delay": float(delay[:-2]) / 1000.0, "jitter": 0.0}
+                # The kernel stores netem latency in scheduler ticks, so tc -j reads back a value a
+                # few tens of ns off the request (GitHub runner: 5ms/2 -> 0.00249997 s).
+                options["delay"] = {"delay": float(delay[:-2]) / 1000.0 - 3e-8, "jitter": 0.0}
             print(json.dumps([{"kind": "netem", "handle": "8001:", "root": True, "options": options}]))
         elif delay:
             delay_text = "" if delay == "0ms" else f" delay {delay}"
@@ -990,6 +992,11 @@ pref = val(args, "pref", "49152")
 chain = int(val(args, "chain", "0"))
 key = filter_key(scope, dev, chain, int(pref))
 if op == "del":
+    if key not in state["filters"]:
+        # Real tc output for deleting an absent preference (GitHub runner, iproute2 6.1).
+        print("Error: Filter with specified priority/protocol not found.", file=sys.stderr)
+        print("We have an error talking to the kernel", file=sys.stderr)
+        raise SystemExit(2)
     state["filters"].pop(key, None); save(); raise SystemExit(0)
 target_args = args[args.index("redirect"):] if "redirect" in args else []
 action = "redirect" if "mirred" in args else "continue" if "continue" in args else "pipe" if "pipe" in args else \
@@ -1144,7 +1151,8 @@ EOF
     echo "fake classifier let a chain 1 filter affect a chain 0 probe: $classify_result" >&2
     return 1
   fi
-  FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter del dev veth-study parent ffff: pref 999
+  # tc deletes from chain 0 unless chain is given, so the chain 1 filter needs it explicitly.
+  FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter del dev veth-study parent ffff: chain 1 pref 999
   FAKE_TC_SCOPE=host "$scenario_dir/bin/tc" filter replace dev veth-study parent ffff: \
     protocol ip pref 999 matchall action gact drop
   classify_result="$("$FAKE_REAL_PYTHON" "$FAKE_TC_PY" classify host veth-study ip \

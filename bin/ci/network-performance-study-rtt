@@ -381,7 +381,9 @@ def qdisc_matches(output, expected_ms):
         observed_seconds = delay_object["delay"]
     if isinstance(observed_seconds, bool) or not isinstance(observed_seconds, (int, float)):
         return False
-    return math.isclose(observed_seconds, expected_ms / 1000.0, rel_tol=0.0, abs_tol=1e-9)
+    # The kernel keeps netem latency in scheduler ticks; a 2.5 ms request reads back as
+    # 0.00249997 s on the GitHub runner. 1 us is far below the 2.5 ms step between levels.
+    return math.isclose(observed_seconds, expected_ms / 1000.0, rel_tol=0.0, abs_tol=1e-6)
 
 def is_node(row):
     options = row.get("options")
@@ -650,7 +652,7 @@ cleanup_command() {
     return 0
   else
     rc=$?
-    if printf '%s' "$output" | grep -Eqi 'cannot find qdisc|cannot find device|no such (file|device|process)|does not exist'; then
+    if printf '%s' "$output" | grep -Eqi 'cannot find qdisc|cannot find device|no such (file|device|process)|does not exist|specified priority/protocol not found'; then
       return 0
     fi
     printf 'RTT cleanup command failed (exit %s): %s\n%s\n' "$rc" "$*" "$output" >&2

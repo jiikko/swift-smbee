@@ -74,7 +74,8 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
   commit `ci: profile 別の E2E は、その profile のための test が 1 回 pass したことを必須にする (issue 102 #10)`。e2e.yml は CI のログで 6 profile 分の `passed once` を確認。
   samba-compat.yml は週次の定期 run で確認する（手動起動は費用のため見送り）
 - #7 #8 #11 #12 #13 は「裏取り済みの対応」節、#2 #4 #17 #18 #19 #20 #21 は「残り 7 件の対応」節
-- 残り: #5 #6（issue 010 M3 で対応中）、#9（069 M2）、#14 #15 #16（READ/WRITE パイプライン化）
+- #5 #6 は issue 010 M3 で対応済み（2026-10-03。READ / WRITE の要求サイズを実際の credit に合わせる、通常の cancel tombstone の上限 64）
+- 残り: #9（069 M2）、#14 #15 #16（READ/WRITE パイプライン化）
 
 ## 未検証 13 件の裏取り（2026-10-02、codex luna 5 本 + merger。#3 は 069 そのものなので除外）
 

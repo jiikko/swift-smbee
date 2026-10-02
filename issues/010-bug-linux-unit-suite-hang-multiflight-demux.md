@@ -374,10 +374,10 @@ D3 が出した改訂 13 件は `[D2 v2]` として設計に反映済み（設�
 | # | 内容 | 状態 |
 |---|---|---|
 | M1 | characterization | **完了** |
-| M2 | `sendPhase` 導入・`sentResponseMessageIds` 撤去（reader は現行のまま） | 未着手 |
-| M3 | long-lived reader 導入（生存条件の切断・weak 捕捉・generation・close/deinit） | 未着手 |
-| M4 | transport 契約 + fixture 移行 + credit 循環の回帰テスト | 未着手 |
-| M5 | 全体検証（macOS / Linux / E2E smoke / verify-agent-push） | 未着手 |
+| M2 | `sendPhase` 導入・`sentResponseMessageIds` 撤去（reader は現行のまま） | **完了**（2026-09-09） |
+| M3 | long-lived reader 導入（生存条件の切断・weak 捕捉・generation・close/deinit） | **完了**（2026-10-03、下の「進捗チェックポイント — M3」） |
+| M4 | transport 契約 + fixture 移行 + credit 循環の回帰テスト | 一部を M3 に前倒し（下の節）。残りは未着手 |
+| M5 | 全体検証（macOS / Linux / E2E smoke / verify-agent-push） | M3 の push で CI を確認中 |
 
 M2 で最初に触るべき箇所（D3 + Claude の実測）: `pendingResponses` に tombstone を混在させると
 意味が変わる **5 箇所** — `:5471` `:5480` `:5488` `:5515`（count ベースの待機・観測）と
@@ -528,3 +528,30 @@ macOS / Linux unit / `bin/e2e/container-samba.sh` / `bin/ci/verify-agent-push` r
 - `sentResponseMessageIds` を 4 コレクションに分割する案 / `SMBRequestLedger` 型を新設する案 /
   集合を tombstone として残す案 — いずれも**同期すべき台帳が増える**ので却下（D1 の 4 案から選定）
 - 当初の回帰テスト案（`initialCredits=1` + `charge=2` の park だけ）— 変異で red にならない
+
+## 進捗チェックポイント — M3 完了 (2026-10-03)
+
+commit `feat(session): issue 010 M3 — session が所有する常駐 reader で応答を受ける (issue 102 #5 #6 を含む)`。
+契約（M3 / M4 の実装コントラクト、2 周の設計レビューを反映）を codex-drive で実装し、sol の敵対レビューを 3 周
+（reader の寿命と状態遷移 / wire とテストの偽の緑 / master の issue 102 #17〜#20 との合流点）通した。
+
+- 入ったもの: session 所有の reader（最初の full send で 1 本起動、weak 捕捉、generation fence、close / deinit / EOF / 受信失敗の
+  終端）、`.sent` gate と 64 frame の orphan FIFO、issue 102 #5（READ / WRITE の要求サイズを実際の credit に合わせる。FileId の
+  ledger の検査は credit 予約の前と後）、#6（通常の cancel tombstone の上限 64）
+- M4 から前倒ししたもの: transport の close を終端にする `SMBTransportConnectionSlot`、テストの fixture（InMemory / VNI script /
+  Performance / deadline）を送信回数ではなく request の MessageId と command で応答する形へ移行、入力の枯渇を待ちとして扱う
+- 敵対レビューで見つけて直したもの: 後始末中の FileId への READ / WRITE が credit 待ちで止まる退行、fixture の偽の緑（close 後も
+  receive を受け付ける、send 回数で応答を出す、public API を通らない requestTimeout のテスト ほか）
+- 見つけて別 issue にしたもの: compound 応答の分割漏れ（既存。issue 104）
+- 性能: synthetic の write で master より throughput -7.0%（95% CI -8.2〜-5.8%）、user CPU +8.8% まで詰めた（最初は -16% / +20%。
+  受信 header の decode の重複と write の chunk ごとのコピーを除いた）。残る差は credit window への往復・送信完了の処理・
+  generation fence など契約上必要な request ごとの処理。CI の regression gate の上限は throughput 15% / CPU 25%
+- テストが実時間の timeout を待っていた退行（swift test 全体 7 s → 141 s）を見つけ、fixture を直したうえで
+  `bin/ci/check-xctest-durations`（1 件 3 s を超えたら CI で落とす）を足した
+
+### M4 の残り
+
+- `SMBTransport` の doc に「close は待機中の receive を起こす・close は終端」を明記する（外部 conformer には強制できない）
+- credit 循環の回帰テスト（queue 済みの grant を reader が消費する刺激。契約 §3.3）が M3 で入っているかを確認し、無ければ足す
+- M5: push 後の `verify-agent-push`（性能の対応比較の gate を含む）
+

@@ -38,12 +38,22 @@ source_test_count=$(find "$TEST_ROOT" -name '*Tests.swift' -print0 \
       depth == 0 && /^[[:space:]]*(public[[:space:]]+|internal[[:space:]]+|private[[:space:]]+)?func[[:space:]]+test[A-Za-z0-9_]*[[:space:]]*\(/ { count++ }
       END { print count + 0 }')
 
-# Every XCTestCase class in a *Tests.swift file should appear at least once in --list-tests.
-# This catches newly added files/classes that compile but are not discovered by SwiftPM/XCTest.
+# Every unconditional XCTestCase class in a *Tests.swift file should appear at least once in
+# --list-tests. This catches newly added files/classes that compile but are not discovered by
+# SwiftPM/XCTest. Classes inside `#if ... #endif` (e.g. the macOS-only NWConnectionTransport
+# tests) are excluded by the same depth rule as the method lower bound above; otherwise Linux
+# reports them as missing although they are correctly compiled out.
 mapfile -t source_test_classes < <(
   find "$TEST_ROOT" -name '*Tests.swift' -print0 \
-    | xargs -0 grep -hE '^[[:space:]]*(final[[:space:]]+)?class[[:space:]]+[A-Za-z0-9_]+[[:space:]]*:[^{]*XCTestCase' \
-    | sed -E 's/.*class[[:space:]]+([A-Za-z0-9_]+)[[:space:]]*:.*/\1/' \
+    | xargs -0 -n1 awk '
+        /^[[:space:]]*#[[:space:]]*if/    { depth++; next }
+        /^[[:space:]]*#[[:space:]]*endif/ { if (depth > 0) depth--; next }
+        depth == 0 && /^[[:space:]]*(final[[:space:]]+)?class[[:space:]]+[A-Za-z0-9_]+[[:space:]]*:[^{]*XCTestCase/ {
+          line = $0
+          sub(/^.*class[[:space:]]+/, "", line)
+          sub(/[[:space:]]*:.*$/, "", line)
+          print line
+        }' \
     | sort -u
 )
 

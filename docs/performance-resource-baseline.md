@@ -405,3 +405,23 @@ direct-TCP の 4 byte header と本体を別の `send()` で書くこと（`0709
 （https://github.com/jiikko/swift-smbee/actions/runs/36701434912）で、4 profile の 1 MiB wall が -47〜-98%、64 MiB read が
 +22〜+3387%。CCM の 64 MiB write だけ -12.4%（client の user CPU が約 17% 増。仮説と確かめ方は issue 099 / 075）。
 以降の表は修正前の値なので、比べるなら fix-ab か新しい profiles run を使う。
+
+## 2026-10-02: 追加 RTT ごとの Samba 転送 baseline（パイプライン化前）
+
+`Network performance study` run 37007111257（commit 92e6146、`experiment=profiles`、
+`profiles=smb311-signing-required`、`rtt_levels=0,5,20`、`sizes_mib=1,64`、20 invocations × 5 samples、warm-up 2）。
+GitHub-hosted ubuntu runner、Samba 4.19.5、SMB 3.1.1 signing（AES-GMAC）。追加 RTT は IFB + netem で両方向に半分ずつ入れ、
+各 arm の前後で校正した増加は RTT 0 で ±0.05 ms、5 ms で 4.96〜5.11 ms、20 ms で 20.12〜20.31 ms（60 回すべて pass）。
+
+| 追加 RTT | サイズ | read median（MAD） | write median（MAD） |
+|---|---|---|---|
+| 0 ms | 1 MiB | 462.75 MiB/s（48.54） | 352.52 MiB/s（15.43） |
+| 0 ms | 64 MiB | 911.77 MiB/s（14.91） | 214.06 MiB/s（1.00） |
+| 5 ms | 1 MiB | 44.86 MiB/s（0.50） | 42.81 MiB/s（0.62） |
+| 5 ms | 64 MiB | 159.24 MiB/s（0.36） | 100.86 MiB/s（0.46） |
+| 20 ms | 1 MiB | 12.04 MiB/s（0.03） | 6.93 MiB/s（1.12） |
+| 20 ms | 64 MiB | 45.00 MiB/s（0.03） | 38.70 MiB/s（0.04） |
+
+各 cell は 100 samples。RTT 20 ms の 64 MiB read（45.0 MiB/s）は、1 MiB の READ を 1 往復に 1 本ずつ送る場合の
+上限（1 MiB / 20 ms ≒ 50 MiB/s）にほぼ一致し、現状は READ / WRITE が往復ごとに直列であることを示す。
+READ / WRITE のパイプライン化（issue 102 #14 #15 #16）の効果は、この表を before として同じ条件で測る。

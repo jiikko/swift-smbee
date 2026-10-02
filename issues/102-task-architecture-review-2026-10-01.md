@@ -74,3 +74,22 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
   commit `ci: profile 別の E2E は、その profile のための test が 1 回 pass したことを必須にする (issue 102 #10)`。e2e.yml は CI のログで 6 profile 分の `passed once` を確認。
   samba-compat.yml は週次の定期 run で確認する（手動起動は費用のため見送り）
 - 残り: 裏取り済みの #7（close 後の再接続）・#8・#11（credential の保持）・#12（ACL の過大確保）・#13・#16 と、未検証の 13 件
+
+## 未検証 13 件の裏取り（2026-10-02、codex luna 5 本 + merger。#3 は 069 そのものなので除外）
+
+12 件すべて本物と判定（偽物 0）。判定根拠の原文は tmp/t3/out/（一時領域）。要点:
+
+| # | 判定 | 重要度 | 要点 / 扱い |
+|---|---|---|---|
+| 5 | 本物 | P2 | READ 長と CreditCharge を残高のスナップショットで固定して packet を作るので、2 本の並行 READ が同じ残高を当てにし、片方が 1 credit しか grant されないと他方は永久に待つ。未送信の request には request timeout が効かない。サーバがその grant を返すかは未確認。issue 010（常駐の受信ループ）で扱う |
+| 6 | 本物 | P2 | 送信後に cancel した request の tombstone には、069 の cleanup tombstone のような drain 上限も件数上限も無い。サーバが final を返さないと残り続ける。010 で扱う |
+| 9 | 本物 | P2 | `withTree` は本体の結果の後に `child.close()` → `bestEffortTreeDisconnect` が失敗を飲み込み transport を閉じる。本体は成功として返り、次の操作で失敗する。069 M2 で扱う |
+| 14 | 本物 | P2 | `streamRead` は `readChunk` と `onChunk` を await してから次の READ を送る（1 flight）。遅延つきの性能は未実測。READ/WRITE パイプライン化で扱う |
+| 15 | 本物 | P2 | WRITE も各 chunk の応答を待つ。done/015 の「64 KiB 上限」の記述は今の実装（1 MiB）と食い違う。パイプライン化で扱う |
+| 2 | 本物 | P3 | `docs/api-stability.md` の「Calls are serialized through actor isolation」は呼び出し全体の排他と読めるが、実装は await をまたいで別の呼び出しが進む。文書の修正 |
+| 4 | 本物 | P3 | 安定性契約は `SMBClient` を列挙しないが、custom transport を使う一部の経路は `SMBClient` の API を使う（`read` / `withReadStream` / `download` には `makeTransport` がある — custom transport は connect だけ、という元の主張は一部反証） |
+| 17 | 本物 | P3 | 2 回目の `close()` は `isClosed` を見て即 return し、1 回目の後始末の完了を待たない。公開契約上の要件かは未確認 |
+| 18 | 本物 | P3 | `withReadStream` と単一ファイルの `download` に全体の deadline（`operationTimeout`）が無い |
+| 19 | 本物 | P3 | `SMBEE_DEBUG=1` + `SMBEE_TRACE_WIRE=1` + `SMBEE_TRACE_WIRE_FULL=1` で、暗号化 session でも平文のファイル内容が stderr に出る（3 つとも明示的に有効にしたときだけ） |
+| 20 | 本物 | P3 | NWConnection の transport は segment 版の send を持たず、protocol の既定実装が frame 全体を連結する（性能への影響は未実測） |
+| 21 | 本物 | P3 | NWConnection の経路で TCP_NODELAY を明示していない（実効値・遅延差は未実測） |

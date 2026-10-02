@@ -690,6 +690,9 @@ public actor SMBClientSession {
     private let reconnectInfo: ReconnectInfo?
     private var keepAliveTask: Task<Void, Never>?
     private var isClosed = false
+    private var sessionGeneration: UInt64 = 0
+    private var reconnectTask: Task<Void, Error>?
+    private var reconnectTaskID: UUID?
 
     init(session: SMBSession, treeId: UInt32, reconnectInfo: ReconnectInfo? = nil) {
         self.session = session
@@ -724,12 +727,56 @@ public actor SMBClientSession {
     /// Tear down the current connection and establish a fresh session + tree from the
     /// stored reconnect info. Throws `SMBError.connectionLost` if this session was not
     /// created with reconnect support.
-    private func reconnect() async throws {
+    private func reconnect(
+        expectedGeneration: UInt64,
+        onRequest: (@Sendable () -> Void)? = nil
+    ) async throws {
+        onRequest?()
+        guard !isClosed else {
+            throw SMBError.connectionLost(operation: "RECONNECT")
+        }
+        guard expectedGeneration == sessionGeneration else { return }
+        if let reconnectTask {
+            try await reconnectTask.value
+            guard !isClosed else {
+                throw SMBError.connectionLost(operation: "RECONNECT")
+            }
+            return
+        }
+        let taskID = UUID()
+        reconnectTaskID = taskID
+        let task = Task { try await self.performReconnect(taskID: taskID) }
+        reconnectTask = task
+        try await task.value
+    }
+
+    /// Test entry point keeps deterministic concurrency tests on the same reconnect path.
+    func reconnectForTesting(onRequest: @escaping @Sendable () -> Void) async throws {
+        try await reconnect(expectedGeneration: sessionGeneration, onRequest: onRequest)
+    }
+
+    private func performReconnect(taskID: UUID) async throws {
+        defer {
+            if reconnectTaskID == taskID {
+                reconnectTask = nil
+                reconnectTaskID = nil
+            }
+        }
+        guard !isClosed else {
+            throw SMBError.connectionLost(operation: "RECONNECT")
+        }
         guard let info = reconnectInfo else {
             throw SMBError.connectionLost(operation: "RECONNECT")
         }
-        await session.closeTransport(cause: "reconnect_old_session")
+        let oldSession = session
+        await oldSession.closeTransport(cause: "reconnect_old_session")
+        guard !isClosed else {
+            throw SMBError.connectionLost(operation: "RECONNECT")
+        }
         let credential = try await info.credentialProvider()
+        guard !isClosed else {
+            throw SMBError.connectionLost(operation: "RECONNECT")
+        }
         let newSession = SMBSession(
             host: info.host,
             port: info.port,
@@ -739,9 +786,16 @@ public actor SMBClientSession {
         )
         do {
             try await newSession.connect()
+            guard !isClosed else {
+                throw SMBError.connectionLost(operation: "RECONNECT")
+            }
             let newTreeId = try await newSession.treeConnect(share: info.share)
+            guard !isClosed else {
+                throw SMBError.connectionLost(operation: "RECONNECT")
+            }
             session = newSession
             treeId = newTreeId
+            sessionGeneration &+= 1
         } catch {
             await newSession.closeTransport(cause: "reconnect_new_session", diagnosticError: error)
             throw error
@@ -980,39 +1034,53 @@ public actor SMBClientSession {
         try ensureOpen()
         var reconnectAttempts = 0
         while true {
+            guard !isClosed else { return }
             try Task.checkCancellation()
+            let watchedSession = session
+            let watchedTreeId = treeId
+            let watchedGeneration = sessionGeneration
             do {
-                let fileId = try await session.create(treeId: treeId, request: .changeNotify(path: path))
+                let fileId = try await watchedSession.create(
+                    treeId: watchedTreeId,
+                    request: .changeNotify(path: path)
+                )
+                guard !isClosed else {
+                    await watchedSession.bestEffortClose(treeId: watchedTreeId, fileId: fileId)
+                    return
+                }
                 do {
-                    try await session.changeNotify(
-                        treeId: treeId,
+                    try await watchedSession.changeNotify(
+                        treeId: watchedTreeId,
                         fileId: fileId,
                         filter: filter,
                         watchTree: watchTree,
                         onChange: onChange
                     )
-                    await session.bestEffortClose(treeId: treeId, fileId: fileId)
+                    await watchedSession.bestEffortClose(treeId: watchedTreeId, fileId: fileId)
                     return
                 } catch {
-                    await session.bestEffortClose(treeId: treeId, fileId: fileId)
+                    await watchedSession.bestEffortClose(treeId: watchedTreeId, fileId: fileId)
                     throw error
                 }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                guard !isClosed else { return }
                 guard autoReconnect, reconnectInfo != nil, Self.isReconnectable(error) else {
                     throw error
                 }
                 try Task.checkCancellation()
                 do {
-                    try await reconnect()
+                    try await reconnect(expectedGeneration: watchedGeneration)
                 } catch {
+                    guard !isClosed else { return }
                     reconnectAttempts += 1
                     if reconnectAttempts >= maxReconnectAttempts {
                         throw error
                     }
                     continue
                 }
+                guard !isClosed else { return }
                 reconnectAttempts = 0
                 // The subscription lapsed during the reconnect; signal a full rescan before
                 // resubscribing so the caller can reconcile any changes missed in the gap.

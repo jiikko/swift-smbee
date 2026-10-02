@@ -27,6 +27,17 @@ enum SMBIssue102WireFixtures {
         ]
     }
 
+    static func anonymousReconnectCancelledAtSessionSetupResponses() throws -> [[UInt8]] {
+        [
+            try negotiateResponse(),
+            try SMB2Header(
+                status: SMB2Status.cancelled,
+                command: SMB2Commands.sessionSetup,
+                messageId: 1
+            ).encode()
+        ]
+    }
+
     static func framed(_ packets: [[UInt8]]) throws -> [UInt8] {
         try packets.reduce(into: []) { result, packet in
             result.append(contentsOf: try DirectTCPFraming.frame(packet))
@@ -127,10 +138,10 @@ private func smbPacketInDirectTCPStream(_ bytes: [UInt8]) throws -> [UInt8]? {
 final class SMBContinuationCountBarrier: @unchecked Sendable {
     private let lock = NSLock()
     private var count = 0
-    private var waiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var waiters: [(id: UUID, target: Int, continuation: CheckedContinuation<Void, Error>)] = []
 
     func signal() {
-        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
             count += 1
             let ready = waiters.filter { count >= $0.target }.map(\.continuation)
             waiters.removeAll { count >= $0.target }
@@ -139,15 +150,30 @@ final class SMBContinuationCountBarrier: @unchecked Sendable {
         ready.forEach { $0.resume() }
     }
 
-    func waitForCount(_ target: Int) async {
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard count < target else { return true }
-                waiters.append((target, continuation))
-                return false
+    func waitForCount(_ target: Int) async throws {
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let result = lock.withLock { () -> Int in
+                    if Task.isCancelled { return -1 }
+                    guard count < target else { return 1 }
+                    waiters.append((waiterID, target, continuation))
+                    return 0
+                }
+                if result < 0 { continuation.resume(throwing: CancellationError()) }
+                if result > 0 { continuation.resume() }
             }
-            if resumeNow { continuation.resume() }
+        } onCancel: {
+            cancelWaiter(waiterID)
         }
+    }
+
+    private func cancelWaiter(_ waiterID: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard let index = waiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return waiters.remove(at: index).continuation
+        }
+        continuation?.resume(throwing: CancellationError())
     }
 }
 
@@ -155,9 +181,9 @@ final class SMBContinuationCredentialGate: @unchecked Sendable {
     private let lock = NSLock()
     private let credential: SMBCredential
     private var released = false
-    private var continuations: [CheckedContinuation<SMBCredential, Error>] = []
+    private var continuations: [(id: UUID, continuation: CheckedContinuation<SMBCredential, Error>)] = []
     private var callCountStorage = 0
-    private var callWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var callWaiters: [(id: UUID, target: Int, continuation: CheckedContinuation<Void, Error>)] = []
 
     init(credential: SMBCredential) {
         self.credential = credential
@@ -168,40 +194,73 @@ final class SMBContinuationCredentialGate: @unchecked Sendable {
     }
 
     func getCredential() async throws -> SMBCredential {
-        try await withCheckedThrowingContinuation { continuation in
-            let state = lock.withLock { () -> (Bool, [CheckedContinuation<Void, Never>]) in
-                callCountStorage += 1
-                let ready = callWaiters.filter { callCountStorage >= $0.target }.map(\.continuation)
-                callWaiters.removeAll { callCountStorage >= $0.target }
-                if !released {
-                    continuations.append(continuation)
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let state = lock.withLock { () -> (released: Bool, cancelled: Bool, ready: [CheckedContinuation<Void, Error>]) in
+                    callCountStorage += 1
+                    let ready = callWaiters.filter { callCountStorage >= $0.target }.map(\.continuation)
+                    callWaiters.removeAll { callCountStorage >= $0.target }
+                    if Task.isCancelled { return (false, true, ready) }
+                    if !released {
+                        continuations.append((waiterID, continuation))
+                    }
+                    return (released, false, ready)
                 }
-                return (released, ready)
+                state.ready.forEach { $0.resume() }
+                if state.cancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else if state.released {
+                    continuation.resume(returning: credential)
+                }
             }
-            state.1.forEach { $0.resume() }
-            if state.0 { continuation.resume(returning: credential) }
+        } onCancel: {
+            cancelCredentialWaiter(waiterID)
         }
     }
 
-    func waitForCallCount(_ target: Int) async {
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard callCountStorage < target else { return true }
-                callWaiters.append((target, continuation))
-                return false
+    func waitForCallCount(_ target: Int) async throws {
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let result = lock.withLock { () -> Int in
+                    if Task.isCancelled { return -1 }
+                    guard callCountStorage < target else { return 1 }
+                    callWaiters.append((waiterID, target, continuation))
+                    return 0
+                }
+                if result < 0 { continuation.resume(throwing: CancellationError()) }
+                if result > 0 { continuation.resume() }
             }
-            if resumeNow { continuation.resume() }
+        } onCancel: {
+            cancelCallWaiter(waiterID)
         }
     }
 
     func release() {
         let pending = lock.withLock { () -> [CheckedContinuation<SMBCredential, Error>] in
             released = true
-            let pending = continuations
+            let pending = continuations.map(\.continuation)
             continuations.removeAll()
             return pending
         }
         pending.forEach { $0.resume(returning: credential) }
+    }
+
+    private func cancelCredentialWaiter(_ waiterID: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<SMBCredential, Error>? in
+            guard let index = continuations.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return continuations.remove(at: index).continuation
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    private func cancelCallWaiter(_ waiterID: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard let index = callWaiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return callWaiters.remove(at: index).continuation
+        }
+        continuation?.resume(throwing: CancellationError())
     }
 }
 
@@ -236,10 +295,9 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     private var inbound: [UInt8]
     private var pendingReceive: SMBContinuationPendingReceive?
     private var closed = false
-    private var treeConnectRequest: SMB2Header?
     private var closeCountStorage = 0
     private var commandCounts: [UInt16: Int] = [:]
-    private var commandWaiters: [(command: UInt16, target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var commandWaiters: [(id: UUID, command: UInt16, target: Int, continuation: CheckedContinuation<Void, Error>)] = []
 
     init(inbound: [UInt8]) {
         self.inbound = inbound
@@ -259,9 +317,8 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
         try Task.checkCancellation()
         guard let packet = try smbPacketInDirectTCPStream(bytes) else { return }
         let header = try SMB2Header.decode(packet)
-        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
             commandCounts[header.command, default: 0] += 1
-            if header.command == SMB2Commands.treeConnect { treeConnectRequest = header }
             let ready = commandWaiters
                 .filter { $0.command == header.command && commandCounts[header.command, default: 0] >= $0.target }
                 .map(\.continuation)
@@ -295,32 +352,30 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
         }
     }
 
-    func waitForCommand(_ command: UInt16, occurrence: Int = 1) async {
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard commandCounts[command, default: 0] < occurrence else { return true }
-                commandWaiters.append((command, occurrence, continuation))
-                return false
+    func waitForCommand(_ command: UInt16, occurrence: Int = 1) async throws {
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let resumeNow = lock.withLock { () -> Int in
+                    if Task.isCancelled { return -1 }
+                    guard commandCounts[command, default: 0] < occurrence else { return 1 }
+                    commandWaiters.append((waiterID, command, occurrence, continuation))
+                    return 0
+                }
+                if resumeNow < 0 { continuation.resume(throwing: CancellationError()) }
+                if resumeNow > 0 { continuation.resume() }
             }
-            if resumeNow { continuation.resume() }
+        } onCancel: {
+            cancelCommandWaiter(waiterID)
         }
     }
 
-    func completeTreeConnect() throws {
-        guard let request = lock.withLock({ treeConnectRequest }) else {
-            throw SMBCodecError.invalidValue("test transport has no TREE_CONNECT request")
+    private func cancelCommandWaiter(_ waiterID: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard let index = commandWaiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return commandWaiters.remove(at: index).continuation
         }
-        var response = try SMB2Header(
-            command: SMB2Commands.treeConnect,
-            messageId: request.messageId,
-            treeId: 0x3344,
-            sessionId: request.sessionId
-        ).encode()
-        response.append(contentsOf: Array(repeating: 0, count: 16))
-        writeUInt16LE(16, to: &response, at: 64)
-        response[66] = 1
-        writeUInt32LE(0x001f_01ff, to: &response, at: 76)
-        try enqueue(response)
+        continuation?.resume(throwing: CancellationError())
     }
 
     func close() {
@@ -360,7 +415,9 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
     private let autoRespondChangeNotify: Bool
     private var createRequest: SMB2Header?
     private var treeDisconnectRequest: SMB2Header?
+    private var changeNotifyRequest: SMB2Header?
     private var watchedCommands: [UInt16] = []
+    private var afterCommandSignalHook: (@Sendable (UInt16) async -> Void)?
 
     init(autoRespondChangeNotify: Bool = false) {
         self.autoRespondChangeNotify = autoRespondChangeNotify
@@ -368,17 +425,23 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
     }
 
     override func send(_ bytes: [UInt8]) async throws {
-        try await super.send(bytes)
-        guard let packet = try smbPacketInDirectTCPStream(bytes) else { return }
+        guard let packet = try smbPacketInDirectTCPStream(bytes) else {
+            try await super.send(bytes)
+            return
+        }
         let header = try SMB2Header.decode(packet)
         watchLock.withLock {
             watchedCommands.append(header.command)
             switch header.command {
             case SMB2Commands.create: createRequest = header
             case SMB2Commands.treeDisconnect: treeDisconnectRequest = header
+            case SMB2Commands.changeNotify: changeNotifyRequest = header
             default: break
             }
         }
+        try await super.send(bytes)
+        let hook = watchLock.withLock { afterCommandSignalHook }
+        await hook?(header.command)
         switch header.command {
         case SMB2Commands.close, SMB2Commands.logoff:
             try respond(status: SMB2Status.success, to: header)
@@ -390,6 +453,10 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
 
     var sentCommands: [UInt16] {
         watchLock.withLock { watchedCommands }
+    }
+
+    func installAfterCommandSignalHook(_ hook: (@Sendable (UInt16) async -> Void)?) {
+        watchLock.withLock { afterCommandSignalHook = hook }
     }
 
     func completeCreate() throws {
@@ -415,6 +482,13 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
         try respond(status: SMB2Status.success, to: request)
     }
 
+    func completeChangeNotify(status: UInt32 = SMB2Status.notifyEnumDir) throws {
+        guard let request = watchLock.withLock({ changeNotifyRequest }) else {
+            throw SMBCodecError.invalidValue("test transport has no CHANGE_NOTIFY request")
+        }
+        try respond(status: status, to: request)
+    }
+
     private func respond(status: UInt32, to request: SMB2Header) throws {
         let response = try SMB2Header(
             status: status,
@@ -424,5 +498,100 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
             sessionId: request.sessionId
         ).encode()
         try enqueue(response)
+    }
+}
+
+final class SMBContinuationAsyncGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard !released else { return true }
+                self.continuation = continuation
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    func release() {
+        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            released = true
+            let pending = continuation
+            continuation = nil
+            return pending
+        }
+        pending?.resume()
+    }
+}
+
+struct SMBIssue102WaitTimeout: Error, CustomStringConvertible {
+    let label: String
+
+    var description: String { "Timed out waiting for \(label)" }
+}
+
+private final class SMBIssue102WaitResult<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+    private var continuation: CheckedContinuation<T, Error>?
+    private var pendingResult: Result<T, Error>?
+
+    func install(_ continuation: CheckedContinuation<T, Error>) {
+        let result = lock.withLock { () -> Result<T, Error>? in
+            if completed {
+                let result = pendingResult
+                pendingResult = nil
+                return result
+            }
+            self.continuation = continuation
+            return nil
+        }
+        if let result { continuation.resume(with: result) }
+    }
+
+    func finish(_ result: Result<T, Error>) {
+        let continuation = lock.withLock { () -> CheckedContinuation<T, Error>? in
+            guard !completed else { return nil }
+            completed = true
+            guard let continuation = self.continuation else {
+                pendingResult = result
+                return nil
+            }
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume(with: result)
+    }
+}
+
+func smbIssue102AwaitWithTimeout<T: Sendable>(
+    _ label: String,
+    timeout: Duration = .seconds(3),
+    operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    let result = SMBIssue102WaitResult<T>()
+    let operationTask = Task {
+        do {
+            result.finish(.success(try await operation()))
+        } catch {
+            result.finish(.failure(error))
+        }
+    }
+    let timeoutTask = Task {
+        do {
+            try await Task.sleep(for: timeout)
+        } catch {
+            return
+        }
+        result.finish(.failure(SMBIssue102WaitTimeout(label: label)))
+        operationTask.cancel()
+    }
+    defer { timeoutTask.cancel() }
+    return try await withCheckedThrowingContinuation { continuation in
+        result.install(continuation)
     }
 }

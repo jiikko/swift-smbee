@@ -691,8 +691,10 @@ public actor SMBClientSession {
     private var keepAliveTask: Task<Void, Never>?
     private var isClosed = false
     private var sessionGeneration: UInt64 = 0
-    private var reconnectTask: Task<Void, Error>?
+    private var reconnectTask: Task<Void, Never>?
     private var reconnectTaskID: UUID?
+    private var reconnectWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var reconnectCandidate: (taskID: UUID, session: SMBSession)?
 
     init(session: SMBSession, treeId: UInt32, reconnectInfo: ReconnectInfo? = nil) {
         self.session = session
@@ -736,18 +738,37 @@ public actor SMBClientSession {
             throw SMBError.connectionLost(operation: "RECONNECT")
         }
         guard expectedGeneration == sessionGeneration else { return }
-        if let reconnectTask {
-            try await reconnectTask.value
-            guard !isClosed else {
-                throw SMBError.connectionLost(operation: "RECONNECT")
+        let waiterID = UUID()
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                guard !isClosed else {
+                    continuation.resume(throwing: SMBError.connectionLost(operation: "RECONNECT"))
+                    return
+                }
+                guard expectedGeneration == sessionGeneration else {
+                    continuation.resume()
+                    return
+                }
+                reconnectWaiters[waiterID] = continuation
+                guard reconnectTask == nil else { return }
+                let taskID = UUID()
+                reconnectTaskID = taskID
+                reconnectTask = Task {
+                    do {
+                        try await self.performReconnect(taskID: taskID)
+                        self.finishReconnect(taskID: taskID, result: .success(()))
+                    } catch {
+                        self.finishReconnect(taskID: taskID, result: .failure(error))
+                    }
+                }
             }
-            return
-        }
-        let taskID = UUID()
-        reconnectTaskID = taskID
-        let task = Task { try await self.performReconnect(taskID: taskID) }
-        reconnectTask = task
-        try await task.value
+        }, onCancel: {
+            Task { await self.cancelReconnectWaiter(waiterID) }
+        })
     }
 
     /// Test entry point keeps deterministic concurrency tests on the same reconnect path.
@@ -756,12 +777,6 @@ public actor SMBClientSession {
     }
 
     private func performReconnect(taskID: UUID) async throws {
-        defer {
-            if reconnectTaskID == taskID {
-                reconnectTask = nil
-                reconnectTaskID = nil
-            }
-        }
         guard !isClosed else {
             throw SMBError.connectionLost(operation: "RECONNECT")
         }
@@ -770,10 +785,12 @@ public actor SMBClientSession {
         }
         let oldSession = session
         await oldSession.closeTransport(cause: "reconnect_old_session")
+        try Task.checkCancellation()
         guard !isClosed else {
             throw SMBError.connectionLost(operation: "RECONNECT")
         }
         let credential = try await info.credentialProvider()
+        try Task.checkCancellation()
         guard !isClosed else {
             throw SMBError.connectionLost(operation: "RECONNECT")
         }
@@ -784,27 +801,71 @@ public actor SMBClientSession {
             transport: info.makeTransport(),
             requestTimeout: info.requestTimeout
         )
+        reconnectCandidate = (taskID, newSession)
         do {
             try await newSession.connect()
+            try Task.checkCancellation()
             guard !isClosed else {
                 throw SMBError.connectionLost(operation: "RECONNECT")
             }
             let newTreeId = try await newSession.treeConnect(share: info.share)
+            try Task.checkCancellation()
             guard !isClosed else {
                 throw SMBError.connectionLost(operation: "RECONNECT")
             }
             session = newSession
             treeId = newTreeId
             sessionGeneration &+= 1
+            reconnectCandidate = nil
         } catch {
             await newSession.closeTransport(cause: "reconnect_new_session", diagnosticError: error)
+            if reconnectCandidate?.taskID == taskID {
+                reconnectCandidate = nil
+            }
             throw error
+        }
+    }
+
+    private func finishReconnect(taskID: UUID, result: Result<Void, Error>) {
+        guard reconnectTaskID == taskID else { return }
+        reconnectTask = nil
+        reconnectTaskID = nil
+        if reconnectCandidate?.taskID == taskID {
+            reconnectCandidate = nil
+        }
+        let waiters = Array(reconnectWaiters.values)
+        reconnectWaiters.removeAll()
+        waiters.forEach { $0.resume(with: result) }
+    }
+
+    private func cancelReconnectWaiter(_ waiterID: UUID) async {
+        guard let continuation = reconnectWaiters.removeValue(forKey: waiterID) else { return }
+        continuation.resume(throwing: CancellationError())
+        guard reconnectWaiters.isEmpty, let taskID = reconnectTaskID else { return }
+        let candidate = reconnectCandidate?.taskID == taskID ? reconnectCandidate?.session : nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectTaskID = nil
+        reconnectCandidate = nil
+        if let candidate {
+            await candidate.closeTransport(cause: "reconnect_cancelled")
         }
     }
 
     public func close() async {
         guard !isClosed else { return }
         isClosed = true
+        let waiters = Array(reconnectWaiters.values)
+        reconnectWaiters.removeAll()
+        waiters.forEach { $0.resume(throwing: SMBError.connectionLost(operation: "RECONNECT")) }
+        let candidateSession = reconnectCandidate?.session
+        self.reconnectCandidate = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        reconnectTaskID = nil
+        if let candidateSession {
+            await candidateSession.closeTransport(cause: "client_close_during_reconnect")
+        }
         keepAliveTask?.cancel()
         await keepAliveTask?.value
         keepAliveTask = nil
@@ -1054,6 +1115,7 @@ public actor SMBClientSession {
                         fileId: fileId,
                         filter: filter,
                         watchTree: watchTree,
+                        shouldContinue: { await self.isWatchingOpen() },
                         onChange: onChange
                     )
                     await watchedSession.bestEffortClose(treeId: watchedTreeId, fileId: fileId)
@@ -1072,6 +1134,8 @@ public actor SMBClientSession {
                 try Task.checkCancellation()
                 do {
                     try await reconnect(expectedGeneration: watchedGeneration)
+                } catch is CancellationError {
+                    throw CancellationError()
                 } catch {
                     guard !isClosed else { return }
                     reconnectAttempts += 1
@@ -1101,6 +1165,10 @@ public actor SMBClientSession {
         default:
             return false
         }
+    }
+
+    private func isWatchingOpen() -> Bool {
+        !isClosed
     }
 
     public func stat(path: String) async throws -> SMBFileStat {
@@ -4614,9 +4682,11 @@ actor SMBSession {
         fileId: [UInt8],
         filter: SMBChangeNotifyFilter,
         watchTree: Bool,
+        shouldContinue: @escaping @Sendable () async -> Bool = { true },
         onChange: @escaping @Sendable (SMBChangeNotifyEvent) async throws -> Void
     ) async throws {
         while true {
+            guard await shouldContinue() else { return }
             try Task.checkCancellation()
             let event = try await changeNotifyOnce(treeId: treeId, fileId: fileId, filter: filter, watchTree: watchTree)
             try Task.checkCancellation()

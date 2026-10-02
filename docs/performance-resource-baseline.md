@@ -113,6 +113,14 @@ max RSSはprocess lifetime high-waterとして区別する。いずれもObserve
 
 guardrailは改善目標ではない。改善のA/B判定にはmedianとMADを使い、同一runner/workloadで差を確認する。
 
+## 2026-10-02: read workload を 8 MiB × 80 iteration に変更
+
+session の debug logger が packet ごとに `ProcessInfo.environment` を組み立てていたのをやめた結果
+（`perf(debug): session の debug logger は環境変数を作成時に 1 回だけ読む …`）、read の 1 sample
+(8 MiB × 20) が CI の runner で約 77 ms になり、計時の下限 100 ms を割った。read を 8 MiB × 80 iteration
+（640 MiB/sample）に増やした。上の baseline の数値は 20 iteration 時代のもので、以後の run とは同一 workload の
+比較にならない（履歴比較は `No comparable baseline` になる）。
+
 ## History comparison
 
 master の `push` では、同一 workflow の直近の成功した `push` run（現在の run 自身を除く）にある、30日保持の

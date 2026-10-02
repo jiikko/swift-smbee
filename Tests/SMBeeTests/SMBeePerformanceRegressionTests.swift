@@ -286,7 +286,9 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
 final class SMBeeResourcePerformanceTests: XCTestCase {
     private let measuredRuns = 5
     private let payloadSize = 8 * 1024 * 1024
-    private let readIterationsPerSample = 20
+    // 80 keeps a read sample above the 100 ms timing floor after the debug logger stopped
+    // rebuilding ProcessInfo.environment per packet (20 iterations took ~77 ms on the CI runner).
+    private let readIterationsPerSample = 80
     private let writeIterationsPerSample = 14
     private let treeId: UInt32 = 0x3344
     private let fileId = Array(UInt8(0)..<UInt8(16))

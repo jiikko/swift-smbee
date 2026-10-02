@@ -19,7 +19,10 @@ def receive_exact(connection, size):
     return bytes(data)
 
 
-def negotiate_request(message_id):
+def negotiate_request():
+    # Every probe uses a fresh TCP connection, and the first request on a connection must use
+    # MessageId 0; Samba drops the connection on any other value (smb2_validate_sequence_number).
+    message_id = 0
     # Match SMBNegotiateCodec.probeDialects, including preauth, encryption, and signing contexts.
     client_guid = os.urandom(16)
     header = struct.pack(
@@ -83,10 +86,10 @@ def validate_response(response):
 def direct_probe(host, port):
     # Connect first, then time only the SMB request/response. Direct container IP bypasses docker-proxy.
     samples_ms = []
-    for message_id in range(15):
+    for _ in range(15):
         with socket.create_connection((host, port), timeout=5) as connection:
             connection.settimeout(5)
-            request = negotiate_request(message_id)
+            request = negotiate_request()
             start = time.perf_counter_ns()
             connection.sendall(request)
             response = receive_negotiate_response(connection)
@@ -127,8 +130,8 @@ def held_probe(host, port, workdir):
             time.sleep(0.01)
 
         samples_ms = []
-        for message_id, connection in enumerate(connections):
-            request = negotiate_request(message_id)
+        for connection in connections:
+            request = negotiate_request()
             start = time.perf_counter_ns()
             connection.sendall(request)
             response = receive_negotiate_response(connection)

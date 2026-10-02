@@ -263,10 +263,25 @@ ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 PY
   PYTHONDONTWRITEBYTECODE=1 python3 - "${SCRIPT_DIR}/network-performance-study-rtt-probe.py" <<'PY'
 import ast
+import importlib.util
 import pathlib
+import struct
 import sys
 
 ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+# Every probe request opens a fresh connection, so it must be a NEGOTIATE with MessageId 0.
+# The fake tc tests never parse the bytes; a real Samba drops any other MessageId
+# (first found on a GitHub runner, 2026-10-02).
+spec = importlib.util.spec_from_file_location("rtt_probe", sys.argv[1])
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+frame = probe.negotiate_request()
+smb2 = frame[4:]
+assert frame[0] == 0 and int.from_bytes(frame[1:4], "big") == len(smb2), "direct TCP length"
+assert smb2[:4] == b"\xfeSMB", "SMB2 protocol id"
+assert struct.unpack_from("<H", smb2, 12)[0] == 0, "command is NEGOTIATE"
+assert struct.unpack_from("<Q", smb2, 24)[0] == 0, "first request on a connection must use MessageId 0"
 PY
   PYTHONDONTWRITEBYTECODE=1 python3 - "${SCRIPT_DIR}/publish-network-performance-summary" <<'PY'
 import ast

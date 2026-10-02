@@ -73,10 +73,8 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 - **#10（対応済み、2026-10-01）**: `e2e.yml` の 6 profile と `samba-compat.yml` の 7 profile すべてで、その profile のための test が 1 回 pass したことを必須にした。
   commit `ci: profile 別の E2E は、その profile のための test が 1 回 pass したことを必須にする (issue 102 #10)`。e2e.yml は CI のログで 6 profile 分の `passed once` を確認。
   samba-compat.yml は週次の定期 run で確認する（手動起動は費用のため見送り）
-- **#18（対応済み、2026-10-02）**: `SMBClientSession` と `SMBClient` / `SMBee` の one-shot `withReadStream`・単一ファイル `download` に `operationTimeout` を追加。
-  deadline は credential provider、接続、resume prefix の照合、転送、CLOSE、session teardown、download の一時ファイル cleanup / install を覆う。
-  provider API は既存 overload を保ち、deadline を必須引数とする overload を追加。deadline timer の sleeper をテストから注入可能にし、CLOSE の完了・tombstone drain、resume の two one-shot connections を unit test で確認する。
-- 残り: 裏取り済みの #7（close 後の再接続）・#8・#11（credential の保持）・#12（ACL の過大確保）・#13・#16 と、未検証の 12 件
+- #7 #8 #11 #12 #13 は「裏取り済みの対応」節、#2 #4 #17 #18 #19 #20 #21 は「残り 7 件の対応」節
+- 残り: #5 #6（issue 010 M3 で対応中）、#9（069 M2）、#14 #15 #16（READ/WRITE パイプライン化）
 
 ## 未検証 13 件の裏取り（2026-10-02、codex luna 5 本 + merger。#3 は 069 そのものなので除外）
 
@@ -107,14 +105,26 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 | 12 | 対応済み。reserveCapacity を min(aceCount, (aclSize - 8) / 4) で抑える | `fix(acl): ACE の件数で過大に確保しない …` |
 | 13 | 対応済み。署名の比較を constant-time に | `fix(signing): SMB 署名の比較を constant-time にする` |
 | 16 | issue 010 M3（常駐の受信ループ）で受信経路を作り直すので、READ/WRITE パイプライン化と一緒に計測つきで扱う（未着手） | — |
-| 17 | 対応済み。session と scoped tree の close が共有 cleanup task に join する。close は reconnect waiter を先に解放し、candidate を閉じ、TREE_CONNECT setup は注入可能な close deadline で drain する。期限を超えた setup の transport は閉じる | worktree（未 commit） |
 
 不採用（記録）: 匿名 session でサーバが署名必須を示しても、匿名には署名鍵が無いので署名なしの応答を受け入れる（MS-SMB2 の匿名 session の扱い。
 VALIDATE_NEGOTIATE_INFO の匿名の例外と同じ方針）。#7 の設計・実装は sol の敵対レビューを計 3 周（設計 1・実装 2）通し、最後の周は指摘 0 件。
 
-### 102 #19 実装結果（2026-10-02）
+## 残り 7 件の対応（2026-10-02、codex-drive。設計 D1 → sol の敵対レビュー D3 → 4 worktree で実装 → 各件に sol の敵対レビュー）
 
-- 対応済み: 暗号化鍵が存在する session の SMB plaintext dump は、`SMBEE_TRACE_WIRE_FULL=1` でもラベルと長さだけを出す。秘匿判定は `encryptionKey != nil` とし、WRITE 前・復号後の応答・VALIDATE_NEGOTIATE_INFO の例外送信経路を含めた。暗号化済み transform bytes と、暗号化鍵のない session の trace は従来どおり。
-- テスト: 注入 logger/sink で encrypted WRITE と実際に decryptTransform を通る encrypted READ 応答を捕捉し、`SMBDebug.hex(sentinel)` が現れないこと、非暗号化の陽性対照で現れることを確認。VALIDATE_NEGOTIATE_INFO の送信は SessionFlags が 0 でも鍵があるとき平文 request を出力せず、wire では特例として transform なしで送ることを確認。
-- 変異: formatter の秘匿解除、復号済み応答・WRITE・VALIDATE_NEGOTIATE_INFO の誤った ciphertext 分類、SessionFlags 判定への逆戻しはいずれも対象テストが失敗。暗号化 session の ciphertext まで redaction する変異も formatter の比較が失敗。
-- 検証: macOS `swift build && swift test` は 544 件中 544 件を実行し、37 件 skip、失敗 0。strict SwiftLint と `make lint-analyze` は clean。container E2E は実行していない。worktree のみ変更し、commit はしていない。
+ユーザーの判断: #19 は暗号化 session の平文を full trace でも伏せる / #4 は既に public な SMBClient の高レベル API を契約に載せる（コード不変）。
+
+| # | 結果 | 主な commit（subject の先頭） |
+|---|---|---|
+| 2 | 対応済み。「actor が呼び出しを直列化する」を、actor が守るのは isolated state で await の間に別の呼び出しが進む・複数 request の操作は原子的でない、に直した | `docs(api): actor は await をまたいで別の呼び出しを進めると直し …` |
+| 4 | 対応済み。SMBClient の公開の高レベル API を 0.x の互換の範囲に明記し、makeTransport で注入できる入口を表にした。約束する入口の named call を compile-only のテストに置いた | 同上 |
+| 17 | 対応済み。最初の close が共有の close task を持ち、後の close はその完了を待つ。reconnect の waiter 解放・candidate の所有権移転・cancel は最初の await より前。withTree の TREE_CONNECT 待ちは close 所有の期限 (5 秒) で有限にする | `fix(client): 2 回目以降の close が最初の後始末の完了を待つ` と `test(client): 並行 close の join …` |
+| 18 | 対応済み。withReadStream と単一ファイルの download（SMBClientSession / SMBClient / SMBee）に operationTimeout。session API は nonisolated の外側で actor に入る前から期限を測る。一時ファイルは O_EXCL で作り、mode は umask に従う | `feat(transfer): withReadStream と単一ファイルの download に全体の deadline …` ほか 3 本 |
+| 19 | 対応済み。暗号化鍵のある session の平文の dump は full trace でもラベルと長さだけ。判定は encryptionKey != nil。不正な protocol id のエラー文言から受信バイトの hex も外した（復号した平文が perf log / smbcli に漏れていた） | `security(debug): 暗号化 session の平文を …` と `security(debug): 不正な SMB2 protocol id のエラー文言から …` |
+| 20 | 対応済み。frame を連結せず segment ごとの Data を 1 つの batch で enqueue し、frame の直列化は FIFO の gate。close → connect をまたいで旧 frame が新接続へ流れないよう接続の同一性を確かめる。本物の NWListener の loopback で、frame ごとに別の ContentContext だと後続 frame が止まることを確認し、共有の .defaultMessage にした（D3 の推奨は実機で誤りだった）。性能は未実測 | `perf(transport): NWConnectionTransport を segment のまま送り …` ほか 2 本 |
+| 21 | 対応済み。connect が使う NWParameters に noDelay = true。実効値の読み戻しは API に無いので、渡した parameters を検査する | `perf(transport): NWConnectionTransport を segment のまま送り …` |
+
+敵対レビューで採らなかった指摘（記録）:
+- #18 R2: requestTimeout が nil の session で CLOSE の応答が来ないと FileId と transport が残る（既存）。069 M2 で cleanup の drain を TreeId と共通化するときに、requestTimeout と独立した有限の grace を入れる
+- #18 R7: 旧シグネチャを function value として参照するとコンパイルできなくなる。docs/api-stability.md が保証しないと明記済み
+- #17: setup の期限切れで共有 transport を閉じると進行中の他の操作も巻き込む。親の close が始まった後に限られ、close は既存操作の完了を保証しない契約なので不具合としない
+- RTT 計測の P2-5（測定中に外部プロセスが tc を変えて戻す）: 脅威モデルの外として script のヘッダと docs に記録

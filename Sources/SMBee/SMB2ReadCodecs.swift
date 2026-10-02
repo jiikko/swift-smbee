@@ -609,6 +609,20 @@ enum SMB2QueryInfo {
     }
 
     static func decodeSecurityDescriptor(_ data: [UInt8]) throws -> SMBSecurityInfo {
+        try decodeSecurityDescriptor(data, onACLReserveCapacity: nil)
+    }
+
+    static func decodeSecurityDescriptorForTesting(
+        _ data: [UInt8],
+        onACLReserveCapacity: @escaping (Int) -> Void
+    ) throws -> SMBSecurityInfo {
+        try decodeSecurityDescriptor(data, onACLReserveCapacity: onACLReserveCapacity)
+    }
+
+    private static func decodeSecurityDescriptor(
+        _ data: [UInt8],
+        onACLReserveCapacity: ((Int) -> Void)?
+    ) throws -> SMBSecurityInfo {
         guard data.count >= 20 else { throw SMBCodecError.truncated }
         guard data[0] == 1 else {
             throw SMBCodecError.invalidValue("unsupported SECURITY_DESCRIPTOR revision")
@@ -620,7 +634,11 @@ enum SMB2QueryInfo {
         return SMBSecurityInfo(
             ownerSID: ownerOffset == 0 ? nil : try decodeSID(data, at: ownerOffset, limit: data.count),
             groupSID: groupOffset == 0 ? nil : try decodeSID(data, at: groupOffset, limit: data.count),
-            dacl: daclOffset == 0 ? nil : try decodeACL(data, at: daclOffset),
+            dacl: daclOffset == 0 ? nil : try decodeACL(
+                data,
+                at: daclOffset,
+                onReserveCapacity: onACLReserveCapacity
+            ),
             controlFlags: control
         )
     }
@@ -638,7 +656,11 @@ enum SMB2QueryInfo {
         return Array(bytes[offset..<offset + length])
     }
 
-    private static func decodeACL(_ data: [UInt8], at offset: Int) throws -> [SMBAccessControlEntry] {
+    private static func decodeACL(
+        _ data: [UInt8],
+        at offset: Int,
+        onReserveCapacity: ((Int) -> Void)?
+    ) throws -> [SMBAccessControlEntry] {
         guard offset >= 0, offset + 8 <= data.count else { throw SMBCodecError.truncated }
         let aclSize = Int(readUInt16LE(data, at: offset + 2))
         let aceCount = Int(readUInt16LE(data, at: offset + 4))
@@ -646,7 +668,9 @@ enum SMB2QueryInfo {
         let aclEnd = offset + aclSize
         var cursor = offset + 8
         var entries: [SMBAccessControlEntry] = []
-        entries.reserveCapacity(aceCount)
+        let reserveCount = min(aceCount, (aclSize - 8) / 4)
+        entries.reserveCapacity(reserveCount)
+        onReserveCapacity?(entries.capacity)
         for _ in 0..<aceCount {
             guard cursor + 4 <= aclEnd else { throw SMBCodecError.truncated }
             let type = data[cursor]

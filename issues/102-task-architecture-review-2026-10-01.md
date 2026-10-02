@@ -107,3 +107,10 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 
 不採用（記録）: 匿名 session でサーバが署名必須を示しても、匿名には署名鍵が無いので署名なしの応答を受け入れる（MS-SMB2 の匿名 session の扱い。
 VALIDATE_NEGOTIATE_INFO の匿名の例外と同じ方針）。#7 の設計・実装は sol の敵対レビューを計 3 周（設計 1・実装 2）通し、最後の周は指摘 0 件。
+
+### 102 #19 実装結果（2026-10-02）
+
+- 対応済み: 暗号化鍵が存在する session の SMB plaintext dump は、`SMBEE_TRACE_WIRE_FULL=1` でもラベルと長さだけを出す。秘匿判定は `encryptionKey != nil` とし、WRITE 前・復号後の応答・VALIDATE_NEGOTIATE_INFO の例外送信経路を含めた。暗号化済み transform bytes と、暗号化鍵のない session の trace は従来どおり。
+- テスト: 注入 logger/sink で encrypted WRITE と実際に decryptTransform を通る encrypted READ 応答を捕捉し、`SMBDebug.hex(sentinel)` が現れないこと、非暗号化の陽性対照で現れることを確認。VALIDATE_NEGOTIATE_INFO の送信は SessionFlags が 0 でも鍵があるとき平文 request を出力せず、wire では特例として transform なしで送ることを確認。
+- 変異: formatter の秘匿解除、復号済み応答・WRITE・VALIDATE_NEGOTIATE_INFO の誤った ciphertext 分類、SessionFlags 判定への逆戻しはいずれも対象テストが失敗。暗号化 session の ciphertext まで redaction する変異も formatter の比較が失敗。
+- 検証: macOS `swift build && swift test` は 544 件中 544 件を実行し、37 件 skip、失敗 0。strict SwiftLint と `make lint-analyze` は clean。container E2E は実行していない。worktree のみ変更し、commit はしていない。

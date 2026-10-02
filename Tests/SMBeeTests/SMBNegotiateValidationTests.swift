@@ -282,6 +282,71 @@ final class SMBNegotiateValidationTests: XCTestCase {
         XCTAssertEqual(header.signature, expectedSignature)
     }
 
+    func testValidateNegotiatePlaintextExceptionStillRedactsWhenEncryptionKeyExists() async throws {
+        let capture = SMBTraceLogCapture()
+        let logger = SMBSessionDebugLogger(
+            configuration: SMBSessionDebugConfiguration(enabled: true, traceWire: true, traceWireFull: true),
+            sink: { capture.append($0) }
+        )
+        let negotiateRequest = try requestSnapshot()
+        let validationResponse = try validateResponse(
+            protection: .signed(outputLength: 24),
+            capabilities: SMBNegotiateConstants.globalCapEncryption,
+            guidBytes: serverGuidBytes,
+            securityMode: SMBNegotiateConstants.signingEnabled | SMBNegotiateConstants.signingRequired,
+            dialect: SMBNegotiateConstants.dialect302
+        )
+        let inbound = try frame([
+            try signedTestPacket(
+                treeConnectResponse(messageId: 0, sessionId: sessionId),
+                algorithm: .aesCMAC,
+                key: signingKey,
+                sender: .server
+            ),
+            validationResponse
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: signingKey,
+            debugLogger: logger
+        )
+        await session.installValidateNegotiateStateForTesting(
+            snapshot: negotiateRequest,
+            serverResult: try serverResult(),
+            sessionId: sessionId,
+            sessionFlags: 0,
+            encryptionKey: signingKey,
+            decryptionKey: signingKey
+        )
+
+        let connectedTreeId = try await session.treeConnect(share: "share")
+        XCTAssertEqual(connectedTreeId, treeId)
+        let packets = try unframe(transport.outbound)
+        XCTAssertEqual(packets.count, 2)
+        XCTAssertTrue(packets[0].starts(with: SMB3TransformHeader.protocolId))
+        XCTAssertFalse(packets[1].starts(with: SMB3TransformHeader.protocolId))
+        let validationRequest = try SMB2ValidateNegotiateInfo.encodeRequest(
+            messageId: 1,
+            sessionId: sessionId,
+            treeId: treeId,
+            snapshot: negotiateRequest
+        )
+        XCTAssertEqual(try SMB2Header.decode(packets[1]).command, SMB2Commands.ioctl)
+        XCTAssertTrue(capture.messages.contains {
+            $0.hasPrefix("FSCTL_VALIDATE_NEGOTIATE_INFO request") &&
+                $0.contains("<redacted; encrypted session plaintext>")
+        })
+        XCTAssertFalse(capture.messages.joined(separator: "\n").contains(SMBDebug.hex(validationRequest)))
+        let counts = await session.validateNegotiateCountsForTesting()
+        XCTAssertEqual(counts.sent, 1)
+        XCTAssertEqual(counts.succeeded, 1)
+        await session.closeTransport(cause: "validate_negotiate_trace_redaction_test")
+    }
+
     private enum Protection {
         case signed(outputLength: Int)
         case short

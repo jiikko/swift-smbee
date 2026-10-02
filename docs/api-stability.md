@@ -74,12 +74,21 @@ over errors and should not parse human-readable associated strings.
 `NWConnectionTransport` currently turns each nonempty segment into its own `Data`, then
 enqueues the frame's segments in one Network.framework batch on the shared, non-final
 default message context (a separate context per frame stalled the following frame on a real
-TCP loopback). Frames are serialized by a FIFO gate. `NWConnection.send` also accepts `DispatchData`; per-segment `Data` is used here
-because it keeps ownership and buffer lifetime explicit for Swift `[UInt8]` inputs without
+TCP loopback). Frames are serialized by a FIFO gate. `NWConnection.send` also accepts
+`DispatchData`; per-segment `Data` is used here because it keeps ownership and buffer lifetime explicit for Swift `[UInt8]` inputs without
 adding discontiguous-storage conversion and retention machinery. The performance effect of
 this implementation has not been measured. A send returns after all of its
 `contentProcessed` callbacks complete; this indicates processing by Network.framework, not
 an acknowledgement from the peer.
+
+## Wire diagnostics
+
+`SMBEE_DEBUG=1`, `SMBEE_TRACE_WIRE=1`, and `SMBEE_TRACE_WIRE_FULL=1` enable full SMB
+packet hex in session diagnostics. When an SMB session has an encryption key, plaintext
+packets are redacted to their label and byte count even in full-trace mode. This applies
+to outbound packets before encryption, inbound packets after decryption, and the
+VALIDATE_NEGOTIATE_INFO exception send path. Encrypted transform ciphertext may still be
+shown in full. Sessions without an encryption key keep the existing trace behavior.
 
 ## Credential migration
 

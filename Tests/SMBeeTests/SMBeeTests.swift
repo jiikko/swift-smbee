@@ -30,6 +30,19 @@ private final class RecursiveActionRecorder: @unchecked Sendable {
     }
 }
 
+final class SMBTraceLogCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String] = []
+
+    var messages: [String] {
+        lock.withLock { storage }
+    }
+
+    func append(_ message: String) {
+        lock.withLock { storage.append(message) }
+    }
+}
+
 private struct SMBTestTimeoutError: Error, CustomStringConvertible {
     let label: String
     let seconds: Double
@@ -10124,10 +10137,143 @@ final class SMBeeTests: XCTestCase {
         let bytes = (0..<4).map(UInt8.init)
 
         XCTAssertEqual(
-            SMBDebug.packetSummary(bytes, traceWire: false),
+            SMBDebug.packetSummary(
+                bytes,
+                traceWire: false,
+                traceWireFull: true,
+                provenance: .plaintext,
+                encryptedSession: true
+            ),
             "<redacted; set SMBEE_TRACE_WIRE=1 to dump raw packet hex>"
         )
-        XCTAssertEqual(SMBDebug.packetSummary(bytes, traceWire: true), "00010203")
+        XCTAssertEqual(
+            SMBDebug.packetSummary(
+                bytes,
+                traceWire: true,
+                traceWireFull: true,
+                provenance: .plaintext,
+                encryptedSession: true
+            ),
+            "<redacted; encrypted session plaintext>"
+        )
+        XCTAssertEqual(
+            SMBDebug.packetSummary(
+                bytes,
+                traceWire: true,
+                traceWireFull: true,
+                provenance: .ciphertext,
+                encryptedSession: true
+            ),
+            "00010203"
+        )
+        XCTAssertEqual(
+            SMBDebug.packetSummary(
+                bytes,
+                traceWire: true,
+                traceWireFull: true,
+                provenance: .plaintext,
+                encryptedSession: false
+            ),
+            "00010203"
+        )
+    }
+
+    func testEncryptedSessionWireTraceRedactsWriteAndDecryptedReadPayloads() async throws {
+        let sentinel = Array("SMBEE_TRACE_SECRET_SENTINEL_19".utf8)
+        let sentinelHex = SMBDebug.hex(sentinel)
+        let encryptionKey = Array(repeating: UInt8(0x5a), count: 16)
+        let encryptedWriteResponse = try smb3CCMTransform(
+            smb2WriteResponse(count: sentinel.count, messageId: 0, treeId: 0x3344),
+            key: encryptionKey,
+            nonce: (1...11).map(UInt8.init),
+            sessionId: 0
+        )
+        let encryptedReadResponse = try smb3CCMTransform(
+            smb2ReadResponse(sentinel, messageId: 1, treeId: 0x3344),
+            key: encryptionKey,
+            nonce: (12...22).map(UInt8.init),
+            sessionId: 0
+        )
+        let encryptedTransport = InMemoryTransport(inbound: try framed([
+            encryptedWriteResponse,
+            encryptedReadResponse
+        ]))
+        let encryptedCapture = SMBTraceLogCapture()
+        let logger = SMBSessionDebugLogger(
+            configuration: SMBSessionDebugConfiguration(enabled: true, traceWire: true, traceWireFull: true),
+            sink: { encryptedCapture.append($0) }
+        )
+        let encryptedSession = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: encryptedTransport,
+            debugLogger: logger
+        )
+        await encryptedSession.installEncryptionStateForTesting(
+            encryptionKey: encryptionKey,
+            decryptionKey: encryptionKey
+        )
+        let sessionFlags = await encryptedSession.sessionFlagsForTesting()
+        XCTAssertEqual(sessionFlags, 0)
+
+        try await encryptedSession.write(
+            treeId: 0x3344,
+            fileId: Array(repeating: 0x11, count: 16),
+            data: sentinel
+        )
+        let decryptedRead = try await encryptedSession.readChunk(
+            treeId: 0x3344,
+            fileId: Array(repeating: 0x22, count: 16),
+            offset: 0,
+            length: UInt64(sentinel.count)
+        )
+        XCTAssertEqual(decryptedRead, sentinel)
+
+        let encryptedMessages = encryptedCapture.messages
+        XCTAssertTrue(encryptedMessages.contains {
+            $0.hasPrefix("WRITE request") && $0.contains("<redacted; encrypted session plaintext>")
+        })
+        XCTAssertTrue(encryptedMessages.contains {
+            $0.hasPrefix("decrypted ") && $0.contains("<redacted; encrypted session plaintext>")
+        })
+        XCTAssertTrue(encryptedMessages.contains {
+            $0.hasPrefix("SMB response") && $0.contains(SMBDebug.hex(encryptedReadResponse))
+        })
+        XCTAssertFalse(encryptedMessages.joined(separator: "\n").contains(sentinelHex))
+
+        let plaintextTransport = InMemoryTransport(inbound: try framed([
+            smb2WriteResponse(count: sentinel.count, messageId: 0, treeId: 0x3344),
+            smb2ReadResponse(sentinel, messageId: 1, treeId: 0x3344)
+        ]))
+        let plaintextCapture = SMBTraceLogCapture()
+        let plaintextLogger = SMBSessionDebugLogger(
+            configuration: SMBSessionDebugConfiguration(enabled: true, traceWire: true, traceWireFull: true),
+            sink: { plaintextCapture.append($0) }
+        )
+        let plaintextSession = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: plaintextTransport,
+            debugLogger: plaintextLogger
+        )
+        try await plaintextSession.write(
+            treeId: 0x3344,
+            fileId: Array(repeating: 0x11, count: 16),
+            data: sentinel
+        )
+        let plaintextRead = try await plaintextSession.readChunk(
+            treeId: 0x3344,
+            fileId: Array(repeating: 0x22, count: 16),
+            offset: 0,
+            length: UInt64(sentinel.count)
+        )
+        XCTAssertEqual(plaintextRead, sentinel)
+        XCTAssertTrue(plaintextCapture.messages.joined(separator: "\n").contains(sentinelHex))
+
+        await encryptedSession.closeTransport(cause: "wire_trace_redaction_test")
+        await plaintextSession.closeTransport(cause: "wire_trace_positive_control_test")
     }
 
     func testWriteChunkRangesCoverBoundarySizes() throws {
@@ -11652,6 +11798,30 @@ final class SMBeeTests: XCTestCase {
         writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
         response.append(contentsOf: payload)
         return response
+    }
+
+    private func smb3CCMTransform(
+        _ plaintext: [UInt8],
+        key: [UInt8],
+        nonce: [UInt8],
+        sessionId: UInt64
+    ) throws -> [UInt8] {
+        var header = SMB3TransformHeader(
+            signature: Array(repeating: 0, count: 16),
+            nonce: nonce + Array(repeating: 0, count: 5),
+            originalMessageSize: UInt32(plaintext.count),
+            flags: SMB3TransformHeader.encryptedFlag,
+            sessionId: sessionId
+        )
+        let sealed = try AESCCM.seal(
+            key: key,
+            nonce: nonce,
+            plaintext: plaintext,
+            authenticatedData: header.authenticatedData(),
+            tagLength: 16
+        )
+        header.signature = sealed.tag
+        return try header.encode() + sealed.ciphertext
     }
 
     private func dcerpcResponsePDU(stub: [UInt8], flags: UInt8, callId: UInt32 = 2) throws -> [UInt8] {

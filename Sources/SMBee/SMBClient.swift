@@ -4259,6 +4259,7 @@ actor SMBSession {
     private let requestTimeout: Duration?
     private let requestTimeoutSleeper: @Sendable (Duration) async throws -> Void
     private let cleanupTimeoutSleeper: @Sendable (Duration) async throws -> Void
+    private let debugLogger: SMBSessionDebugLogger
 
     /// - Parameter requestTimeout: Per-request response timeout started only after the
     ///   complete request has been sent. It is independent of transport socket timeouts;
@@ -4279,7 +4280,8 @@ actor SMBSession {
         },
         cleanupTimeoutSleeper: @escaping @Sendable (Duration) async throws -> Void = {
             try await Task.sleep(for: $0)
-        }
+        },
+        debugLogger: SMBSessionDebugLogger = .environment
     ) {
         // A locked monotonic base-36 ID is short, non-secret, collision-free within a run, and reproducible.
         let diagnosticSessionId = Self.makeDiagnosticSessionId()
@@ -4306,6 +4308,7 @@ actor SMBSession {
         self.requestTimeout = requestTimeout
         self.requestTimeoutSleeper = requestTimeoutSleeper
         self.cleanupTimeoutSleeper = cleanupTimeoutSleeper
+        self.debugLogger = debugLogger
     }
 
     func connect() async throws {
@@ -4487,6 +4490,16 @@ actor SMBSession {
         self.sessionFlags = sessionFlags
         self.encryptionKey = encryptionKey
         self.decryptionKey = decryptionKey
+    }
+
+    func installEncryptionStateForTesting(
+        encryptionKey: [UInt8],
+        decryptionKey: [UInt8],
+        algorithm: SMBSessionEncryptionAlgorithm = .aes128CCM
+    ) {
+        self.encryptionKey = encryptionKey
+        self.decryptionKey = decryptionKey
+        encryptionAlgorithm = algorithm
     }
 
     private func logNegotiatePerf(_ result: SMBProbeResult) async {
@@ -6548,10 +6561,10 @@ actor SMBSession {
     private func receiveDecryptedFrame(label: String) async throws -> SMBReceivedFrame {
         let header = try await receiveExactly(4)
         let length = try DirectTCPFraming.length(from: header)
-        debugDump("\(label) direct-TCP header length=\(length)", header)
+        debugDump("\(label) direct-TCP header length=\(length)", header, provenance: .metadata)
         let body = try await receiveExactly(length)
-        debugDump(label, body)
         let decryptedFromTransform = body.starts(with: SMB3TransformHeader.protocolId)
+        debugDump(label, body, provenance: decryptedFromTransform ? .ciphertext : .plaintext)
         let packet = decryptedFromTransform ? try decryptTransform(body) : body
         await recordCreditGrant(packet, label: label)
         return SMBReceivedFrame(bytes: packet, decryptedFromTransform: decryptedFromTransform)
@@ -7109,14 +7122,20 @@ actor SMBSession {
     }
 
     private func debugDump(_ label: String, _ bytes: [UInt8]) {
-        guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
-        let traceWire = ProcessInfo.processInfo.environment["SMBEE_TRACE_WIRE"] == "1"
-        FileHandle.standardError.write(Data("\(label) (\(bytes.count) bytes): \(SMBDebug.packetSummary(bytes, traceWire: traceWire))\n".utf8))
+        debugDump(label, bytes, provenance: .plaintext)
+    }
+
+    private func debugDump(_ label: String, _ bytes: [UInt8], provenance: SMBWireDataProvenance) {
+        debugLogger.dump(
+            label,
+            bytes: bytes,
+            provenance: provenance,
+            encryptedSession: encryptionKey != nil
+        )
     }
 
     private func debugLine(_ message: String) {
-        guard ProcessInfo.processInfo.environment["SMBEE_DEBUG"] == "1" else { return }
-        FileHandle.standardError.write(Data("\(message)\n".utf8))
+        debugLogger.line(message)
     }
 }
 

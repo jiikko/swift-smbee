@@ -197,6 +197,10 @@ final class SMBContinuationCredentialGate: @unchecked Sendable {
         lock.withLock { callCountStorage }
     }
 
+    var isReleased: Bool {
+        lock.withLock { released }
+    }
+
     func getCredential() async throws -> SMBCredential {
         let waiterID = UUID()
         return try await withTaskCancellationHandler {
@@ -220,6 +224,29 @@ final class SMBContinuationCredentialGate: @unchecked Sendable {
             }
         } onCancel: {
             cancelCredentialWaiter(waiterID)
+        }
+    }
+
+    func getCredentialIgnoringCancellation() async throws -> SMBCredential {
+        try await withCheckedThrowingContinuation { continuation in
+            let state = lock.withLock { () -> (
+                released: Bool,
+                ready: [CheckedContinuation<Void, Error>]
+            ) in
+                callCountStorage += 1
+                let ready = callWaiters
+                    .filter { callCountStorage >= $0.target }
+                    .map(\.continuation)
+                callWaiters.removeAll { callCountStorage >= $0.target }
+                if !released {
+                    continuations.append((UUID(), continuation))
+                }
+                return (released, ready)
+            }
+            state.ready.forEach { $0.resume() }
+            if state.released {
+                continuation.resume(returning: credential)
+            }
         }
     }
 
@@ -488,19 +515,22 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
         try enqueue(response)
     }
 
-    func completeTreeConnect(treeId: UInt32 = 0x5566) throws {
+    func completeTreeConnect(status: UInt32 = SMB2Status.success, treeId: UInt32 = 0x5566) throws {
         guard let request = watchLock.withLock({ treeConnectRequest }) else {
             throw SMBCodecError.invalidValue("test transport has no TREE_CONNECT request")
         }
         var response = try SMB2Header(
+            status: status,
             command: SMB2Commands.treeConnect,
             messageId: request.messageId,
             treeId: treeId,
             sessionId: request.sessionId
         ).encode()
-        response.append(contentsOf: Array(repeating: 0, count: 16))
-        writeUInt16LE(16, to: &response, at: 64)
-        response[66] = 1
+        if status == SMB2Status.success {
+            response.append(contentsOf: Array(repeating: 0, count: 16))
+            writeUInt16LE(16, to: &response, at: 64)
+            response[66] = 1
+        }
         try enqueue(response)
     }
 

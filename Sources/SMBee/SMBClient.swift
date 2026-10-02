@@ -803,6 +803,14 @@ public actor SMBClientSession {
         try await reconnect(expectedGeneration: sessionGeneration, onRequest: onRequest)
     }
 
+    func reconnectTaskForTesting() -> Task<Void, Never>? {
+        reconnectTask
+    }
+
+    func treeSetupCountForTesting() -> Int {
+        treeSetupSessions.count
+    }
+
     private func performReconnect(taskID: UUID) async throws {
         guard !isClosed else {
             throw SMBError.connectionLost(operation: "RECONNECT")

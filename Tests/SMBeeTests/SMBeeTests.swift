@@ -10407,6 +10407,13 @@ final class SMBeeTests: XCTestCase {
             try await runDefaultEnvironmentTraceProbe()
             return
         }
+        // A sanitizer-instrumented bundle aborts (exit 6) when re-launched by a plain
+        // `xcrun xctest` host that does not load the sanitizer runtime. The normal macOS and Linux
+        // jobs still run this probe; only the TSan/ASan jobs skip it.
+        if dlsym(UnsafeMutableRawPointer(bitPattern: -2), "__tsan_init") != nil
+            || dlsym(UnsafeMutableRawPointer(bitPattern: -2), "__asan_init") != nil {
+            throw XCTSkip("subprocess trace probe cannot re-launch a sanitizer-instrumented test bundle")
+        }
 
         let process = try defaultEnvironmentTraceProbeProcess(childFlag: childFlag)
         // stdout is discarded instead of piped: reading two pipes sequentially deadlocks once the

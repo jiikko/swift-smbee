@@ -375,9 +375,9 @@ D3 が出した改訂 13 件は `[D2 v2]` として設計に反映済み（設�
 |---|---|---|
 | M1 | characterization | **完了** |
 | M2 | `sendPhase` 導入・`sentResponseMessageIds` 撤去（reader は現行のまま） | **完了**（2026-09-09） |
-| M3 | long-lived reader 導入（生存条件の切断・weak 捕捉・generation・close/deinit） | **完了**（2026-10-03、下の「進捗チェックポイント — M3」） |
+| M3 | long-lived reader 導入（生存条件の切断・weak 捕捉・generation・close/deinit） | 一度 master に入れたが **revert**（2026-10-03、Linux の性能退行。下の「進捗チェックポイント — M3」） |
 | M4 | transport 契約 + fixture 移行 + credit 循環の回帰テスト | 一部を M3 に前倒し（下の節）。残りは未着手 |
-| M5 | 全体検証（macOS / Linux / E2E smoke / verify-agent-push） | M3 の push で CI を確認中 |
+| M5 | 全体検証（macOS / Linux / E2E smoke / verify-agent-push） | 未完（M3 の入れ直しの後） |
 
 M2 で最初に触るべき箇所（D3 + Claude の実測）: `pendingResponses` に tombstone を混在させると
 意味が変わる **5 箇所** — `:5471` `:5480` `:5488` `:5515`（count ベースの待機・観測）と
@@ -529,7 +529,7 @@ macOS / Linux unit / `bin/e2e/container-samba.sh` / `bin/ci/verify-agent-push` r
   集合を tombstone として残す案 — いずれも**同期すべき台帳が増える**ので却下（D1 の 4 案から選定）
 - 当初の回帰テスト案（`initialCredits=1` + `charge=2` の park だけ）— 変異で red にならない
 
-## 進捗チェックポイント — M3 完了 (2026-10-03)
+## 進捗チェックポイント — M3 (2026-10-03、push の後に revert)
 
 commit `feat(session): issue 010 M3 — session が所有する常駐 reader で応答を受ける (issue 102 #5 #6 を含む)`。
 契約（M3 / M4 の実装コントラクト、2 周の設計レビューを反映）を codex-drive で実装し、sol の敵対レビューを 3 周
@@ -554,4 +554,17 @@ commit `feat(session): issue 010 M3 — session が所有する常駐 reader で
 - `SMBTransport` の doc に「close は待機中の receive を起こす・close は終端」を明記する（外部 conformer には強制できない）
 - credit 循環の回帰テスト（queue 済みの grant を reader が消費する刺激。契約 §3.3）が M3 で入っているかを確認し、無ければ足す
 - M5: push 後の `verify-agent-push`（性能の対応比較の gate を含む）
+
+### M3 を revert した理由と、入れ直しの条件 (2026-10-03)
+
+push の後、CI の Performance（Linux x86_64、20 組の交互比較）で regression gate が FAIL した:
+read_stream の throughput 1611 → 873 MiB/s（-45.8%）、user CPU +43.8%、system CPU +203%、write の throughput -19.5%。
+macOS では read の差がほぼ無かったため push 前に見落とした（手元の確認が macOS だけだった）。
+
+原因は、常駐 reader が frame ごとに session actor へ await で渡す経路。aarch64 の Linux container で
+voluntary context switch が read で 18,263 → 38,956 / sample（frame あたり約 +2 回）、write で 3,733 → 6,291 に増えた。
+actor の中で reader を回す試作は改善せず戻した。
+
+入れ直しの条件: frame をまとめて 1 回の hop で順に処理する形などで Linux の差を throughput -10% 以内 / user CPU +12% 以内に
+詰め、push 前に Linux の container で master と交互に測る。CI の Performance の gate が通ってから入れる。
 

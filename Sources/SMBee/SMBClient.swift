@@ -4233,7 +4233,9 @@ actor SMBSession {
             challengePacket, responseLabel: "SESSION_SETUP#1 response",
             preauthMessages: &preauthMessages, foldResponse: true)
         let challengeHeader = try SMB2Header.decode(challengeResponse)
-        guard challengeHeader.status == SMB2Status.moreProcessingRequired else {
+        if challengeHeader.status != SMB2Status.moreProcessingRequired {
+            try SMBErrorMapper.throwIfFailure(status: challengeHeader.status, operation: "SESSION_SETUP#1")
+            // Preserve the legacy mapping for unexpected successful SESSION_SETUP#1 replies.
             throw SMBErrorMapper.map(status: challengeHeader.status, operation: "SESSION_SETUP#1")
         }
         sessionId = challengeHeader.sessionId

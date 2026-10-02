@@ -41,8 +41,11 @@ struct SMBSessionDebugLogger: Sendable {
     }
 
     static var environment: Self {
-        Self(
-            configurationProvider: { .environment },
+        // Snapshot once per logger (one per session): building ProcessInfo.environment on every
+        // packet dump cost ~40% of read_stream throughput in the resource benchmark.
+        let configuration = SMBSessionDebugConfiguration.environment
+        return Self(
+            configurationProvider: { configuration },
             sink: { message in FileHandle.standardError.write(Data("\(message)\n".utf8)) }
         )
     }

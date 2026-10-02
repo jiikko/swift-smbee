@@ -314,15 +314,38 @@ final class NWConnectionTransportGateRegressionTests: XCTestCase {
             XCTFail("B should remain cancelled whichever actor event wins")
         } catch is CancellationError {
         }
-        try await smbIssue102AwaitWithTimeout("C enqueued after release/cancel race") {
-            try await sends.wait(atLeast: 2)
+
+        let bWasSent = fake.snapshots.contains { $0.bytes == [2] }
+        if bWasSent {
+            try await smbIssue102AwaitWithTimeout("C enqueued after active B cancellation") {
+                try await sends.wait(atLeast: 3)
+            }
+            do {
+                try await smbIssue102AwaitWithTimeout("C settles after active B cancellation") {
+                    try await nextWaiter.value
+                }
+                XCTFail("C should receive the cancelled connection error")
+            } catch let error as NWError {
+                XCTAssertEqual(error, .posix(.ECANCELED))
+            }
+            XCTAssertEqual(fake.snapshots.map(\.bytes), [[1], [2], [3]])
+            XCTAssertEqual(fake.cancelCount, 1)
+        } else {
+            try await smbIssue102AwaitWithTimeout("C enqueued after queued B cancellation") {
+                try await sends.wait(atLeast: 2)
+            }
+            XCTAssertEqual(fake.snapshots.map(\.bytes), [[1], [3]])
+            XCTAssertEqual(fake.cancelCount, 0)
+            fake.completeSend(at: 1)
+            try await smbIssue102AwaitWithTimeout("C completes after queued B cancellation") {
+                try await nextWaiter.value
+            }
         }
-        XCTAssertEqual(fake.snapshots.map(\.bytes), [[1], [3]])
-        XCTAssertEqual(fake.cancelCount, 0)
-        fake.completeSend(at: 1)
-        try await smbIssue102AwaitWithTimeout("C completes after release/cancel race") {
-            try await nextWaiter.value
+
+        try await smbIssue102AwaitWithTimeout("gate queue drains after release/cancel race") {
+            try await queuedSends.wait(untilEqual: 0)
         }
+        XCTAssertEqual(fake.pendingCompletionCount, 0)
     }
 
     func testCloseReconnectDoesNotMoveQueuedOldFrameToNewConnection() async throws {

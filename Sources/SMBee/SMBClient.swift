@@ -6380,7 +6380,11 @@ actor SMBSession {
     private func verifySigned(_ frame: SMBReceivedFrame) throws {
         if frame.decryptedFromTransform { return }
         let packet = frame.bytes
-        guard let signingKey else { return }
+        guard let signingKey else {
+            // Anonymous sessions have no signing key; accept unsigned replies even when the server
+            // advertises required signing, following the MS-SMB2 anonymous-session exception.
+            return
+        }
         let header = try SMB2Header.decode(packet)
         guard (header.flags & SMB2Flags.signed) != 0 else {
             guard !signingRequired else {
@@ -6394,9 +6398,13 @@ actor SMBSession {
             packet: packet,
             sender: .server
         )
-        guard expected == header.signature else {
+        guard AESCCM.constantTimeEqual(expected, header.signature) else {
             throw SMBCodecError.invalidValue("SMB signature verification failed")
         }
+    }
+
+    func verifySignedForTesting(_ packet: [UInt8]) throws {
+        try verifySigned(SMBReceivedFrame(bytes: packet, decryptedFromTransform: false))
     }
 
     private func receiveDecryptedFrame(label: String) async throws -> SMBReceivedFrame {

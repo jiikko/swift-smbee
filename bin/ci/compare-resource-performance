@@ -24,6 +24,14 @@ REGRESSION_LIMITS = {
     "user_cpu_ms": Decimal("25"),
     "max_rss_kb": Decimal("20"),
 }
+# One-time step for issue 010 M3 (session-owned demand-driven reader). On the Linux x86_64 runner it
+# costs read_stream throughput -27.8% against the pre-M3 master (system CPU +167%, user CPU +5.6%);
+# the user accepted Linux performance as nice to have. The gate compares with the previous
+# *successful* master push, so this override lets one run at the M3 level succeed. Remove it in
+# the next commit, which then compares against M3 with the normal 15% limit (issue 010).
+OPERATION_REGRESSION_LIMITS = {
+    ("read_stream", "throughput_mib_s"): Decimal("35"),
+}
 
 
 class ComparableError(Exception):
@@ -255,7 +263,10 @@ def compare(current_path: Path, reference_path: Path, fail_on_regression: bool) 
             "Paired effects use geometric mean ratios, deterministic 95% bootstrap confidence intervals, "
             "and two-sided sign-flip permutation tests."
         )
-        print("Limits: throughput -15%, user CPU +25%, process RSS +20%. System CPU remains observe-only.")
+        print(
+            "Limits: throughput -15% (read_stream -35% for the issue 010 M3 step), user CPU +25%, "
+            "process RSS +20%. System CPU remains observe-only."
+        )
     else:
         print("Advisory only: compared with the previous successful master push run; this does not affect guardrails or job status.")
     print(
@@ -298,7 +309,7 @@ def compare(current_path: Path, reference_path: Path, fail_on_regression: bool) 
         current = result["current"]
         reference = result["reference"]
         regression = regression_percent(current, reference, metric)
-        limit = REGRESSION_LIMITS.get(metric)
+        limit = OPERATION_REGRESSION_LIMITS.get((operation, metric), REGRESSION_LIMITS.get(metric))
         adjusted_p = adjusted_by_index.get(index, 1.0)
         inference = result["inference"]
         pair_count = len(current_summaries[f"{operation}.{metric}"])

@@ -4536,12 +4536,6 @@ struct SMBRequestIdentity: Hashable, Sendable {
     // UUID() reads the system random source each time (issue 010 showed per-request costs show up
     // in the Linux performance gate). sessionInstance already makes the triple unique across sessions.
     let requestSequence: UInt64
-
-    init(sessionInstance: UUID, generation: UInt64, requestSequence: UInt64) {
-        self.sessionInstance = sessionInstance
-        self.generation = generation
-        self.requestSequence = requestSequence
-    }
 }
 
 /// Clock and sleeper used together by request retirement and future wire deadlines.

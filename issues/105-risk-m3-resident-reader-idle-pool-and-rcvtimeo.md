@@ -65,6 +65,12 @@ M3 の入れ直しの前提条件にするかは、下の再現テストで実�
 
 ## 進捗
 
+- 2026-10-03: issue 010 で需要駆動の reader を採ることにした（pending が 0 なら reader を止め、次の send で起こし直す。
+  master の `receiveLoop` と同じ idle の挙動）。
+  - 1（idle 中の pool の占有）は、idle 中に recv しなくなるので消える見込み。実装の後に確かめる。
+  - 2（SO_RCVTIMEO）は、idle 中の切断は消えて master と同じ状態に戻る。long-poll が outstanding の間に `.timedOut` になる根は
+    master にもあり、残る。
+
 - [ ] 1 の再現テスト
 - [ ] 2 の再現テスト
 - [ ] 扱いの決定

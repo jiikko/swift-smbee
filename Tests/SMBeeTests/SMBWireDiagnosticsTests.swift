@@ -1609,6 +1609,918 @@ final class SMBWireDiagnosticsTests: XCTestCase {
     }
 }
 
+final class SMBRequestRetirementPrimitiveTests: XCTestCase {
+    func testOneShotCreditRefundTokenCannotBeConsumedTwice() {
+        let token = SMBOneShotCreditRefundToken(charge: 3)
+        XCTAssertEqual(token.consume(), 3)
+        XCTAssertNil(token.consume())
+    }
+
+    func testUnsentRetirementShrinksAndRefundsEachCreditOwnerOnce() async throws {
+        for retireBeforeSurplusAcknowledgement in [true, false] {
+            let window = SMB2CreditWindow(initialCredits: 4, diagnosticSessionId: "retire-test")
+            let reservedBalance = try await window.reserve(charge: 4)
+            XCTAssertEqual(reservedBalance, 0)
+
+            let surplusEntered = SMBRetirementEvent()
+            let residualEntered = SMBRetirementEvent()
+            let surplusRelease = SMBRetirementEvent()
+            let residualRelease = SMBRetirementEvent()
+            let probe = SMBRetirementCreditProbe()
+            let record = SMBUnsentRequestRecord(
+                identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 1),
+                maximumCharge: 4,
+                reservedCharge: 4,
+                refundCredits: { charge in
+                    await probe.started(charge)
+                    if charge == 3 {
+                        await surplusEntered.signal()
+                        await surplusRelease.wait()
+                    } else if charge == 1 {
+                        await residualEntered.signal()
+                        await residualRelease.wait()
+                    }
+                    _ = await window.refund(charge: charge)
+                    await probe.acknowledged(charge)
+                }
+            )
+
+            let prepared = await record.prepareCredit(actualCharge: 1)
+            XCTAssertTrue(prepared)
+            try await awaitWithTimeout("surplus refund entered") { await surplusEntered.wait() }
+            if !retireBeforeSurplusAcknowledgement {
+                await surplusRelease.signal()
+                try await awaitWithTimeout("surplus refund acknowledged") {
+                    await probe.waitForAcknowledgement(charge: 3, count: 1)
+                }
+            }
+
+            let firstDecision = await record.retireUnsent()
+            guard case .retiredLocally(let receipt) = firstDecision else {
+                XCTFail("first retirement should be local")
+                return
+            }
+            let duplicateDecision = await record.retireUnsent()
+            guard case .alreadyRetired(let duplicateReceipt) = duplicateDecision else {
+                XCTFail("duplicate retirement should reuse the receipt")
+                return
+            }
+            XCTAssertEqual(receipt, duplicateReceipt)
+            XCTAssertEqual(receipt.id, duplicateReceipt.id)
+
+            try await awaitWithTimeout("residual refund entered") { await residualEntered.wait() }
+            let completedBeforeAcks = receipt.isComplete
+            XCTAssertFalse(completedBeforeAcks)
+
+            await surplusRelease.signal()
+            await residualRelease.signal()
+            try await awaitWithTimeout("retirement receipt closed") { await receipt.wait() }
+
+            let snapshot = await record.snapshot()
+            XCTAssertEqual(snapshot.caller, .localRefusal)
+            XCTAssertEqual(snapshot.send, .neverSubmitted, "a local retirement has no MID")
+            XCTAssertEqual(snapshot.credit, .refunded)
+            let finalBalance = await window.balance
+            XCTAssertEqual(finalBalance, 4)
+            let surplusCalls = await probe.calls(for: 3)
+            let residualCalls = await probe.calls(for: 1)
+            XCTAssertEqual(surplusCalls, 1, "the surplus refund is one-shot")
+            XCTAssertEqual(residualCalls, 1, "the residual refund is one-shot")
+        }
+    }
+
+    func testRetirementReceiptWaitsForLateCreditReservationAndRefundAcknowledgement() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "late-retire-test")
+        let reservationAcquired = SMBRetirementEvent()
+        let reservationSettlement = SMBRetirementEvent()
+        let cancellationObserved = SMBRetirementCallbackCounter()
+        let refundEntered = SMBRetirementEvent()
+        let refundAcknowledged = SMBRetirementEvent()
+        let refundRelease = SMBRetirementEvent()
+        let probe = SMBRetirementCreditProbe()
+        await window.setReservationAcquiredHookForTesting { _ in
+            await reservationAcquired.signal()
+            await reservationSettlement.wait()
+            if Task.isCancelled { await cancellationObserved.increment() }
+        }
+        let record = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 2),
+            maximumCharge: 4,
+            refundCredits: { charge in
+                await probe.started(charge)
+                await refundEntered.signal()
+                await refundRelease.wait()
+                _ = await window.refund(charge: charge)
+                await probe.acknowledged(charge)
+                await refundAcknowledged.signal()
+            }
+        )
+        let reservationStarted = await record.startCreditReservation(window: window, maximumCharge: 4)
+        XCTAssertTrue(reservationStarted, "settlement ownership and task creation are one operation")
+        try await awaitWithTimeout("credit waiter registered") {
+            await window.waitForPendingWaiterCount(atLeast: 1)
+        }
+        _ = await window.grant(4)
+        try await awaitWithTimeout("late reservation acquired") { await reservationAcquired.wait() }
+
+        let decision = await record.retireUnsent()
+        guard case .retiredLocally(let receipt) = decision else {
+            XCTFail("waiting request should retire locally")
+            return
+        }
+        try await awaitWithTimeout("only reservation settlement remains") {
+            await record.waitForAcknowledgementCountForTesting(atMost: 1)
+        }
+        let completeAfterWaiterAck = receipt.isComplete
+        XCTAssertFalse(completeAfterWaiterAck, "waiter acknowledgement cannot close a receipt with a possible late grant")
+
+        await reservationSettlement.signal()
+        try await awaitWithTimeout("acquired reservation observes retirement cancellation") {
+            await cancellationObserved.waitForCount(atLeast: 1)
+        }
+        try await awaitWithTimeout("late grant refund entered") { await refundEntered.wait() }
+        let completeBeforeRefundAck = receipt.isComplete
+        XCTAssertFalse(completeBeforeRefundAck, "the receipt waits for the credit-window refund acknowledgement")
+        await refundRelease.signal()
+        try await awaitWithTimeout("late refund acknowledged") { await refundAcknowledged.wait() }
+        try await awaitWithTimeout("late-grant retirement receipt closed") { await receipt.wait() }
+
+        let lateRefundCalls = await probe.calls(for: 4)
+        XCTAssertEqual(lateRefundCalls, 1)
+        let finalBalance = await window.balance
+        XCTAssertEqual(finalBalance, 4)
+        let snapshot = await record.snapshot()
+        XCTAssertEqual(snapshot.send, .neverSubmitted)
+        XCTAssertEqual(snapshot.credit, .refunded)
+    }
+
+    func testCreditReservationIsStartedAndOwnedAtomically() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "retire-before-attach-test")
+        let reservationAcquired = SMBRetirementEvent()
+        let reservationRelease = SMBRetirementEvent()
+        let cancellationObserved = SMBRetirementCallbackCounter()
+        let refundEntered = SMBRetirementEvent()
+        let refundRelease = SMBRetirementEvent()
+        let probe = SMBRetirementCreditProbe()
+        await window.setReservationAcquiredHookForTesting { _ in
+            await reservationAcquired.signal()
+            await reservationRelease.wait()
+            if Task.isCancelled { await cancellationObserved.increment() }
+        }
+        let record = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 20),
+            maximumCharge: 4,
+            refundCredits: { charge in
+                await probe.started(charge)
+                await refundEntered.signal()
+                await refundRelease.wait()
+                _ = await window.refund(charge: charge)
+                await probe.acknowledged(charge)
+            }
+        )
+        let firstStarted = await record.startCreditReservation(window: window, maximumCharge: 4)
+        XCTAssertTrue(firstStarted)
+        let secondStarted = await record.startCreditReservation(window: window, maximumCharge: 4)
+        XCTAssertFalse(secondStarted, "a second call cannot create or attach a second reserve task")
+        try await awaitWithTimeout("credit waiter registered") {
+            await window.waitForPendingWaiterCount(atLeast: 1)
+        }
+        _ = await window.grant(4)
+        try await awaitWithTimeout("reservation succeeded") { await reservationAcquired.wait() }
+        let waiterCountAfterGrant = await window.pendingWaiterCount
+        XCTAssertEqual(waiterCountAfterGrant, 0)
+
+        let retirement = await record.retireUnsent()
+        guard case .retiredLocally(let receipt) = retirement else {
+            XCTFail("uncommitted request should retire locally")
+            return
+        }
+        XCTAssertFalse(receipt.isComplete)
+        try await awaitWithTimeout("only reservation settlement remains") {
+            await record.waitForAcknowledgementCountForTesting(atMost: 1)
+        }
+        XCTAssertFalse(receipt.isComplete, "retirement must continue to own the successful reservation result")
+
+        await reservationRelease.signal()
+        try await awaitWithTimeout("acquired reservation observes retirement cancellation") {
+            await cancellationObserved.waitForCount(atLeast: 1)
+        }
+        try await awaitWithTimeout("late-grant refund entered") { await refundEntered.wait() }
+        let balanceBeforeRefundAck = await window.balance
+        XCTAssertEqual(balanceBeforeRefundAck, 0)
+        XCTAssertFalse(receipt.isComplete, "receipt remains open until the late-grant refund is acknowledged")
+        await refundRelease.signal()
+        try await awaitWithTimeout("late-grant refund acknowledged") {
+            await probe.waitForAcknowledgement(charge: 4, count: 1)
+        }
+        try await awaitWithTimeout("atomic-reservation retirement receipt completed") { await receipt.wait() }
+
+        let finalBalance = await window.balance
+        let refundCalls = await probe.calls(for: 4)
+        XCTAssertEqual(finalBalance, 4)
+        XCTAssertEqual(refundCalls, 1)
+    }
+
+    func testRetirementAckOwnersKeepRecordAliveUntilReceiptCompletes() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "record-lifetime-test")
+        let reservationHeld = SMBRetirementEvent()
+        let reservationRelease = SMBRetirementEvent()
+        let refundEntered = SMBRetirementEvent()
+        let refundRelease = SMBRetirementEvent()
+        let probe = SMBRetirementCreditProbe()
+        let deinitialized = SMBRequestRecordLifetimeProbe()
+        await window.setReservationAcquiredHookForTesting { _ in
+            await reservationHeld.signal()
+            await reservationRelease.wait()
+        }
+        var record: SMBUnsentRequestRecord? = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 21),
+            maximumCharge: 1,
+            refundCredits: { charge in
+                await probe.started(charge)
+                await refundEntered.signal()
+                await refundRelease.wait()
+                await probe.acknowledged(charge)
+            },
+            onDeinit: { deinitialized.signal() }
+        )
+        let weakRecord = SMBWeakRequestRecordBox(record!)
+        let reservationStarted = await record!.startCreditReservation(window: window, maximumCharge: 1)
+        XCTAssertTrue(reservationStarted)
+        try await awaitWithTimeout("reservation waiter registered") {
+            await window.waitForPendingWaiterCount(atLeast: 1)
+        }
+        _ = await window.grant(1)
+        try await awaitWithTimeout("reservation acquired and held by credit-window test hook") {
+            await reservationHeld.wait()
+        }
+        let decision = await record!.retireUnsent()
+        guard case .retiredLocally(let receipt) = decision else {
+            XCTFail("record should retire locally")
+            return
+        }
+
+        record = nil
+        XCTAssertNotNil(weakRecord.value, "the settlement owner retains the record while its gate is closed")
+        XCTAssertFalse(deinitialized.isSignaled)
+
+        await reservationRelease.signal()
+        try await awaitWithTimeout("refund acknowledgement is gated") { await refundEntered.wait() }
+        XCTAssertNotNil(weakRecord.value, "the refund acknowledgement owner retains the record while its gate is closed")
+        XCTAssertFalse(deinitialized.isSignaled)
+        XCTAssertFalse(receipt.isComplete)
+
+        await refundRelease.signal()
+        try await awaitWithTimeout("lifecycle receipt completed") { await receipt.wait() }
+        try await awaitWithTimeout("record released after all owners complete") { await deinitialized.wait() }
+        let refundCalls = await probe.calls(for: 1)
+        XCTAssertEqual(refundCalls, 1)
+        XCTAssertNil(weakRecord.value, "the receipt does not retain the completed record")
+    }
+
+    func testRecordKeepsCommitCallerSendAndWireStateIndependent() async {
+        let successful = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 3),
+            maximumCharge: 2,
+            reservedCharge: 2,
+            refundCredits: { _ in }
+        )
+        let committed = await successful.commitSend(messageId: 42)
+        XCTAssertTrue(committed)
+        let retireDecision = await successful.retireUnsent()
+        if case .committedNeedsWireDrain(let identity) = retireDecision {
+            let successfulIdentity = await successful.identity
+            XCTAssertEqual(identity, successfulIdentity)
+        } else {
+            XCTFail("committed request must retain wire ownership")
+        }
+        await successful.markWireStatusPending(asyncId: 99)
+        await successful.markWireFinalAccepted()
+        await successful.markSendFullySent()
+        await successful.markCallerTerminal(.success)
+        let successState = await successful.snapshot()
+        XCTAssertEqual(successState.caller, .success)
+        XCTAssertEqual(successState.send, .fullySent)
+        XCTAssertEqual(successState.wire, .finalAccepted)
+        XCTAssertEqual(successState.credit, .committed(actualCharge: 2))
+
+        let failed = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 4),
+            maximumCharge: 1,
+            reservedCharge: 1,
+            refundCredits: { _ in }
+        )
+        let failedCommitted = await failed.commitSend(messageId: 43)
+        XCTAssertTrue(failedCommitted)
+        await failed.markSendFailed()
+        await failed.markCallerTerminal(.transportError)
+        await failed.markSessionTerminal()
+        let terminalState = await failed.snapshot()
+        XCTAssertEqual(terminalState.caller, .transportError)
+        XCTAssertEqual(terminalState.send, .failed)
+        XCTAssertEqual(terminalState.wire, .sessionTerminal)
+        XCTAssertEqual(terminalState.credit, .discardedOnTerminal)
+    }
+
+    func testLocalRetirementRequiresNotStartedSendAndPreservesTerminalCallerOutcome() async {
+        let fullySent = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 22),
+            maximumCharge: 2,
+            reservedCharge: 2,
+            refundCredits: { _ in }
+        )
+        let fullSendCommitted = await fullySent.commitSend(messageId: 42)
+        XCTAssertTrue(fullSendCommitted)
+        await fullySent.markSendFullySent()
+        await fullySent.markCallerTerminal(.success)
+        let fullSendDecision = await fullySent.retireUnsent()
+        guard case .committedNeedsWireDrain(let fullSendIdentity) = fullSendDecision else {
+            XCTFail("fully sent request must remain committed for wire drain")
+            return
+        }
+        let expectedFullSendIdentity = await fullySent.identity
+        XCTAssertEqual(fullSendIdentity, expectedFullSendIdentity)
+        let fullSendSnapshot = await fullySent.snapshot()
+        XCTAssertEqual(fullSendSnapshot.caller, .success)
+        XCTAssertEqual(fullSendSnapshot.send, .fullySent)
+        XCTAssertEqual(fullSendSnapshot.credit, .committed(actualCharge: 2))
+
+        let failedSend = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 23),
+            maximumCharge: 1,
+            reservedCharge: 1,
+            refundCredits: { _ in }
+        )
+        let failureCommitted = await failedSend.commitSend(messageId: 43)
+        XCTAssertTrue(failureCommitted)
+        await failedSend.markSendFailed()
+        await failedSend.markCallerTerminal(.transportError)
+        let failedSendDecision = await failedSend.retireUnsent()
+        guard case .committedNeedsWireDrain(let failedSendIdentity) = failedSendDecision else {
+            XCTFail("send failure after commit must not be reclassified as unsent")
+            return
+        }
+        let expectedFailedSendIdentity = await failedSend.identity
+        XCTAssertEqual(failedSendIdentity, expectedFailedSendIdentity)
+        let failedSendSnapshot = await failedSend.snapshot()
+        XCTAssertEqual(failedSendSnapshot.caller, .transportError)
+        XCTAssertEqual(failedSendSnapshot.send, .failed)
+        XCTAssertEqual(failedSendSnapshot.credit, .committed(actualCharge: 1))
+
+        let callerAlreadyCompleted = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 26),
+            maximumCharge: 1,
+            refundCredits: { _ in }
+        )
+        await callerAlreadyCompleted.markCallerTerminal(.success)
+        let localRetirement = await callerAlreadyCompleted.retireUnsent()
+        guard case .retiredLocally = localRetirement else {
+            XCTFail("a not-started send remains locally retireable")
+            return
+        }
+        let callerAlreadyCompletedSnapshot = await callerAlreadyCompleted.snapshot()
+        XCTAssertEqual(callerAlreadyCompletedSnapshot.caller, .success, "local retirement only changes a pending caller")
+    }
+
+    func testCallerCompletionCallbackRunsOnceForEachTerminalState() async throws {
+        let terminalStates: [SMBRequestCallerState] = [
+            .success,
+            .localRefusal,
+            .cancelled,
+            .timedOut,
+            .transportError
+        ]
+
+        for (index, terminalState) in terminalStates.enumerated() {
+            let callbackCounter = SMBRetirementCallbackCounter()
+            let record = SMBUnsentRequestRecord(
+                identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: UInt64(30 + index)),
+                maximumCharge: 1,
+                refundCredits: { _ in },
+                completeCaller: { await callbackCounter.increment() }
+            )
+
+            let firstTransition = await record.markCallerTerminal(terminalState)
+            XCTAssertTrue(firstTransition)
+            let repeatedTransition = await record.markCallerTerminal(.transportError)
+            XCTAssertFalse(repeatedTransition)
+            guard case .retiredLocally(let receipt) = await record.retireUnsent() else {
+                XCTFail("not-started send should retire locally after caller completion")
+                continue
+            }
+            guard case .alreadyRetired(let duplicateReceipt) = await record.retireUnsent() else {
+                XCTFail("duplicate retire should reuse the same receipt")
+                continue
+            }
+            XCTAssertEqual(receipt, duplicateReceipt)
+
+            try await awaitWithTimeout("caller completion and retirement acknowledgements") {
+                await record.waitForAcknowledgementCountForTesting(atMost: 0)
+            }
+            let callbackCount = await callbackCounter.count
+            XCTAssertEqual(callbackCount, 1, "caller terminal state \(terminalState) must claim completion once")
+            await receipt.wait()
+        }
+
+        let callbackCounter = SMBRetirementCallbackCounter()
+        let pendingCaller = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 40),
+            maximumCharge: 1,
+            refundCredits: { _ in },
+            completeCaller: { await callbackCounter.increment() }
+        )
+        guard case .retiredLocally(let receipt) = await pendingCaller.retireUnsent() else {
+            XCTFail("pending caller should complete through local retirement")
+            return
+        }
+        try await awaitWithTimeout("local refusal completion acknowledgement") {
+            await pendingCaller.waitForAcknowledgementCountForTesting(atMost: 0)
+        }
+        let callbackCount = await callbackCounter.count
+        XCTAssertEqual(callbackCount, 1, "local refusal claims and invokes caller completion once")
+        await receipt.wait()
+    }
+
+    func testSessionTerminalCannotBeReopenedByPrepareOrCommit() async {
+        let record = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 24),
+            maximumCharge: 2,
+            reservedCharge: 2,
+            refundCredits: { _ in }
+        )
+        await record.markSessionTerminal()
+        let preparedAfterTerminal = await record.prepareCredit(actualCharge: 1)
+        let committedAfterTerminal = await record.commitSend(messageId: 44)
+        XCTAssertFalse(preparedAfterTerminal)
+        XCTAssertFalse(committedAfterTerminal)
+        let snapshot = await record.snapshot()
+        XCTAssertEqual(snapshot.wire, .sessionTerminal)
+        XCTAssertEqual(snapshot.send, .notStarted)
+        XCTAssertEqual(snapshot.credit, .discardedOnTerminal)
+    }
+
+    func testLateReservationAfterSessionTerminalCannotCommit() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "terminal-late-reservation-test")
+        let resultReady = SMBRetirementEvent()
+        let resultRelease = SMBRetirementEvent()
+        await window.setReservationAcquiredHookForTesting { _ in
+            await resultReady.signal()
+            await resultRelease.wait()
+        }
+        let record = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 25),
+            maximumCharge: 2,
+            refundCredits: { _ in XCTFail("terminal reservations are discarded, not reattached or refunded") }
+        )
+        let reservationStarted = await record.startCreditReservation(window: window, maximumCharge: 2)
+        XCTAssertTrue(reservationStarted)
+        try await awaitWithTimeout("reservation waiter registered") {
+            await window.waitForPendingWaiterCount(atLeast: 1)
+        }
+        _ = await window.grant(2)
+        try await awaitWithTimeout("reservation acquired before terminal transition") { await resultReady.wait() }
+
+        await record.markSessionTerminal()
+        await resultRelease.signal()
+        try await awaitWithTimeout("terminal reservation settlement acknowledgement") {
+            await record.waitForAcknowledgementCountForTesting(atMost: 0)
+        }
+        let committedAfterGrant = await record.commitSend(messageId: 45)
+        XCTAssertFalse(committedAfterGrant)
+        let snapshot = await record.snapshot()
+        XCTAssertEqual(snapshot.wire, .sessionTerminal)
+        XCTAssertEqual(snapshot.credit, .discardedOnTerminal)
+        XCTAssertEqual(snapshot.send, .notStarted)
+    }
+
+    func testSessionTerminalCancelsRealCreditWindowWaiter() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "terminal-cancels-waiter-test")
+        let record = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 27),
+            maximumCharge: 1,
+            refundCredits: { _ in XCTFail("cancelled waiter cannot produce a grant to refund") }
+        )
+        let started = await record.startCreditReservation(window: window, charge: 1)
+        XCTAssertTrue(started)
+        try await awaitWithTimeout("real credit waiter is parked") {
+            await window.waitForPendingWaiterCount(atLeast: 1)
+        }
+
+        await record.markSessionTerminal()
+        try await awaitWithTimeout("cancelled credit waiter settlement acknowledgement") {
+            await record.waitForAcknowledgementCountForTesting(atMost: 0)
+        }
+        let waiterCount = await window.pendingWaiterCount
+        XCTAssertEqual(waiterCount, 0)
+        let state = await record.snapshot()
+        XCTAssertEqual(state.credit, .discardedOnTerminal)
+        XCTAssertEqual(state.outstandingAcknowledgements, 0)
+    }
+
+    func testFailedCreditReservationLeavesCreditWaiting() async throws {
+        let window = SMB2CreditWindow(initialCredits: 0, diagnosticSessionId: "failed-reservation-test")
+        let record = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 28),
+            maximumCharge: 2,
+            refundCredits: { _ in XCTFail("a reservation that failed before acquisition has nothing to refund") }
+        )
+        let started = await record.startCreditReservation(window: window, maximumCharge: 2)
+        XCTAssertTrue(started)
+        try await awaitWithTimeout("failed reservation waiter registered") {
+            await window.waitForPendingWaiterCount(atLeast: 1)
+        }
+
+        await window.failAllWaiters(SMBTransportError.connectionClosed)
+        try await awaitWithTimeout("failed reservation settled") {
+            await record.waitForAcknowledgementCountForTesting(atMost: 0)
+        }
+
+        let snapshot = await record.snapshot()
+        XCTAssertEqual(snapshot.credit, .waiting, "failure before acquisition cannot claim a refund")
+    }
+
+    func testSurplusAndResidualRefundAcknowledgementsIndependentlyGateReceipt() async throws {
+        for blockedCharge: UInt16 in [3, 1] {
+            let window = SMB2CreditWindow(initialCredits: 4, diagnosticSessionId: "independent-refund-ack-test")
+            let reservedBalance = try await window.reserve(charge: 4)
+            XCTAssertEqual(reservedBalance, 0)
+            let blockedAckEntered = SMBRetirementEvent()
+            let blockedAckRelease = SMBRetirementEvent()
+            let probe = SMBRetirementCreditProbe()
+            let record = SMBUnsentRequestRecord(
+                identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: UInt64(blockedCharge)),
+                maximumCharge: 4,
+                reservedCharge: 4,
+                refundCredits: { charge in
+                    await probe.started(charge)
+                    if charge == blockedCharge {
+                        await blockedAckEntered.signal()
+                        await blockedAckRelease.wait()
+                    }
+                    _ = await window.refund(charge: charge)
+                    await probe.acknowledged(charge)
+                }
+            )
+            let prepared = await record.prepareCredit(actualCharge: 1)
+            XCTAssertTrue(prepared)
+
+            if blockedCharge == 1 {
+                try await awaitWithTimeout("surplus acknowledgement before retire") {
+                    await probe.waitForAcknowledgement(charge: 3, count: 1)
+                }
+                try await awaitWithTimeout("surplus refund acknowledgement") {
+                    await record.waitForAcknowledgementCountForTesting(atMost: 0)
+                }
+            } else {
+                try await awaitWithTimeout("surplus acknowledgement gate entered") { await blockedAckEntered.wait() }
+            }
+
+            let decision = await record.retireUnsent()
+            guard case .retiredLocally(let receipt) = decision else {
+                XCTFail("request must retire locally")
+                return
+            }
+            if blockedCharge == 3 {
+                try await awaitWithTimeout("residual acknowledgement while surplus remains blocked") {
+                    await probe.waitForAcknowledgement(charge: 1, count: 1)
+                }
+            } else {
+                try await awaitWithTimeout("residual acknowledgement gate entered") { await blockedAckEntered.wait() }
+            }
+            let blockedOwner: SMBRequestRefundOwner = blockedCharge == 3 ? .surplus : .residual
+            try await awaitWithTimeout("only the selected refund acknowledgement remains") {
+                await record.waitForOnlyPendingRefundAcknowledgementForTesting(blockedOwner)
+            }
+            let acknowledgements = await record.acknowledgementSnapshotForTesting()
+            XCTAssertEqual(acknowledgements.outstandingCount, 1)
+            XCTAssertEqual(acknowledgements.reservationSettlement, nil)
+            XCTAssertEqual(acknowledgements.refunds[.surplus], blockedCharge == 3 ? .pending : .acknowledged)
+            XCTAssertEqual(acknowledgements.refunds[.residual], blockedCharge == 1 ? .pending : .acknowledged)
+            XCTAssertEqual(acknowledgements.effects[.removeQueuedItem], .acknowledged)
+            XCTAssertEqual(acknowledgements.effects[.releaseTimer], .acknowledged)
+            XCTAssertEqual(acknowledgements.effects[.completeCaller], .acknowledged)
+            XCTAssertFalse(receipt.isComplete, "the one held refund acknowledgement must keep the receipt open")
+
+            await blockedAckRelease.signal()
+            try await awaitWithTimeout("single held refund acknowledgement released") { await receipt.wait() }
+            let finalAcknowledgements = await record.acknowledgementSnapshotForTesting()
+            XCTAssertEqual(finalAcknowledgements.outstandingCount, 0)
+            XCTAssertTrue(finalAcknowledgements.refunds.values.allSatisfy { $0 == .acknowledged })
+            XCTAssertTrue(finalAcknowledgements.effects.values.allSatisfy { $0 == .acknowledged })
+            let finalBalance = await window.balance
+            let surplusCalls = await probe.calls(for: 3)
+            let residualCalls = await probe.calls(for: 1)
+            XCTAssertEqual(finalBalance, 4)
+            XCTAssertEqual(surplusCalls, 1)
+            XCTAssertEqual(residualCalls, 1)
+        }
+    }
+
+    func testRetirementRecordHasNoPipelineState() async {
+        let record = SMBUnsentRequestRecord(
+            identity: SMBRequestIdentity(sessionInstance: UUID(), generation: 1, requestSequence: 5),
+            maximumCharge: 4,
+            reservedCharge: 4,
+            refundCredits: { _ in }
+        )
+        let labels = Set(Mirror(reflecting: record).children.compactMap(\.label))
+        XCTAssertFalse(labels.contains("transferEpoch"))
+        XCTAssertFalse(labels.contains("bulkSlot"))
+        XCTAssertFalse(labels.contains("byteLease"))
+        XCTAssertFalse(labels.contains("delivery"))
+    }
+
+    func testRequestIdentityIsStableAndSessionIndexIsReclaimedOnTerminal() async throws {
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: CommandAwareCloseTimeoutTransport(),
+            initialCredits: 1
+        )
+        let first = Task { try await session.parkPendingForTesting(messageId: 100, command: SMB2Commands.echo) }
+        let second = Task { try await session.parkPendingForTesting(messageId: 101, command: SMB2Commands.read) }
+        try await awaitWithTimeout("identity records registered") {
+            await session.waitForPendingCountForTesting(atLeast: 2)
+        }
+        let firstValue = await session.requestIdentityForTesting(messageId: 100)
+        let secondValue = await session.requestIdentityForTesting(messageId: 101)
+        let firstIdentity = try XCTUnwrap(firstValue)
+        let secondIdentity = try XCTUnwrap(secondValue)
+        XCTAssertEqual(firstIdentity.sessionInstance, secondIdentity.sessionInstance)
+        XCTAssertEqual(firstIdentity.generation, secondIdentity.generation)
+        XCTAssertNotEqual(firstIdentity.requestSequence, secondIdentity.requestSequence)
+        let activeBeforeClose = await session.activeRequestIdentityCountForTesting()
+        XCTAssertEqual(activeBeforeClose, 2)
+
+        await session.closeTransportAndWait(cause: "test_identity_index_reclamation")
+        _ = try? await first.value
+        _ = try? await second.value
+        let activeAfterClose = await session.activeRequestIdentityCountForTesting()
+        let wireRecordsAfterClose = await session.wirePendingRecordCountForTesting()
+        XCTAssertEqual(activeAfterClose, 0)
+        XCTAssertEqual(wireRecordsAfterClose, 0)
+    }
+
+    func testOpenSessionReclaimsIdentitiesForFinalCancelledFinalAndCorrelationFailure() async throws {
+        let transport = CommandAwareCloseTimeoutTransport()
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 2
+        )
+        defer { Task { await session.closeTransport(cause: "test_identity_removal_paths") } }
+
+        let normalRegistered = SMBRetirementEvent()
+        let normalFinal = Task {
+            try await session.parkPendingForTesting(
+                messageId: 110,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { Task { await normalRegistered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("normal-final pending record registered") { await normalRegistered.wait() }
+        await assertPendingIdentityCounts(session, pending: 1, identities: 1)
+        try await session.dispatchReceivedPacketForTesting(
+            SMB2Header(command: SMB2Commands.echo, messageId: 110).encode()
+        )
+        _ = try await normalFinal.value
+        await assertPendingIdentityCounts(session, pending: 0, identities: 0)
+
+        let cancelledRegistered = SMBRetirementEvent()
+        let cancelledFinal = Task {
+            try await session.parkPendingForTesting(
+                messageId: 111,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { Task { await cancelledRegistered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("cancelled pending record registered") { await cancelledRegistered.wait() }
+        await session.failPendingResponseForTesting(messageId: 111, error: CancellationError())
+        do {
+            _ = try await cancelledFinal.value
+            XCTFail("caller cancellation should be delivered before the wire final")
+        } catch is CancellationError {
+            // The tombstone remains to correlate the late final.
+        }
+        await assertPendingIdentityCounts(session, pending: 1, identities: 1)
+        let tombstoneCount = await session.ordinaryCancellationTombstoneCountForTesting()
+        XCTAssertEqual(tombstoneCount, 1, "cancel tombstone remains wire-owned with its identity")
+        try await session.dispatchReceivedPacketForTesting(
+            SMB2Header(command: SMB2Commands.echo, messageId: 111).encode()
+        )
+        await assertPendingIdentityCounts(session, pending: 0, identities: 0)
+
+        let correlationRegistered = SMBRetirementEvent()
+        let correlationFailure = Task {
+            try await session.parkPendingForTesting(
+                messageId: 112,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { Task { await correlationRegistered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("correlation-failure pending record registered") { await correlationRegistered.wait() }
+        try await session.dispatchReceivedPacketForTesting(
+            SMB2Header.asyncHeader(
+                status: SMB2Status.pending,
+                command: SMB2Commands.echo,
+                credits: 0,
+                messageId: 112,
+                asyncId: 0x1111
+            ).encode()
+        )
+        await assertPendingIdentityCounts(session, pending: 1, identities: 1)
+        try await session.dispatchReceivedPacketForTesting(
+            SMB2Header.asyncHeader(
+                command: SMB2Commands.echo,
+                credits: 0,
+                messageId: 112,
+                asyncId: 0x2222
+            ).encode()
+        )
+        do {
+            _ = try await correlationFailure.value
+            XCTFail("mismatched AsyncId must fail correlation")
+        } catch SMBCodecError.invalidValue {
+            // Correlation failure removes the ordinary pending record without closing the session.
+        }
+        await assertPendingIdentityCounts(session, pending: 0, identities: 0)
+        let transportClosed = await session.isTransportClosedForTesting()
+        XCTAssertFalse(transportClosed, "the session remains open after request-scoped correlation failure")
+        await session.closeTransportAndWait(cause: "test_identity_removal_paths_complete")
+    }
+
+    func testProductionAndFakeMonotonicTimeSourcesUseTheirPairedClock() async throws {
+        let production = SMBSessionMonotonicTime.production()
+        let productionStart = production.now()
+        try await production.sleep(.milliseconds(1))
+        XCTAssertGreaterThanOrEqual(productionStart.duration(to: production.now()), .milliseconds(1))
+
+        let fake = SMBVirtualMonotonicTime()
+        let virtual = fake.source
+        let virtualStart = virtual.now()
+        try await virtual.sleep(.seconds(7))
+        XCTAssertEqual(virtualStart.duration(to: virtual.now()), .seconds(7))
+    }
+
+    private func assertPendingIdentityCounts(
+        _ session: SMBSession,
+        pending expectedPending: Int,
+        identities expectedIdentities: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let pending = await session.wirePendingRecordCountForTesting()
+        let identities = await session.activeRequestIdentityCountForTesting()
+        XCTAssertEqual(pending, expectedPending, "wire pending record count", file: file, line: line)
+        XCTAssertEqual(identities, expectedIdentities, "active request identity count", file: file, line: line)
+    }
+}
+
+private final class SMBVirtualMonotonicTime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant = ContinuousClock().now
+
+    var source: SMBSessionMonotonicTime {
+        SMBSessionMonotonicTime(
+            now: { self.lock.withLock { self.instant } },
+            sleep: { duration in
+                self.lock.withLock { self.instant += duration }
+            }
+        )
+    }
+}
+
+private actor SMBRetirementEvent {
+    private var signaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        guard !signaled else { return }
+        signaled = true
+        let parked = waiters
+        waiters.removeAll()
+        parked.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        if signaled { return }
+        await withCheckedContinuation { continuation in
+            if signaled {
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+            }
+        }
+    }
+}
+
+private actor SMBRetirementCallbackCounter {
+    private(set) var count = 0
+    private var waiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func increment() {
+        count += 1
+        let ready = waiters.filter { count >= $0.target }
+        waiters.removeAll { count >= $0.target }
+        ready.forEach { $0.continuation.resume() }
+    }
+
+    func waitForCount(atLeast target: Int) async {
+        if count >= target { return }
+        await withCheckedContinuation { continuation in
+            if count >= target {
+                continuation.resume()
+            } else {
+                waiters.append((target, continuation))
+            }
+        }
+    }
+}
+
+private final class SMBRequestRecordLifetimeProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var isSignaled: Bool { lock.withLock { signaled } }
+
+    func signal() {
+        let parked = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !signaled else { return [] }
+            signaled = true
+            defer { waiters.removeAll() }
+            return waiters
+        }
+        parked.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let alreadySignaled = lock.withLock { () -> Bool in
+                if signaled { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if alreadySignaled { continuation.resume() }
+        }
+    }
+}
+
+private final class SMBWeakRequestRecordBox: @unchecked Sendable {
+    weak var value: SMBUnsentRequestRecord?
+
+    init(_ value: SMBUnsentRequestRecord) {
+        self.value = value
+    }
+}
+
+private actor SMBRetirementCreditProbe {
+    private var callsByCharge: [UInt16: Int] = [:]
+    private var acknowledgementsByCharge: [UInt16: Int] = [:]
+    private var acknowledgementWaiters: [(charge: UInt16, count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func started(_ charge: UInt16) {
+        callsByCharge[charge, default: 0] += 1
+        resumeReadyWaiters()
+    }
+
+    func acknowledged(_ charge: UInt16) {
+        acknowledgementsByCharge[charge, default: 0] += 1
+        resumeReadyWaiters()
+    }
+
+    func calls(for charge: UInt16) -> Int {
+        callsByCharge[charge, default: 0]
+    }
+
+    func waitForAcknowledgement(charge: UInt16, count: Int) async {
+        if acknowledgementsByCharge[charge, default: 0] >= count { return }
+        await withCheckedContinuation { continuation in
+            if acknowledgementsByCharge[charge, default: 0] >= count {
+                continuation.resume()
+            } else {
+                acknowledgementWaiters.append((charge, count, continuation))
+            }
+        }
+    }
+
+    private func resumeReadyWaiters() {
+        let readyAcknowledgements = acknowledgementWaiters.filter {
+            acknowledgementsByCharge[$0.charge, default: 0] >= $0.count
+        }
+        acknowledgementWaiters.removeAll {
+            acknowledgementsByCharge[$0.charge, default: 0] >= $0.count
+        }
+        readyAcknowledgements.forEach { $0.continuation.resume() }
+    }
+}
+
 private final class SMBWireLogCapture: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [String] = []

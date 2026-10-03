@@ -9037,8 +9037,12 @@ final class SMBeeTests: XCTestCase {
         let first = Task { try await session.echo() }
         try await waitForOutboundFrameCount(1, transport: transport)
         let firstHeader = try SMB2Header.decode(try unframed(transport.outbound)[0])
+        XCTAssertEqual(firstHeader.messageId, 0)
         first.cancel()
         try await waitForOutboundFrameCount(2, transport: transport)
+        let cancelHeader = try SMB2Header.decode(try unframed(transport.outbound)[1])
+        XCTAssertEqual(cancelHeader.command, SMB2Commands.cancel)
+        XCTAssertEqual(cancelHeader.messageId, firstHeader.messageId, "CANCEL reuses the target MID")
         transport.enqueueInbound(try framed([smb2EchoResponse(messageId: firstHeader.messageId)]))
 
         do {
@@ -9050,6 +9054,7 @@ final class SMBeeTests: XCTestCase {
         let second = Task { try await session.echo() }
         try await waitForOutboundFrameCount(3, transport: transport)
         let secondHeader = try SMB2Header.decode(try unframed(transport.outbound)[2])
+        XCTAssertEqual(secondHeader.messageId, firstHeader.messageId + 1)
         transport.enqueueInbound(try framed([smb2EchoResponse(messageId: secondHeader.messageId)]))
         try await awaitWithTimeout("ECHO after cancelled ECHO") { try await second.value }
     }

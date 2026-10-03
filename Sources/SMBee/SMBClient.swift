@@ -4526,6 +4526,567 @@ private struct SMBReceivedFrame {
     let generation: UInt64
 }
 
+/// Stable session-local identity for a request before it has a wire MessageId.
+/// The legacy transaction path attaches this identity to its existing pending record;
+/// it does not use the identity to allocate or send packets yet.
+struct SMBRequestIdentity: Hashable, Sendable {
+    let sessionInstance: UUID
+    let generation: UInt64
+    // A per-session counter, not a UUID: identities are minted on every request, and on Linux
+    // UUID() reads the system random source each time (issue 010 showed per-request costs show up
+    // in the Linux performance gate). sessionInstance already makes the triple unique across sessions.
+    let requestSequence: UInt64
+
+    init(sessionInstance: UUID, generation: UInt64, requestSequence: UInt64) {
+        self.sessionInstance = sessionInstance
+        self.generation = generation
+        self.requestSequence = requestSequence
+    }
+}
+
+/// Clock and sleeper used together by request retirement and future wire deadlines.
+/// Task.sleep uses the same monotonic clock as ContinuousClock and retains the current
+/// production timer behavior. Tests inject both closures from one virtual time source.
+struct SMBSessionMonotonicTime: Sendable {
+    let now: @Sendable () -> ContinuousClock.Instant
+    let sleep: @Sendable (Duration) async throws -> Void
+
+    static func production() -> SMBSessionMonotonicTime {
+        let clock = ContinuousClock()
+        return SMBSessionMonotonicTime(
+            now: { clock.now },
+            sleep: { try await Task.sleep(for: $0) }
+        )
+    }
+}
+
+enum SMBRequestCallerState: Equatable, Sendable {
+    case pending
+    case success
+    case localRefusal
+    case cancelled
+    case timedOut
+    case transportError
+}
+
+enum SMBRequestSendState: Equatable, Sendable {
+    case notStarted
+    case neverSubmitted
+    case committed(messageId: UInt64, charge: UInt16)
+    case fullySent
+    case failed
+}
+
+enum SMBRequestWireState: Equatable, Sendable {
+    case notApplicable
+    case waiting
+    case statusPending(asyncId: UInt64)
+    case finalAccepted
+    case sessionTerminal
+}
+
+enum SMBRequestCreditState: Equatable, Sendable {
+    case waiting
+    case reserved(maximumCharge: UInt16)
+    case prepared(maximumCharge: UInt16, actualCharge: UInt16)
+    case committed(actualCharge: UInt16)
+    case refunded
+    case discardedOnTerminal
+}
+
+struct SMBRequestRecordSnapshot: Sendable {
+    let identity: SMBRequestIdentity
+    let caller: SMBRequestCallerState
+    let send: SMBRequestSendState
+    let wire: SMBRequestWireState
+    let credit: SMBRequestCreditState
+    let outstandingAcknowledgements: Int
+}
+
+private final class SMBRetirementReceiptCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    var isComplete: Bool { lock.withLock { completed } }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let alreadyCompleted = lock.withLock { () -> Bool in
+                if completed { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if alreadyCompleted {
+                continuation.resume()
+            }
+        }
+    }
+
+    func complete() {
+        let parked = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !completed else { return [] }
+            completed = true
+            defer { waiters.removeAll() }
+            return waiters
+        }
+        parked.forEach { $0.resume() }
+    }
+}
+
+/// Immutable handle-side receipt. Copies and duplicate retire calls share one completion.
+struct SMBRetirementReceipt: Sendable, Equatable {
+    let identity: SMBRequestIdentity
+    private let receiptUUID: UUID
+    private let completion: SMBRetirementReceiptCompletion
+
+    fileprivate init(identity: SMBRequestIdentity, completion: SMBRetirementReceiptCompletion) {
+        self.identity = identity
+        self.receiptUUID = UUID()
+        self.completion = completion
+    }
+
+    var id: UUID { receiptUUID }
+    var isComplete: Bool { completion.isComplete }
+
+    func wait() async {
+        await completion.wait()
+    }
+
+    fileprivate func markComplete() {
+        completion.complete()
+    }
+
+    static func == (lhs: SMBRetirementReceipt, rhs: SMBRetirementReceipt) -> Bool {
+        lhs.receiptUUID == rhs.receiptUUID
+    }
+}
+
+enum SMBUnsentRetirementDecision: Sendable {
+    case retiredLocally(SMBRetirementReceipt)
+    case alreadyRetired(SMBRetirementReceipt)
+    case committedNeedsWireDrain(SMBRequestIdentity)
+}
+
+enum SMBRequestRefundOwner: Hashable, Sendable {
+    case surplus
+    case residual
+    case lateReservation
+}
+
+enum SMBRequestRetirementEffectOwner: Hashable, Sendable {
+    case removeQueuedItem
+    case releaseTimer
+    case completeCaller
+}
+
+enum SMBRequestAcknowledgementState: Equatable, Sendable {
+    case pending
+    case acknowledged
+}
+
+struct SMBRequestAcknowledgementSnapshot: Sendable {
+    let reservationSettlement: SMBRequestAcknowledgementState?
+    let refunds: [SMBRequestRefundOwner: SMBRequestAcknowledgementState]
+    let effects: [SMBRequestRetirementEffectOwner: SMBRequestAcknowledgementState]
+
+    var outstandingCount: Int {
+        [reservationSettlement].compactMap { $0 }.filter { $0 == .pending }.count
+            + refunds.values.filter { $0 == .pending }.count
+            + effects.values.filter { $0 == .pending }.count
+    }
+}
+
+/// One-shot credit refund right. The token is consumed synchronously before the async
+/// credit-window acknowledgement begins, so overlapping retirement effects cannot refund
+/// the same credit twice.
+final class SMBOneShotCreditRefundToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private let charge: UInt16
+    private var consumed = false
+
+    init(charge: UInt16) {
+        self.charge = charge
+    }
+
+    func consume() -> UInt16? {
+        lock.withLock {
+            guard !consumed, charge > 0 else { return nil }
+            consumed = true
+            return charge
+        }
+    }
+}
+
+/// Commit-1 request record. It is prepared for future callers; existing post-auth callers
+/// remain on the MessageId-first transaction path in this milestone.
+actor SMBUnsentRequestRecord {
+    let identity: SMBRequestIdentity
+    private let maximumCharge: UInt16
+    private let refundCredits: @Sendable (UInt16) async -> Void
+    private let removeQueuedItem: @Sendable () async -> Void
+    private let releaseTimer: @Sendable () async -> Void
+    private let completeCaller: @Sendable () async -> Void
+    private let onDeinit: @Sendable () -> Void
+
+    private var caller: SMBRequestCallerState = .pending
+    private var send: SMBRequestSendState = .notStarted
+    private var wire: SMBRequestWireState = .notApplicable
+    private var credit: SMBRequestCreditState
+    private var sessionTerminal = false
+    private var reservationTask: Task<UInt16, Error>?
+    private var reservationSettlementState: SMBRequestAcknowledgementState?
+    private var acknowledgementCountWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var onlyPendingRefundWaiters: [(owner: SMBRequestRefundOwner, continuation: CheckedContinuation<Void, Never>)] = []
+    private var refundStates: [SMBRequestRefundOwner: SMBRequestAcknowledgementState] = [:]
+    private var effectStates: [SMBRequestRetirementEffectOwner: SMBRequestAcknowledgementState] = [:]
+    private var retired = false
+    private var retirementReceipt: SMBRetirementReceipt?
+
+    private var outstandingAcknowledgements: Int {
+        acknowledgementSnapshot().outstandingCount
+    }
+
+    init(
+        identity: SMBRequestIdentity,
+        maximumCharge: UInt16,
+        reservedCharge: UInt16? = nil,
+        refundCredits: @escaping @Sendable (UInt16) async -> Void,
+        removeQueuedItem: @escaping @Sendable () async -> Void = {},
+        releaseTimer: @escaping @Sendable () async -> Void = {},
+        completeCaller: @escaping @Sendable () async -> Void = {},
+        onDeinit: @escaping @Sendable () -> Void = {}
+    ) {
+        precondition(maximumCharge > 0)
+        self.identity = identity
+        self.maximumCharge = maximumCharge
+        self.refundCredits = refundCredits
+        self.removeQueuedItem = removeQueuedItem
+        self.releaseTimer = releaseTimer
+        self.completeCaller = completeCaller
+        self.onDeinit = onDeinit
+        if let reservedCharge {
+            precondition(reservedCharge > 0 && reservedCharge <= maximumCharge)
+            self.credit = .reserved(maximumCharge: reservedCharge)
+        } else {
+            self.credit = .waiting
+        }
+    }
+
+    deinit {
+        onDeinit()
+    }
+
+    /// Reserves an exact charge using the credit window before handing its known charge
+    /// to the settlement observer. No caller-supplied work can throw after acquisition.
+    func startCreditReservation(window: SMB2CreditWindow, charge: UInt16) -> Bool {
+        guard canStartCreditReservation(charge: charge) else { return false }
+        reservationSettlementState = .pending
+        let task = Task<UInt16, Error> {
+            _ = try await window.reserve(charge: charge)
+            return charge
+        }
+        ownCreditReservation(task)
+        return true
+    }
+
+    /// Reserves up to the requested maximum directly from the credit window. Its acquired
+    /// value is the Task result, with no intervening throwing processing before settlement.
+    func startCreditReservation(window: SMB2CreditWindow, maximumCharge requestedMaximumCharge: UInt16) -> Bool {
+        guard canStartCreditReservation(charge: requestedMaximumCharge) else { return false }
+        reservationSettlementState = .pending
+        let task = Task<UInt16, Error> {
+            try await window.reserveUpTo(maximumCharge: requestedMaximumCharge)
+        }
+        ownCreditReservation(task)
+        return true
+    }
+
+    private func canStartCreditReservation(charge: UInt16) -> Bool {
+        guard !retired, !sessionTerminal, reservationTask == nil,
+              reservationSettlementState == nil, case .waiting = credit,
+              charge > 0, charge <= maximumCharge else {
+            return false
+        }
+        return true
+    }
+
+    private func ownCreditReservation(_ task: Task<UInt16, Error>) {
+        reservationTask = task
+        Task { [self] in
+            let result = await task.result
+            creditReservationDidSettle(result)
+        }
+    }
+
+    /// Claims the actual packet charge and starts a one-shot refund for a shrink surplus.
+    func prepareCredit(actualCharge: UInt16) -> Bool {
+        guard !retired, !sessionTerminal, actualCharge > 0, actualCharge <= maximumCharge,
+              case .reserved(let reservedCharge) = credit,
+              actualCharge <= reservedCharge else {
+            return false
+        }
+        credit = .prepared(maximumCharge: reservedCharge, actualCharge: actualCharge)
+        let surplus = reservedCharge - actualCharge
+        if surplus > 0 {
+            let token = SMBOneShotCreditRefundToken(charge: surplus)
+            beginRefund(owner: .surplus, token: token)
+        }
+        return true
+    }
+
+    /// Synchronous commit boundary for later activation work. After commit, credit is
+    /// consumed by the wire and local retirement cannot refund it.
+    func commitSend(messageId: UInt64) -> Bool {
+        guard !retired, !sessionTerminal, case .notStarted = send else { return false }
+        let actualCharge: UInt16
+        switch credit {
+        case .reserved(let reservedCharge):
+            actualCharge = reservedCharge
+        case .prepared(_, let preparedCharge):
+            actualCharge = preparedCharge
+        case .waiting, .committed, .refunded, .discardedOnTerminal:
+            return false
+        }
+        credit = .committed(actualCharge: actualCharge)
+        send = .committed(messageId: messageId, charge: actualCharge)
+        wire = .waiting
+        return true
+    }
+
+    @discardableResult
+    func markCallerTerminal(_ state: SMBRequestCallerState) -> Bool {
+        guard case .pending = caller, state != .pending else { return false }
+        caller = state
+        beginEffect(owner: .completeCaller, completeCaller)
+        return true
+    }
+
+    func markSendFullySent() {
+        guard case .committed = send else { return }
+        send = .fullySent
+    }
+
+    func markSendFailed() {
+        guard case .committed = send else { return }
+        send = .failed
+    }
+
+    func markWireStatusPending(asyncId: UInt64) {
+        guard case .waiting = wire else { return }
+        wire = .statusPending(asyncId: asyncId)
+    }
+
+    func markWireFinalAccepted() {
+        switch wire {
+        case .waiting, .statusPending:
+            wire = .finalAccepted
+        case .notApplicable, .finalAccepted, .sessionTerminal:
+            break
+        }
+    }
+
+    func markSessionTerminal() {
+        guard !sessionTerminal else { return }
+        sessionTerminal = true
+        wire = .sessionTerminal
+        reservationTask?.cancel()
+        if reservationSettlementState == .pending, case .waiting = credit {
+            // Keep the reservation pending until its already-owned settlement observer
+            // learns whether a grant won before cancellation.
+        } else if case .waiting = credit {
+            credit = .discardedOnTerminal
+        } else if case .reserved = credit {
+            credit = .discardedOnTerminal
+        } else if case .prepared = credit {
+            credit = .discardedOnTerminal
+        } else if case .committed = credit {
+            credit = .discardedOnTerminal
+        }
+    }
+
+    func retireUnsent() -> SMBUnsentRetirementDecision {
+        if let retirementReceipt {
+            return .alreadyRetired(retirementReceipt)
+        }
+        guard case .notStarted = send else {
+            return .committedNeedsWireDrain(identity)
+        }
+
+        retired = true
+        markCallerTerminal(.localRefusal)
+        send = .neverSubmitted
+        let completion = SMBRetirementReceiptCompletion()
+        let receipt = SMBRetirementReceipt(identity: identity, completion: completion)
+        retirementReceipt = receipt
+
+        beginEffect(owner: .removeQueuedItem, removeQueuedItem)
+        beginEffect(owner: .releaseTimer, releaseTimer)
+
+        if reservationSettlementState == .pending {
+            reservationTask?.cancel()
+        } else if sessionTerminal {
+            credit = .discardedOnTerminal
+        } else {
+            beginResidualRefundForRetirement()
+        }
+        completeReceiptIfReady()
+        return .retiredLocally(receipt)
+    }
+
+    func snapshot() -> SMBRequestRecordSnapshot {
+        SMBRequestRecordSnapshot(
+            identity: identity,
+            caller: caller,
+            send: send,
+            wire: wire,
+            credit: credit,
+            outstandingAcknowledgements: outstandingAcknowledgements
+        )
+    }
+
+    func acknowledgementSnapshotForTesting() -> SMBRequestAcknowledgementSnapshot {
+        acknowledgementSnapshot()
+    }
+
+    func waitForOnlyPendingRefundAcknowledgementForTesting(_ owner: SMBRequestRefundOwner) async {
+        if onlyPendingRefundAcknowledgementIs(owner) { return }
+        await withCheckedContinuation { continuation in
+            if onlyPendingRefundAcknowledgementIs(owner) {
+                continuation.resume()
+            } else {
+                onlyPendingRefundWaiters.append((owner, continuation))
+            }
+        }
+    }
+
+    func waitForAcknowledgementCountForTesting(atMost target: Int) async {
+        if outstandingAcknowledgements <= target { return }
+        await withCheckedContinuation { continuation in
+            if outstandingAcknowledgements <= target {
+                continuation.resume()
+            } else {
+                acknowledgementCountWaiters.append((target, continuation))
+            }
+        }
+    }
+
+    private func beginResidualRefundForRetirement() {
+        let residual: UInt16
+        switch credit {
+        case .reserved(let reservedCharge):
+            residual = reservedCharge
+        case .prepared(_, let actualCharge):
+            residual = actualCharge
+        case .waiting, .committed, .refunded, .discardedOnTerminal:
+            return
+        }
+        guard residual > 0 else { return }
+        let token = SMBOneShotCreditRefundToken(charge: residual)
+        beginRefund(owner: .residual, token: token)
+    }
+
+    private func beginRefund(owner: SMBRequestRefundOwner, token: SMBOneShotCreditRefundToken) {
+        guard refundStates[owner] == nil, let charge = token.consume() else { return }
+        refundStates[owner] = .pending
+        resumeAcknowledgementWaiters()
+        let refundCredits = self.refundCredits
+        Task { [self] in
+            await refundCredits(charge)
+            refundDidAcknowledge(owner)
+        }
+    }
+
+    private func beginEffect(
+        owner: SMBRequestRetirementEffectOwner,
+        _ effect: @escaping @Sendable () async -> Void
+    ) {
+        guard effectStates[owner] == nil else { return }
+        effectStates[owner] = .pending
+        resumeAcknowledgementWaiters()
+        Task { [self] in
+            await effect()
+            retirementEffectDidAcknowledge(owner)
+        }
+    }
+
+    private func creditReservationDidSettle(_ result: Result<UInt16, Error>) {
+        reservationTask = nil
+        if case .success(let reservedCharge) = result {
+            if sessionTerminal {
+                credit = .discardedOnTerminal
+            } else if retired {
+                let token = SMBOneShotCreditRefundToken(charge: reservedCharge)
+                beginRefund(owner: .lateReservation, token: token)
+            } else if reservedCharge > 0, reservedCharge <= maximumCharge {
+                credit = .reserved(maximumCharge: reservedCharge)
+            } else {
+                credit = .refunded
+            }
+        } else if sessionTerminal {
+            credit = .discardedOnTerminal
+        } else if !retired {
+            credit = .waiting
+        }
+        reservationSettlementState = .acknowledged
+        resumeAcknowledgementWaiters()
+        if retired && !sessionTerminal && refundStates.isEmpty {
+            beginResidualRefundForRetirement()
+        }
+        completeReceiptIfReady()
+    }
+
+    private func refundDidAcknowledge(_ owner: SMBRequestRefundOwner) {
+        guard refundStates[owner] == .pending else { return }
+        refundStates[owner] = .acknowledged
+        resumeAcknowledgementWaiters()
+        completeReceiptIfReady()
+    }
+
+    private func retirementEffectDidAcknowledge(_ owner: SMBRequestRetirementEffectOwner) {
+        guard effectStates[owner] == .pending else { return }
+        effectStates[owner] = .acknowledged
+        resumeAcknowledgementWaiters()
+        completeReceiptIfReady()
+    }
+
+    private func acknowledgementSnapshot() -> SMBRequestAcknowledgementSnapshot {
+        SMBRequestAcknowledgementSnapshot(
+            reservationSettlement: reservationSettlementState,
+            refunds: refundStates,
+            effects: effectStates
+        )
+    }
+
+    private func onlyPendingRefundAcknowledgementIs(_ owner: SMBRequestRefundOwner) -> Bool {
+        let snapshot = acknowledgementSnapshot()
+        guard snapshot.outstandingCount == 1,
+              snapshot.reservationSettlement != .pending,
+              snapshot.refunds[owner] == .pending,
+              snapshot.refunds.allSatisfy({ $0.key == owner || $0.value == .acknowledged }),
+              snapshot.effects.values.allSatisfy({ $0 == .acknowledged }) else {
+            return false
+        }
+        return true
+    }
+
+    private func resumeAcknowledgementWaiters() {
+        let readyCounts = acknowledgementCountWaiters.filter { outstandingAcknowledgements <= $0.target }
+        acknowledgementCountWaiters.removeAll { outstandingAcknowledgements <= $0.target }
+        readyCounts.forEach { $0.continuation.resume() }
+
+        let readyRefunds = onlyPendingRefundWaiters.filter { onlyPendingRefundAcknowledgementIs($0.owner) }
+        onlyPendingRefundWaiters.removeAll { onlyPendingRefundAcknowledgementIs($0.owner) }
+        readyRefunds.forEach { $0.continuation.resume() }
+    }
+
+    private func completeReceiptIfReady() {
+        guard retired, outstandingAcknowledgements == 0, let retirementReceipt else { return }
+        if !sessionTerminal { credit = .refunded }
+        retirementReceipt.markComplete()
+    }
+}
+
 /// A variable length request reserves its CreditCharge before it fixes its payload and
 /// MessageId. The send task claims the reservation exactly once; a caller that is cancelled
 /// before the send task reaches it refunds the still-unclaimed credits.
@@ -4597,6 +5158,7 @@ private enum SMBCleanupAttemptState: Equatable {
 }
 
 private struct SMBPendingResponse {
+    let requestIdentity: SMBRequestIdentity
     let generation: UInt64
     let label: String
     let longPoll: Bool
@@ -4701,6 +5263,7 @@ actor SMBSession {
     private let host: String
     private let port: UInt16
     private let diagnosticSessionId: String
+    private let sessionInstanceIdentity = UUID()
     // The source credential is needed only while SESSION_SETUP is being built. Derived session
     // keys are sufficient afterwards; reconnect obtains a fresh value from its provider.
     private var authenticationCredential: SMBCredential?
@@ -4725,6 +5288,8 @@ actor SMBSession {
     private var maxWriteSize: UInt32 = UInt32.max
     private let creditWindow: SMB2CreditWindow
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
+    private var activeRequestIdentities: Set<SMBRequestIdentity> = []
+    private var nextRequestSequence: UInt64 = 0
     private var cleanupLedger: [SMBFileIdLedgerKey: SMBCleanupAttemptState] = [:]
     private var testingCountWaiters: [SMBTestingCountWaiter] = []
     private var nextTestingCountWaiterId: UInt64 = 0
@@ -4758,6 +5323,7 @@ actor SMBSession {
     private let requestTimeout: Duration?
     private let requestTimeoutSleeper: @Sendable (Duration) async throws -> Void
     private let cleanupTimeoutSleeper: @Sendable (Duration) async throws -> Void
+    private let sessionTime: SMBSessionMonotonicTime
     private let debugLogger: SMBSessionDebugLogger
 
     /// - Parameter requestTimeout: Per-request response timeout started only after the
@@ -4774,12 +5340,9 @@ actor SMBSession {
         initialCredits: UInt32 = 1,
         cleanupTimeout: Duration = SMBSession.defaultCleanupTimeout,
         requestTimeout: Duration? = nil,
-        requestTimeoutSleeper: @escaping @Sendable (Duration) async throws -> Void = {
-            try await Task.sleep(for: $0)
-        },
-        cleanupTimeoutSleeper: @escaping @Sendable (Duration) async throws -> Void = {
-            try await Task.sleep(for: $0)
-        },
+        sessionTime: SMBSessionMonotonicTime = .production(),
+        requestTimeoutSleeper: (@Sendable (Duration) async throws -> Void)? = nil,
+        cleanupTimeoutSleeper: (@Sendable (Duration) async throws -> Void)? = nil,
         debugLogger: SMBSessionDebugLogger = .environment
     ) {
         // A locked monotonic base-36 ID is short, non-secret, collision-free within a run, and reproducible.
@@ -4804,8 +5367,9 @@ actor SMBSession {
         )
         self.cleanupTimeout = cleanupTimeout
         self.requestTimeout = requestTimeout
-        self.requestTimeoutSleeper = requestTimeoutSleeper
-        self.cleanupTimeoutSleeper = cleanupTimeoutSleeper
+        self.sessionTime = sessionTime
+        self.requestTimeoutSleeper = requestTimeoutSleeper ?? sessionTime.sleep
+        self.cleanupTimeoutSleeper = cleanupTimeoutSleeper ?? sessionTime.sleep
         self.debugLogger = debugLogger
     }
 
@@ -6460,9 +7024,16 @@ actor SMBSession {
         creditGrantAfterAwaitHookForTesting = hook
     }
 
-    func parkPendingForTesting(messageId: UInt64, command: UInt16, sent: Bool = false) async throws {
+    func parkPendingForTesting(
+        messageId: UInt64,
+        command: UInt16,
+        sent: Bool = false,
+        onRegistered: @Sendable () -> Void = {}
+    ) async throws {
+        let identity = makeRequestIdentity(generation: Self.initialWireGeneration)
         _ = try await withCheckedThrowingContinuation { continuation in
-            pendingResponses[messageId] = SMBPendingResponse(
+            storePendingResponse(messageId: messageId, pending: SMBPendingResponse(
+                requestIdentity: identity,
                 generation: Self.initialWireGeneration,
                 label: "testing",
                 longPoll: false,
@@ -6477,9 +7048,18 @@ actor SMBSession {
                 sendPhase: sent ? .sent : .registered,
                 cancellationRequested: false,
                 continuationResumed: false
-            )
+            ))
+            onRegistered()
             resumePendingCountWaiters()
         }
+    }
+
+    func activeRequestIdentityCountForTesting() -> Int {
+        activeRequestIdentities.count
+    }
+
+    func requestIdentityForTesting(messageId: UInt64) -> SMBRequestIdentity? {
+        pendingResponses[messageId]?.requestIdentity
     }
 
     func parkCreditWaiterForTesting(charge: UInt16) async throws {
@@ -6536,10 +7116,12 @@ actor SMBSession {
         fileId: [UInt8]
     ) async throws {
         let fileKey = SMBFileIdLedgerKey(bytes: fileId)
+        let requestIdentity = makeRequestIdentity(generation: Self.initialWireGeneration)
         cleanupLedger[fileKey] = .sending
         resumeCleanupLedgerCountWaiters()
         _ = try await withCheckedThrowingContinuation { continuation in
-            pendingResponses[messageId] = SMBPendingResponse(
+            storePendingResponse(messageId: messageId, pending: SMBPendingResponse(
+                requestIdentity: requestIdentity,
                 generation: Self.initialWireGeneration,
                 label: "testing cleanup",
                 longPoll: false,
@@ -6555,7 +7137,7 @@ actor SMBSession {
                 cancellationRequested: false,
                 continuationResumed: false,
                 cleanupFileId: fileKey
-            )
+            ))
             let identity = UUID()
             pendingResponses[messageId]?.cleanupTimeoutIdentity = identity
             pendingResponses[messageId]?.cleanupTimeoutTask = startCleanupTimeout(
@@ -7028,7 +7610,9 @@ actor SMBSession {
             resumeCleanupLedgerCountWaiters()
         }
         return try await withCheckedThrowingContinuation { continuation in
-            pendingResponses[requestHeader.messageId] = SMBPendingResponse(
+            let requestIdentity = makeRequestIdentity(generation: generation)
+            storePendingResponse(messageId: requestHeader.messageId, pending: SMBPendingResponse(
+                requestIdentity: requestIdentity,
                 generation: generation,
                 label: responseLabel,
                 longPoll: longPoll,
@@ -7046,7 +7630,7 @@ actor SMBSession {
                 cleanupFileId: cleanupKey,
                 cleanupTimeoutIdentity: nil,
                 cleanupDrainIdentity: nil
-            )
+            ))
             if cleanupKey != nil {
                 let identity = UUID()
                 pendingResponses[requestHeader.messageId]?.cleanupTimeoutIdentity = identity
@@ -7077,6 +7661,27 @@ actor SMBSession {
             activeSendTasks[sendOperationID] = sendTask
             pendingResponses[requestHeader.messageId]?.sendTask = sendTask
         }
+    }
+
+    private func makeRequestIdentity(generation: UInt64) -> SMBRequestIdentity {
+        nextRequestSequence &+= 1
+        return SMBRequestIdentity(
+            sessionInstance: sessionInstanceIdentity,
+            generation: generation,
+            requestSequence: nextRequestSequence
+        )
+    }
+
+    private func storePendingResponse(messageId: UInt64, pending: SMBPendingResponse) {
+        activeRequestIdentities.insert(pending.requestIdentity)
+        pendingResponses[messageId] = pending
+    }
+
+    @discardableResult
+    private func removePendingResponse(messageId: UInt64) -> SMBPendingResponse? {
+        guard let pending = pendingResponses.removeValue(forKey: messageId) else { return nil }
+        activeRequestIdentities.remove(pending.requestIdentity)
+        return pending
     }
 
     private func performDemuxSend(
@@ -7232,7 +7837,7 @@ actor SMBSession {
 
         switch pending.sendPhase {
         case .registered:
-            pendingResponses.removeValue(forKey: messageId)
+            removePendingResponse(messageId: messageId)
             pending.sendTask?.cancel()
             cleanupLedger[fileId] = .retiredUnknown
             resumeCleanupLedgerCountWaiters()
@@ -7820,7 +8425,7 @@ actor SMBSession {
                 if pending.cleanupFileId != nil {
                     throw SMBCodecError.invalidValue("too many cleanup CLOSE STATUS_PENDING responses")
                 }
-                pendingResponses.removeValue(forKey: header.messageId)
+                removePendingResponse(messageId: header.messageId)
                 pending.timeoutTask?.cancel()
                 if !pending.continuationResumed {
                     pending.continuationResumed = true
@@ -7866,7 +8471,7 @@ actor SMBSession {
                 throw SMBCodecError.invalidValue("SMB2 cleanup sync final response after async interim (message id \(header.messageId))")
             }
         }
-        pendingResponses.removeValue(forKey: header.messageId)
+        removePendingResponse(messageId: header.messageId)
         pending.timeoutTask?.cancel()
         pending.cleanupTimeoutTask?.cancel()
         pending.cleanupDrainTask?.cancel()
@@ -8026,7 +8631,7 @@ actor SMBSession {
               current.timeoutIdentity == identity,
               !current.continuationResumed,
               !current.cleanupTombstone,
-              var pending = pendingResponses.removeValue(forKey: messageId) else {
+              var pending = removePendingResponse(messageId: messageId) else {
             return
         }
         pending.timeoutTask?.cancel()
@@ -8055,7 +8660,7 @@ actor SMBSession {
         pending.timeoutTask?.cancel()
         pending.timeoutTask = nil
         pending.timeoutIdentity = nil
-        pendingResponses.removeValue(forKey: messageId)
+        removePendingResponse(messageId: messageId)
         if pending.continuationResumed {
             debugLine("drained cancelled request after async correlation violation: \(reason)")
             return
@@ -8074,10 +8679,10 @@ actor SMBSession {
                 pending.cancellationRequested = true
                 pendingResponses[messageId] = pending
             } else {
-                pendingResponses.removeValue(forKey: messageId)
+                removePendingResponse(messageId: messageId)
             }
         } else {
-            pendingResponses.removeValue(forKey: messageId)
+            removePendingResponse(messageId: messageId)
             pending.sendTask?.cancel()
         }
         // Cancellation releases the caller but the wire response is unfinished — retain the
@@ -8141,6 +8746,7 @@ actor SMBSession {
             SMBPerfLog.line("[wire] victim session=\(diagnosticSessionId) count=\(pending.count) resumed=\(resumed) pending=\(livePending.count) detail=\(detail)")
         }
         pendingResponses.removeAll()
+        activeRequestIdentities.removeAll()
         orphanResponses.removeAll()
         orphanResponseOrder.removeAll()
         for var waiter in pending.values {

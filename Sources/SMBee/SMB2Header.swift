@@ -246,6 +246,7 @@ actor SMB2CreditWindow {
     private var nextWaiterId: UInt64 = 0
     private var nextWaiterCountObserverId: UInt64 = 0
     private var state: State = .active
+    private var reservationAcquiredHookForTesting: (@Sendable (UInt16) async -> Void)?
 
     init(initialCredits: UInt32 = 1, diagnosticSessionId: String) {
         self.available = initialCredits
@@ -284,17 +285,23 @@ actor SMB2CreditWindow {
         waiterCountWaiters.count
     }
 
+    func setReservationAcquiredHookForTesting(_ hook: (@Sendable (UInt16) async -> Void)?) {
+        reservationAcquiredHookForTesting = hook
+    }
+
     func reserve(
         charge requestedCharge: UInt16,
         messageId: UInt64? = nil,
         command: UInt16? = nil
     ) async throws -> UInt32 {
-        try await reserveCredits(
+        let reservation = try await reserveCredits(
             upTo: requestedCharge,
             minimumCharge: requestedCharge,
             messageId: messageId,
             command: command
-        ).remainingBalance
+        )
+        await reservationAcquiredHookForTesting?(reservation.charge)
+        return reservation.remainingBalance
     }
 
     /// Atomically reserves up to `maximumCharge`, but wakes as soon as one credit is
@@ -306,12 +313,14 @@ actor SMB2CreditWindow {
         messageId: UInt64? = nil,
         command: UInt16? = nil
     ) async throws -> UInt16 {
-        try await reserveCredits(
+        let reservation = try await reserveCredits(
             upTo: maximumCharge,
             minimumCharge: 1,
             messageId: messageId,
             command: command
-        ).charge
+        )
+        await reservationAcquiredHookForTesting?(reservation.charge)
+        return reservation.charge
     }
 
     private func reserveCredits(

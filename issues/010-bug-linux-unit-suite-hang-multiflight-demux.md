@@ -568,3 +568,30 @@ actor の中で reader を回す試作は改善せず戻した。
 入れ直しの条件: frame をまとめて 1 回の hop で順に処理する形などで Linux の差を throughput -10% 以内 / user CPU +12% 以内に
 詰め、push 前に Linux の container で master と交互に測る。CI の Performance の gate が通ってから入れる。
 
+
+### 入れ直しの 3 回目の試み — fixture の切り分け（2026-10-03、条件は未達）
+
+- 2 回目の試み（frame の batching）は改善しなかった。そこで 3 回目は修正の前に観測を足した。
+  - 計数は 52,400 frame で取った。reader の receive の待ちが 1.000 回/frame、send による起床が 0.992 回/frame、
+    reader → session actor の handoff が 1.000 回/frame だった。
+  - master の benchmark 用 transport は同期の cursor で、待ちは 0 回だった。
+  - futex は master 193,221 回、M3 499,760 回だった（strace の補助観測。実行時間の比較には使わない）。
+- **fixture 由来の分**: M3 では benchmark 用 transport も request-ID の照合 + 毎回 continuation に変わっていた。
+  同じ M3 の production で fixture だけを、送信順に応答を返し、準備済みの bytes を同期で返す mode に替えて 5 組を測った。
+  - read: throughput +8.0% / user CPU −8.4%。
+  - write: +1.0% / +0.1%。
+- **production に残る分**: 上の mode を使った M3 と master（2d47e8a）を Linux の container で 5 組測った（paired median）。
+  - read: throughput −32.3% / user CPU +45.5%。
+  - write: +3.4% / +1.5%。
+  - 測っている間に host の負荷が変わり、master の read が 3,448 → 1,324 MiB/s まで動いた。
+    このため数値は paired median だけを使う。5 組とも向きは負。
+  - reader → actor の 1 frame ごとの hop は、まだ減らせていない。
+  - 却下済みの案: reader を actor の中に置く案、frame の batching。
+- 実 Samba の CI（1 MiB の read、p50）: M3（136268a）6.47 ms、revert 後（76d70ed）6.07 ms、2d47e8a 9.96 ms。
+  run ごとの runner の差の方が大きいので、実ネットワークへの影響はここからは判定できない（組にした計測ではない）。
+- 修正 2 回が外れたので、次は forge に上げる。
+  - 設計の課題: reader を actor に入れずに、frame ごとの hop を減らすこと。
+  - 守る不変条件: generation fence、`.sent` gate、orphan FIFO、close terminal。
+- 試作は worktree にある（未 commit）。M3 を入れ直す commit に fixture の mode を含めるかは、M3 の側と合わせて判断する。
+  - 試作: `SMBeePerformanceRegressionTests` の `PerformanceResponseDelivery.orderedAfterSend` と、
+    generation が終わった後に dispatch しないことのテスト。

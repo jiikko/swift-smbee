@@ -633,3 +633,11 @@ actor の中で reader を回す試作は改善せず戻した。
   - 次は、受信ループを session actor に隔離した需要駆動 reader (master の receiveLoop を需要駆動で起こす形) を試作して測る (ユーザー選択)。
 - 計数は観測用の一時コピーで取った。出典は `tmp/forge/probe/report.md`。master と M3 のソースは tar のスナップショットで、
   M3 (F1 なし) は worktree から F1 を外して組み直したコピー (136268a の archive ではない)。
+- **probe 2: 受信ループを actor に隔離した需要駆動 reader** (`tmp/forge/probe2/report.md`)
+  - 計数した経路は全部 master と同じ値になった。
+    - send Task の enqueue、park / resume、reader → actor の handoff は 0。
+    - credit actor の await は 3/frame。
+  - それでも nvcsw は 3.06/frame（master は 1.74）。
+  - Linux の read は master と 5 組交互に測って −27.4% / user CPU +23.8%（paired median）。write は 3 組で −1.1% / +10.1%。
+  - まだ数えていない経路に、frame あたり約 1.3 回の余分な起床がある。
+  - 次は futex の呼び出し元をスタックで集計して、発生源を特定する（probe 3）。

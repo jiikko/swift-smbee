@@ -641,3 +641,16 @@ actor の中で reader を回す試作は改善せず戻した。
   - Linux の read は master と 5 組交互に測って −27.4% / user CPU +23.8%（paired median）。write は 3 組で −1.1% / +10.1%。
   - まだ数えていない経路に、frame あたり約 1.3 回の余分な起床がある。
   - 次は futex の呼び出し元をスタックで集計して、発生源を特定する（probe 3）。
+- **probe 3: futex の呼び出し元の特定** (`tmp/forge/probe3/report.md`)
+  - 手段: Linux container の中で GDB の `catch syscall futex` を使い、スタックを Swift の関数名まで symbol 化して集計した。
+    strace は `-k`（スタックの出力）を持たない build で、perf はパッケージが無かった。
+  - 余分な起床の出どころは 2 つ。
+    1. `startReaderIfNeeded` が作る reader Task の global enqueue（0.9999/frame）。
+       単一 flight では、応答ごとに pending が 0 になって reader が止まり、次の request で作り直される。
+    2. `DefaultActorImpl::unlock → swift_task_switch` の起床（0.995/frame。master は 0.0085）。
+       reader Task を `[weak self]` で捕捉しているので、Task が actor の外で始まってから actor へ移る。
+  - reader Task の捕捉だけを strong self に変えると、nvcsw/frame は 3.060 → 1.733 になり、master の 1.740 と並んだ。
+    - それでも read は master 比 throughput −13.5% / user CPU +4.1%（3 組）。
+    - CPU の差がほぼ消えたのに throughput の差が残るので、待ち時間か fixture の差を疑っている（probe 4）。
+- 遅くなったのは、狙ったトレードオフではない。M3 の目的は正しさの修正（multi-flight の demux の hang、issue 102 #5 #6）で、
+  reader を session の外の独立した Task として組んだことによる副作用。

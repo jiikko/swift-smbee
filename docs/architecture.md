@@ -48,6 +48,41 @@ protocol SMBTransport            // TCP 445 上の双方向バイトストリー
   POSIX の writer / reader / lifecycle hook は internal injection seam を持ち、送信交錯・
   lease・poison の決定論的テストに使う。
 
+### session の reader（issue 010 M3）
+
+- `SMBSession` は一つの transport lifetime に一つの generation と reader handle を所有する。
+  同一 session の再接続はしない。再接続は `SMBClient` が新しい session / transport を作る。
+- reader は需要駆動で動く。request の `transport.send` が全量成功し、orphan replay を終えた後に
+  `.sent` の応答待ちが残っていれば起動する。`.sent` の応答待ちが 0 件になったら、最後の dispatch と
+  同じ actor turn で dormant に戻り、次の送信完了まで `transport.receive` に入らない（master の
+  `receiveLoop` と同じ idle の挙動）。cancel 後の final を待つ tombstone は `.sent` のまま残るので、
+  その final は reader が読む。dormant 中に届いた frame は次に reader が起きるまで transport に残る。
+- reader の受信ループは session actor に隔離され、reader Task は session を強参照する。framing、
+  復号、credit grant、generation 確認、demux は frame ごとの actor 間の受け渡し無しに同じ actor で
+  行う。`[weak self]` の Task は actor の外で始まり、Linux で frame ごとに余分な起床を生んだ
+  （issue 010 の probe 3）。応答待ちのまま session を手放すと reader が session を保持し続けるので、
+  中断には明示の close が要る（master の `receiveLoop` と同じ制約）。
+- reader は自分が現在の reader (generation と handle) か確かめてから受信する。dormant にした後で
+  古い Task が戻りきる前に次の reader が起きても、close はすべての reader Task を join する。
+- close は generation を terminal にしてから transport を閉じ、reader、通常 send、CANCEL send、
+  connect と credit waiter の終了を待つ。graceful disconnect は TREE_DISCONNECT / LOGOFF の
+  response を受け取ってから close する。reader が受信中に起きた fault / EOF は pending 件数に関係なく
+  wire を terminal にし、transport を閉じる。dormant 中は受信しないので、idle 中の EOF は次の request の
+  送信または受信で見つかる。
+- `SMBTransport.close()` は未完了 connect / send / receive を相手側の応答待ちなしで終了させ、
+  以後の I/O を拒否する契約を持つ。外部 conformer がこの要件を守らない場合、session teardown
+  の join はその conformer の operation 完了に依存する。
+- 応答が full-send 完了通知より先に届いた場合は MessageId ごとの順序付き FIFO に退避し、`.sent`
+  後に replay する。orphan は unknown 応答を優先して退避し、総 frame 数を 64 に制限する。
+  required 応答を保持できない場合は session を閉じて黙った応答欠落を避ける。
+- 可変長の READ / WRITE は残高 snapshot から長さと charge を決めず、credit window が実際に予約した
+  charge を受け取ってから payload 長と MessageId 範囲を確定する。credit が0なら待ち、1〜N 個あれば
+  その範囲に request を縮めて送るため、並行要求の stale な multi-credit 見積もりで waiter が止まらない。
+  固定長コマンドは従来どおり要求 charge 全量を予約する。
+- 通常 request の cancel tombstone は遅着応答との相関に残すが、件数は64を上限とする。上限を超えたら
+  共有 wire を terminal にして全 pending / credit waiter を解放する。close は通常 send と SMB CANCEL send
+  の双方を cancel して join し、close 後に遅れて戻る connect が transport candidate を公開しても再 close する。
+
 ### プラットフォーム条件
 
 - `SMBSession` / protocol / crypto / auth は **Linux でもビルド可能**に保つ（swift-crypto は

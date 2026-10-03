@@ -220,11 +220,17 @@ actor SMB2CreditWindow {
 
     private struct Waiter {
         let charge: UInt16
+        let minimumCharge: UInt16
         let id: UInt64
         let messageId: UInt64?
         let command: UInt16?
         let enqueuedAt: ContinuousClock.Instant?
-        let continuation: CheckedContinuation<UInt32, Error>
+        let continuation: CheckedContinuation<CreditReservation, Error>
+    }
+
+    private struct CreditReservation {
+        let charge: UInt16
+        let remainingBalance: UInt32
     }
 
     private struct PendingWaiterCountObserver {
@@ -283,14 +289,47 @@ actor SMB2CreditWindow {
         messageId: UInt64? = nil,
         command: UInt16? = nil
     ) async throws -> UInt32 {
+        try await reserveCredits(
+            upTo: requestedCharge,
+            minimumCharge: requestedCharge,
+            messageId: messageId,
+            command: command
+        ).remainingBalance
+    }
+
+    /// Atomically reserves up to `maximumCharge`, but wakes as soon as one credit is
+    /// available. Variable length READ/WRITE callers then size the packet to the exact
+    /// reservation. This avoids parking behind a stale multi-credit size estimate when a
+    /// server grants fewer credits than the prior request consumed.
+    func reserveUpTo(
+        maximumCharge: UInt16,
+        messageId: UInt64? = nil,
+        command: UInt16? = nil
+    ) async throws -> UInt16 {
+        try await reserveCredits(
+            upTo: maximumCharge,
+            minimumCharge: 1,
+            messageId: messageId,
+            command: command
+        ).charge
+    }
+
+    private func reserveCredits(
+        upTo requestedCharge: UInt16,
+        minimumCharge: UInt16,
+        messageId: UInt64?,
+        command: UInt16?
+    ) async throws -> CreditReservation {
         if case .failed(let error) = state {
             throw error
         }
-        guard requestedCharge > 0 else { return available }
-        let charge = requestedCharge
-        if available >= UInt32(charge) {
-            available -= UInt32(charge)
-            return available
+        guard requestedCharge > 0, minimumCharge > 0 else {
+            return CreditReservation(charge: 0, remainingBalance: available)
+        }
+        if available >= UInt32(minimumCharge) {
+            let charge = min(UInt32(requestedCharge), available)
+            available -= charge
+            return CreditReservation(charge: UInt16(charge), remainingBalance: available)
         }
         let id = nextWaiterId
         nextWaiterId += 1
@@ -309,7 +348,8 @@ actor SMB2CreditWindow {
                 }
                 let enqueuedAt = SMBPerfLog.effectiveIsEnabled ? ContinuousClock.now : nil
                 waiters.append(Waiter(
-                    charge: charge,
+                    charge: requestedCharge,
+                    minimumCharge: minimumCharge,
                     id: id,
                     messageId: messageId,
                     command: command,
@@ -320,7 +360,7 @@ actor SMB2CreditWindow {
                 SMBPerfLog.line(
                     "[wire] credit_wait session=\(diagnosticSessionId) " +
                         "\(Self.identityFields(messageId: messageId, command: command))" +
-                        "charge=\(charge) available=\(available) waiters=\(waiters.count) " +
+                        "charge=\(requestedCharge) available=\(available) waiters=\(waiters.count) " +
                         "ts_ns=\(SMBPerfLog.timestampNanoseconds())"
                 )
                 resumeReadyWaiters()
@@ -383,19 +423,23 @@ actor SMB2CreditWindow {
         // smaller charge would fit the current balance. First-fit would let a stream of
         // small requests starve a large multi-credit READ/WRITE indefinitely; the cost is
         // head-of-line blocking while the window refills (issues/012 §3).
-        while let waiter = waiters.first, available >= UInt32(waiter.charge) {
+        while let waiter = waiters.first, available >= UInt32(waiter.minimumCharge) {
             waiters.removeFirst()
-            available -= UInt32(waiter.charge)
+            let charge = min(UInt32(waiter.charge), available)
+            available -= charge
             if let enqueuedAt = waiter.enqueuedAt {
                 SMBPerfLog.line(
                     "[wire] credit_granted session=\(diagnosticSessionId) " +
                         "\(Self.identityFields(messageId: waiter.messageId, command: waiter.command))" +
-                        "charge=\(waiter.charge) " +
+                        "charge=\(charge) " +
                         "waited_ms=\(SMBPerfLog.milliseconds(ContinuousClock.now - enqueuedAt)) " +
                         "ts_ns=\(SMBPerfLog.timestampNanoseconds())"
                 )
             }
-            waiter.continuation.resume(returning: available)
+            waiter.continuation.resume(returning: CreditReservation(
+                charge: UInt16(charge),
+                remainingBalance: available
+            ))
         }
         resumeWaiterCountWaiters()
     }

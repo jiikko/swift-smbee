@@ -23,14 +23,21 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
             transformOverhead: 0
         )
         let expectedChunks = ceilDiv(fileSize, effectiveReadChunkSize)
+        // A READ larger than 64 KiB carries CreditCharge > 1 and advances MessageId by that
+        // charge (MS-SMB2 §3.2.4.1.6), so the CLOSE id is not 2 + chunk count. A wrong id here
+        // makes the cleanup CLOSE fail silently inside bestEffortClose while the test stays green.
+        let readCharges = chunkLengths(fileSize: fileSize, chunkSize: effectiveReadChunkSize)
+            .map { max(1, ceilDiv($0, 64 * 1024)) }
+        let closeMessageId = UInt64(2 + readCharges.reduce(0, +))
         let inbound = try framed(
             [try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId),
              try smb2QueryInfoResponse(size: UInt64(fileSize), messageId: 1, treeId: treeId)]
                 + readResponses(fileSize: fileSize, chunkSize: effectiveReadChunkSize, firstMessageId: 2)
-                + [try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: UInt64(2 + expectedChunks), treeId: treeId)]
+                + [try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: closeMessageId, treeId: treeId)]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound)
-        let clientSession = makeClientSession(transport: transport, initialCredits: negotiatedServerCredits)
+        let session = SMBSession(host: "server", port: 445, credential: credential, transport: transport, signingKey: signingKey, initialCredits: negotiatedServerCredits)
+        let clientSession = SMBClientSession(session: session, treeId: treeId)
         let sink = CountingChunkSink()
 
         try await clientSession.withReadStream(path: "large.bin") { chunk in
@@ -41,6 +48,16 @@ final class SMBeePerformanceRegressionTests: XCTestCase {
         counter.assertMetric("read_stream.commands.READ", command: SMB2Commands.read, expected: expectedChunks)
         sink.assertMetric("read_stream.chunks", actual: sink.chunkCount, expected: expectedChunks)
         sink.assertMetric("read_stream.bytes", actual: sink.byteCount, expected: fileSize)
+        XCTAssertEqual(try counter.messageIds(of: SMB2Commands.close), [closeMessageId])
+        // A cleanup CLOSE whose response does not correlate closes the wire.
+        let transportClosed = await session.isTransportClosedForTesting()
+        XCTAssertFalse(transportClosed, "cleanup CLOSE must succeed")
+        // A correlated CLOSE with a failure status keeps the wire open but leaves the FileId
+        // retired-unknown, so also require the cleanup ledger entry to be resolved.
+        let cleanupState = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertNil(cleanupState, "cleanup CLOSE must resolve the FileId")
+        let pendingCount = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingCount, 0)
     }
 
     func testPrefixReadUsesThreeCommandsAndExistingReadUsesFour() async throws {
@@ -802,6 +819,13 @@ private struct SMBCommandCounter {
 
     func count(_ command: UInt16) -> Int {
         histogram[command, default: 0]
+    }
+
+    func messageIds(of command: UInt16) throws -> [UInt64] {
+        try requests.compactMap { request in
+            let header = try SMB2Header.decode(request)
+            return header.command == command ? header.messageId : nil
+        }
     }
 
     func assertMetric(_ name: String, command: UInt16, expected: Int, file: StaticString = #filePath, line: UInt = #line) {

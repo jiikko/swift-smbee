@@ -136,48 +136,161 @@ private func smbPacketInDirectTCPStream(_ bytes: [UInt8]) throws -> [UInt8]? {
 }
 
 final class SMBContinuationCountBarrier: @unchecked Sendable {
+    private struct Waiter {
+        let id: UUID
+        let target: Int
+        let continuation: CheckedContinuation<Void, Error>
+        var timeoutTask: Task<Void, Never>?
+    }
+
     private let lock = NSLock()
     private var count = 0
-    private var waiters: [(id: UUID, target: Int, continuation: CheckedContinuation<Void, Error>)] = []
+    private var waiters: [Waiter] = []
+
+    var waiterCount: Int {
+        lock.withLock { waiters.count }
+    }
 
     var currentCount: Int {
         lock.withLock { count }
     }
 
     func signal() {
-        let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+        let ready = lock.withLock { () -> [Waiter] in
             count += 1
-            let ready = waiters.filter { count >= $0.target }.map(\.continuation)
+            let ready = waiters.filter { count >= $0.target }
             waiters.removeAll { count >= $0.target }
             return ready
         }
-        ready.forEach { $0.resume() }
+        ready.forEach {
+            $0.timeoutTask?.cancel()
+            $0.continuation.resume()
+        }
     }
 
+    /// For callers already wrapped in `smbIssue102AwaitWithTimeout`: that wrapper is the hang
+    /// guard, so this timeout is only a backstop longer than any wrapper deadline.
     func waitForCount(_ target: Int) async throws {
+        try await waitForCount(target, timeout: .seconds(60), sleeper: { try await Task.sleep(for: $0) })
+    }
+
+    func waitForCount(
+        _ target: Int,
+        timeout: Duration,
+        sleeper: @escaping @Sendable (Duration) async throws -> Void
+    ) async throws {
         let waiterID = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let result = lock.withLock { () -> Int in
                     if Task.isCancelled { return -1 }
                     guard count < target else { return 1 }
-                    waiters.append((waiterID, target, continuation))
+                    waiters.append(Waiter(id: waiterID, target: target, continuation: continuation))
                     return 0
                 }
                 if result < 0 { continuation.resume(throwing: CancellationError()) }
                 if result > 0 { continuation.resume() }
+                if result == 0 {
+                    let timeoutTask = Task { [weak self] in
+                        do {
+                            try await sleeper(timeout)
+                        } catch {
+                            return
+                        }
+                        self?.timeoutWaiter(waiterID)
+                    }
+                    let shouldCancel = lock.withLock { () -> Bool in
+                        guard let index = waiters.firstIndex(where: { $0.id == waiterID }) else { return true }
+                        waiters[index].timeoutTask = timeoutTask
+                        return false
+                    }
+                    if shouldCancel { timeoutTask.cancel() }
+                }
             }
         } onCancel: {
             cancelWaiter(waiterID)
         }
     }
 
-    private func cancelWaiter(_ waiterID: UUID) {
-        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
-            guard let index = waiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
-            return waiters.remove(at: index).continuation
+    func reset() {
+        let drained = lock.withLock { () -> [Waiter] in
+            count = 0
+            defer { waiters.removeAll() }
+            return waiters
         }
-        continuation?.resume(throwing: CancellationError())
+        drained.forEach {
+            $0.timeoutTask?.cancel()
+            $0.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    private func timeoutWaiter(_ waiterID: UUID) {
+        let waiter = lock.withLock { () -> Waiter? in
+            guard let index = waiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return waiters.remove(at: index)
+        }
+        waiter?.continuation.resume(throwing: SMBContinuationWaitTimedOut())
+    }
+
+    private func cancelWaiter(_ waiterID: UUID) {
+        let waiter = lock.withLock { () -> Waiter? in
+            guard let index = waiters.firstIndex(where: { $0.id == waiterID }) else { return nil }
+            return waiters.remove(at: index)
+        }
+        waiter?.timeoutTask?.cancel()
+        waiter?.continuation.resume(throwing: CancellationError())
+    }
+}
+
+struct SMBContinuationWaitTimedOut: Error {}
+
+/// Holds reader tasks after their receive loop exits so lifecycle overlap and shutdown joins
+/// can be tested at an exact event boundary. Cancellation intentionally does not release a
+/// held task; the test must release it explicitly after proving the join behavior.
+final class SMBReaderTaskExitGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var enteredHandles: [UUID] = []
+    private var continuations: [UUID: CheckedContinuation<Void, Never>] = [:]
+    private var releasedHandles = Set<UUID>()
+    private var releaseAllRequested = false
+    private let enteredBarrier = SMBContinuationCountBarrier()
+
+    func hold(_ handle: UUID) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let shouldResume = lock.withLock { () -> Bool in
+                enteredHandles.append(handle)
+                guard !releaseAllRequested, !releasedHandles.contains(handle) else { return true }
+                continuations[handle] = continuation
+                return false
+            }
+            enteredBarrier.signal()
+            if shouldResume { continuation.resume() }
+        }
+    }
+
+    func waitForCount(
+        _ count: Int,
+        timeout: Duration,
+        sleeper: @escaping @Sendable (Duration) async throws -> Void
+    ) async throws {
+        try await enteredBarrier.waitForCount(count, timeout: timeout, sleeper: sleeper)
+    }
+
+    func release(_ handle: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            releasedHandles.insert(handle)
+            return continuations.removeValue(forKey: handle)
+        }
+        continuation?.resume()
+    }
+
+    func releaseAll() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            releaseAllRequested = true
+            defer { continuations.removeAll() }
+            return Array(continuations.values)
+        }
+        pending.forEach { $0.resume() }
     }
 }
 
@@ -324,6 +437,7 @@ private struct SMBContinuationPendingReceive {
 class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var inbound: [UInt8]
+    private var preloadedResponses: [[UInt8]]
     private var pendingReceive: SMBContinuationPendingReceive?
     private var closed = false
     private var closeCountStorage = 0
@@ -331,7 +445,8 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     private var commandWaiters: [(id: UUID, command: UInt16, target: Int, continuation: CheckedContinuation<Void, Error>)] = []
 
     init(inbound: [UInt8]) {
-        self.inbound = inbound
+        self.inbound = []
+        self.preloadedResponses = Self.directTCPFrames(inbound)
     }
 
     var closeCount: Int {
@@ -348,7 +463,7 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
         try Task.checkCancellation()
         guard let packet = try smbPacketInDirectTCPStream(bytes) else { return }
         let header = try SMB2Header.decode(packet)
-        let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+        let result = lock.withLock { () -> ([CheckedContinuation<Void, Error>], (SMBContinuationPendingReceive, [UInt8])?) in
             commandCounts[header.command, default: 0] += 1
             let ready = commandWaiters
                 .filter { $0.command == header.command && commandCounts[header.command, default: 0] >= $0.target }
@@ -356,9 +471,13 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
             commandWaiters.removeAll {
                 $0.command == header.command && commandCounts[header.command, default: 0] >= $0.target
             }
-            return ready
+            if header.command != SMB2Commands.cancel, !preloadedResponses.isEmpty {
+                inbound.append(contentsOf: preloadedResponses.removeFirst())
+            }
+            return (ready, takePendingReceiveLocked())
         }
-        ready.forEach { $0.resume() }
+        result.0.forEach { $0.resume() }
+        result.1?.0.continuation.resume(returning: result.1?.1 ?? [])
     }
 
     func receive(maxLength: Int) async throws -> [UInt8] {
@@ -410,14 +529,18 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     }
 
     func close() {
-        let pending = lock.withLock { () -> SMBContinuationPendingReceive? in
+        let result = lock.withLock { () -> (SMBContinuationPendingReceive?, [CheckedContinuation<Void, Error>]) in
             closed = true
             closeCountStorage += 1
             let pending = pendingReceive
             pendingReceive = nil
-            return pending
+            preloadedResponses.removeAll()
+            let waiters = commandWaiters.map(\.continuation)
+            commandWaiters.removeAll()
+            return (pending, waiters)
         }
-        pending?.continuation.resume(throwing: SMBTransportError.connectionClosed)
+        result.0?.continuation.resume(throwing: SMBTransportError.connectionClosed)
+        result.1.forEach { $0.resume(throwing: SMBTransportError.connectionClosed) }
     }
 
     func failConnection() {
@@ -428,16 +551,35 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
         let bytes = try DirectTCPFraming.frame(packet)
         let delivery = lock.withLock { () -> (SMBContinuationPendingReceive, [UInt8])? in
             inbound.append(contentsOf: bytes)
-            guard let pendingReceive else { return nil }
-            let count = min(pendingReceive.maxLength, inbound.count)
-            let chunk = Array(inbound.prefix(count))
-            inbound.removeFirst(count)
-            self.pendingReceive = nil
-            return (pendingReceive, chunk)
+            return takePendingReceiveLocked()
         }
         if let delivery {
             delivery.0.continuation.resume(returning: delivery.1)
         }
+    }
+
+    private func takePendingReceiveLocked() -> (SMBContinuationPendingReceive, [UInt8])? {
+        guard let pendingReceive, !inbound.isEmpty else { return nil }
+        let count = min(pendingReceive.maxLength, inbound.count)
+        let chunk = Array(inbound.prefix(count))
+        inbound.removeFirst(count)
+        self.pendingReceive = nil
+        return (pendingReceive, chunk)
+    }
+
+    private static func directTCPFrames(_ bytes: [UInt8]) -> [[UInt8]] {
+        var frames: [[UInt8]] = []
+        var offset = 0
+        while offset + 4 <= bytes.count {
+            guard let payloadLength = try? DirectTCPFraming.length(from: Array(bytes[offset..<(offset + 4)])) else {
+                return []
+            }
+            let end = offset + 4 + payloadLength
+            guard bytes[offset] == 0, end <= bytes.count else { return [] }
+            frames.append(Array(bytes[offset..<end]))
+            offset = end
+        }
+        return offset == bytes.count ? frames : []
     }
 }
 
@@ -561,29 +703,116 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
 }
 
 final class SMBContinuationAsyncGate: @unchecked Sendable {
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+        var timeoutTask: Task<Void, Never>?
+    }
+
     private let lock = NSLock()
     private var released = false
-    private var continuation: CheckedContinuation<Void, Never>?
+    private var waiters: [UUID: Waiter] = [:]
+    private let suspended = SMBContinuationCountBarrier()
+    private var suspensionSignalCount = 0
 
-    func suspend() async {
-        await withCheckedContinuation { continuation in
-            let resumeNow = lock.withLock { () -> Bool in
-                guard !released else { return true }
-                self.continuation = continuation
-                return false
+    var waiterCount: Int {
+        lock.withLock { waiters.count }
+    }
+
+    func suspend(
+        timeout: Duration,
+        sleeper: @escaping @Sendable (Duration) async throws -> Void
+    ) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { continuation in
+                let shouldWait = lock.withLock { () -> Bool in
+                    guard !released, !Task.isCancelled else { return false }
+                    waiters[id] = Waiter(id: id, continuation: continuation)
+                    suspensionSignalCount += 1
+                    suspended.signal()
+                    return true
+                }
+                guard shouldWait else {
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        continuation.resume()
+                    }
+                    return
+                }
+                let timeoutTask = Task { [weak self] in
+                    do {
+                        try await sleeper(timeout)
+                    } catch {
+                        return
+                    }
+                    self?.timeout(id: id)
+                }
+                let shouldCancel = lock.withLock { () -> Bool in
+                    guard var waiter = waiters[id] else { return true }
+                    waiter.timeoutTask = timeoutTask
+                    waiters[id] = waiter
+                    return false
+                }
+                if shouldCancel { timeoutTask.cancel() }
             }
-            if resumeNow { continuation.resume() }
+        } onCancel: {
+            self.cancel(id: id)
+        }
+    }
+
+    func waitUntilSuspended(
+        timeout: Duration,
+        sleeper: @escaping @Sendable (Duration) async throws -> Void
+    ) async throws {
+        let nextSignal = lock.withLock { () -> Int? in
+            guard waiters.isEmpty else { return nil }
+            return suspensionSignalCount + 1
+        }
+        if let nextSignal {
+            try await suspended.waitForCount(nextSignal, timeout: timeout, sleeper: sleeper)
         }
     }
 
     func release() {
-        let pending = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+        let pending = lock.withLock { () -> [Waiter] in
             released = true
-            let pending = continuation
-            continuation = nil
+            let pending = Array(waiters.values)
+            waiters.removeAll()
             return pending
         }
-        pending?.resume()
+        pending.forEach {
+            $0.timeoutTask?.cancel()
+            $0.continuation.resume()
+        }
+    }
+
+    func reset() {
+        let pending = lock.withLock { () -> [Waiter] in
+            released = false
+            suspensionSignalCount = 0
+            let pending = Array(waiters.values)
+            waiters.removeAll()
+            suspended.reset()
+            return pending
+        }
+        pending.forEach {
+            $0.timeoutTask?.cancel()
+            $0.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    private func timeout(id: UUID) {
+        let waiter = lock.withLock { waiters.removeValue(forKey: id) }
+        waiter?.continuation.resume(throwing: SMBContinuationWaitTimedOut())
+    }
+
+    private func cancel(id: UUID) {
+        let waiter = lock.withLock { waiters.removeValue(forKey: id) }
+        waiter?.timeoutTask?.cancel()
+        waiter?.continuation.resume(throwing: CancellationError())
     }
 }
 

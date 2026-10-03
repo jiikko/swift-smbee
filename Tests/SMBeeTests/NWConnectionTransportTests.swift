@@ -376,7 +376,12 @@ final class NWConnectionTransportGateRegressionTests: XCTestCase {
 
         transport.close()
         XCTAssertTrue(oldConnection.isCancelled)
-        try await transport.connect(host: "new-server", port: 445)
+        do {
+            try await transport.connect(host: "new-server", port: 445)
+            XCTFail("a terminally closed transport must reject reconnect")
+        } catch SMBTransportError.connectionClosed {
+        }
+        XCTAssertEqual(sequence.makeCount, 2, "the reconnect candidate is created then rejected by the closed slot")
         oldConnection.deliverCancelledSends()
 
         do {
@@ -393,7 +398,8 @@ final class NWConnectionTransportGateRegressionTests: XCTestCase {
         } catch SMBTransportError.connectionClosed {
         }
         XCTAssertTrue(newConnection.snapshots.isEmpty)
-        XCTAssertEqual(newConnection.cancelCount, 0)
+        XCTAssertEqual(newConnection.cancelCount, 1, "the rejected reconnect candidate must be cancelled")
+        XCTAssertEqual(sequence.makeCount, 2)
     }
 }
 
@@ -651,13 +657,19 @@ private final class FakeNWConnection: NWConnectionTransportConnection, @unchecke
 private final class FakeNWConnectionSequence: @unchecked Sendable {
     private let lock = NSLock()
     private var connections: [FakeNWConnection]
+    private var makeCountStorage = 0
 
     init(_ connections: [FakeNWConnection]) {
         self.connections = connections
     }
 
+    var makeCount: Int { lock.withLock { makeCountStorage } }
+
     func next() -> FakeNWConnection {
-        lock.withLock { connections.removeFirst() }
+        lock.withLock {
+            makeCountStorage += 1
+            return connections.removeFirst()
+        }
     }
 }
 

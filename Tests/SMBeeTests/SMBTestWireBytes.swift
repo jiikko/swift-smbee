@@ -81,3 +81,20 @@ func signedTestPacket(
     signed.replaceSubrange(48..<64, with: signature)
     return signed
 }
+
+func smbEncryptedRequestDecoder(key: [UInt8]) -> SMBWireRequestDecoder {
+    { packet in
+        guard packet.starts(with: SMB3TransformHeader.protocolId) else {
+            return try SMBWireRequestDescriptor(packet: packet)
+        }
+        let transform = try SMB3TransformHeader.decode(packet)
+        let plaintext = try AESCCM.open(
+            key: key,
+            nonce: Array(transform.nonce.prefix(11)),
+            ciphertext: Array(packet.dropFirst(SMB3TransformHeader.encodedSize)),
+            authenticatedData: transform.authenticatedData(),
+            tag: transform.signature
+        )
+        return try SMBWireRequestDescriptor(packet: plaintext)
+    }
+}

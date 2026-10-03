@@ -1820,7 +1820,7 @@ PY
   expect_contains "${gate_output}" \
     'Regression gate: 2 alternating current/reference pairs on the same runner.' \
     '**Performance regression gate: FAIL**' \
-    'read_stream.throughput_mib_s regressed 50.0% (limit 35%, only 2 pairs; practical-limit safeguard)' \
+    'read_stream.throughput_mib_s regressed 50.0% (limit 15%, only 2 pairs; practical-limit safeguard)' \
     'write_stream.user_cpu_ms regressed 100.0% (limit 25%, only 2 pairs; practical-limit safeguard)'
 
   local passing_gate_output="${scenario_dir}/passing-gate-output.md"

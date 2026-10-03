@@ -675,3 +675,26 @@ actor の中で reader を回す試作は改善せず戻した。
 - Linux で残る遅さ: synthetic の read で約 −12%（fixture を揃えた比較）。原因は「send 完了 → dispatch」区間の約 1 µs で、
   内訳はまだ特定していない（generation fence、credit grant の後の再確認、reader の状態更新のどれか）。
   macOS では差が出ていない。実ネットワークでの影響は未測定。
+
+## 進捗チェックポイント — M3 の入れ直し (2026-10-03)
+
+- commit `feat(session): issue 010 M3 を入れ直す — session の reader を需要駆動・actor 隔離にして Linux の退行を詰める`。
+  - 需要駆動の reader、受信ループの actor 隔離、strong self、send Task の actor 隔離を入れた。
+  - fixture は master と同じ。
+  - Test / E2E は success。push の前に、container Samba の smoke を 3 つのプロファイルで通した。
+- **CI の Performance gate は FAIL**（Linux x86_64、20 組交互）。
+  - read: throughput −27.8%（上限 −15%）、user CPU +5.6%、system CPU +166.5%。
+  - write: throughput −12.8%、system CPU +96.8%。
+  - 最初の M3 は −46% / user CPU +44% だった。user CPU の差はほぼ消え、残りは kernel 側（system CPU）。
+  - 手元の arm64 container では −9〜−12% だったので、x86 の CI の方が大きく出る。
+  - 実 Samba の read p50 は 7.55 ms。過去の master は 6.1〜10.0 ms で、runner ごとの差が大きく判定できない。
+- **ユーザー決定**: Linux の read の gate を緩める（Linux の性能は nice to have）。
+  - gate は直前に *成功した* master の push と比べる。このままでは以後の push もすべて M3 の前の master と比べて落ちる。
+  - そこで `bin/ci/compare-resource-performance` に、read_stream の throughput だけ上限を −35% にする上書き
+    （`OPERATION_REGRESSION_LIMITS`）を入れ、M3 の水準で 1 回 gate を通す。
+  - 次の commit で上書きを外し、M3 を基準にした通常の −15% に戻す。
+- Linux に残る遅さの内訳（system CPU の増分 = kernel 側の起床）は、まだ調べていない。
+  - 次に触る trigger: 実ネットワークで Linux の利用者が遅さを報告したとき、または pipelining（タスク 2）で
+    reader の経路を触るとき。
+- 残り: P2-2。cancel の後に final が来ないと、reader が session を保持し続ける（master と同じ制約）。
+  retirement primitive の drain の期限で扱う。

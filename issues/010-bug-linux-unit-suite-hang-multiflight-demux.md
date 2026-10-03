@@ -595,3 +595,7 @@ actor の中で reader を回す試作は改善せず戻した。
 - 試作は worktree にある（未 commit）。M3 を入れ直す commit に fixture の mode を含めるかは、M3 の側と合わせて判断する。
   - 試作: `SMBeePerformanceRegressionTests` の `PerformanceResponseDelivery.orderedAfterSend` と、
     generation が終わった後に dispatch しないことのテスト。
+- macOS（host、release、`SMBeeResourcePerformanceTests/testSyntheticReadStreamResourceUsage`、4 組交互）では差が無い。
+  - read throughput: master 3,703〜4,022 MiB/s、M3（fixture の mode を入れた版）3,750〜4,025 MiB/s。
+  - user CPU: どちらも 144〜159 ms。
+  - 退行は Linux の executor 上の wake / hop のコストに固有である。

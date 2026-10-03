@@ -654,3 +654,24 @@ actor の中で reader を回す試作は改善せず戻した。
     - CPU の差がほぼ消えたのに throughput の差が残るので、待ち時間か fixture の差を疑っている（probe 4）。
 - 遅くなったのは、狙ったトレードオフではない。M3 の目的は正しさの修正（multi-flight の demux の hang、issue 102 #5 #6）で、
   reader を session の外の独立した Task として組んだことによる副作用。
+- **probe 4: fixture と実装の切り分け** (`tmp/forge/probe4/report.md`)
+  - fixture だけの差: master の実装に M3 の fixture を当てると、read −3.3% / user CPU +3.3%（5 組）。
+  - 実装の差: fixture を揃えて比べると、strong-reader の版は read −12.2% / user CPU +12.4%（5 組）。
+    - probe 3 の +4.1%（3 組）は再現しなかった。5 組の方を採る。
+  - 1 request の区間計測: 差は「send 完了 → 応答の dispatch」に集中している（中央値で +0.96 µs）。
+  - `markRequestSent` を reader の起動より先にする並べ替えは、効果を確認できなかった。
+
+### 入れ直しの条件の変更（2026-10-03、ユーザー決定）
+
+- Linux の性能は nice to have とする。上の「入れ直しの条件（Linux で throughput −10% 以内 / user CPU +12% 以内）」は撤回する。
+- 新しい下限は CI の Performance の regression gate（throughput −15% / user CPU +25%、20 組）を通ること。
+  - gate に落ちたら閾値を勝手に変えず、ユーザーに相談する。
+- 入れる形は、probe で行き着いた次の形とする。
+  - 受信ループを session actor に隔離した reader
+  - reader Task の strong self 捕捉
+  - pending が 0 になったら reader を止め、次の send で起こし直す
+  - send Task の actor 隔離（F1）
+  - これは master の `receiveLoop` と同じ作りで、idle 中の挙動も master と同じに戻る。
+- Linux で残る遅さ: synthetic の read で約 −12%（fixture を揃えた比較）。原因は「send 完了 → dispatch」区間の約 1 µs で、
+  内訳はまだ特定していない（generation fence、credit grant の後の再確認、reader の状態更新のどれか）。
+  macOS では差が出ていない。実ネットワークでの影響は未測定。

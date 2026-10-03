@@ -698,3 +698,12 @@ actor の中で reader を回す試作は改善せず戻した。
     reader の経路を触るとき。
 - 残り: P2-2。cancel の後に final が来ないと、reader が session を保持し続ける（master と同じ制約）。
   retirement primitive の drain の期限で扱う。
+- CI の結果
+  - 上書きを入れた commit（`ci(perf): issue 010 M3 の段差を 1 回だけ通すため、…`）は、Test / E2E / Performance とも success。
+    この run の read は −17.9% で、上書きした上限（−35%）の内側。
+  - 上書きを外した commit（`ci(perf): issue 010 M3 の段差を通したので、…通常の -15% に戻す`）も success。
+    gate は M3 を基準に通常の上限で PASS した（read throughput +0.1%）。
+  - `bin/ci/verify-agent-performance` は比較を手元の script で計算し直す。上書きを外した commit が手元にある状態で、
+    上書きが入った commit を検証すると FAIL と出る。CI の gate の step 自体は success だった。
+- **M3 は完了**。残りは M4（下の「M4 の残り」）と P2-2（cancel の後に final が来ない場合の session の保持。
+  retirement primitive で扱う）。

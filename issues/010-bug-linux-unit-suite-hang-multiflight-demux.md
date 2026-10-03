@@ -599,3 +599,22 @@ actor の中で reader を回す試作は改善せず戻した。
   - read throughput: master 3,703〜4,022 MiB/s、M3（fixture の mode を入れた版）3,750〜4,025 MiB/s。
   - user CPU: どちらも 144〜159 ms。
   - 退行は Linux の executor 上の wake / hop のコストに固有である。
+
+### forge (Maximum) の調査と F1 の結果 (2026-10-03)
+
+- forge は 10 体 + cross-review で調べた。設計は `tmp/forge/design.md` (ユーザー承認済み)。
+- 原因の記述を訂正する。
+  - 「master は caller が send 後に自分で receive する」は誤り。master も、actor に隔離された send Task から、
+    actor に隔離された receiveLoop を起こしている。
+  - 上の「reader → actor の handoff が主因」は仮説のまま。forge の統合結果は、frame ごとのスレッドまたぎの起床が増えた経路として次の 3 つを挙げた。
+    - W1: reader が次の send より前に receive で park し、send がそれを起こす。
+    - W2: reader が caller を resume した後に actor を手放し、actor の再スケジュールが起きる。
+    - F1: send Task が `[weak self]` で nonisolated になり、request ごとに global executor へ enqueue される。
+- **F1 は確定した差分**。M3 の `sendTask` は `Task { [weak self] in ... }` で、master は actor に隔離されている。
+  - 修正: strong self の actor 隔離に戻した。closure の中の `activeSendTasks.removeValue` を同期呼び出しにして、隔離をコンパイラに強制させる。
+  - 確認: `[weak self]` に戻す変異で `actor-isolated property 'activeSendTasks' can not be mutated from a nonisolated context` の compile error になる。
+- **F1 単独の効果: 無し**。Linux container (4G / 4 CPU、1 台ずつ `--rm`) で master 2d47e8a と 5 組交互に測った。
+  - read の paired ratio: 0.628 / 0.696 / 0.441 / 0.536 / 0.709 (median −37%)。user CPU +54%。
+  - write: 3 組とも throughput −2〜−4%。
+  - 経路別の計数と、需要駆動 reader の使い捨て試作の A/B を、codex の probe で取っている (`tmp/forge/probe/`)。
+- issue 105 を起票した: M3 の常駐 reader の idle 中の pool 占有と SO_RCVTIMEO による切断。

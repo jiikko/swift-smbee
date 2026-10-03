@@ -618,3 +618,18 @@ actor の中で reader を回す試作は改善せず戻した。
   - write: 3 組とも throughput −2〜−4%。
   - 経路別の計数と、需要駆動 reader の使い捨て試作の A/B を、codex の probe で取っている (`tmp/forge/probe/`)。
 - issue 105 を起票した: M3 の常駐 reader の idle 中の pool 占有と SO_RCVTIMEO による切断。
+- **経路別の計数 (probe 1、Linux container、52,400 frame)**。値は 1 frame あたり。
+
+  | variant | send Task の global enqueue | receive の park | send による resume | reader → actor の handoff | nvcsw |
+  |---|---:|---:|---:|---:|---:|
+  | master | 0 | 0 | 0 | 0 | 1.74 |
+  | M3 (F1 なし) | 1.00 | 1.00 | 0.99 | 1.00 | 3.44 |
+  | M3 + F1 | 0 | 1.00 | 0.99 | 1.00 | 3.07 |
+  | M3 + F1 + 需要駆動 reader (試作) | 0 | 0 | 0 | 1.00 | 3.32 |
+
+  - 需要駆動 reader の試作は、pending が 0 なら reader を止め、次の send が完了したら起こし直す形。
+    master と 5 組交互に測ると read −30.5% / user CPU +45.9% (paired median) で、park / resume を消しても差は縮まなかった。
+  - どの M3 の variant にも残っているのは、reader → actor の handoff 1 回/frame だけ。
+  - 次は、受信ループを session actor に隔離した需要駆動 reader (master の receiveLoop を需要駆動で起こす形) を試作して測る (ユーザー選択)。
+- 計数は観測用の一時コピーで取った。出典は `tmp/forge/probe/report.md`。master と M3 のソースは tar のスナップショットで、
+  M3 (F1 なし) は worktree から F1 を外して組み直したコピー (136268a の archive ではない)。

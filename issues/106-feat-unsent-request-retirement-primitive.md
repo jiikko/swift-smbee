@@ -58,6 +58,28 @@ commit の分け方（各 commit が単独で契約を満たす）:
 - 踏んだこと: 自分で後から入れた修正が SwiftLint の strict に当たり、最初の push で CI の Test が落ちた。
   手元では `make lint-analyze` しか回しておらず、CI の strict lint とは別物だった。
 
+### Commit 2 の受信境界の脅威モデル（2026-10-04、敵対レビュー 2 周目の後に固定）
+
+敵対レビューの 1・2 周目は、どちらも違う不変条件で P2 を 3 件ずつ出した。受信の攻撃面が広く、範囲が決まっていなかった。
+3 周目からは次の線で判定する。
+- **範囲内（commit を止める）**:
+  - 設計 §5 が約束した検査。対象は、slice ごとの AEAD と署名、session 全体の保護要件、wire 順の仮状態、
+    duplicate final の grant 前の拒否、未知 MID の discard、R1 の request ごとの protection policy。
+  - master からの退行。
+- **範囲外（記録に回す。commit を止めない）**: master と同じ既存の穴で、§5 が約束していないもの。
+
+範囲外として記録した既存の穴:
+- **AsyncId の identity 間の一意性**（2 周目 P2-2）。
+  - 発火条件: signing required の平文 session で、request B の正常 interim を観測できる攻撃者が、
+    まだ AsyncId を持たない request A に偽の interim を返し、B の AsyncId を流用させる。
+  - 結果: A を cancel すると、クライアントが正しく署名した CANCEL（MID=A、AsyncId=b）が、AsyncId で検索するサーバで B を取り消す。
+    既に記録済みの A の AsyncId を上書きする攻撃は拒否される。初回の記録だけが通る。
+  - master も同じで、interim の AsyncId の照合は request の中に閉じている（`dispatchReceivedPacket` の interim 分岐）。
+  - 直すには、wire outstanding の identity をまたいで AsyncId → identity を引く索引が要る。
+    MS-SMB2 §3.3.4.2 の AsyncId の一意性と §3.3.5.16 の CANCEL の検索規則に合わせる。
+  - 再提起に要るもの: この索引を設ける commit で、同一 compound の staged state と既存の pending の両方で
+    別 identity の AsyncId を拒否するテスト。
+
 ### 次
 
 - Commit 2: 受信の土台と compound の相関（設計の §5 と Commit 2 節）。

@@ -104,6 +104,43 @@ commit の分け方（各 commit が単独で契約を満たす）:
   その commit の CI は Test / E2E / Performance とも success。
 - Commit 3 へ申し送り: close は keepalive の ECHO だけ drain を待つ（上の fix）。cancel 済みの他の request への一般化は Commit 3 の drain の期限で行う。
 
+### Commit 3（2026-10-05、push の後に revert）
+
+- commit `feat(session): 未送信 request 退役 primitive の Commit 3 — post-auth の送信経路の有効化、取消、wire の drain の期限`（3d6eace）を、
+  `revert: issue 106 Commit 3 を戻す — CI の Linux x86 で read -22% / user CPU +46%、P2-2 のテストが flaky` で戻した（ユーザー決定）。
+- 機能: 受け入れ条件はすべて満たしていた。
+  - 変異 13 本と、敵対レビューの指摘ごとの変異で red を確認した。
+  - テストは macOS 669 件 / Linux 657 件で失敗 0。
+  - stress は macOS 20 回 / Linux 10 回、Samba は 2 profile で通った。
+  - 敵対レビュー: codex 1 周（範囲内 P2 4 件）と Claude opus 2 体（範囲内 P2 1 件）。どれも直した。
+- **CI の性能 gate が FAIL**（Linux x86_64、20 組、[run](https://github.com/jiikko/swift-smbee/actions/runs/37240281391)）。
+  - read: throughput −22.3%（95% CI −23.0〜−21.7%）、user CPU +45.8%、system CPU +40.1%。
+  - write: throughput −7.8%、user CPU +21.4%。
+  - 計測中の署名処理（SMB 3.0.2 / AES-CMAC、固定の key）は master の benchmark と揃えてある。新しい送信経路そのもののコストと見る。
+  - 手元の macOS では read −0.75% / user CPU +1.2%（3 組）。arm64 の Linux container は 3 組でばらつきが大きかった。
+    x86 の CI の数字は、どちらからも予測できなかった。
+- **CI の Test も FAIL**: `testFinalDrainReleasesTimerBeforeCreditGrantAckAndReapsRecordAfterAck` が Linux で 1 回落ちた。
+  record の数を見る時点が早く、ack の処理と競合する（レビュー 2 周目の P3 で指摘されていた箇所）。
+- 性能の経緯:
+  - 最初の実装は、benchmark が define なしでは新しい経路を通らなかった（gate の偽の緑）。
+  - define つきの計測では、Linux arm64 で read −33.8% / user CPU +47%、macOS で −8〜−21% だった。
+  - 次を入れて、macOS は −2% まで戻した:
+    - credit に余裕があるときは予約を同期で済ませる。
+    - 通常の request では drain の timer を作らない。
+    - header を直接読む。
+  - Time Profiler では、sender loop の起床と開始（frame ごとに約 5 µs、inclusive）と、response effect と dictionary の更新が残っていた。
+    request ごとに `SMBSessionActiveRequestRecord`（class）を確保している。
+- **入れ直しの条件**:
+  - CI の 20 組の gate を通る（throughput −15% / user CPU +25%）。
+  - 上の flaky なテストを直し、stress と同じように繰り返しても落ちないことを確かめる。
+  - Linux の性能を x86 で測る手段を用意する。手元の arm64 と macOS では予測できない。
+    候補: 変更を別の branch に push して、Performance の workflow を workflow_dispatch で回す。
+- レビューの P3（commit を止めない後続の課題）:
+  - P2-1 の close のテストは、snapshot の直後に完了数を見ていて競合する。join を待ちに入ったことを確かめてから見る。
+  - compound の final の credit の ack で record が回収されることを確かめるテストが無い。credit の fast path のテストも無い。
+  - source の形を見るテスト（`testSourceShapeSenderLoopHasNoNestedTasksOrGlobalExecutorHops`）は射程が狭い。
+- codex の週の枠が 99%（2026-10-05）で、10-10 までは Claude で進める。
+
 ### 次
 
 - Commit 3: 新しい送信経路の有効化、取消、wire の drain の期限、reader の後始末（設計の §2.3・§4・Commit 3 節。issue 010 の P2-2 を含む）。

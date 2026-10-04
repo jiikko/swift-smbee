@@ -53,5 +53,9 @@ compound にすることを許す）には反するので潜在的な互換性�
 ## 進捗
 
 - [ ] 実サーバが compound 応答を返す条件を調べる（Samba の設定・Windows の挙動）
-- [ ] 分割の実装とテスト
-- [ ] container Samba の smoke
+- [x] 分割の実装とテスト（issue 106 の Commit 2。slice ごとの AEAD・署名・相関を wire 順の仮状態で検証し、全 slice が通ったときだけ確定する）
+- [x] container Samba の smoke（Commit 2 で 3 profile とも pass）
+
+- 2026-10-04: 分割は issue 106 の Commit 2（`feat(session): 未送信 request 退役 primitive の Commit 2 — 受信の土台と compound の相関 (issue 104 を含む)`）で入った。
+  合成した compound の応答（平文の署名つき・暗号化・不正な NextCommand・duplicate final）のテストで固定した。
+  - 残り: 実サーバが compound 応答を返す条件の調査（Samba の設定・Windows）。調べて実サーバで確かめたら done にする。

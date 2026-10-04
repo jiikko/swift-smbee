@@ -724,3 +724,9 @@ actor の中で reader を回す試作は改善せず戻した。
   - 落ちるのは主に `testCloseDrainsBlockedCancelSendAfterOriginalResponseIsCancelled`（M3 で足したテスト）で、ときどき上のテストも落ちる。
 - 結論: M3 の入れ直し（b809c9b）で入った。Commit 2 の退行ではない。M3 の CI はたまたま当たらずに通っていた。
 - 本番コードの競合かテストの書き方かは観測中（`tmp/retire/flake/`）。
+- 2026-10-04 直した: `fix(session): close が cancel 済みの keepalive ECHO の drain を待ってから graceful teardown を送る (issue 010 M3 の退行)`。
+  - 原因は 2 つ:
+    - 本番: close が、cancel 済みの keepalive の ECHO の応答が処理される前に TREE_DISCONNECT を送っていた。
+    - テスト: fake が「送信を試みた」を「送信が保留に登録された」と取り違えていた。
+  - 直した後の stress は macOS 60 回・Linux 10 回で失敗 0。CI は Test / E2E / Performance とも success。
+  - cancel 済みの他の request の drain は、issue 106 の Commit 3 で一般化する。

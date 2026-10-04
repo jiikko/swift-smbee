@@ -25,7 +25,7 @@ MessageId を割り当てる前は、ローカルで退役できる。割り当�
 commit の分け方（各 commit が単独で契約を満たす）:
 
 1. request の識別と credit の所有の準備（送信経路は旧経路のまま）— **完了**
-2. 受信の土台と compound の相関（認証前に grant を適用しないようにする。issue 104 を含む）
+2. 受信の土台と compound の相関（認証前に grant を適用しないようにする。issue 104 を含む）— **完了**
 3. 新しい送信経路の有効化、取消、wire の drain の期限、reader の後始末（issue 010 の P2-2）
 4. issue 069 M2 の統合
 5. READ / WRITE の ticket と delivery の統合（pipelining）
@@ -80,10 +80,33 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - 再提起に要るもの: この索引を設ける commit で、同一 compound の staged state と既存の pending の両方で
     別 identity の AsyncId を拒否するテスト。
 
+### Commit 2（2026-10-04、完了）
+
+- commit `feat(session): 未送信 request 退役 primitive の Commit 2 — 受信の土台と compound の相関 (issue 104 を含む)`。
+- 内容:
+  - compound の slice ごとに AEAD・署名・内外の SessionId・request ごとの protection policy・相関を、仮状態で wire 順に検証する。
+    全 slice が通ったときだけ確定する。
+  - 認証の前に grant を適用しない。
+  - 未知の MID は捨てる。
+  - early final は送信完了まで保持する。
+  - STATUS_PENDING と MID 0xFFFF... の署名の例外を持つ。
+  - VALIDATE_NEGOTIATE_INFO は署名か AEAD を必須にする（R1）。暗号化して送った request への平文の応答は拒否する。
+  - 単一 frame では slice / effect の配列を作らない。
+- 敵対レビュー 3 周。範囲内の P2 は 3 → 2 → 1 → 0。2 周目の後に上の脅威モデルを固定した。
+- 性能:
+  - CI（Linux x86_64、20 組）の paired effect は read throughput −0.87%（95% CI −1.56〜−0.21%）、user CPU +1.08%、
+    system CPU +0.70%（[Performance run](https://github.com/jiikko/swift-smbee/actions/runs/37194519561)）。
+  - 手元の Linux arm64 container の 5 組では −10.6% / +8.3% / +33% だったが、x86 の CI には出なかった。
+    M3 では逆に x86 で大きく出たので、arm の container の数字は x86 の CI の予測に使えない。
+  - 最初の実装は、単一 frame でも frame ごとに配列を 2 つ確保していた。macOS の Time Profiler で見つけて削った。
+- c4d354e の CI の Test は「Cancel and teardown bounded stress」で落ちた。原因は Commit 2 ではなく issue 010 M3 の入れ直しの退行で、
+  `fix(session): close が cancel 済みの keepalive ECHO の drain を待ってから graceful teardown を送る (issue 010 M3 の退行)` で直した。
+  その commit の CI は Test / E2E / Performance とも success。
+- Commit 3 へ申し送り: close は keepalive の ECHO だけ drain を待つ（上の fix）。cancel 済みの他の request への一般化は Commit 3 の drain の期限で行う。
+
 ### 次
 
-- Commit 2: 受信の土台と compound の相関（設計の §5 と Commit 2 節）。
-  - 受け入れ条件に R1 を含める: 署名 optional の無署名 VALIDATE を、final・grant・pending removal を一切確定せずに拒否する。
+- Commit 3: 新しい送信経路の有効化、取消、wire の drain の期限、reader の後始末（設計の §2.3・§4・Commit 3 節。issue 010 の P2-2 を含む）。
 
 ## 関連
 

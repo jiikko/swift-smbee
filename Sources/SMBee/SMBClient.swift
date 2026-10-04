@@ -983,12 +983,16 @@ public actor SMBClientSession {
         }
         await waitForTreeSetupsOrCloseDeadline()
         await keepAliveTask?.value
+        // On a drain timeout the shared transport is already closed, so children are still
+        // released here (their close sends nothing) and only the graceful disconnect is skipped.
+        let echoDrained = await closingSession.drainEchoResponsesBeforeDisconnect()
 
         let children = Array(childTrees.values)
         childTrees.removeAll()
         for child in children {
             await child.child.closeIfMatching(session: child.session, treeId: child.treeId)
         }
+        guard echoDrained else { return }
         await closingSession.disconnect(treeId: closingTreeId)
     }
 
@@ -5267,11 +5271,18 @@ private enum SMBReaderLifecycle {
 
 private enum SMBTestingCountWaitKind: Equatable {
     case pendingResponses
+    case pendingCommandResponseDrainWaiters(UInt16)
     case requestSent
     case requestSentWaiterRegistrations
     case cleanupLedger
     case cleanupDrainTimeoutCallbacks
     case receivedPacketDispatches
+}
+
+private struct SMBPendingCommandResponseDrainWaiter {
+    let id: UUID
+    let command: UInt16
+    let continuation: CheckedContinuation<Void, Error>
 }
 
 private struct SMBTestingCountWaiter {
@@ -5346,6 +5357,7 @@ actor SMBSession {
     private var activeRequestIdentities: Set<SMBRequestIdentity> = []
     private var nextRequestSequence: UInt64 = 0
     private var cleanupLedger: [SMBFileIdLedgerKey: SMBCleanupAttemptState] = [:]
+    private var pendingCommandResponseDrainWaiters: [SMBPendingCommandResponseDrainWaiter] = []
     private var testingCountWaiters: [SMBTestingCountWaiter] = []
     private var nextTestingCountWaiterId: UInt64 = 0
     private var requestSentWaiterRegistrationCountForTestingStorage = 0
@@ -7245,6 +7257,10 @@ actor SMBSession {
         pendingResponses.count
     }
 
+    func waitForPendingCommandResponseDrainWaiterCountForTesting(command: UInt16, atLeast count: Int) async {
+        await waitForTestingCount(.pendingCommandResponseDrainWaiters(command), atLeast: count)
+    }
+
     func cleanupTombstoneCountForTesting() -> Int {
         pendingResponses.values.filter(\.cleanupTombstone).count
     }
@@ -7447,6 +7463,8 @@ actor SMBSession {
         switch kind {
         case .pendingResponses:
             value = pendingResponses.values.filter { !$0.continuationResumed }.count
+        case .pendingCommandResponseDrainWaiters(let command):
+            value = pendingCommandResponseDrainWaiters.filter { $0.command == command }.count
         case .requestSent:
             value = requestSentCountForTestingStorage
         case .requestSentWaiterRegistrations:
@@ -7761,7 +7779,80 @@ actor SMBSession {
     private func removePendingResponse(messageId: UInt64) -> SMBPendingResponse? {
         guard let pending = pendingResponses.removeValue(forKey: messageId) else { return nil }
         activeRequestIdentities.remove(pending.requestIdentity)
+        resumePendingCommandResponseDrainWaiters()
         return pending
+    }
+
+    /// Waits until no response record for `command` remains. Cancelled callers keep a
+    /// tombstone here until their final wire response is dispatched, so graceful teardown
+    /// cannot mistake caller cancellation for completion of the SMB request itself.
+    private func waitForPendingResponsesToDrain(command: UInt16) async throws {
+        let waiterID = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                guard pendingResponses.values.contains(where: { $0.expectedCommand == command }) else {
+                    continuation.resume()
+                    return
+                }
+                pendingCommandResponseDrainWaiters.append(SMBPendingCommandResponseDrainWaiter(
+                    id: waiterID,
+                    command: command,
+                    continuation: continuation
+                ))
+                resumeSatisfiedTestingCountWaiters()
+            }
+        } onCancel: {
+            Task { await self.cancelPendingCommandResponseDrainWaiter(waiterID) }
+        }
+    }
+
+    /// Close is graceful only while an in-flight keepalive ECHO can still be drained.
+    /// If its server final never arrives, close the wire after the existing cleanup bound
+    /// instead of sending TREE_DISCONNECT/LOGOFF across an unresolved request.
+    func drainEchoResponsesBeforeDisconnect() async -> Bool {
+        // Preserve the existing close path when there is no ECHO to drain. In
+        // particular, avoid creating a deadline task group (and an extra actor
+        // suspension) for the common case.
+        guard pendingResponses.values.contains(where: { $0.expectedCommand == SMB2Commands.echo }) else {
+            return true
+        }
+        do {
+            try await SMBOperationDeadline.run(timeout: cleanupTimeout, sleeper: cleanupTimeoutSleeper) {
+                try await self.waitForPendingResponsesToDrain(command: SMB2Commands.echo)
+            }
+            return true
+        } catch {
+            await closeTransportAndWait(cause: "keepalive_echo_drain_timeout", diagnosticError: error)
+            return false
+        }
+    }
+
+    private func resumePendingCommandResponseDrainWaiters() {
+        var remaining: [SMBPendingCommandResponseDrainWaiter] = []
+        var ready: [CheckedContinuation<Void, Error>] = []
+        for waiter in pendingCommandResponseDrainWaiters {
+            if pendingResponses.values.contains(where: { $0.expectedCommand == waiter.command }) {
+                remaining.append(waiter)
+            } else {
+                ready.append(waiter.continuation)
+            }
+        }
+        pendingCommandResponseDrainWaiters = remaining
+        if !ready.isEmpty {
+            resumeSatisfiedTestingCountWaiters()
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    private func cancelPendingCommandResponseDrainWaiter(_ id: UUID) {
+        guard let index = pendingCommandResponseDrainWaiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = pendingCommandResponseDrainWaiters.remove(at: index)
+        resumeSatisfiedTestingCountWaiters()
+        waiter.continuation.resume(throwing: CancellationError())
     }
 
     private func performDemuxSend(
@@ -9013,6 +9104,7 @@ actor SMBSession {
             SMBPerfLog.line("[wire] victim session=\(diagnosticSessionId) count=\(pending.count) resumed=\(resumed) pending=\(livePending.count) detail=\(detail)")
         }
         pendingResponses.removeAll()
+        resumePendingCommandResponseDrainWaiters()
         activeRequestIdentities.removeAll()
         for var waiter in pending.values {
             waiter.timeoutTask?.cancel()

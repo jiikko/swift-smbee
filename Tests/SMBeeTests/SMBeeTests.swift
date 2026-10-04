@@ -1217,6 +1217,7 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
     private enum WaitEvent {
         case sendAttempt(Int)
         case outboundFrames(Int)
+        case blockedSendCount(Int)
         case receiveBlocked
     }
 
@@ -1234,6 +1235,7 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
     private var receiveBlockedWaiters: [UUID: ReceiveCountWaiter] = [:]
     private var sendAttemptWaiters: [UUID: ReceiveCountWaiter] = [:]
     private var outboundFrameWaiters: [UUID: ReceiveCountWaiter] = [:]
+    private var blockedSendCountWaiters: [UUID: ReceiveCountWaiter] = [:]
     private var blockedSends: [PendingSend] = []
     private var blockNextSendCount = 0
     private var isInputFinished = false
@@ -1308,7 +1310,11 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
                         blockedSends.append(PendingSend(id: sendID, bytes: bytes, continuation: continuation))
                         return nil
                     }
-                    if let failure { continuation.resume(throwing: failure) }
+                    if let failure {
+                        continuation.resume(throwing: failure)
+                    } else {
+                        signalSatisfiedBlockedSendCountWaiters()
+                    }
                 }
             } onCancel: {
                 self.cancelBlockedSend(id: sendID)
@@ -1357,6 +1363,21 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
             sleeper: sleeper,
             timeoutHandler: { self.timeoutOutboundFrameWaiter(id: $0) },
             cancelHandler: { self.cancelOutboundFrameWaiter(id: $0) }
+        )
+    }
+
+    /// Unlike the attempt counter, this event fires only after `blockedSends` owns the send continuation.
+    func waitForBlockedSendCount(
+        atLeast target: Int,
+        timeout: Duration,
+        sleeper: @escaping @Sendable (Duration) async throws -> Void
+    ) async throws {
+        try await waitForEvent(
+            event: .blockedSendCount(target),
+            timeout: timeout,
+            sleeper: sleeper,
+            timeoutHandler: { self.timeoutBlockedSendCountWaiter(id: $0) },
+            cancelHandler: { self.cancelBlockedSendCountWaiter(id: $0) }
         )
     }
 
@@ -1474,6 +1495,7 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
         drainReceiveCountWaiters(error: SMBTransportError.connectionClosed)
         drainSendAttemptWaiters(error: SMBTransportError.connectionClosed)
         drainOutboundFrameWaiters(error: SMBTransportError.connectionClosed)
+        drainBlockedSendCountWaiters(error: SMBTransportError.connectionClosed)
         drainReceiveBlockedWaiters(error: SMBTransportError.connectionClosed)
     }
 
@@ -1500,6 +1522,7 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
         drainReceiveCountWaiters(error: CancellationError())
         drainSendAttemptWaiters(error: CancellationError())
         drainOutboundFrameWaiters(error: CancellationError())
+        drainBlockedSendCountWaiters(error: CancellationError())
         drainReceiveBlockedWaiters(error: CancellationError())
     }
 
@@ -1649,6 +1672,40 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
         }
     }
 
+    private func signalSatisfiedBlockedSendCountWaiters() {
+        let satisfied = lock.withLock { () -> [ReceiveCountWaiter] in
+            let ids = blockedSendCountWaiters.filter { blockedSends.count >= $0.value.target }.map(\.key)
+            return ids.compactMap { blockedSendCountWaiters.removeValue(forKey: $0) }
+        }
+        for waiter in satisfied {
+            waiter.timeoutTask?.cancel()
+            waiter.continuation.resume()
+        }
+    }
+
+    private func timeoutBlockedSendCountWaiter(id: UUID) {
+        let waiter = lock.withLock { blockedSendCountWaiters.removeValue(forKey: id) }
+        waiter?.continuation.resume(throwing: SMBTestEventWaitTimedOut())
+    }
+
+    private func cancelBlockedSendCountWaiter(id: UUID) {
+        let waiter = lock.withLock { blockedSendCountWaiters.removeValue(forKey: id) }
+        waiter?.timeoutTask?.cancel()
+        waiter?.continuation.resume(throwing: CancellationError())
+    }
+
+    private func drainBlockedSendCountWaiters(error: Error) {
+        let waiters = lock.withLock { () -> [ReceiveCountWaiter] in
+            let values = Array(blockedSendCountWaiters.values)
+            blockedSendCountWaiters.removeAll()
+            return values
+        }
+        for waiter in waiters {
+            waiter.timeoutTask?.cancel()
+            waiter.continuation.resume(throwing: error)
+        }
+    }
+
     private func timeoutOutboundFrameWaiter(id: UUID) {
         let waiter = lock.withLock { outboundFrameWaiters.removeValue(forKey: id) }
         waiter?.continuation.resume(throwing: SMBTestEventWaitTimedOut())
@@ -1717,6 +1774,8 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
                     ready = sendAttemptCountStorage >= target
                 case .outboundFrames(let target):
                     ready = outboundFrameCountStorage >= target
+                case .blockedSendCount(let target):
+                    ready = blockedSends.count >= target
                 case .receiveBlocked:
                     ready = pending != nil
                 }
@@ -1735,6 +1794,8 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
                     sendAttemptWaiters[waiterID] = ReceiveCountWaiter(target: target, continuation: continuation)
                 case .outboundFrames(let target):
                     outboundFrameWaiters[waiterID] = ReceiveCountWaiter(target: target, continuation: continuation)
+                case .blockedSendCount(let target):
+                    blockedSendCountWaiters[waiterID] = ReceiveCountWaiter(target: target, continuation: continuation)
                 case .receiveBlocked:
                     receiveBlockedWaiters[waiterID] = ReceiveCountWaiter(target: 0, continuation: continuation)
                 }
@@ -1763,6 +1824,14 @@ private final class ControlledReceiveTransport: SMBTransport, @unchecked Sendabl
                     if var waiter = outboundFrameWaiters[waiterID] {
                         waiter.timeoutTask = timeoutTask
                         outboundFrameWaiters[waiterID] = waiter
+                        shouldCancelTimeout = false
+                    } else {
+                        shouldCancelTimeout = true
+                    }
+                case .blockedSendCount:
+                    if var waiter = blockedSendCountWaiters[waiterID] {
+                        waiter.timeoutTask = timeoutTask
+                        blockedSendCountWaiters[waiterID] = waiter
                         shouldCancelTimeout = false
                     } else {
                         shouldCancelTimeout = true
@@ -3628,14 +3697,14 @@ final class SMBeeTests: XCTestCase {
             XCTFail("cancelled ECHO should throw CancellationError")
         } catch is CancellationError {
         }
-        try await awaitWithTimeout("CANCEL transport send is blocked") {
-            try await transport.waitForSendAttemptCount(
-                atLeast: 2,
+        try await awaitWithTimeout("CANCEL send is registered as blocked") {
+            try await transport.waitForBlockedSendCount(
+                atLeast: 1,
                 timeout: .seconds(1),
                 sleeper: { try await clock.sleep(for: $0) }
             )
         }
-        XCTAssertEqual(transport.blockedSendCount, 1)
+        XCTAssertEqual(transport.blockedSendCount, 1, "the CANCEL send waiter returns only after blocked registration")
 
         transport.enqueueInbound(try framed([smb2EchoResponse(messageId: echoMessageId)]))
         try await awaitWithTimeout("late final retires the cancellation record") {
@@ -10554,29 +10623,96 @@ final class SMBeeTests: XCTestCase {
 
         try await clientSession.startKeepAlive(interval: .milliseconds(50))
         try await waitForOutboundFrameCount(1, transport: transport)
+        try await awaitWithTimeout("keepalive ECHO full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let echoRequest = try XCTUnwrap(try unframed(transport.outbound).first)
+        let echoHeader = try SMB2Header.decode(echoRequest)
         let closeTask = Task { await clientSession.close() }
 
-        // Release the in-flight ECHO only after close has had a chance to cancel it.
-        try await Task.sleep(nanoseconds: 20_000_000)
-        transport.enqueueInbound(try framed([smb2EchoResponse(messageId: 0)]))
+        try await awaitWithTimeout("close registers the in-flight ECHO drain") {
+            await session.waitForPendingCommandResponseDrainWaiterCountForTesting(
+                command: SMB2Commands.echo,
+                atLeast: 1
+            )
+        }
         try await waitForOutboundFrameCount(2, transport: transport)
-        let outboundAfterEcho = try unframed(transport.outbound)
-        let teardownCount = outboundAfterEcho.filter {
-            let command = try? SMB2Header.decode($0).command
-            return command == SMB2Commands.treeDisconnect || command == SMB2Commands.logoff
-        }.count
-        XCTAssertEqual(teardownCount, 0)
+        let outboundBeforeEchoFinal = try unframed(transport.outbound)
+        let commandsBeforeEchoFinal = try outboundBeforeEchoFinal.map { try SMB2Header.decode($0).command }
+        XCTAssertEqual(commandsBeforeEchoFinal, [SMB2Commands.echo, SMB2Commands.cancel])
 
-        transport.enqueueInbound(try framed([
-            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.treeDisconnect, messageId: 1, treeId: 0x3344),
-            smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.logoff, messageId: 2, treeId: 0)
-        ]))
-        try await awaitWithTimeout("close after in-flight keepalive") { await closeTask.value }
+        transport.enqueueInbound(try framed([smb2EchoResponse(messageId: echoHeader.messageId)]))
+        try await awaitWithTimeout("keepalive ECHO final retires its wire record") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 1)
+        }
+        try await waitForOutboundFrameCount(3, transport: transport)
+        let treeDisconnect = try SMB2Header.decode(try XCTUnwrap(try unframed(transport.outbound).last))
+        XCTAssertEqual(treeDisconnect.command, SMB2Commands.treeDisconnect)
+        transport.enqueueInbound(try framed([smb2StatusResponse(
+            status: SMB2Status.success,
+            command: treeDisconnect.command,
+            messageId: treeDisconnect.messageId,
+            treeId: 0x3344
+        )]))
+
+        try await waitForOutboundFrameCount(4, transport: transport)
+        let logoff = try SMB2Header.decode(try XCTUnwrap(try unframed(transport.outbound).last))
+        XCTAssertEqual(logoff.command, SMB2Commands.logoff)
+        transport.enqueueInbound(try framed([smb2StatusResponse(
+            status: SMB2Status.success,
+            command: logoff.command,
+            messageId: logoff.messageId,
+            treeId: 0
+        )]))
+        try await awaitWithTimeout("close after in-flight keepalive final") { await closeTask.value }
 
         let commands = try unframed(transport.outbound).map { try SMB2Header.decode($0).command }
         XCTAssertEqual(commands.filter { $0 != SMB2Commands.cancel }, [
             SMB2Commands.echo, SMB2Commands.treeDisconnect, SMB2Commands.logoff
         ])
+    }
+
+    func testClientSessionCloseSkipsGracefulTeardownWhenKeepAliveEchoNeverDrains() async throws {
+        let transport = ControlledReceiveTransport()
+        let clock = ManualSMBSleeper()
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16),
+            cleanupTimeout: .seconds(5),
+            cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
+        )
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        try await clientSession.startKeepAlive(interval: .milliseconds(50))
+        try await waitForOutboundFrameCount(1, transport: transport)
+        try await awaitWithTimeout("keepalive ECHO full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let closeTask = Task { await clientSession.close() }
+        try await awaitWithTimeout("close registers the in-flight ECHO drain") {
+            await session.waitForPendingCommandResponseDrainWaiterCountForTesting(
+                command: SMB2Commands.echo,
+                atLeast: 1
+            )
+        }
+        try await awaitWithTimeout("ECHO drain deadline armed") {
+            try await clock.waitUntilCallCount(
+                atLeast: 1,
+                timeout: .seconds(1),
+                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
+            )
+        }
+        // The ECHO final never arrives: the deadline closes the wire instead of sending
+        // TREE_DISCONNECT / LOGOFF across the unresolved request.
+        clock.fireNext()
+        try await awaitWithTimeout("close after ECHO drain timeout") { await closeTask.value }
+
+        let transportClosed = await session.isTransportClosedForTesting()
+        XCTAssertTrue(transportClosed)
+        let commands = try unframed(transport.outbound).map { try SMB2Header.decode($0).command }
+        XCTAssertFalse(commands.contains(SMB2Commands.treeDisconnect), "\(commands)")
+        XCTAssertFalse(commands.contains(SMB2Commands.logoff), "\(commands)")
     }
 
     func testCancelledParkedEchoDoesNotSendStaleFrameAfterCreditGrant() async throws {

@@ -707,3 +707,20 @@ actor の中で reader を回す試作は改善せず戻した。
     上書きが入った commit を検証すると FAIL と出る。CI の gate の step 自体は success だった。
 - **M3 は完了**。残りは M4（下の「M4 の残り」）と P2-2（cancel の後に final が来ない場合の session の保持。
   retirement primitive で扱う）。
+
+### M3 の入れ直しで cancel / teardown の stress が flaky になった（2026-10-04 に発見、調査中）
+
+- issue 106 Commit 2（c4d354e）の CI の Test が、「Cancel and teardown bounded stress」step で落ちた。
+  - この step は `swift test --skip SMBeeE2ETests --filter 'KeepAlive|Cancel'` を 20 回回す。
+  - `testClientSessionCloseWaitsForInFlightKeepAliveEcho` の teardownCount が 1 だった（期待は 0）。
+- 手元の macOS で同じ command を 20 回ずつ回して切り分けた。
+
+  | commit | 失敗 |
+  |---|---|
+  | 76d70ed（M3 の入れ直しの前） | 0/20 |
+  | a0fac80（Commit 2 の前） | 5/20 |
+  | c4d354e（Commit 2） | 5/20 |
+
+  - 落ちるのは主に `testCloseDrainsBlockedCancelSendAfterOriginalResponseIsCancelled`（M3 で足したテスト）で、ときどき上のテストも落ちる。
+- 結論: M3 の入れ直し（b809c9b）で入った。Commit 2 の退行ではない。M3 の CI はたまたま当たらずに通っていた。
+- 本番コードの競合かテストの書き方かは観測中（`tmp/retire/flake/`）。

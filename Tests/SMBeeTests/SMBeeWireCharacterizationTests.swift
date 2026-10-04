@@ -627,7 +627,7 @@ final class SMBeeWireCharacterizationTests: XCTestCase {
         XCTAssertEqual(try m1OutboundHeaders(transport).map(\.command), [SMB2Commands.read])
     }
 
-    func testFutureReadResponseArrivingBeforeSendCompletesRequest() async throws {
+    func testFutureReadResponseIsDiscardedBeforeMessageIdReuse() async throws {
         let transport = M1WireTransport(blockFirstSend: true)
         let session = m1Session(transport, initialCredits: 3)
         let (firstReadTask, firstResult) = m1Start {
@@ -659,7 +659,7 @@ final class SMBeeWireCharacterizationTests: XCTestCase {
             try m1ReadResponse([0x70, 0x72, 0x65], messageId: futureReadMessageId, treeId: 0x3344)
         ]))
 
-        // Wait until the active receive loop has dispatched the future response as an orphan.
+        // The response arrives before its request is registered, so it must be discarded.
         try await m1WaitForReceiveCallCount(3, transport: transport)
         try await m1WaitForInboundDrain(transport: transport)
 
@@ -671,10 +671,15 @@ final class SMBeeWireCharacterizationTests: XCTestCase {
         }
         defer { futureReadTask.cancel() }
 
+        try await m1WaitForOutboundFrameCount(3, transport: transport)
+        transport.enqueueInbound(try m1Framed([
+            try m1ReadResponse([0x66, 0x72, 0x65], messageId: futureReadMessageId, treeId: 0x3344)
+        ]))
+
         let outcome = try await m1WaitForResult("READ after pre-send response", futureResult)
         switch outcome {
         case .success(let data):
-            XCTAssertEqual(data, [0x70, 0x72, 0x65])
+            XCTAssertEqual(data, [0x66, 0x72, 0x65], "the earlier unsolicited payload was discarded")
         case .failure(let error):
             XCTFail("READ failed after pre-send response: \(error)")
         }

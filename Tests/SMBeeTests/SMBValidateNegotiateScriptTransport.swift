@@ -222,9 +222,12 @@ final class SMBValidateNegotiateScriptTransport: SMBTransport, @unchecked Sendab
         let ready = try delivery.responseSteps.map { step -> [UInt8] in
             switch step {
             case .packet(let response):
-                Self.directTCPFrame(response)
+                let protectedResponse = try delivery.requestWasEncrypted
+                    ? protectResponseForEncryptedRequest(response, request: delivery.request)
+                    : response
+                return Self.directTCPFrame(protectedResponse)
             case .validateNegotiate(let validation):
-                try Self.directTCPFrame(completeValidateNegotiateRequest(
+                return try Self.directTCPFrame(completeValidateNegotiateRequest(
                     request: delivery.request,
                     validation: validation,
                     encryptResponse: delivery.requestWasEncrypted
@@ -239,6 +242,29 @@ final class SMBValidateNegotiateScriptTransport: SMBTransport, @unchecked Sendab
         if let (pending, responseBytes) = waiter {
             pending.continuation.resume(returning: responseBytes)
         }
+    }
+
+    private func protectResponseForEncryptedRequest(
+        _ packet: [UInt8],
+        request: SMBWireRequestDescriptor
+    ) throws -> [UInt8] {
+        guard !packet.starts(with: SMB3TransformHeader.protocolId) else { return packet }
+        guard packet.count >= SMB2Header.encodedSize,
+              let authenticationRequest = lock.withLock({ authenticationRequest }) else {
+            throw SMBCodecError.invalidValue("encrypted SMB response fixture has no authenticated request")
+        }
+        var response = packet
+        writeUInt64LE(request.sessionId, to: &response, at: 40)
+        let exportedSessionKey = try Self.smb302ExportedSessionKey(
+            authenticationRequest: authenticationRequest,
+            credential: credential
+        )
+        return try Self.encryptServerPacket(
+            response,
+            sessionId: request.sessionId,
+            messageId: request.identity.messageId,
+            key: SMBCrypto.smb302DecryptionKey(sessionKey: exportedSessionKey)
+        )
     }
 
     func receive(maxLength: Int) async throws -> [UInt8] {

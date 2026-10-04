@@ -2738,7 +2738,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(transport.receiveCount, 0, "idle completion must not enter transport.receive")
     }
 
-    func testOrphanReplayDoesNotCreateOverlappingReaderTasks() async throws {
+    func testUnsentResponseIsDiscardedAndReaderRemainsSingle() async throws {
         let transport = ControlledReceiveTransport()
         let session = SMBSession(
             host: "test",
@@ -2749,10 +2749,10 @@ final class SMBeeTests: XCTestCase {
         )
         defer { transport.close() }
 
-        let replayed = Task {
+        let requestB = Task {
             try await session.parkPendingForTesting(messageId: 0xB0, command: SMB2Commands.echo)
         }
-        let outstanding = Task {
+        let requestC = Task {
             try await session.parkPendingForTesting(messageId: 0xC0, command: SMB2Commands.echo)
         }
         try await awaitWithTimeout("both unsent ECHOs are registered") {
@@ -2760,13 +2760,12 @@ final class SMBeeTests: XCTestCase {
         }
         try await session.dispatchReceivedPacketForTesting(smb2EchoResponse(messageId: 0xB0))
         let orphanCountBeforeSend = await session.orphanResponseCountForTesting()
-        XCTAssertEqual(orphanCountBeforeSend, 1, "the early B final waits for its send completion")
+        XCTAssertEqual(orphanCountBeforeSend, 0, "a response for a registered but unsent request is discarded")
 
         let taskCountAfterBootstrap = await session.sendDidSucceedInOrderForTesting([0xB0, 0xC0])
-        XCTAssertEqual(taskCountAfterBootstrap, 1, "only C needs a reader after B's orphan final is replayed")
-        try await awaitWithTimeout("orphan final replays during B send completion") { try await replayed.value }
-        let orphanCountAfterReplay = await session.orphanResponseCountForTesting()
-        XCTAssertEqual(orphanCountAfterReplay, 0)
+        XCTAssertEqual(taskCountAfterBootstrap, 1, "both sent requests share one reader")
+        let pendingAfterBootstrap = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterBootstrap, 2, "the discarded response is not replayed after send completion")
 
         let receiveClock = ManualSMBSleeper()
         try await awaitWithTimeout("single reader waits for C's final") {
@@ -2784,9 +2783,15 @@ final class SMBeeTests: XCTestCase {
         let currentHandle = try XCTUnwrap(optionalCurrentHandle)
         let optionalCurrentReader = await session.readerTaskForTesting(handle: currentHandle)
         let currentReader = try XCTUnwrap(optionalCurrentReader)
-        transport.enqueueInbound(try framed([smb2EchoResponse(messageId: 0xC0)]))
-        try await awaitWithTimeout("C final is delivered by the sole reader") { try await outstanding.value }
-        try await awaitWithTimeout("sole reader becomes dormant after C final") { await currentReader.value }
+        transport.enqueueInbound(try framed([
+            smb2EchoResponse(messageId: 0xB0),
+            smb2EchoResponse(messageId: 0xC0)
+        ]))
+        try await awaitWithTimeout("fresh B and C finals are delivered by the sole reader") {
+            _ = try await requestB.value
+            _ = try await requestC.value
+        }
+        try await awaitWithTimeout("sole reader becomes dormant after both finals") { await currentReader.value }
         XCTAssertEqual(transport.maxConcurrentReceiveCount, 1)
         await session.closeTransportAndWait(cause: "test_orphan_replay_reader_join")
     }
@@ -2912,7 +2917,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertNil(stoppedHandle, "the matching stop acknowledgement clears the handle")
     }
 
-    func testCloseWhileCreditGrantIsSuspendedDoesNotDispatchTheFrame() async throws {
+    func testCloseWhileCreditGrantHookIsSuspendedPreservesAcceptedFinal() async throws {
         let transport = ControlledReceiveTransport()
         let session = SMBSession(
             host: "test",
@@ -2946,18 +2951,16 @@ final class SMBeeTests: XCTestCase {
                 sleeper: { try await eventClock.sleep(for: $0) }
             )
         }
-
-        await session.closeTransport(cause: "test_close_during_credit_grant")
-        grantGate.release()
-        await session.closeTransportAndWait(cause: "test_credit_grant_post_close_join")
-        do {
-            try await awaitWithTimeout("closed ECHO fails") { try await echo.value }
-            XCTFail("close should fail the request waiting for a response")
-        } catch SMBTransportError.connectionClosed {
+        try await awaitWithTimeout("accepted ECHO completes while credit acknowledgement is paused") {
+            try await echo.value
         }
+
+        await session.closeTransport(cause: "test_close_during_credit_ack")
+        grantGate.release()
+        await session.closeTransportAndWait(cause: "test_credit_ack_post_close_join")
         let dispatchCount = await session.receivedPacketDispatchCountForTesting()
         let pending = await session.pendingCountForTesting()
-        XCTAssertEqual(dispatchCount, 0, "close during the awaited grant fences demux")
+        XCTAssertEqual(dispatchCount, 1, "final acceptance precedes the delayed credit acknowledgement")
         XCTAssertEqual(pending, 0)
         XCTAssertEqual(transport.closeCount, 1)
         await session.setCreditGrantAfterAwaitHookForTesting(nil)
@@ -2999,14 +3002,16 @@ final class SMBeeTests: XCTestCase {
         try await awaitWithTimeout("second ECHO sent before generation test") {
             await session.waitForRequestSentCountForTesting(atLeast: 2)
         }
+        let secondRequest = try XCTUnwrap(try unframed(transport.outbound).last)
+        let secondMessageId = try SMB2Header.decode(secondRequest).messageId
         transport.enqueueInbound(try framed([
             smb2EchoResponse(messageId: firstMessageId),
-            smb2EchoResponse(messageId: 0x1111),
+            smb2EchoResponse(messageId: secondMessageId),
             smb2EchoResponse(messageId: 0x2222)
         ]))
 
         let eventClock = ManualSMBSleeper()
-        try await awaitWithTimeout("second frame reached the suspended credit grant") {
+        try await awaitWithTimeout("second accepted response reached the suspended credit grant") {
             try await hookEntered.waitForCount(
                 1,
                 timeout: .seconds(1),
@@ -3016,22 +3021,19 @@ final class SMBeeTests: XCTestCase {
         try await awaitWithTimeout("first frame was processed before the generation changed") {
             try await firstEcho.value
         }
+        try await awaitWithTimeout("second final completes before its credit acknowledgement") {
+            try await secondEcho.value
+        }
         let dispatchCountBeforeClose = await session.receivedPacketDispatchCountForTesting()
-        XCTAssertEqual(dispatchCountBeforeClose, 1)
+        XCTAssertEqual(dispatchCountBeforeClose, 2)
 
         await session.closeTransport(cause: "test_close_during_reader_generation")
         grantGate.release()
         await session.closeTransportAndWait(cause: "test_reader_generation_join")
-        do {
-            try await awaitWithTimeout("second ECHO fails after generation close") { try await secondEcho.value }
-            XCTFail("close should fail the second outstanding request")
-        } catch SMBTransportError.connectionClosed {
-        }
-
         XCTAssertEqual(hookCount.value, 2, "the third frame must not start credit processing")
         let dispatchCountAfterClose = await session.receivedPacketDispatchCountForTesting()
         let orphanCountAfterClose = await session.orphanResponseCountForTesting()
-        XCTAssertEqual(dispatchCountAfterClose, 1)
+        XCTAssertEqual(dispatchCountAfterClose, 2)
         XCTAssertEqual(orphanCountAfterClose, 0)
         XCTAssertEqual(transport.closeCount, 1)
         await session.setCreditGrantAfterAwaitHookForTesting(nil)
@@ -3522,22 +3524,26 @@ final class SMBeeTests: XCTestCase {
             try await first.value
         }
         let pendingBeforeSendCompletion = await session.pendingCountForTesting()
-        let orphanCountBeforeSendCompletion = await session.orphanResponseCountForTesting()
+        let asyncIdBeforeSendCompletion = await session.pendingAsyncIdForTesting(messageId: secondID)
+        let finalSeenBeforeSendCompletion = await session.pendingFinalSeenForTesting(messageId: secondID)
+        let callerResumedBeforeSendCompletion = await session.pendingContinuationResumedForTesting(messageId: secondID)
         XCTAssertEqual(pendingBeforeSendCompletion, 1, "response is gated until full-send completion")
-        XCTAssertEqual(orphanCountBeforeSendCompletion, 2, "both frames retain FIFO order")
+        XCTAssertEqual(asyncIdBeforeSendCompletion, asyncId, "STATUS_PENDING correlation is committed while sending")
+        XCTAssertTrue(finalSeenBeforeSendCompletion, "the final is accepted while sending")
+        XCTAssertFalse(callerResumedBeforeSendCompletion, "the caller gate stays closed until full-send completion")
 
         transport.releaseBlockedSend()
-        try await awaitWithTimeout("buffered ECHO response replay") { try await second.value }
+        try await awaitWithTimeout("accepted ECHO final releases after send completion") { try await second.value }
         let pendingAfterReplay = await session.pendingCountForTesting()
-        let orphanCountAfterReplay = await session.orphanResponseCountForTesting()
         let creditBalance = await session.creditBalanceForTesting()
+        let grantReceiptCount = await session.creditGrantReceiptCountForTesting()
         XCTAssertEqual(pendingAfterReplay, 0)
-        XCTAssertEqual(orphanCountAfterReplay, 0)
         XCTAssertEqual(creditBalance, 2, "the two interim grants are applied once; the legal async final grants zero")
+        XCTAssertEqual(grantReceiptCount, 3, "each accepted slice grants once, including the zero-credit final")
         await session.closeTransportAndWait(cause: "test_fifo_orphan_reader_join")
     }
 
-    func testRequiredPreSendResponseOverflowClosesTheWire() async throws {
+    func testUnknownPreSendResponsesDoNotOverflowOrReplay() async throws {
         let transport = ControlledReceiveTransport()
         let session = SMBSession(
             host: "test",
@@ -3551,6 +3557,7 @@ final class SMBeeTests: XCTestCase {
         try await awaitWithTimeout("first ECHO is sent") {
             await session.waitForRequestSentCountForTesting(atLeast: 1)
         }
+        let firstID = try SMB2Header.decode(try XCTUnwrap(try unframed(transport.outbound).first)).messageId
         transport.blockNextSend()
         let blockedEcho = Task { try await session.echo() }
         defer { blockedEcho.cancel() }
@@ -3563,29 +3570,32 @@ final class SMBeeTests: XCTestCase {
         }
         let blockedSend = try XCTUnwrap(transport.firstBlockedSendBytes)
         let messageId = try SMB2Header.decode(Array(blockedSend.dropFirst(4))).messageId
-        let overflowFrames = try (0..<65).map { _ in
-            try DirectTCPFraming.frame(smb2EchoResponse(messageId: messageId))
+        let unknownMessageId = messageId &+ 1_000
+        let unknownFrames = try (0..<65).map { _ in
+            try DirectTCPFraming.frame(smb2EchoResponse(messageId: unknownMessageId))
         }.flatMap { $0 }
-        transport.enqueueInbound(overflowFrames)
+        transport.enqueueInbound(unknownFrames + (try DirectTCPFraming.frame(smb2EchoResponse(messageId: firstID))))
+        try await awaitWithTimeout("first ECHO completes after unsolicited frames are discarded") {
+            try await firstEcho.value
+        }
+        let closedAfterUnknowns = await session.isTransportClosedForTesting()
+        let balanceAfterFirst = await session.creditBalanceForTesting()
+        let grantsAfterFirst = await session.creditGrantReceiptCountForTesting()
+        XCTAssertFalse(closedAfterUnknowns, "unknown MessageIds do not overflow or close the wire")
+        XCTAssertEqual(balanceAfterFirst, 1, "only the known first response grants a credit")
+        XCTAssertEqual(grantsAfterFirst, 1, "unknown response credits are discarded")
 
-        try await awaitWithTimeout("required response overflow is terminal") {
-            await session.waitForPendingCountForTesting(atLeast: Int.max)
+        transport.releaseBlockedSend()
+        try await awaitWithTimeout("second ECHO completes its send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
         }
-        let terminal = await session.isTransportClosedForTesting()
-        XCTAssertTrue(terminal)
-        XCTAssertEqual(transport.closeCount, 1)
-        do {
-            try await awaitWithTimeout("overflow fails the first ECHO") { try await firstEcho.value }
-            XCTFail("the terminal overflow must fail every in-flight request")
-        } catch {
-        }
-        do {
-            try await awaitWithTimeout("overflow fails the blocked ECHO") { try await blockedEcho.value }
-            XCTFail("a required pre-send response overflow must fail its pending request")
-        } catch {
-            // The terminal close is expected to fail both the receive and blocked send paths.
-        }
-        await session.closeTransportAndWait(cause: "test_required_orphan_overflow_join")
+        transport.enqueueInbound(try DirectTCPFraming.frame(smb2EchoResponse(messageId: messageId)))
+        try await awaitWithTimeout("second ECHO receives a fresh response") { try await blockedEcho.value }
+        let balanceAfterSecond = await session.creditBalanceForTesting()
+        let grantsAfterSecond = await session.creditGrantReceiptCountForTesting()
+        XCTAssertEqual(balanceAfterSecond, 2)
+        XCTAssertEqual(grantsAfterSecond, 2)
+        await session.closeTransportAndWait(cause: "test_unknown_unsent_frames_join")
     }
 
     func testCloseDrainsBlockedCancelSendAfterOriginalResponseIsCancelled() async throws {
@@ -5822,7 +5832,11 @@ final class SMBeeTests: XCTestCase {
         let inbound = try framed([
             negotiateResponse(messageId: 0, capabilities: capabilities),
             sessionSetupChallengeResponse(messageId: 1, sessionId: 0x1122_3344_5566_7788),
-            try sessionSetupSuccessResponse(messageId: 2, sessionFlags: sessionFlags),
+            try sessionSetupSuccessResponse(
+                messageId: 2,
+                sessionFlags: sessionFlags,
+                sessionId: 0x1122_3344_5566_7788
+            ),
             smb2TreeConnectResponse(treeId: 0x3344, shareType: 1, shareFlags: 0, capabilities: 0, maximalAccess: 0x001f_01ff),
             try SMBValidateNegotiateScript.responseTemplate(capabilities: capabilities)
         ])
@@ -9059,6 +9073,234 @@ final class SMBeeTests: XCTestCase {
         try await awaitWithTimeout("ECHO after cancelled ECHO") { try await second.value }
     }
 
+    func testEncryptedEchoRejectsPlaintextStatusPendingBeforeCorrelationOrGrant() async throws {
+        let transport = ControlledReceiveTransport()
+        let encryptionKey = [UInt8](repeating: 0x6D, count: 16)
+        let sessionId: UInt64 = 0x8877_6655_4433_2211
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 2
+        )
+        await session.installEncryptionStateForTesting(
+            encryptionKey: encryptionKey,
+            decryptionKey: encryptionKey,
+            sessionId: sessionId
+        )
+
+        let echo = Task { try await session.echo() }
+        try await awaitWithTimeout("encrypted ECHO is sent") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let request = try XCTUnwrap(try unframed(transport.outbound).first)
+        XCTAssertTrue(request.starts(with: SMB3TransformHeader.protocolId), "ECHO must be sent inside SMB3 transform")
+        let messageId: UInt64 = 0
+        let creditsBefore = await session.creditBalanceForTesting()
+        let grantsBefore = await session.creditGrantReceiptCountForTesting()
+        for innerSessionId in [sessionId, UInt64(0)] {
+            let plainInterim = try smb2AsyncPendingResponse(
+                command: SMB2Commands.echo,
+                messageId: messageId,
+                asyncId: 0x1234_5678,
+                sessionId: innerSessionId,
+                credits: UInt16.max
+            )
+            do {
+                _ = try await session.processRawFrameForTesting(plainInterim, generation: 1)
+                XCTFail("a plaintext STATUS_PENDING cannot answer an encrypted request")
+            } catch SMBCodecError.invalidValue(let message) {
+                XCTAssertTrue(message.contains("plaintext SMB response to an encrypted request"), message)
+            }
+
+            let asyncIdAfter = await session.pendingAsyncIdForTesting(messageId: messageId)
+            let interimCountAfter = await session.pendingInterimCountForTesting(messageId: messageId)
+            let pendingCountAfter = await session.pendingCountForTesting()
+            let creditsAfter = await session.creditBalanceForTesting()
+            let grantsAfter = await session.creditGrantReceiptCountForTesting()
+            XCTAssertNil(asyncIdAfter)
+            XCTAssertEqual(interimCountAfter, 0)
+            XCTAssertEqual(pendingCountAfter, 1)
+            XCTAssertEqual(creditsAfter, creditsBefore)
+            XCTAssertEqual(grantsAfter, grantsBefore)
+        }
+        XCTAssertEqual(grantsBefore, 0)
+
+        await session.closeTransportAndWait(cause: "test_encrypted_request_rejects_plaintext_interim")
+        do {
+            try await awaitWithTimeout("encrypted ECHO teardown") { try await echo.value }
+            XCTFail("the rejected plaintext interim must not complete ECHO")
+        } catch {
+        }
+    }
+
+    func testEncryptedEarlyFinalDiscardsPlaintextFinalUntilSendCompletes() async throws {
+        try await assertEncryptedEarlyFinalDiscardsPlaintextPostFinalFrame(isInterim: false)
+    }
+
+    func testEncryptedEarlyFinalDiscardsPlaintextStatusPendingUntilSendCompletes() async throws {
+        try await assertEncryptedEarlyFinalDiscardsPlaintextPostFinalFrame(isInterim: true)
+    }
+
+    private func assertEncryptedEarlyFinalDiscardsPlaintextPostFinalFrame(isInterim: Bool) async throws {
+        let transport = ControlledReceiveTransport()
+        let encryptionKey = [UInt8](repeating: 0x6D, count: 16)
+        let sessionId: UInt64 = 0x8877_6655_4433_2211
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 4
+        )
+        await session.installEncryptionStateForTesting(
+            encryptionKey: encryptionKey,
+            decryptionKey: encryptionKey,
+            sessionId: sessionId
+        )
+        var sessionJoined = false
+        defer {
+            if !sessionJoined {
+                transport.releaseBlockedSend()
+                Task { await session.closeTransportAndWait(cause: "encrypted_early_final_test_cleanup") }
+            }
+        }
+
+        // R keeps the single reader alive while X is still inside transport.send.
+        let unrelatedRequest = Task { try await session.echo() }
+        try await awaitWithTimeout("unrelated encrypted ECHO sent") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let unrelatedRequestBytes = try XCTUnwrap(try unframed(transport.outbound).first)
+        XCTAssertTrue(unrelatedRequestBytes.starts(with: SMB3TransformHeader.protocolId))
+        let readerClock = ManualSMBSleeper()
+        try await awaitWithTimeout("reader waits for R response") {
+            try await transport.waitForReceiveCount(
+                atLeast: 1,
+                timeout: .seconds(1),
+                sleeper: { try await readerClock.sleep(for: $0) }
+            )
+        }
+        let readerRunningForR = await session.receiveLoopRunningForTesting()
+        XCTAssertTrue(readerRunningForR)
+
+        transport.blockNextSend()
+        let earlyFinalRequest = Task { try await session.echo() }
+        let sendClock = ManualSMBSleeper()
+        try await awaitWithTimeout("encrypted X send is held") {
+            try await transport.waitForSendAttemptCount(
+                atLeast: 2,
+                timeout: .seconds(1),
+                sleeper: { try await sendClock.sleep(for: $0) }
+            )
+        }
+        let blockedSendBytes = try XCTUnwrap(transport.firstBlockedSendBytes)
+        let blockedSendLength = try DirectTCPFraming.length(from: Array(blockedSendBytes.prefix(4)))
+        XCTAssertEqual(
+            Array(blockedSendBytes[4..<(4 + blockedSendLength)].prefix(4)),
+            SMB3TransformHeader.protocolId,
+            "X must be an encrypted request while its send completion is held"
+        )
+        let pendingRequests = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingRequests, 2)
+
+        // The fresh session assigns R MID 0 and X MID 1. X's transform is authenticated,
+        // with matching command, MID, and inner/outer SessionId.
+        let xMessageId: UInt64 = 1
+        let earlyFinal = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 1,
+            messageId: xMessageId,
+            sessionId: sessionId
+        ).encode() + [4, 0, 0, 0]
+        let encryptedEarlyFinal = try smb3CCMTransform(
+            earlyFinal,
+            key: encryptionKey,
+            nonce: Array(repeating: 0x41, count: 11),
+            sessionId: sessionId
+        )
+        transport.enqueueInbound(try framed([encryptedEarlyFinal]))
+        try await awaitWithTimeout("encrypted early final accepted for X") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 1)
+        }
+        let finalSeenBeforeSend = await session.pendingFinalSeenForTesting(messageId: xMessageId)
+        let callerResumedBeforeSend = await session.pendingContinuationResumedForTesting(messageId: xMessageId)
+        XCTAssertTrue(finalSeenBeforeSend)
+        XCTAssertFalse(callerResumedBeforeSend)
+        let sessionOpenAfterEarlyFinal = !(await session.isTransportClosedForTesting())
+        XCTAssertTrue(sessionOpenAfterEarlyFinal)
+
+        let plaintextPostFinal: [UInt8]
+        if isInterim {
+            plaintextPostFinal = try smb2AsyncPendingResponse(
+                command: SMB2Commands.echo,
+                messageId: xMessageId,
+                asyncId: 0x1234_5678,
+                sessionId: sessionId,
+                credits: UInt16.max
+            )
+        } else {
+            plaintextPostFinal = try SMB2Header(
+                command: SMB2Commands.echo,
+                credits: UInt16.max,
+                messageId: xMessageId,
+                sessionId: sessionId
+            ).encode() + [4, 0, 0, 0]
+        }
+        let dispatchCountAfterEarlyFinal = await session.receivedPacketDispatchCountForTesting()
+        transport.enqueueInbound(try framed([plaintextPostFinal]))
+        try await awaitWithTimeout("plaintext post-final frame discarded while X send is held") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: dispatchCountAfterEarlyFinal + 1)
+        }
+        let sessionOpenWhileXSendHeld = !(await session.isTransportClosedForTesting())
+        XCTAssertTrue(sessionOpenWhileXSendHeld)
+        let readerRunningWhileXSendHeld = await session.receiveLoopRunningForTesting()
+        XCTAssertTrue(readerRunningWhileXSendHeld)
+        let finalStillSeenBeforeSend = await session.pendingFinalSeenForTesting(messageId: xMessageId)
+        let callerStillBlocked = await session.pendingContinuationResumedForTesting(messageId: xMessageId)
+        XCTAssertTrue(finalStillSeenBeforeSend)
+        XCTAssertFalse(callerStillBlocked)
+
+        let grantsBeforeSendRelease = await session.creditGrantReceiptCountForTesting()
+        XCTAssertEqual(grantsBeforeSendRelease, 1, "the discarded plaintext frame grants no credits")
+        transport.releaseBlockedSend()
+        try await awaitWithTimeout("X succeeds after its full send") { try await earlyFinalRequest.value }
+        let pendingAfterXCompletes = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterXCompletes, 1, "R remains outstanding after X completes")
+
+        // Once X is retired, the same late plaintext frame is unknown and must also leave
+        // the shared session and R's reader untouched.
+        let dispatchCountAfterXCompletes = await session.receivedPacketDispatchCountForTesting()
+        transport.enqueueInbound(try framed([plaintextPostFinal]))
+        try await awaitWithTimeout("same plaintext frame discarded after X send completes") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: dispatchCountAfterXCompletes + 1)
+        }
+        let sessionOpenAfterPostSendDuplicate = !(await session.isTransportClosedForTesting())
+        XCTAssertTrue(sessionOpenAfterPostSendDuplicate)
+
+        let unrelatedFinal = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 1,
+            messageId: 0,
+            sessionId: sessionId
+        ).encode() + [4, 0, 0, 0]
+        let encryptedUnrelatedFinal = try smb3CCMTransform(
+            unrelatedFinal,
+            key: encryptionKey,
+            nonce: Array(repeating: 0x42, count: 11),
+            sessionId: sessionId
+        )
+        transport.enqueueInbound(try framed([encryptedUnrelatedFinal]))
+        try await awaitWithTimeout("R succeeds after X") { try await unrelatedRequest.value }
+        let sessionOpenAfterBothRequests = !(await session.isTransportClosedForTesting())
+        XCTAssertTrue(sessionOpenAfterBothRequests)
+        XCTAssertEqual(transport.closeCount, 0)
+
+        await session.closeTransportAndWait(cause: "encrypted_early_final_plaintext_post_final")
+        sessionJoined = true
+    }
+
     func testChangeNotifyEventConvenienceProperties() {
         let changes = [
             SMBFileChange(action: .added, name: "new.txt")
@@ -11928,7 +12170,7 @@ final class SMBeeTests: XCTestCase {
         let timersAfterLateResponse = await session.requestTimeoutTaskCountForTesting()
         XCTAssertEqual(pendingAfterLateResponse, 0)
         XCTAssertEqual(timersAfterLateResponse, 0)
-        XCTAssertEqual(dispatchesAfterLateResponse, dispatchesBeforeLateResponse + 1)
+        XCTAssertEqual(dispatchesAfterLateResponse, dispatchesBeforeLateResponse, "a terminal generation discards late responses")
         XCTAssertEqual(transport.closeCount, 1)
     }
 
@@ -12825,17 +13067,18 @@ final class SMBeeTests: XCTestCase {
         let sentinel = Array("SMBEE_TRACE_SECRET_SENTINEL_19".utf8)
         let sentinelHex = SMBDebug.hex(sentinel)
         let encryptionKey = Array(repeating: UInt8(0x5a), count: 16)
+        let encryptedSessionId: UInt64 = 0x8877_6655_4433_2211
         let encryptedWriteResponse = try smb3CCMTransform(
-            smb2WriteResponse(count: sentinel.count, messageId: 0, treeId: 0x3344),
+            smb2WriteResponse(count: sentinel.count, messageId: 0, treeId: 0x3344, sessionId: encryptedSessionId),
             key: encryptionKey,
             nonce: (1...11).map(UInt8.init),
-            sessionId: 0
+            sessionId: encryptedSessionId
         )
         let encryptedReadResponse = try smb3CCMTransform(
-            smb2ReadResponse(sentinel, messageId: 1, treeId: 0x3344),
+            smb2ReadResponse(sentinel, messageId: 1, treeId: 0x3344, sessionId: encryptedSessionId),
             key: encryptionKey,
             nonce: (12...22).map(UInt8.init),
-            sessionId: 0
+            sessionId: encryptedSessionId
         )
         let encryptedTransport = InMemoryTransport(
             inbound: try framed([
@@ -12864,7 +13107,8 @@ final class SMBeeTests: XCTestCase {
         )
         await encryptedSession.installEncryptionStateForTesting(
             encryptionKey: encryptionKey,
-            decryptionKey: encryptionKey
+            decryptionKey: encryptionKey,
+            sessionId: encryptedSessionId
         )
         let sessionFlags = await encryptedSession.sessionFlagsForTesting()
         XCTAssertEqual(sessionFlags, 0)
@@ -12946,17 +13190,22 @@ final class SMBeeTests: XCTestCase {
         )
         await untransformedSession.installEncryptionStateForTesting(
             encryptionKey: encryptionKey,
-            decryptionKey: encryptionKey
+            decryptionKey: encryptionKey,
+            sessionId: encryptedSessionId
         )
         let untransformedSessionFlags = await untransformedSession.sessionFlagsForTesting()
         XCTAssertEqual(untransformedSessionFlags, 0)
-        let untransformedRead = try await untransformedSession.readChunk(
-            treeId: 0x3344,
-            fileId: Array(repeating: 0x33, count: 16),
-            offset: 0,
-            length: UInt64(sentinel.count)
-        )
-        XCTAssertEqual(untransformedRead, sentinel)
+        do {
+            _ = try await untransformedSession.readChunk(
+                treeId: 0x3344,
+                fileId: Array(repeating: 0x33, count: 16),
+                offset: 0,
+                length: UInt64(sentinel.count)
+            )
+            XCTFail("a plaintext response to an encrypted READ must be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("plaintext SMB response to an encrypted request"))
+        }
 
         let untransformedMessages = untransformedCapture.messages
         XCTAssertTrue(untransformedMessages.contains {
@@ -12974,12 +13223,13 @@ final class SMBeeTests: XCTestCase {
         let sentinel = Array("DECRYPTED_ERROR_SENTINEL_10219".utf8)
         let sentinelHex = SMBDebug.hex(sentinel)
         let encryptionKey = Array(repeating: UInt8(0x6b), count: 16)
+        let encryptedSessionId: UInt64 = 0x8877_6655_4433_2211
         let invalidPlaintext = sentinel + Array(repeating: UInt8(0x00), count: 80 - sentinel.count)
         let encryptedResponse = try smb3CCMTransform(
             invalidPlaintext,
             key: encryptionKey,
             nonce: (31...41).map(UInt8.init),
-            sessionId: 0
+            sessionId: encryptedSessionId
         )
         let transport = InMemoryTransport(
             inbound: try framed([encryptedResponse]),
@@ -13010,7 +13260,8 @@ final class SMBeeTests: XCTestCase {
         )
         await session.installEncryptionStateForTesting(
             encryptionKey: encryptionKey,
-            decryptionKey: encryptionKey
+            decryptionKey: encryptionKey,
+            sessionId: encryptedSessionId
         )
 
         var returnedErrorDescription: String?
@@ -13138,7 +13389,8 @@ final class SMBeeTests: XCTestCase {
         )
         await encryptedSession.installEncryptionStateForTesting(
             encryptionKey: fixtures.encryptionKey,
-            decryptionKey: fixtures.encryptionKey
+            decryptionKey: fixtures.encryptionKey,
+            sessionId: fixtures.sessionId
         )
         let sessionFlags = await encryptedSession.sessionFlagsForTesting()
         XCTAssertEqual(sessionFlags, 0)
@@ -13170,6 +13422,7 @@ final class SMBeeTests: XCTestCase {
 
     private func defaultEnvironmentTraceProbeFixtures() throws -> (
         encryptionKey: [UInt8],
+        sessionId: UInt64,
         encryptedSentinel: [UInt8],
         encryptedResponse: [UInt8],
         encryptedFrameHeaderHex: String,
@@ -13178,18 +13431,25 @@ final class SMBeeTests: XCTestCase {
         plaintextFrameHeaderHex: String
     ) {
         let encryptionKey = Array(repeating: UInt8(0x73), count: 16)
+        let sessionId: UInt64 = 0x8877_6655_4433_2211
         let encryptedSentinel = Array("ENCRYPTED_STDERR_SENTINEL_10219".utf8)
-        let encryptedReadResponse = try smb2ReadResponse(encryptedSentinel, messageId: 0, treeId: 0x3344)
+        let encryptedReadResponse = try smb2ReadResponse(
+            encryptedSentinel,
+            messageId: 0,
+            treeId: 0x3344,
+            sessionId: sessionId
+        )
         let encryptedResponse = try smb3CCMTransform(
             encryptedReadResponse,
             key: encryptionKey,
             nonce: (51...61).map(UInt8.init),
-            sessionId: 0
+            sessionId: sessionId
         )
         let plaintextSentinel = Array("PLAIN_STDERR_FULL_TRACE_10219".utf8)
         let plaintextResponse = try smb2ReadResponse(plaintextSentinel, messageId: 0, treeId: 0x3344)
         return (
             encryptionKey,
+            sessionId,
             encryptedSentinel,
             encryptedResponse,
             SMBDebug.hex(Array(try DirectTCPFraming.frame(encryptedResponse).prefix(4))),
@@ -14547,8 +14807,16 @@ final class SMBeeTests: XCTestCase {
 
     // SESSION_SETUP success response body (MS-SMB2 §2.2.6): StructureSize=9, SessionFlags,
     // SecurityBufferOffset, SecurityBufferLength. The client decodes SessionFlags from the final response.
-    private func sessionSetupSuccessResponse(messageId: UInt64, sessionFlags: UInt16 = 0) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.sessionSetup, messageId: messageId).encode()
+    private func sessionSetupSuccessResponse(
+        messageId: UInt64,
+        sessionFlags: UInt16 = 0,
+        sessionId: UInt64 = 0
+    ) throws -> [UInt8] {
+        var response = try SMB2Header(
+            command: SMB2Commands.sessionSetup,
+            messageId: messageId,
+            sessionId: sessionId
+        ).encode()
         response.append(contentsOf: [9, 0, UInt8(sessionFlags & 0xff), UInt8(sessionFlags >> 8), 72, 0, 0, 0])
         return response
     }
@@ -14714,8 +14982,20 @@ final class SMBeeTests: XCTestCase {
         return response
     }
 
-    private func smb2ReadResponse(_ payload: [UInt8], messageId: UInt64, treeId: UInt32, credits: UInt16 = 1) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.read, credits: credits, messageId: messageId, treeId: treeId).encode()
+    private func smb2ReadResponse(
+        _ payload: [UInt8],
+        messageId: UInt64,
+        treeId: UInt32,
+        credits: UInt16 = 1,
+        sessionId: UInt64 = 0
+    ) throws -> [UInt8] {
+        var response = try SMB2Header(
+            command: SMB2Commands.read,
+            credits: credits,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
         writeUInt16LE(17, to: &response, at: 64)
         response[66] = 80
@@ -14786,8 +15066,20 @@ final class SMBeeTests: XCTestCase {
         return stub
     }
 
-    private func smb2WriteResponse(count: Int, messageId: UInt64, treeId: UInt32, credits: UInt16 = 1) throws -> [UInt8] {
-        var response = try SMB2Header(command: SMB2Commands.write, credits: credits, messageId: messageId, treeId: treeId).encode()
+    private func smb2WriteResponse(
+        count: Int,
+        messageId: UInt64,
+        treeId: UInt32,
+        credits: UInt16 = 1,
+        sessionId: UInt64 = 0
+    ) throws -> [UInt8] {
+        var response = try SMB2Header(
+            command: SMB2Commands.write,
+            credits: credits,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
         response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
         writeUInt16LE(17, to: &response, at: 64)
         writeUInt32LE(UInt32(count), to: &response, at: 68)

@@ -296,15 +296,12 @@ final class SMBNegotiateValidationTests: XCTestCase {
             securityMode: SMBNegotiateConstants.signingEnabled | SMBNegotiateConstants.signingRequired,
             dialect: SMBNegotiateConstants.dialect302
         )
-        let inbound = try frame([
-            try signedTestPacket(
-                treeConnectResponse(messageId: 0, sessionId: sessionId),
-                algorithm: .aesCMAC,
-                key: signingKey,
-                sender: .server
-            ),
-            validationResponse
-        ])
+        let encryptedTreeConnectResponse = try encryptServerPacket(
+            treeConnectResponse(messageId: 0, sessionId: sessionId),
+            key: signingKey,
+            invalidTag: false
+        )
+        let inbound = try frame([encryptedTreeConnectResponse, validationResponse])
         let transport = InMemoryTransport(
             inbound: inbound,
             mode: .sendGatedWaitUntilClosed,
@@ -398,15 +395,16 @@ final class SMBNegotiateValidationTests: XCTestCase {
                 securityMode: responseSecurityMode ?? negotiateSecurityMode,
                 dialect: responseDialect
             )
-            let responses = try frame([
-                try signedTestPacket(
-                    treeConnectResponse(messageId: 0, sessionId: sessionId),
+            let treeConnectReply = try treeConnectResponse(messageId: 0, sessionId: sessionId)
+            let protectedTreeConnectReply = encryptedSession
+                ? try encryptServerPacket(treeConnectReply, key: signingKey, invalidTag: false)
+                : try signedTestPacket(
+                    treeConnectReply,
                     algorithm: .aesCMAC,
                     key: signingKey,
                     sender: .server
-                ),
-                response
-            ])
+                )
+            let responses = try frame([protectedTreeConnectReply, response])
             let requestEncryptionKey = signingKey
             let transport = InMemoryTransport(
                 inbound: responses,

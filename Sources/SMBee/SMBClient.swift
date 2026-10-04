@@ -4522,7 +4522,10 @@ extension Error {
 /// AEAD で完全性検証済みなので、署名必須の対象は平文で届いた frame だけ (MS-SMB2 §3.2.5.1.3)。
 private struct SMBReceivedFrame {
     let bytes: [UInt8]
-    let decryptedFromTransform: Bool
+    // Transform SessionIds are required to be nonzero, so zero doubles as the plaintext
+    // sentinel without enlarging the hot-path frame value with an Optional payload.
+    let transformSessionId: UInt64
+    var decryptedFromTransform: Bool { transformSessionId != 0 }
     let generation: UInt64
 }
 
@@ -5141,6 +5144,60 @@ private enum SMBPendingResponseSendPhase {
     case sent
 }
 
+enum SMBResponseProtectionPolicy: Sendable {
+    case sessionDefault
+    case signatureOrAEADRequired
+    case encryptedRequest
+}
+
+private enum SMBVerifiedResponseProtection: Equatable {
+    case unprotected
+    case signature
+    case authenticatedEncryption
+}
+
+private struct SMBResponseSlice {
+    let frame: SMBReceivedFrame
+    let header: SMB2Header
+}
+
+private struct SMBValidatedResponseEffect {
+    enum Kind {
+        case ignored
+        case interim(asyncId: UInt64, pendingCount: Int)
+        case final(
+            asyncId: UInt64?,
+            pendingCount: Int,
+            frame: SMBReceivedFrame,
+            status: UInt32,
+            sendPhase: SMBPendingResponseSendPhase
+        )
+    }
+
+    let messageId: UInt64
+    let requestIdentity: SMBRequestIdentity?
+    let credits: UInt16?
+    let kind: Kind
+}
+
+private enum SMBValidatedResponseBatch {
+    case single(SMBValidatedResponseEffect)
+    case compound([SMBValidatedResponseEffect])
+}
+
+private struct SMBResponseCorrelationState {
+    let messageId: UInt64
+    let expectedCommand: UInt16
+    let expectedSessionId: UInt64
+    let expectedTreeId: UInt32
+    let longPoll: Bool
+    let cleanupFileId: SMBFileIdLedgerKey?
+    let responseProtectionPolicy: SMBResponseProtectionPolicy
+    var asyncId: UInt64?
+    var pendingCount: Int
+    var finalSeen: Bool
+}
+
 private struct SMBFileIdLedgerKey: Hashable {
     let bytes: [UInt8]
 }
@@ -5157,6 +5214,7 @@ private struct SMBPendingResponse {
     let label: String
     let longPoll: Bool
     let requestTimeoutPolicy: SMBRequestTimeoutPolicy
+    let responseProtectionPolicy: SMBResponseProtectionPolicy
     let expectedCommand: UInt16
     let expectedSessionId: UInt64
     let expectedTreeId: UInt32
@@ -5164,6 +5222,9 @@ private struct SMBPendingResponse {
     /// AsyncId observed on the first STATUS_PENDING interim (MS-SMB2 §3.2.5.1.5 requires
     /// storing it); nil until the request is seen going async.
     var asyncId: UInt64?
+    var finalSeen = false
+    var acceptedFinalFrame: SMBReceivedFrame?
+    var acceptedFinalStatus: UInt32?
     let continuation: CheckedContinuation<SMBReceivedFrame, Error>
     var sendTask: Task<Void, Never>?
     var timeoutTask: Task<Void, Never>?
@@ -5288,9 +5349,6 @@ actor SMBSession {
     private var testingCountWaiters: [SMBTestingCountWaiter] = []
     private var nextTestingCountWaiterId: UInt64 = 0
     private var requestSentWaiterRegistrationCountForTestingStorage = 0
-    private var orphanResponses: [UInt64: [SMBReceivedFrame]] = [:]
-    private var orphanResponseOrder: [(messageId: UInt64, generation: UInt64)] = []
-    private static let maxOrphanResponses = 64
     private var readerLifecycle = SMBReaderLifecycle.dormant(generation: initialWireGeneration)
     // A reader may become dormant before its Task returns. A later send can start its
     // replacement during that interval, so keep every live Task by handle until it exits.
@@ -5310,6 +5368,7 @@ actor SMBSession {
     private var validateNegotiateSuccessCountForTestingStorage = 0
     private var requestTimeoutCompletionCountForTestingStorage = 0
     private var receivedPacketDispatchCountForTestingStorage = 0
+    private var lastFinalAcceptanceForTestingStorage: ContinuousClock.Instant?
     private var cleanupDrainTimeoutCallbackCountForTestingStorage = 0
     private var wireFailure: Error?
     private var creditGrantAfterAwaitHookForTesting: (@Sendable () async -> Void)?
@@ -5584,10 +5643,14 @@ actor SMBSession {
     func installEncryptionStateForTesting(
         encryptionKey: [UInt8],
         decryptionKey: [UInt8],
+        sessionId: UInt64? = nil,
         algorithm: SMBSessionEncryptionAlgorithm = .aes128CCM
     ) {
         self.encryptionKey = encryptionKey
         self.decryptionKey = decryptionKey
+        if let sessionId {
+            self.sessionId = sessionId
+        }
         encryptionAlgorithm = algorithm
     }
 
@@ -7018,10 +7081,16 @@ actor SMBSession {
         creditGrantAfterAwaitHookForTesting = hook
     }
 
+    func setCreditGrantActorHookForTesting(_ hook: (@Sendable () async -> Void)?) async {
+        await creditWindow.setGrantActorHookForTesting(hook)
+    }
+
     func parkPendingForTesting(
         messageId: UInt64,
         command: UInt16,
         sent: Bool = false,
+        sending: Bool = false,
+        responseProtectionPolicy: SMBResponseProtectionPolicy = .sessionDefault,
         onRegistered: @Sendable () -> Void = {}
     ) async throws {
         let identity = makeRequestIdentity(generation: Self.initialWireGeneration)
@@ -7032,14 +7101,15 @@ actor SMBSession {
                 label: "testing",
                 longPoll: false,
                 requestTimeoutPolicy: .eligible,
+                responseProtectionPolicy: responseProtectionPolicy,
                 expectedCommand: command,
-                expectedSessionId: 0,
+                expectedSessionId: sessionId,
                 expectedTreeId: 0,
                 continuation: continuation,
                 sendTask: nil,
                 timeoutTask: nil,
                 timeoutIdentity: nil,
-                sendPhase: sent ? .sent : .registered,
+                sendPhase: sent ? .sent : (sending ? .sending : .registered),
                 cancellationRequested: false,
                 continuationResumed: false
             ))
@@ -7066,6 +7136,10 @@ actor SMBSession {
 
     func creditBalanceForTesting() async -> UInt32 {
         await creditWindow.balance
+    }
+
+    func creditGrantReceiptCountForTesting() async -> Int {
+        await creditWindow.grantReceiptCountForTesting()
     }
 
     func readerTaskForTesting() -> Task<Void, Never>? {
@@ -7103,6 +7177,26 @@ actor SMBSession {
         pendingResponses[messageId]?.asyncId
     }
 
+    func pendingInterimCountForTesting(messageId: UInt64) -> Int {
+        pendingResponses[messageId]?.pendingCount ?? 0
+    }
+
+    func pendingFinalSeenForTesting(messageId: UInt64) -> Bool {
+        pendingResponses[messageId]?.finalSeen ?? false
+    }
+
+    func pendingContinuationResumedForTesting(messageId: UInt64) -> Bool {
+        pendingResponses[messageId]?.continuationResumed ?? false
+    }
+
+    func lastFinalAcceptanceForTesting() -> ContinuousClock.Instant? {
+        lastFinalAcceptanceForTestingStorage
+    }
+
+    func markRequestSentWithoutReaderForTesting(messageId: UInt64) {
+        _ = markRequestSent(messageId: messageId, generation: Self.initialWireGeneration)
+    }
+
     func parkCleanupPendingForTesting(
         messageId: UInt64,
         sessionId: UInt64,
@@ -7120,6 +7214,7 @@ actor SMBSession {
                 label: "testing cleanup",
                 longPoll: false,
                 requestTimeoutPolicy: .eligible,
+                responseProtectionPolicy: .sessionDefault,
                 expectedCommand: SMB2Commands.close,
                 expectedSessionId: sessionId,
                 expectedTreeId: treeId,
@@ -7140,16 +7235,6 @@ actor SMBSession {
                 identity: identity
             )
         }
-    }
-
-    func queueOrphanAndMarkRequestSentForTesting(_ packet: [UInt8]) throws {
-        let header = try SMB2Header.decode(packet)
-        queueOrphan(SMBReceivedFrame(
-            bytes: packet,
-            decryptedFromTransform: false,
-            generation: Self.initialWireGeneration
-        ), messageId: header.messageId)
-        _ = markRequestSent(messageId: header.messageId, generation: Self.initialWireGeneration)
     }
 
     func pendingCountForTesting() -> Int {
@@ -7209,7 +7294,7 @@ actor SMBSession {
     }
 
     func orphanResponseCountForTesting() -> Int {
-        orphanResponses.values.reduce(0) { $0 + $1.count }
+        0
     }
 
     func requestDidTimeOutForTesting(messageId: UInt64, command: UInt16) {
@@ -7288,7 +7373,7 @@ actor SMBSession {
     func dispatchReceivedPacketForTesting(_ packet: [UInt8], generation: UInt64) throws {
         try dispatchReceivedPacket(SMBReceivedFrame(
             bytes: packet,
-            decryptedFromTransform: false,
+            transformSessionId: 0,
             generation: generation
         ))
     }
@@ -7303,7 +7388,7 @@ actor SMBSession {
     ) throws {
         try dispatchReceivedPacket(SMBReceivedFrame(
             bytes: packet,
-            decryptedFromTransform: false,
+            transformSessionId: 0,
             generation: Self.initialWireGeneration
         ))
         cancel()
@@ -7470,7 +7555,6 @@ actor SMBSession {
     private func signedWireTransaction(
         packet: [UInt8],
         responseLabel: String,
-        verifySignature: Bool = true,
         requestTimeoutPolicy: SMBRequestTimeoutPolicy = .eligible,
         cleanupFileId: [UInt8]? = nil,
         creditReservation: SMBPreReservedCredit? = nil
@@ -7485,6 +7569,7 @@ actor SMBSession {
                 responseLabel: responseLabel,
                 longPoll: false,
                 requestTimeoutPolicy: requestTimeoutPolicy,
+                responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
                 cleanupFileId: cleanupFileId,
                 send: { [weak self] packet, messageId in
                     guard let self else { throw CancellationError() }
@@ -7505,9 +7590,6 @@ actor SMBSession {
                 await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
             }
         }
-        if verifySignature {
-            try verifySigned(response)
-        }
         return response.bytes
     }
 
@@ -7522,6 +7604,7 @@ actor SMBSession {
                 responseLabel: "VALIDATE_NEGOTIATE_INFO response",
                 longPoll: false,
                 requestTimeoutPolicy: .eligible,
+                responseProtectionPolicy: encrypt ? .encryptedRequest : .signatureOrAEADRequired,
                 send: { [weak self] packet, messageId in
                     guard let self else { throw CancellationError() }
                     try await self.sendValidateNegotiateSigned(
@@ -7537,11 +7620,14 @@ actor SMBSession {
                 await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
             }
         }
-        try verifyValidateNegotiateProtection(frame)
         return frame
     }
 
-    private func signedLongPollWireTransaction(packet: [UInt8], responseLabel: String, verifySignature: Bool = true) async throws -> [UInt8] {
+    func validateNegotiateWireTransactionForTesting(packet: [UInt8]) async throws -> [UInt8] {
+        try await validateNegotiateWireTransaction(packet: packet, encrypt: false).bytes
+    }
+
+    private func signedLongPollWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
         let requestHeader = try SMB2Header.decode(packet)
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
@@ -7552,6 +7638,7 @@ actor SMBSession {
                 responseLabel: responseLabel,
                 longPoll: true,
                 requestTimeoutPolicy: .excluded(.longPoll),
+                responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
                 send: { [weak self] packet, messageId in
                     guard let self else { throw CancellationError() }
                     try await self.sendSigned(packet, messageId: messageId, generation: generation)
@@ -7562,9 +7649,6 @@ actor SMBSession {
                 await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
             }
         }
-        if verifySignature {
-            try verifySigned(response)
-        }
         return response.bytes
     }
 
@@ -7573,6 +7657,7 @@ actor SMBSession {
         responseLabel: String,
         longPoll: Bool,
         requestTimeoutPolicy: SMBRequestTimeoutPolicy,
+        responseProtectionPolicy: SMBResponseProtectionPolicy = .sessionDefault,
         cleanupFileId: [UInt8]? = nil,
         send: @escaping @Sendable ([UInt8], UInt64) async throws -> Void
     ) async throws -> SMBReceivedFrame {
@@ -7611,6 +7696,7 @@ actor SMBSession {
                 label: responseLabel,
                 longPoll: longPoll,
                 requestTimeoutPolicy: requestTimeoutPolicy,
+                responseProtectionPolicy: responseProtectionPolicy,
                 expectedCommand: requestHeader.command,
                 expectedSessionId: requestHeader.sessionId,
                 expectedTreeId: requestHeader.treeId,
@@ -8050,27 +8136,6 @@ actor SMBSession {
         }
     }
 
-    private func verifyValidateNegotiateProtection(_ frame: SMBReceivedFrame) throws {
-        if frame.decryptedFromTransform { return }
-        guard let signingKey else {
-            throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO response has no authenticated protection")
-        }
-        let packet = frame.bytes
-        let header = try SMB2Header.decode(packet)
-        guard (header.flags & SMB2Flags.signed) != 0 else {
-            throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO response is neither signed nor encrypted")
-        }
-        let expected = try SMBSessionSigning.signature(
-            algorithm: signingAlgorithm,
-            key: signingKey,
-            packet: packet,
-            sender: .server
-        )
-        guard AESCCM.constantTimeEqual(expected, header.signature) else {
-            throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO response signature verification failed")
-        }
-    }
-
     private func sendEncrypted(
         _ packet: [UInt8],
         messageId: UInt64? = nil,
@@ -8164,7 +8229,7 @@ actor SMBSession {
     func verifySignedForTesting(_ packet: [UInt8]) throws {
         try verifySigned(SMBReceivedFrame(
             bytes: packet,
-            decryptedFromTransform: false,
+            transformSessionId: 0,
             generation: Self.initialWireGeneration
         ))
     }
@@ -8248,17 +8313,27 @@ actor SMBSession {
             }
             debugDump(label, body, provenance: decryptedFromTransform ? .ciphertext : .plaintext)
         }
-        let packet = decryptedFromTransform ? try decryptTransform(body) : body
-        let header = try SMB2Header.decode(packet)
-        await recordCreditGrant(header.credits, label: "SMB response", generation: generation)
-        // close can interleave while the credit actor resumes waiters. Old grants stay
-        // inside this one-shot credit window, and stale frames never reach demux.
-        guard isGenerationActive(generation) else { return false }
-        try dispatchReceivedPacket(SMBReceivedFrame(
+        let packet: [UInt8]
+        let transformSessionId: UInt64
+        if decryptedFromTransform {
+            let decrypted = try decryptTransform(body)
+            packet = decrypted.plaintext
+            transformSessionId = decrypted.sessionId
+        } else {
+            packet = body
+            transformSessionId = 0
+        }
+        let frame = SMBReceivedFrame(
             bytes: packet,
-            decryptedFromTransform: decryptedFromTransform,
+            transformSessionId: transformSessionId,
             generation: generation
-        ), header: header)
+        )
+        let effects = try validateResponseFrame(frame)
+        try commitResponseEffects(effects, generation: generation)
+        // Correlation state, final acceptance time, and caller release are committed before
+        // this one credit-window hop. A delayed credit acknowledgement cannot move the final
+        // acceptance time or release an unvalidated slice.
+        await recordCreditGrants(effects, generation: generation)
         guard isGenerationActive(generation) else { return false }
         guard hasSentResponseOutstanding else {
             // Commit the stop and lifecycle transition in this actor turn, with no await
@@ -8302,8 +8377,8 @@ actor SMBSession {
     /// tombstone until its final response is consumed, so that late final is still read and
     /// drained. Once the last sent record is gone, the reader stops before another receive;
     /// a duplicate or unsolicited frame arriving while dormant stays in the transport until
-    /// a later send, just as it does with the master's idle receiveLoop. Dispatch order,
-    /// `.sent` gating, and the 64-frame orphan FIFO remain in `dispatchReceivedPacket`.
+    /// a later send, just as it does with the master's idle receiveLoop. The caller gate is
+    /// separate from response correlation so a valid early final can be held without replay.
     private func makeReaderDormantIfIdle(generation: UInt64, handle: UUID? = nil) {
         guard !hasSentResponseOutstanding,
               case .running(let currentGeneration, let currentHandle) = readerLifecycle,
@@ -8324,153 +8399,426 @@ actor SMBSession {
         }
     }
 
-    private func dispatchReceivedPacket(_ frame: SMBReceivedFrame, header suppliedHeader: SMB2Header? = nil) throws {
-        defer {
-            receivedPacketDispatchCountForTestingStorage += 1
-            resumeReceivedPacketDispatchWaiters()
-        }
-        guard isGenerationActive(frame.generation) else { return }
-        let packet = frame.bytes
-        let header: SMB2Header
-        if let suppliedHeader {
-            header = suppliedHeader
-        } else {
-            header = try SMB2Header.decode(packet)
-        }
-        SMBPerfLog.line("[wire] recv session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "") ts_ns=\(SMBPerfLog.timestampNanoseconds())")
-        // Server-initiated notifications (oplock/lease break) arrive with MessageId
-        // 0xFFFFFFFFFFFFFFFF and never correspond to a request. This client never requests
-        // oplocks or leases (CREATE RequestedOplockLevel is always NONE), so drop them
-        // instead of queueing them as orphan responses forever.
-        if header.command == SMB2Commands.oplockBreak || header.messageId == UInt64.max {
-            debugLine("ignoring unsolicited server notification (command \(header.command), messageId \(header.messageId))")
-            return
-        }
-        guard var pending = pendingResponses[header.messageId] else {
-            queueOrphan(frame, messageId: header.messageId)
-            debugLine("SMB response queued for future message id \(header.messageId)")
-            return
-        }
-        guard pending.generation == frame.generation else { return }
-        guard pending.sendPhase == .sent else {
-            // A peer may answer before the transport's full-send completion callback.
-            // Preserve every interim/final in order and apply only demux after .sent.
-            try storeOrphan(frame, messageId: header.messageId, required: true)
-            return
-        }
-        // SESSION_SETUP/legacy test and server responses may carry zero session/tree
-        // before the authenticated context is established; once populated, both are
-        // part of the correlation key.
-        guard header.command == pending.expectedCommand else {
-            throw SMBCodecError.invalidValue("SMB response correlation mismatch command=\(header.command)/\(pending.expectedCommand) session=\(header.sessionId)/\(pending.expectedSessionId)")
-        }
-        if pending.cleanupFileId != nil {
-            guard header.sessionId == pending.expectedSessionId else {
-                throw SMBCodecError.invalidValue("SMB cleanup response correlation mismatch session=\(header.sessionId)/\(pending.expectedSessionId)")
+    private func splitResponseChain(
+        _ frame: SMBReceivedFrame,
+        firstHeader: SMB2Header
+    ) throws -> [SMBResponseSlice] {
+        var slices: [SMBResponseSlice] = []
+        var offset = 0
+        var header = firstHeader
+        while true {
+            let remaining = frame.bytes.count - offset
+            guard remaining >= SMB2Header.encodedSize else {
+                throw SMBCodecError.invalidValue("SMB2 compound response has a short header at offset \(offset)")
             }
-            // MS-SMB2 §3.2.5.1.3 forbids the client from verifying interim STATUS_PENDING
-            // signatures; the server is also advised not to sign them (§3.3.4.2). Final
-            // cleanup responses and other non-interim frames remain signature-verified.
-            if try !SMB2AsyncInterim.isInterim(header) {
-                try verifySigned(frame)
-            }
-            if !header.isAsync {
-                guard header.treeId == pending.expectedTreeId else {
-                    throw SMBCodecError.invalidValue("SMB cleanup response correlation mismatch tree=\(header.treeId)/\(pending.expectedTreeId)")
-                }
-            }
-        } else {
-            // SESSION_SETUP and legacy responses may use zero before authentication; preserve that rule outside cleanup.
-            guard pending.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == pending.expectedSessionId else {
-                throw SMBCodecError.invalidValue("SMB response correlation mismatch command=\(header.command)/\(pending.expectedCommand) session=\(header.sessionId)/\(pending.expectedSessionId)")
-            }
-        }
-        // Async responses carry an AsyncId instead of a TreeId (MS-SMB2 §2.2.1.1); the
-        // TreeId correlation below therefore applies to sync responses only. The AsyncId
-        // itself becomes the correlation key once the first interim establishes it.
-        // Violations of the async invariants fail only the affected request: unlike a
-        // command/session mismatch they cannot misattribute a frame to another request,
-        // and treating a single nonconforming server frame as session-fatal would take
-        // down every unrelated in-flight operation (issues/078 review M1/M2).
-        if try SMB2AsyncInterim.isInterim(header) {
-            guard let interimAsyncId = header.asyncId, interimAsyncId != 0 else {
-                if pending.cleanupFileId != nil {
-                    throw SMBCodecError.invalidValue("SMB2 STATUS_PENDING cleanup interim carries a zero AsyncId")
-                }
-                failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 STATUS_PENDING interim carries a zero AsyncId")
-                return
-            }
-            if let storedAsyncId = pending.asyncId {
-                guard storedAsyncId == interimAsyncId else {
-                    if pending.cleanupFileId != nil {
-                        throw SMBCodecError.invalidValue("SMB2 cleanup interim AsyncId mismatch \(interimAsyncId)/\(storedAsyncId)")
-                    }
-                    failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 interim AsyncId mismatch \(interimAsyncId)/\(storedAsyncId)")
-                    return
-                }
+            logReceivedResponseHeader(header)
+            let end: Int
+            if header.nextCommand == 0 {
+                end = frame.bytes.count
             } else {
-                // An unsigned interim can establish an AsyncId, but its value is not
-                // authenticated. The signed final response must match it; a substituted
-                // AsyncId therefore becomes a wire fault at final-response correlation.
-                pending.asyncId = interimAsyncId
-            }
-            pending.pendingCount += 1
-            if !pending.longPoll && pending.pendingCount > SMB2AsyncInterim.maxPendingResponses {
-                if pending.cleanupFileId != nil {
-                    throw SMBCodecError.invalidValue("too many cleanup CLOSE STATUS_PENDING responses")
+                let next = Int(header.nextCommand)
+                guard next >= SMB2Header.encodedSize,
+                      next.isMultiple(of: 8),
+                      next <= remaining - SMB2Header.encodedSize else {
+                    throw SMBCodecError.invalidValue(
+                        "SMB2 compound response NextCommand is out of bounds or unaligned at offset \(offset)"
+                    )
                 }
-                removePendingResponse(messageId: header.messageId)
-                pending.timeoutTask?.cancel()
-                if !pending.continuationResumed {
-                    pending.continuationResumed = true
-                    pending.continuation.resume(throwing: SMBCodecError.invalidValue("too many interim SMB2 STATUS_PENDING responses"))
-                }
-                return
+                end = offset + next
             }
-            // STATUS_PENDING does not extend the response deadline. Operations allowed to
-            // remain pending indefinitely (notably CHANGE_NOTIFY) never install a timer.
-            pendingResponses[header.messageId] = pending
-            debugLine("\(pending.label) ignored interim STATUS_PENDING async response")
+            let sliceFrame = SMBReceivedFrame(
+                bytes: offset == 0 && end == frame.bytes.count
+                    ? frame.bytes
+                    : Array(frame.bytes[offset..<end]),
+                transformSessionId: frame.transformSessionId,
+                generation: frame.generation
+            )
+            slices.append(SMBResponseSlice(frame: sliceFrame, header: header))
+            if header.nextCommand == 0 { return slices }
+            offset = end
+            let headerBytes = Array(frame.bytes[offset..<(offset + SMB2Header.encodedSize)])
+            header = try SMB2Header.decode(headerBytes)
+        }
+    }
+
+    private func logReceivedResponseHeader(_ header: SMB2Header) {
+        SMBPerfLog.line(
+            "[wire] recv session=\(diagnosticSessionId) message_id=\(header.messageId) command=\(header.command) " +
+                "status=0x\(String(format: "%08x", header.status))\(header.status == SMB2Status.pending ? " STATUS_PENDING" : "") " +
+                "ts_ns=\(SMBPerfLog.timestampNanoseconds())"
+        )
+    }
+
+    /// Decodes once, then keeps a single un-compounded response out of the temporary arrays.
+    /// Both forms below call `validateResponseSlice`, so the single-frame route enforces the
+    /// same per-slice authentication, correlation, policy, and speculative-state rules.
+    private func validateResponseFrame(_ frame: SMBReceivedFrame) throws -> SMBValidatedResponseBatch {
+        guard frame.bytes.count >= SMB2Header.encodedSize else { throw SMBCodecError.truncated }
+        let firstHeader = try SMB2Header.decode(frame.bytes)
+        if firstHeader.nextCommand == 0 {
+            logReceivedResponseHeader(firstHeader)
+            var stagedStates: [SMBRequestIdentity: SMBResponseCorrelationState] = [:]
+            let effect = try validateResponseSlice(
+                frame,
+                header: firstHeader,
+                stagedStates: &stagedStates,
+                tracksWireOrderState: false
+            )
+            return .single(effect)
+        }
+
+        let slices = try splitResponseChain(frame, firstHeader: firstHeader)
+        return .compound(try validateResponseChain(slices))
+    }
+
+    private func validateResponseChain(_ slices: [SMBResponseSlice]) throws -> [SMBValidatedResponseEffect] {
+        var effects: [SMBValidatedResponseEffect] = []
+        var stagedStates: [SMBRequestIdentity: SMBResponseCorrelationState] = [:]
+        let tracksWireOrderState = slices.count > 1
+        effects.reserveCapacity(slices.count)
+        if tracksWireOrderState {
+            stagedStates.reserveCapacity(slices.count)
+        }
+
+        for slice in slices {
+            effects.append(try validateResponseSlice(
+                slice.frame,
+                header: slice.header,
+                stagedStates: &stagedStates,
+                tracksWireOrderState: tracksWireOrderState
+            ))
+        }
+        return effects
+    }
+
+    private func validateResponseSlice(
+        _ frame: SMBReceivedFrame,
+        header: SMB2Header,
+        stagedStates: inout [SMBRequestIdentity: SMBResponseCorrelationState],
+        tracksWireOrderState: Bool
+    ) throws -> SMBValidatedResponseEffect {
+        if frame.decryptedFromTransform {
+            try verifyTransformResponseSessionId(frame, header: header)
+        }
+
+        // MessageId-free notifications are discarded before signature verification, as
+        // required by MS-SMB2 §3.2.5.1.3. Transform SessionId binding is checked above; they
+        // have no request to authenticate or credit.
+        if header.command == SMB2Commands.oplockBreak || header.messageId == UInt64.max {
+            return SMBValidatedResponseEffect(
+                messageId: header.messageId,
+                requestIdentity: nil,
+                credits: nil,
+                kind: .ignored
+            )
+        }
+
+        let pendingAtArrival = pendingResponses[header.messageId]
+        if pendingAtArrival?.finalSeen == true {
+            // A final accepted in an earlier frame is no longer wire-outstanding, so drop this
+            // frame before its protection checks, including the encrypted-request policy below:
+            // a later plaintext frame for a finished request must not fail the shared session.
+            // Same-chain duplicates still reach the staged finalSeen guard below because pending
+            // state commits after the whole chain.
+            return SMBValidatedResponseEffect(
+                messageId: header.messageId,
+                requestIdentity: nil,
+                credits: nil,
+                kind: .ignored
+            )
+        }
+
+        if encryptionKey != nil,
+           !frame.decryptedFromTransform,
+           let pendingAtArrival,
+           pendingAtArrival.generation == frame.generation,
+           pendingAtArrival.sendPhase != .registered,
+           case .encryptedRequest = pendingAtArrival.responseProtectionPolicy {
+            throw SMBCodecError.invalidValue(
+                "plaintext SMB response to an encrypted request MessageId \(header.messageId) " +
+                    "command=\(header.command) status=0x\(String(header.status, radix: 16))"
+            )
+        }
+
+        let isInterim = try SMB2AsyncInterim.isInterim(header)
+        let protection: SMBVerifiedResponseProtection = isInterim && !frame.decryptedFromTransform
+            ? .unprotected
+            : try verifyResponseProtection(frame, header: header)
+        guard let pending = pendingAtArrival,
+              pending.generation == frame.generation,
+              pending.sendPhase != .registered else {
+            // Unknown and not-yet-committed requests are discarded without retaining a
+            // MID-keyed replay candidate. A later request reusing this MID gets no frame.
+            return SMBValidatedResponseEffect(
+                messageId: header.messageId,
+                requestIdentity: nil,
+                credits: nil,
+                kind: .ignored
+            )
+        }
+
+        let identity = pending.requestIdentity
+        var state: SMBResponseCorrelationState
+        if tracksWireOrderState, let stagedState = stagedStates[identity] {
+            state = stagedState
+        } else {
+            state = SMBResponseCorrelationState(
+                messageId: header.messageId,
+                expectedCommand: pending.expectedCommand,
+                expectedSessionId: pending.expectedSessionId,
+                expectedTreeId: pending.expectedTreeId,
+                longPoll: pending.longPoll,
+                cleanupFileId: pending.cleanupFileId,
+                responseProtectionPolicy: pending.responseProtectionPolicy,
+                asyncId: pending.asyncId,
+                pendingCount: pending.pendingCount,
+                finalSeen: pending.finalSeen
+            )
+        }
+        guard state.messageId == header.messageId else {
+            throw SMBCodecError.invalidValue("SMB response identity was rebound to another MessageId")
+        }
+        try validateResponseHeader(header, isInterim: isInterim, state: state)
+        guard !state.finalSeen else {
+            throw SMBCodecError.invalidValue("SMB duplicate or post-final response for MessageId \(header.messageId)")
+        }
+
+        if !isInterim, signingRequired, signingKey != nil {
+            guard protection == .signature || protection == .authenticatedEncryption else {
+                throw SMBCodecError.invalidValue("SMB response missing required signature")
+            }
+        }
+
+        if isInterim {
+            guard let interimAsyncId = header.asyncId, interimAsyncId != 0 else {
+                throw SMBCodecError.invalidValue("SMB2 STATUS_PENDING interim carries a zero AsyncId")
+            }
+            if let storedAsyncId = state.asyncId, storedAsyncId != interimAsyncId {
+                throw SMBCodecError.invalidValue(
+                    "SMB2 interim AsyncId mismatch \(interimAsyncId)/\(storedAsyncId)"
+                )
+            }
+            // issue 106: cross-identity AsyncId uniqueness is not checked here; enforcing it
+            // requires an AsyncId-to-identity index.
+            state.asyncId = interimAsyncId
+            state.pendingCount += 1
+            if !state.longPoll && state.pendingCount > SMB2AsyncInterim.maxPendingResponses {
+                let label = state.cleanupFileId == nil ? "SMB2" : "SMB2 cleanup CLOSE"
+                throw SMBCodecError.invalidValue("too many \(label) STATUS_PENDING responses")
+            }
+            if tracksWireOrderState {
+                stagedStates[identity] = state
+            }
+            return SMBValidatedResponseEffect(
+                messageId: header.messageId,
+                requestIdentity: identity,
+                credits: header.credits,
+                kind: .interim(asyncId: interimAsyncId, pendingCount: state.pendingCount)
+            )
+        }
+
+        if case .signatureOrAEADRequired = state.responseProtectionPolicy {
+            guard protection == .signature || protection == .authenticatedEncryption else {
+                throw SMBCodecError.invalidValue(
+                    "VALIDATE_NEGOTIATE_INFO response has no authenticated protection"
+                )
+            }
+        }
+        state.finalSeen = true
+        if tracksWireOrderState {
+            stagedStates[identity] = state
+        }
+        return SMBValidatedResponseEffect(
+            messageId: header.messageId,
+            requestIdentity: identity,
+            credits: header.credits,
+            kind: .final(
+                asyncId: state.asyncId,
+                pendingCount: state.pendingCount,
+                frame: frame,
+                status: header.status,
+                sendPhase: pending.sendPhase
+            )
+        )
+    }
+
+    private func validateResponseHeader(
+        _ header: SMB2Header,
+        isInterim: Bool,
+        state: SMBResponseCorrelationState
+    ) throws {
+        guard header.command == state.expectedCommand else {
+            throw SMBCodecError.invalidValue(
+                "SMB response correlation mismatch command=\(header.command)/\(state.expectedCommand)"
+            )
+        }
+        if state.cleanupFileId != nil {
+            guard header.sessionId == state.expectedSessionId else {
+                throw SMBCodecError.invalidValue(
+                    "SMB cleanup response correlation mismatch session=\(header.sessionId)/\(state.expectedSessionId)"
+                )
+            }
+        } else {
+            // SESSION_SETUP and legacy responses may carry zero before authentication.
+            guard state.expectedSessionId == 0 || header.sessionId == 0 || header.sessionId == state.expectedSessionId else {
+                throw SMBCodecError.invalidValue(
+                    "SMB response correlation mismatch session=\(header.sessionId)/\(state.expectedSessionId)"
+                )
+            }
+        }
+        if isInterim {
             return
         }
         if header.isAsync {
-            // A final async response is only valid for a request that was seen going
-            // async, and it must carry the AsyncId stored from the interim.
-            guard let storedAsyncId = pending.asyncId, header.asyncId == storedAsyncId else {
-                if pending.cleanupFileId != nil {
+            guard let storedAsyncId = state.asyncId, header.asyncId == storedAsyncId else {
+                throw SMBCodecError.invalidValue(
+                    "SMB2 async final AsyncId mismatch \(header.asyncId.map(String.init) ?? "nil")/\(state.asyncId.map(String.init) ?? "no interim")"
+                )
+            }
+        } else {
+            guard state.asyncId == nil else {
+                throw SMBCodecError.invalidValue("SMB2 sync final response after async interim (message id \(header.messageId))")
+            }
+            if state.cleanupFileId != nil {
+                guard header.treeId == state.expectedTreeId else {
                     throw SMBCodecError.invalidValue(
-                        "SMB2 cleanup async final AsyncId mismatch \(header.asyncId.map(String.init) ?? "nil")/\(pending.asyncId.map(String.init) ?? "no interim")"
+                        "SMB cleanup response correlation mismatch tree=\(header.treeId)/\(state.expectedTreeId)"
                     )
                 }
-                failCorrelatedRequest(
-                    messageId: header.messageId,
-                    pending: pending,
-                    reason: "SMB2 async final AsyncId mismatch \(header.asyncId.map(String.init) ?? "nil")/\(pending.asyncId.map(String.init) ?? "no interim")"
-                )
-                return
-            }
-        } else if !pending.continuationResumed {
-            guard pending.asyncId == nil else {
-                if pending.cleanupFileId != nil {
-                    throw SMBCodecError.invalidValue("SMB2 cleanup sync final response after async interim (message id \(header.messageId))")
+            } else {
+                guard state.expectedTreeId == 0 || header.treeId == 0 || header.treeId == state.expectedTreeId else {
+                    throw SMBCodecError.invalidValue(
+                        "SMB response correlation mismatch tree=\(header.treeId)/\(state.expectedTreeId)"
+                    )
                 }
-                failCorrelatedRequest(messageId: header.messageId, pending: pending, reason: "SMB2 sync final response after async interim (message id \(header.messageId))")
-                return
-            }
-            guard pending.cleanupFileId != nil || pending.expectedTreeId == 0 || header.treeId == 0 || header.treeId == pending.expectedTreeId else {
-                throw SMBCodecError.invalidValue("SMB response correlation mismatch tree=\(header.treeId)/\(pending.expectedTreeId)")
-            }
-        } else if pending.cleanupFileId != nil {
-            guard pending.asyncId == nil else {
-                throw SMBCodecError.invalidValue("SMB2 cleanup sync final response after async interim (message id \(header.messageId))")
             }
         }
-        removePendingResponse(messageId: header.messageId)
+    }
+
+    private func verifyResponseProtection(
+        _ frame: SMBReceivedFrame,
+        header: SMB2Header
+    ) throws -> SMBVerifiedResponseProtection {
+        if frame.decryptedFromTransform {
+            return .authenticatedEncryption
+        }
+        guard (header.flags & SMB2Flags.signed) != 0,
+              let signingKey else {
+            // Anonymous sessions have no signing key; preserve the existing session-wide
+            // exception. STATUS_PENDING may be unsigned; request-specific policies can still
+            // require authenticated protection for their final response.
+            return .unprotected
+        }
+        let expected = try SMBSessionSigning.signature(
+            algorithm: signingAlgorithm,
+            key: signingKey,
+            packet: frame.bytes,
+            sender: .server
+        )
+        guard AESCCM.constantTimeEqual(expected, header.signature) else {
+            throw SMBCodecError.invalidValue("SMB signature verification failed")
+        }
+        return .signature
+    }
+
+    private func verifyTransformResponseSessionId(
+        _ frame: SMBReceivedFrame,
+        header: SMB2Header
+    ) throws {
+        guard frame.transformSessionId != 0,
+              header.sessionId == frame.transformSessionId else {
+            throw SMBCodecError.invalidValue(
+                "SMB3 transform inner session id mismatch \(header.sessionId)/\(frame.transformSessionId)"
+            )
+        }
+    }
+
+    private func commitResponseEffects(
+        _ effects: SMBValidatedResponseBatch,
+        generation: UInt64
+    ) throws {
+        switch effects {
+        case .single(let effect):
+            guard isGenerationActive(generation) else { return }
+            // Validation and commit run in one actor turn with no suspension between them.
+            // The slice validator already checked the pending identity and send phase.
+            applyResponseEffect(effect)
+        case .compound(let compoundEffects):
+            try commitResponseEffects(compoundEffects, generation: generation)
+        }
+    }
+
+    private func commitResponseEffects(
+        _ effects: [SMBValidatedResponseEffect],
+        generation: UInt64
+    ) throws {
+        guard isGenerationActive(generation) else { return }
+        // Preflight every identity before any record or continuation changes. Actor isolation
+        // and the non-suspending commit make rebinding impossible between validation and here.
+        for effect in effects {
+            try preflightResponseEffect(effect, generation: generation)
+        }
+
+        for effect in effects {
+            applyResponseEffect(effect)
+        }
+    }
+
+    private func preflightResponseEffect(
+        _ effect: SMBValidatedResponseEffect,
+        generation: UInt64
+    ) throws {
+        guard let identity = effect.requestIdentity else { return }
+        guard let pending = pendingResponses[effect.messageId],
+              pending.requestIdentity == identity,
+              pending.generation == generation,
+              pending.sendPhase != .registered else {
+            throw SMBCodecError.invalidValue("SMB response request identity changed before commit")
+        }
+    }
+
+    private func applyResponseEffect(_ effect: SMBValidatedResponseEffect) {
+        receivedPacketDispatchCountForTestingStorage += 1
+        resumeReceivedPacketDispatchWaiters()
+        guard let identity = effect.requestIdentity else {
+            debugLine("discarded SMB response for unknown MessageId \(effect.messageId)")
+            return
+        }
+        switch effect.kind {
+        case .ignored:
+            return
+        case .interim(let asyncId, let pendingCount):
+            guard var pending = pendingResponses[effect.messageId],
+                  pending.requestIdentity == identity else { return }
+            pending.asyncId = asyncId
+            pending.pendingCount = pendingCount
+            pendingResponses[effect.messageId] = pending
+            debugLine("\(pending.label) accepted interim STATUS_PENDING AsyncId=\(asyncId)")
+        case .final(let asyncId, let pendingCount, let frame, let status, let sendPhase):
+            let acceptedAt = sessionTime.now()
+            lastFinalAcceptanceForTestingStorage = acceptedAt
+            if sendPhase == .sent {
+                finishAcceptedFinal(messageId: effect.messageId, frame: frame, status: status)
+                return
+            }
+            guard var pending = pendingResponses[effect.messageId],
+                  pending.requestIdentity == identity else { return }
+            pending.asyncId = asyncId
+            pending.pendingCount = pendingCount
+            pending.finalSeen = true
+            pending.acceptedFinalFrame = frame
+            pending.acceptedFinalStatus = status
+            pendingResponses[effect.messageId] = pending
+        }
+    }
+
+    private func finishAcceptedFinal(messageId: UInt64, frame: SMBReceivedFrame, status: UInt32) {
+        guard var pending = removePendingResponse(messageId: messageId) else { return }
         pending.timeoutTask?.cancel()
         pending.cleanupTimeoutTask?.cancel()
         pending.cleanupDrainTask?.cancel()
         if let cleanupFileId = pending.cleanupFileId {
-            if header.status == SMB2Status.success {
+            if status == SMB2Status.success {
                 cleanupLedger.removeValue(forKey: cleanupFileId)
             } else {
                 cleanupLedger[cleanupFileId] = .retiredUnknown
@@ -8483,57 +8831,10 @@ actor SMBSession {
         }
     }
 
-    private func queueOrphan(_ frame: SMBReceivedFrame, messageId: UInt64) {
+    private func dispatchReceivedPacket(_ frame: SMBReceivedFrame) throws {
         guard isGenerationActive(frame.generation) else { return }
-        try? storeOrphan(frame, messageId: messageId, required: false)
-    }
-
-    private func storeOrphan(_ frame: SMBReceivedFrame, messageId: UInt64, required: Bool) throws {
-        guard isGenerationActive(frame.generation) else { return }
-        while orphanFrameCount >= Self.maxOrphanResponses {
-            guard let evictableIndex = orphanResponseOrder.firstIndex(where: { entry in
-                guard entry.generation == frame.generation else { return true }
-                guard let pending = pendingResponses[entry.messageId],
-                      pending.generation == entry.generation else { return true }
-                return pending.sendPhase == .sent
-            }) else {
-                if required {
-                    throw SMBCodecError.invalidValue("SMB pre-send response queue exceeded 64 frames")
-                }
-                debugLine("SMB orphan response queue full; dropped unknown message id \(messageId)")
-                return
-            }
-            let evicted = orphanResponseOrder[evictableIndex]
-            removeOrphan(at: evictableIndex)
-            debugLine("SMB orphan response queue full; dropped unknown message id \(evicted.messageId)")
-        }
-        orphanResponses[messageId, default: []].append(frame)
-        orphanResponseOrder.append((messageId: messageId, generation: frame.generation))
-    }
-
-    private var orphanFrameCount: Int {
-        orphanResponses.values.reduce(0) { $0 + $1.count }
-    }
-
-    private func removeOrphan(at index: Int) {
-        guard orphanResponseOrder.indices.contains(index) else { return }
-        let entry = orphanResponseOrder.remove(at: index)
-        guard var frames = orphanResponses[entry.messageId],
-              let frameIndex = frames.firstIndex(where: { $0.generation == entry.generation }) else {
-            return
-        }
-        frames.remove(at: frameIndex)
-        if frames.isEmpty {
-            orphanResponses.removeValue(forKey: entry.messageId)
-        } else {
-            orphanResponses[entry.messageId] = frames
-        }
-    }
-
-    private func takeOrphans(messageId: UInt64, generation: UInt64) -> [SMBReceivedFrame] {
-        guard let frames = orphanResponses.removeValue(forKey: messageId) else { return [] }
-        orphanResponseOrder.removeAll { $0.messageId == messageId && $0.generation == generation }
-        return frames.filter { $0.generation == generation }
+        let effects = try validateResponseFrame(frame)
+        try commitResponseEffects(effects, generation: frame.generation)
     }
 
     private func markSendStarted(messageId: UInt64, generation: UInt64) -> Bool {
@@ -8553,9 +8854,8 @@ actor SMBSession {
         await sendCancelWithoutGate(target: target, generation: generation)
     }
 
-    /// Reconcile the full-send callback and replay any early response before deciding
-    /// whether a reader is still owed. A retired record does not block bootstrap when
-    /// another sent request remains outstanding.
+    /// Reconcile the full-send callback with receive correlation already bound to this
+    /// RequestIdentity. An accepted early final is released only at this caller gate.
     private func reconcileSuccessfulSend(messageId: UInt64, generation: UInt64) -> SMB2Cancel.Target? {
         guard isGenerationActive(generation) else { return nil }
         let target = markRequestSent(messageId: messageId, generation: generation)
@@ -8572,6 +8872,14 @@ actor SMBSession {
               pending.generation == generation else { return nil }
         requestSentCountForTestingStorage += 1
         pending.sendPhase = .sent
+        pendingResponses[messageId] = pending
+        resumeRequestSentCountWaiters()
+        if pending.finalSeen,
+           let frame = pending.acceptedFinalFrame,
+           let status = pending.acceptedFinalStatus {
+            finishAcceptedFinal(messageId: messageId, frame: frame, status: status)
+            return nil
+        }
         if let cleanupFileId = pending.cleanupFileId {
             cleanupLedger[cleanupFileId] = .draining(messageId)
             resumeCleanupLedgerCountWaiters()
@@ -8591,23 +8899,7 @@ actor SMBSession {
             )
         }
         pendingResponses[messageId] = pending
-        resumeRequestSentCountWaiters()
-        let orphans = takeOrphans(messageId: messageId, generation: generation)
-        for orphan in orphans {
-            guard isGenerationActive(generation),
-                  pendingResponses[messageId]?.generation == generation else { break }
-            do {
-                try dispatchReceivedPacket(orphan)
-            } catch {
-                terminateForReceiveFault(error, cause: "orphan_dispatch_failure")
-                return nil
-            }
-            guard pendingResponses[messageId]?.generation == generation else { break }
-        }
-        // An orphan can be the final response. In that case dispatchReceivedPacket
-        // already consumed it, so there is no wire request left to cancel.
-        guard pendingResponses[messageId]?.cancellationRequested == true,
-              pendingResponses[messageId]?.sendPhase == .sent else {
+        guard pendingResponses[messageId]?.cancellationRequested == true else {
             return nil
         }
         if let asyncId = pendingResponses[messageId]?.asyncId {
@@ -8642,25 +8934,6 @@ actor SMBSession {
         // deliberately not refunded because the request reached the wire.
         closeTransport(cause: "request_timeout", diagnosticError: SMBTransportError.timedOut)
         requestTimeoutCompletionCountForTestingStorage += 1
-    }
-
-    /// Fails a single correlated request whose response frame violated an async-header
-    /// invariant. The frame is addressed to this MessageId, so unlike a command/session
-    /// mismatch it cannot belong to another request — the violation is contained to this
-    /// transaction and must not tear down the shared session. Cancellation tombstones
-    /// have nobody waiting; they are drained with a diagnostic only.
-    private func failCorrelatedRequest(messageId: UInt64, pending: SMBPendingResponse, reason: String) {
-        var pending = pending
-        pending.timeoutTask?.cancel()
-        pending.timeoutTask = nil
-        pending.timeoutIdentity = nil
-        removePendingResponse(messageId: messageId)
-        if pending.continuationResumed {
-            debugLine("drained cancelled request after async correlation violation: \(reason)")
-            return
-        }
-        pending.continuationResumed = true
-        pending.continuation.resume(throwing: SMBCodecError.invalidValue(reason))
     }
 
     private func failPendingResponse(messageId: UInt64, error: Error) {
@@ -8741,8 +9014,6 @@ actor SMBSession {
         }
         pendingResponses.removeAll()
         activeRequestIdentities.removeAll()
-        orphanResponses.removeAll()
-        orphanResponseOrder.removeAll()
         for var waiter in pending.values {
             waiter.timeoutTask?.cancel()
             waiter.cleanupTimeoutTask?.cancel()
@@ -8883,22 +9154,66 @@ actor SMBSession {
         debugLine("SMB credit refund=\(charge) balance=\(balance)")
     }
 
-    private func recordCreditGrant(_ credits: UInt16, label: String, generation: UInt64) async {
-        // Known order: credits are applied before signature/correlation dispatch; do not special-case cleanup here. Any fix must cover every response path.
-        guard isGenerationActive(generation) else { return }
-        let balance = await creditWindow.grant(credits)
-        await creditGrantAfterAwaitHookForTesting?()
-        guard isGenerationActive(generation) else { return }
-        debugLine("\(label) credit grant=\(credits) balance=\(balance)")
+    private func recordCreditGrants(_ effects: [SMBValidatedResponseEffect], generation: UInt64) async {
+        var totalCredits: UInt64 = 0
+        var receiptCount = 0
+        for effect in effects {
+            guard let credits = effect.credits else { continue }
+            totalCredits += UInt64(credits)
+            receiptCount += 1
+        }
+        guard let balance = await applyCreditGrants(
+            totalCredits: totalCredits,
+            receiptCount: receiptCount,
+            generation: generation
+        ) else { return }
+        for effect in effects {
+            if let credits = effect.credits {
+                debugLine("SMB response credit grant=\(credits) balance=\(balance)")
+            }
+        }
     }
 
-    private func decryptTransform(_ packet: [UInt8]) throws -> [UInt8] {
+    private func recordCreditGrants(_ effects: SMBValidatedResponseBatch, generation: UInt64) async {
+        switch effects {
+        case .single(let effect):
+            await recordCreditGrant(effect.credits, generation: generation)
+        case .compound(let compoundEffects):
+            await recordCreditGrants(compoundEffects, generation: generation)
+        }
+    }
+
+    private func recordCreditGrant(_ credits: UInt16?, generation: UInt64) async {
+        guard let credits,
+              let balance = await applyCreditGrants(
+                  totalCredits: UInt64(credits),
+                  receiptCount: 1,
+                  generation: generation
+              ) else { return }
+        debugLine("SMB response credit grant=\(credits) balance=\(balance)")
+    }
+
+    private func applyCreditGrants(
+        totalCredits: UInt64,
+        receiptCount: Int,
+        generation: UInt64
+    ) async -> UInt32? {
+        guard receiptCount > 0, isGenerationActive(generation) else { return nil }
+        let balance = await creditWindow.grant(totalCredits: totalCredits, receiptCount: receiptCount)
+        await creditGrantAfterAwaitHookForTesting?()
+        guard isGenerationActive(generation) else { return nil }
+        return balance
+    }
+
+    private func decryptTransform(_ packet: [UInt8]) throws -> (plaintext: [UInt8], sessionId: UInt64) {
         guard let decryptionKey else { throw SMBCodecError.invalidValue("missing SMB decryption key") }
         let header = try SMB3TransformHeader.decode(packet)
         guard header.flags == SMB3TransformHeader.encryptedFlag else {
             throw SMBCodecError.invalidValue("unsupported SMB3 transform flags")
         }
-        guard header.sessionId == sessionId else { throw SMBCodecError.invalidValue("SMB3 transform session id mismatch") }
+        guard header.sessionId != 0, header.sessionId == sessionId else {
+            throw SMBCodecError.invalidValue("SMB3 transform session id mismatch")
+        }
         let ciphertext = Array(packet.dropFirst(SMB3TransformHeader.encodedSize))
         guard UInt64(ciphertext.count) == UInt64(header.originalMessageSize) else {
             throw SMBCodecError.invalidValue("SMB3 transform original message size mismatch")
@@ -8927,7 +9242,7 @@ actor SMBSession {
             "decrypt cipher=\(encryptionAlgorithm == .aes128CCM ? "ccm" : "gcm") bytes=\(ciphertext.count) ms=\(SMBPerfLog.milliseconds(ContinuousClock.now - perfStart))"
         )
         debugDump("decrypted \(packet.count)-byte SMB3 transform", plaintext)
-        return plaintext
+        return (plaintext, header.sessionId)
     }
 
     /// MS-SMB2 §3.2.4.1.6: the next MessageId must advance by the CreditCharge of the

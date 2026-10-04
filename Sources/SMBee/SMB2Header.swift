@@ -240,6 +240,8 @@ actor SMB2CreditWindow {
     }
 
     private var available: UInt32
+    private var receivedGrantReceiptCount = 0
+    private var grantActorHookForTesting: (@Sendable () async -> Void)?
     private let diagnosticSessionId: String
     private var waiters: [Waiter] = []
     private var waiterCountWaiters: [PendingWaiterCountObserver] = []
@@ -412,11 +414,29 @@ actor SMB2CreditWindow {
         resumeReadyWaiters()
     }
 
-    func grant(_ credits: UInt16) -> UInt32 {
+    func grant(_ credits: UInt16) async -> UInt32 {
+        await grant(totalCredits: UInt64(credits), receiptCount: 1)
+    }
+
+    /// Applies all validated slices from one response chain in a single actor hop while
+    /// retaining one receipt count per slice. Adding nonnegative grants in one saturated
+    /// batch is equivalent to applying them individually in wire order.
+    func grant(totalCredits: UInt64, receiptCount: Int) async -> UInt32 {
+        await grantActorHookForTesting?()
         if case .failed = state { return available }
-        available = SMB2Credit.balanceAfterReceiving(current: available, granted: credits)
+        let (sum, overflow) = UInt64(available).addingReportingOverflow(totalCredits)
+        available = overflow || sum > UInt64(UInt32.max) ? UInt32.max : UInt32(sum)
+        receivedGrantReceiptCount += receiptCount
         resumeReadyWaiters()
         return available
+    }
+
+    func grantReceiptCountForTesting() -> Int {
+        receivedGrantReceiptCount
+    }
+
+    func setGrantActorHookForTesting(_ hook: (@Sendable () async -> Void)?) {
+        grantActorHookForTesting = hook
     }
 
     func refund(charge requestedCharge: UInt16) -> UInt32 {

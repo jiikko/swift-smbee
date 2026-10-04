@@ -1246,7 +1246,7 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         XCTAssertEqual(transport.closeCallCount, 1)
     }
 
-    func testOrphanCleanupDispatchFailureClosesTransportAndClearsLedger() async throws {
+    func testCleanupDispatchSignatureFailureClosesTransportAndClearsLedger() async throws {
         let signingKey = [UInt8](repeating: 0x63, count: 16)
         let transport = CommandAwareCloseTimeoutTransport(signingKey: signingKey)
         let session = SMBSession(
@@ -1257,7 +1257,6 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             signingKey: signingKey,
             signingRequired: true
         )
-        defer { Task { await session.closeTransport(cause: "test_orphan_cleanup_dispatch") } }
         let messageId: UInt64 = 41
         let sessionId: UInt64 = 0x1111_2222_3333_4444
         let fileId = [UInt8](repeating: 0x41, count: 16)
@@ -1281,20 +1280,27 @@ final class SMBWireDiagnosticsTests: XCTestCase {
             sessionId: sessionId
         ).encode()
 
-        try await session.queueOrphanAndMarkRequestSentForTesting(invalidSignatureResponse)
         do {
-            try await awaitWithTimeout("orphan cleanup pending fails on wire fault") {
+            _ = try await session.processRawFrameForTesting(invalidSignatureResponse, generation: 1)
+            XCTFail("invalid cleanup response signature must be rejected before dispatch")
+        } catch SMBCodecError.invalidValue {
+        }
+        let pendingBeforeClose = await session.wirePendingRecordCountForTesting()
+        let ledgerBeforeClose = await session.cleanupLedgerCountForTesting()
+        XCTAssertEqual(pendingBeforeClose, 1)
+        XCTAssertEqual(ledgerBeforeClose, 1)
+        await session.closeTransportAndWait(cause: "test_cleanup_signature_failure")
+        do {
+            try await awaitWithTimeout("cleanup pending fails after terminal close") {
                 try await pending.value
             }
-            XCTFail("orphan cleanup dispatch failure did not terminate the pending CLOSE")
+            XCTFail("cleanup pending must fail after transport teardown")
         } catch SMBTransportError.connectionClosed {
         }
         XCTAssertEqual(transport.closeCallCount, 1)
         let pendingCount = await session.wirePendingRecordCountForTesting()
-        let orphanCount = await session.orphanResponseCountForTesting()
         let ledgerCount = await session.cleanupLedgerCountForTesting()
         XCTAssertEqual(pendingCount, 0)
-        XCTAssertEqual(orphanCount, 0)
         XCTAssertEqual(ledgerCount, 0)
     }
 
@@ -1401,15 +1407,12 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         XCTAssertEqual(tombstoneCountAfterInterim, 1)
 
         transport.releaseNextResponse(command: SMB2Commands.close)
-        try await awaitWithTimeout("mismatched signed final dispatched") {
-            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 2)
-        }
         try await awaitWithTimeout("AsyncId mismatch closes cleanup ledger") {
             await session.waitForCleanupLedgerCountForTesting(0)
         }
         XCTAssertEqual(transport.closeCallCount, 1)
         let dispatchCount = await session.receivedPacketDispatchCountForTesting()
-        XCTAssertEqual(dispatchCount, 2)
+        XCTAssertEqual(dispatchCount, 1, "the invalid final is rejected before the receive transaction commits")
     }
 
     func testCleanupCallerCancellationAfterResponseDispatchKeepsSuccessfulResult() async throws {
@@ -2335,24 +2338,28 @@ final class SMBRequestRetirementPrimitiveTests: XCTestCase {
             ).encode()
         )
         await assertPendingIdentityCounts(session, pending: 1, identities: 1)
-        try await session.dispatchReceivedPacketForTesting(
-            SMB2Header.asyncHeader(
-                command: SMB2Commands.echo,
-                credits: 0,
-                messageId: 112,
-                asyncId: 0x2222
-            ).encode()
-        )
+        do {
+            try await session.dispatchReceivedPacketForTesting(
+                SMB2Header.asyncHeader(
+                    command: SMB2Commands.echo,
+                    credits: 0,
+                    messageId: 112,
+                    asyncId: 0x2222
+                ).encode()
+            )
+            XCTFail("a mismatched final must raise a wire correlation fault")
+        } catch SMBCodecError.invalidValue {
+        }
+        await assertPendingIdentityCounts(session, pending: 1, identities: 1)
+        let transportClosedBeforeTeardown = await session.isTransportClosedForTesting()
+        XCTAssertFalse(transportClosedBeforeTeardown, "the direct validation seam leaves terminal handling to its reader")
+        await session.closeTransportAndWait(cause: "test_identity_correlation_wire_fault")
         do {
             _ = try await correlationFailure.value
-            XCTFail("mismatched AsyncId must fail correlation")
-        } catch SMBCodecError.invalidValue {
-            // Correlation failure removes the ordinary pending record without closing the session.
+            XCTFail("mismatched AsyncId must fail its pending request")
+        } catch SMBTransportError.connectionClosed {
         }
         await assertPendingIdentityCounts(session, pending: 0, identities: 0)
-        let transportClosed = await session.isTransportClosedForTesting()
-        XCTAssertFalse(transportClosed, "the session remains open after request-scoped correlation failure")
-        await session.closeTransportAndWait(cause: "test_identity_removal_paths_complete")
     }
 
     func testProductionAndFakeMonotonicTimeSourcesUseTheirPairedClock() async throws {
@@ -2366,6 +2373,1188 @@ final class SMBRequestRetirementPrimitiveTests: XCTestCase {
         let virtualStart = virtual.now()
         try await virtual.sleep(.seconds(7))
         XCTAssertEqual(virtualStart.duration(to: virtual.now()), .seconds(7))
+    }
+
+    func testSendingStatusPendingAndFinalInOneCompoundKeepCallerBehindSendGate() async throws {
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        let messageId: UInt64 = 0x501
+        let asyncId: UInt64 = 0x1122_3344_5566_7788
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sending: true,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("sending request registered") { await registered.wait() }
+
+        let interim = try SMB2Header.asyncHeader(
+            status: SMB2Status.pending,
+            command: SMB2Commands.echo,
+            credits: 3,
+            nextCommand: UInt32(SMB2Header.encodedSize),
+            messageId: messageId,
+            asyncId: asyncId
+        ).encode()
+        let final = try SMB2Header.asyncHeader(
+            command: SMB2Commands.echo,
+            credits: 5,
+            messageId: messageId,
+            asyncId: asyncId
+        ).encode()
+        _ = try await session.processRawFrameForTesting(interim + final, generation: 1)
+
+        assertAwaitedEqual(await session.pendingAsyncIdForTesting(messageId: messageId), asyncId)
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: messageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 2)
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 8)
+
+        await session.markRequestSentWithoutReaderForTesting(messageId: messageId)
+        try await awaitWithTimeout("caller released after full send") { _ = try await caller.value }
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 0)
+        await session.closeTransportAndWait(cause: "test_sending_compound_send_gate")
+    }
+
+    func testSendingStatusPendingAndFinalAcrossFramesKeepAsyncIdBeforeSendGate() async throws {
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        let messageId: UInt64 = 0x502
+        let asyncId: UInt64 = 0x8877_6655_4433_2211
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sending: true,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("sending request registered") { await registered.wait() }
+
+        let interim = try SMB2Header.asyncHeader(
+            status: SMB2Status.pending,
+            command: SMB2Commands.echo,
+            credits: 2,
+            messageId: messageId,
+            asyncId: asyncId
+        ).encode()
+        let final = try SMB2Header.asyncHeader(
+            command: SMB2Commands.echo,
+            credits: 4,
+            messageId: messageId,
+            asyncId: asyncId
+        ).encode()
+        _ = try await session.processRawFrameForTesting(interim, generation: 1)
+        assertAwaitedEqual(await session.pendingAsyncIdForTesting(messageId: messageId), asyncId)
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+
+        _ = try await session.processRawFrameForTesting(final, generation: 1)
+        let acceptedAt = try awaitUnwrap(await session.lastFinalAcceptanceForTesting())
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: messageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 2)
+
+        await session.markRequestSentWithoutReaderForTesting(messageId: messageId)
+        try await awaitWithTimeout("caller released after full send") { _ = try await caller.value }
+        assertAwaitedEqual(await session.lastFinalAcceptanceForTesting(), acceptedAt)
+        await session.closeTransportAndWait(cause: "test_sending_frames_send_gate")
+    }
+
+    func testSignedCopiedStatusPendingDoesNotVerifySignatureAndKeepsSessionAlive() async throws {
+        let signingKey = [UInt8](repeating: 0x81, count: 16)
+        let sessionId: UInt64 = 0x1234_5678_9ABC_DEF0
+        let asyncId: UInt64 = 0x8877_6655_4433_2211
+        let transport = CommandAwareCloseTimeoutTransport(
+            heldCommands: [SMB2Commands.echo],
+            signingKey: signingKey
+        )
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            signingKey: signingKey,
+            signingRequired: true,
+            initialCredits: 2
+        )
+        await session.setSessionIdForTesting(sessionId)
+        let echo = Task { try await session.echo() }
+        try await awaitWithTimeout("signed ECHO sent") {
+            try await transport.waitUntilSent(command: SMB2Commands.echo, count: 1)
+        }
+        try await awaitWithTimeout("signed ECHO marked sent") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        await transport.waitUntilReceiveIsBlocked()
+
+        let request = try XCTUnwrap(transport.sentPacket(command: SMB2Commands.echo, occurrence: 1))
+        let requestHeader = try SMB2Header.decode(request)
+        XCTAssertNotEqual(requestHeader.flags & SMB2Flags.signed, 0)
+        var interim = try SMB2Header.asyncHeader(
+            status: SMB2Status.pending,
+            command: SMB2Commands.echo,
+            credits: 2,
+            flags: (requestHeader.flags & SMB2Flags.signed) | 0x0000_0001,
+            messageId: requestHeader.messageId,
+            asyncId: asyncId,
+            sessionId: requestHeader.sessionId,
+            signature: requestHeader.signature
+        ).encode()
+        interim.append(contentsOf: [9, 0, 0, 0, 0, 0, 0, 0])
+        try transport.enqueuePacket(interim)
+        await transport.waitUntilReceiveIsBlocked()
+        assertAwaitedEqual(await session.receivedPacketDispatchCountForTesting(), 1)
+        assertAwaitedEqual(await session.pendingAsyncIdForTesting(messageId: requestHeader.messageId), asyncId)
+        assertAwaitedFalse(await session.pendingFinalSeenForTesting(messageId: requestHeader.messageId))
+        let sessionOpenAfterInterim = !(await session.isTransportClosedForTesting())
+        assertAwaitedTrue(sessionOpenAfterInterim)
+        guard sessionOpenAfterInterim else { return }
+
+        var final = try SMB2Header.asyncHeader(
+            status: SMB2Status.success,
+            command: SMB2Commands.echo,
+            credits: 2,
+            flags: 0x0000_0001,
+            messageId: requestHeader.messageId,
+            asyncId: asyncId,
+            sessionId: sessionId
+        ).encode()
+        final.append(contentsOf: [4, 0, 0, 0])
+        final = try signedTestPacket(final, algorithm: .aesCMAC, key: signingKey, sender: .server)
+        try transport.enqueuePacket(final)
+        try await awaitWithTimeout("signed async ECHO final accepted") { try await echo.value }
+        assertAwaitedFalse(await session.isTransportClosedForTesting())
+        XCTAssertEqual(transport.closeCallCount, 0)
+        await session.closeTransportAndWait(cause: "test_signed_copied_interim")
+    }
+
+    func testMaxMessageIdNotificationWithInvalidSignatureIsDiscardedBeforeVerification() async throws {
+        let signingKey = [UInt8](repeating: 0x82, count: 16)
+        let sessionId: UInt64 = 0x0A0B_0C0D_0E0F_1011
+        let transport = CommandAwareCloseTimeoutTransport(
+            heldCommands: [SMB2Commands.echo],
+            signingKey: signingKey
+        )
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            signingKey: signingKey,
+            signingRequired: true,
+            initialCredits: 2
+        )
+        await session.setSessionIdForTesting(sessionId)
+        let echo = Task { try await session.echo() }
+        try await awaitWithTimeout("notification-probe ECHO sent") {
+            try await transport.waitUntilSent(command: SMB2Commands.echo, count: 1)
+        }
+        try await awaitWithTimeout("notification-probe ECHO marked sent") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        await transport.waitUntilReceiveIsBlocked()
+
+        let invalidNotification = try SMB2Header(
+            command: SMB2Commands.oplockBreak,
+            credits: 12,
+            flags: 0x0000_0001 | SMB2Flags.signed,
+            messageId: UInt64.max,
+            sessionId: sessionId,
+            signature: [UInt8](repeating: 0xA5, count: 16)
+        ).encode()
+        try transport.enqueuePacket(invalidNotification)
+        await transport.waitUntilReceiveIsBlocked()
+        let sessionOpenAfterNotification = !(await session.isTransportClosedForTesting())
+        assertAwaitedTrue(sessionOpenAfterNotification)
+        guard sessionOpenAfterNotification else { return }
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 1)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 0)
+
+        transport.releaseNextResponse(command: SMB2Commands.echo)
+        try await awaitWithTimeout("outstanding ECHO survives invalid notification") { try await echo.value }
+        assertAwaitedFalse(await session.isTransportClosedForTesting())
+        XCTAssertEqual(transport.closeCallCount, 0)
+        await session.closeTransportAndWait(cause: "test_invalid_signature_mid_max_notification")
+    }
+
+    func testCompoundChainCompletesSentRequestAndHoldsSendingRequest() async throws {
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        let sentMessageId: UInt64 = 0x50F
+        let sendingMessageId: UInt64 = 0x510
+        let sentRegistered = SMBRetirementEvent()
+        let sendingRegistered = SMBRetirementEvent()
+        let sentCaller = Task {
+            try await session.parkPendingForTesting(
+                messageId: sentMessageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await sentRegistered.signal() } }
+            )
+        }
+        let sendingCaller = Task {
+            try await session.parkPendingForTesting(
+                messageId: sendingMessageId,
+                command: SMB2Commands.echo,
+                sending: true,
+                onRegistered: { _ = Task { await sendingRegistered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("both compound requests registered") {
+            await sentRegistered.wait()
+            await sendingRegistered.wait()
+        }
+
+        let first = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 4,
+            nextCommand: UInt32(SMB2Header.encodedSize),
+            messageId: sentMessageId
+        ).encode()
+        let second = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 6,
+            messageId: sendingMessageId
+        ).encode()
+        _ = try await session.processRawFrameForTesting(first + second, generation: 1)
+
+        try await awaitWithTimeout("sent slice completes its caller") { _ = try await sentCaller.value }
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: sendingMessageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: sendingMessageId))
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 1)
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 10)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 2)
+
+        await session.markRequestSentWithoutReaderForTesting(messageId: sendingMessageId)
+        try await awaitWithTimeout("sending slice completes after its send gate") { _ = try await sendingCaller.value }
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 0)
+        await session.closeTransportAndWait(cause: "test_mixed_sent_sending_compound")
+    }
+
+    func testDuplicateFinalCompoundRejectsBeforeAnyGrantOrCallerCompletion() async throws {
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 1
+        )
+        let messageId: UInt64 = 0x503
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("sent request registered") { await registered.wait() }
+
+        let first = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 7,
+            nextCommand: UInt32(SMB2Header.encodedSize),
+            messageId: messageId
+        ).encode()
+        let duplicate = try SMB2Header(command: SMB2Commands.echo, credits: 9, messageId: messageId).encode()
+        do {
+            _ = try await session.processRawFrameForTesting(first + duplicate, generation: 1)
+            XCTFail("same-chain duplicate final must be rejected")
+        } catch SMBCodecError.invalidValue {
+        }
+
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 1)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 0)
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 1)
+        assertAwaitedFalse(await session.pendingFinalSeenForTesting(messageId: messageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+        await session.closeTransportAndWait(cause: "test_duplicate_final_compound")
+        do {
+            try await awaitWithTimeout("duplicate-final caller teardown") { _ = try await caller.value }
+            XCTFail("the rejected chain must not complete its caller successfully")
+        } catch {
+        }
+    }
+
+    func testInvalidSignatureCannotGrantOrCompletePendingResponse() async throws {
+        let key = [UInt8](repeating: 0x42, count: 16)
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            signingKey: key,
+            signingRequired: false,
+            initialCredits: 0
+        )
+        let messageId: UInt64 = 0x504
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("sent request registered") { await registered.wait() }
+
+        var badSignature = try signedTestPacket(
+            SMB2Header(command: SMB2Commands.echo, credits: 12, messageId: messageId).encode(),
+            algorithm: .aesCMAC,
+            key: key,
+            sender: .server
+        )
+        badSignature[48] ^= 0x01
+        do {
+            _ = try await session.processRawFrameForTesting(badSignature, generation: 1)
+            XCTFail("invalid response signature must be rejected")
+        } catch SMBCodecError.invalidValue {
+        }
+
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 0)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 0)
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 1)
+        assertAwaitedFalse(await session.pendingFinalSeenForTesting(messageId: messageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+        await session.closeTransportAndWait(cause: "test_invalid_signature_no_grant")
+        do {
+            try await awaitWithTimeout("invalid-signature caller teardown") { _ = try await caller.value }
+            XCTFail("invalid response must not complete its caller successfully")
+        } catch {
+        }
+    }
+
+    func testRequiredResponseProtectionFailureRetainsPendingStateUntilOwnerTeardown() async throws {
+        let key = [UInt8](repeating: 0x4A, count: 16)
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            signingKey: key,
+            signingRequired: false,
+            initialCredits: 0
+        )
+        let messageId: UInt64 = 0x50E
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                responseProtectionPolicy: .signatureOrAEADRequired,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("protected-response request registered") { await registered.wait() }
+
+        let unsigned = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 13,
+            messageId: messageId
+        ).encode()
+        do {
+            _ = try await session.processRawFrameForTesting(unsigned, generation: 1)
+            XCTFail("request policy must reject an unsigned final before commit")
+        } catch SMBCodecError.invalidValue(let message) {
+            XCTAssertTrue(message.contains("authenticated protection"), message)
+        }
+
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 0)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 0)
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 1)
+        assertAwaitedFalse(await session.pendingFinalSeenForTesting(messageId: messageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+        await session.closeTransportAndWait(cause: "test_request_protection_policy_transaction")
+        do {
+            try await awaitWithTimeout("protected-response caller teardown") { _ = try await caller.value }
+            XCTFail("a rejected final must not complete its caller successfully")
+        } catch {
+        }
+    }
+
+    func testUnknownMessageIdIsDiscardedBeforeLaterRequestReusesIt() async throws {
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        let messageId: UInt64 = 0x505
+        _ = try await session.processRawFrameForTesting(
+            SMB2Header(command: SMB2Commands.echo, credits: 8, messageId: messageId).encode(),
+            generation: 1
+        )
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 0)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 0)
+        assertAwaitedEqual(await session.orphanResponseCountForTesting(), 0)
+
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("reused MessageId request registered") { await registered.wait() }
+        let newIdentity = try awaitUnwrap(await session.requestIdentityForTesting(messageId: messageId))
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 1)
+        assertAwaitedFalse(await session.pendingFinalSeenForTesting(messageId: messageId))
+
+        _ = try await session.processRawFrameForTesting(
+            SMB2Header(command: SMB2Commands.echo, credits: 1, messageId: messageId).encode(),
+            generation: 1
+        )
+        try await awaitWithTimeout("new request receives only its own final") { _ = try await caller.value }
+        assertAwaitedEqual(await session.requestIdentityForTesting(messageId: messageId), nil)
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 1)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 1)
+        assertAwaitedEqual(await session.orphanResponseCountForTesting(), 0)
+        XCTAssertNotNil(newIdentity)
+        await session.closeTransportAndWait(cause: "test_unknown_mid_no_replay")
+    }
+
+    func testPlaintextCompoundVerifiesSignaturePerSliceIncludingPadding() async throws {
+        let key = [UInt8](repeating: 0x53, count: 16)
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            signingKey: key,
+            signingRequired: true,
+            initialCredits: 0
+        )
+        let firstId: UInt64 = 0x506
+        let secondId: UInt64 = 0x507
+        let firstRegistered = SMBRetirementEvent()
+        let secondRegistered = SMBRetirementEvent()
+        let firstCaller = Task {
+            try await session.parkPendingForTesting(
+                messageId: firstId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await firstRegistered.signal() } }
+            )
+        }
+        let secondCaller = Task {
+            try await session.parkPendingForTesting(
+                messageId: secondId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await secondRegistered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("both requests registered") {
+            await firstRegistered.wait()
+            await secondRegistered.wait()
+        }
+
+        var first = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 1,
+            nextCommand: 72,
+            messageId: firstId
+        ).encode()
+        first.append(contentsOf: Array(repeating: 0, count: 8))
+        first = try signedTestPacket(first, algorithm: .aesCMAC, key: key, sender: .server)
+        let second = try signedTestPacket(
+            SMB2Header(command: SMB2Commands.echo, credits: 2, messageId: secondId).encode(),
+            algorithm: .aesCMAC,
+            key: key,
+            sender: .server
+        )
+        _ = try await session.processRawFrameForTesting(first + second, generation: 1)
+
+        try await awaitWithTimeout("first compound caller") { _ = try await firstCaller.value }
+        try await awaitWithTimeout("second compound caller") { _ = try await secondCaller.value }
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 3)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 2)
+        assertAwaitedEqual(await session.receivedPacketDispatchCountForTesting(), 2)
+        await session.closeTransportAndWait(cause: "test_signed_compound_per_slice")
+    }
+
+    func testEncryptedCompoundResponseAuthenticatesAndGrantsEverySlice() async throws {
+        let key = [UInt8](repeating: 0x64, count: 16)
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        let sessionId: UInt64 = 0x8877_6655_4433_2211
+        await session.setSessionIdForTesting(sessionId)
+        await session.installEncryptionStateForTesting(encryptionKey: key, decryptionKey: key)
+        let firstId: UInt64 = 0x508
+        let secondId: UInt64 = 0x509
+        let firstRegistered = SMBRetirementEvent()
+        let secondRegistered = SMBRetirementEvent()
+        let firstCaller = Task {
+            try await session.parkPendingForTesting(
+                messageId: firstId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await firstRegistered.signal() } }
+            )
+        }
+        let secondCaller = Task {
+            try await session.parkPendingForTesting(
+                messageId: secondId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await secondRegistered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("both encrypted-response requests registered") {
+            await firstRegistered.wait()
+            await secondRegistered.wait()
+        }
+        let first = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 2,
+            nextCommand: UInt32(SMB2Header.encodedSize),
+            messageId: firstId,
+            sessionId: sessionId
+        ).encode()
+        let second = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 3,
+            messageId: secondId,
+            sessionId: sessionId
+        ).encode()
+        let encrypted = try encryptCompoundResponse(first + second, key: key, sessionId: sessionId)
+        _ = try await session.processRawFrameForTesting(encrypted, generation: 1)
+
+        try await awaitWithTimeout("first encrypted compound caller") { _ = try await firstCaller.value }
+        try await awaitWithTimeout("second encrypted compound caller") { _ = try await secondCaller.value }
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 5)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 2)
+        await session.closeTransportAndWait(cause: "test_encrypted_compound_response")
+    }
+
+    func testEncryptedSingleResponseRejectsInnerSessionIdZeroOrMismatchBeforeCommit() async throws {
+        let outerSessionId: UInt64 = 0x8877_6655_4433_2211
+        for innerSessionId in [UInt64(0), outerSessionId ^ 0x100] {
+            try await assertEncryptedResponseSessionMismatchDoesNotCommit(
+                outerSessionId: outerSessionId,
+                innerSessionIds: [innerSessionId],
+                credits: [9]
+            )
+        }
+    }
+
+    func testEncryptedCompoundRejectsInnerSessionIdZeroOrMismatchBeforeCommit() async throws {
+        let outerSessionId: UInt64 = 0x7766_5544_3322_1100
+        for innerSessionId in [UInt64(0), outerSessionId ^ 0x100] {
+            try await assertEncryptedResponseSessionMismatchDoesNotCommit(
+                outerSessionId: outerSessionId,
+                innerSessionIds: [outerSessionId, innerSessionId],
+                credits: [7, 9]
+            )
+        }
+    }
+
+    func testEncryptedPostFinalResponseStillChecksInnerSessionId() async throws {
+        let key = [UInt8](repeating: 0xA7, count: 16)
+        let sessionId: UInt64 = 0x8877_6655_4433_2211
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        await session.setSessionIdForTesting(sessionId)
+        await session.installEncryptionStateForTesting(encryptionKey: key, decryptionKey: key)
+
+        let messageId: UInt64 = 0x60A
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sending: true,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("early-final request registered") { await registered.wait() }
+
+        let earlyFinal = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 0,
+            messageId: messageId,
+            sessionId: sessionId
+        ).encode() + [4, 0, 0, 0]
+        _ = try await session.processRawFrameForTesting(
+            encryptCompoundResponse(earlyFinal, key: key, sessionId: sessionId),
+            generation: 1
+        )
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: messageId))
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 1)
+
+        let mismatchedFinal = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 65535,
+            messageId: messageId,
+            sessionId: 0
+        ).encode() + [4, 0, 0, 0]
+        do {
+            _ = try await session.processRawFrameForTesting(
+                encryptCompoundResponse(mismatchedFinal, key: key, sessionId: sessionId),
+                generation: 1
+            )
+            XCTFail("a post-final transform slice with inner SessionId zero must be rejected")
+        } catch SMBCodecError.invalidValue(let message) {
+            XCTAssertTrue(message.contains("transform inner session id mismatch"), message)
+        }
+
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 0)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 1)
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: messageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+        await session.closeTransportAndWait(cause: "test_post_final_transform_session_id")
+        do {
+            try await awaitWithTimeout("post-final request teardown") { try await caller.value }
+            XCTFail("early-final caller must remain behind its send gate")
+        } catch {
+        }
+    }
+
+    func testEncryptedCompoundPostFinalMismatchRejectsEarlierFinalAndGrant() async throws {
+        let key = [UInt8](repeating: 0xA8, count: 16)
+        let sessionId: UInt64 = 0x7766_5544_3322_1100
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        await session.setSessionIdForTesting(sessionId)
+        await session.installEncryptionStateForTesting(encryptionKey: key, decryptionKey: key)
+
+        let firstMessageId: UInt64 = 0x60B
+        let earlyFinalMessageId: UInt64 = 0x60C
+        let firstRegistered = SMBRetirementEvent()
+        let earlyFinalRegistered = SMBRetirementEvent()
+        let firstCaller = Task {
+            try await session.parkPendingForTesting(
+                messageId: firstMessageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await firstRegistered.signal() } }
+            )
+        }
+        let earlyFinalCaller = Task {
+            try await session.parkPendingForTesting(
+                messageId: earlyFinalMessageId,
+                command: SMB2Commands.echo,
+                sending: true,
+                onRegistered: { _ = Task { await earlyFinalRegistered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("compound requests registered") {
+            await firstRegistered.wait()
+            await earlyFinalRegistered.wait()
+        }
+
+        let earlyFinal = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 0,
+            messageId: earlyFinalMessageId,
+            sessionId: sessionId
+        ).encode() + [4, 0, 0, 0]
+        _ = try await session.processRawFrameForTesting(
+            encryptCompoundResponse(earlyFinal, key: key, sessionId: sessionId),
+            generation: 1
+        )
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: earlyFinalMessageId))
+        let grantsBeforeCompound = await session.creditGrantReceiptCountForTesting()
+        let balanceBeforeCompound = await session.creditBalanceForTesting()
+
+        let firstFinal = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 31,
+            nextCommand: UInt32(SMB2Header.encodedSize),
+            messageId: firstMessageId,
+            sessionId: sessionId
+        ).encode()
+        let mismatchedPostFinal = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 37,
+            messageId: earlyFinalMessageId,
+            sessionId: 0
+        ).encode()
+        do {
+            _ = try await session.processRawFrameForTesting(
+                encryptCompoundResponse(firstFinal + mismatchedPostFinal, key: key, sessionId: sessionId),
+                generation: 1
+            )
+            XCTFail("a post-final SessionId mismatch must reject the complete compound chain")
+        } catch SMBCodecError.invalidValue(let message) {
+            XCTAssertTrue(message.contains("transform inner session id mismatch"), message)
+        }
+
+        assertAwaitedEqual(await session.creditBalanceForTesting(), balanceBeforeCompound)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), grantsBeforeCompound)
+        assertAwaitedFalse(await session.pendingFinalSeenForTesting(messageId: firstMessageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: firstMessageId))
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: earlyFinalMessageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: earlyFinalMessageId))
+
+        await session.closeTransportAndWait(cause: "test_compound_post_final_transform_session_id")
+        for caller in [firstCaller, earlyFinalCaller] {
+            do {
+                try await awaitWithTimeout("compound request teardown") { try await caller.value }
+                XCTFail("rejected compound must not complete either caller")
+            } catch {
+            }
+        }
+    }
+
+    func testSeparateFinalAfterEarlySendingFinalIsDiscardedAndDoesNotFailOtherRequest() async throws {
+        let transport = CommandAwareCloseTimeoutTransport(heldCommands: [SMB2Commands.echo])
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 5
+        )
+        let unrelatedRequest = Task { try await session.echo() }
+        try await awaitWithTimeout("unrelated ECHO sent") {
+            try await transport.waitUntilSent(command: SMB2Commands.echo, count: 1)
+        }
+        try await awaitWithTimeout("unrelated ECHO marked sent") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        await transport.waitUntilReceiveIsBlocked()
+
+        transport.blockSends(for: [SMB2Commands.echo])
+        let earlyFinalRequest = Task { try await session.echo() }
+        try await awaitWithTimeout("second ECHO entered blocked send") {
+            try await transport.waitUntilSent(command: SMB2Commands.echo, count: 2)
+            await transport.waitUntilBlockedSendCount(1)
+        }
+        try await awaitWithTimeout("both unrelated and early-final requests registered") {
+            await session.waitForPendingCountForTesting(atLeast: 2)
+        }
+        let messageIds = transport.messageIds(for: SMB2Commands.echo)
+        XCTAssertEqual(messageIds.count, 2)
+        let earlyFinalMessageId = try XCTUnwrap(messageIds.last)
+        let earlyFinal = try SMB2Header(
+            status: SMB2Status.success,
+            command: SMB2Commands.echo,
+            credits: 4,
+            messageId: earlyFinalMessageId
+        ).encode() + [4, 0, 0, 0]
+
+        try transport.enqueuePacket(earlyFinal)
+        try await awaitWithTimeout("early final accepted while send is blocked") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 1)
+        }
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: earlyFinalMessageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: earlyFinalMessageId))
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 1)
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 7)
+        await transport.waitUntilReceiveIsBlocked()
+
+        try transport.enqueuePacket(earlyFinal)
+        await transport.waitUntilReceiveIsBlocked()
+        let sessionOpenAfterDuplicate = !(await session.isTransportClosedForTesting())
+        assertAwaitedTrue(sessionOpenAfterDuplicate)
+        guard sessionOpenAfterDuplicate else { return }
+        assertAwaitedTrue(await session.pendingFinalSeenForTesting(messageId: earlyFinalMessageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: earlyFinalMessageId))
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 1)
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 7)
+        await transport.waitUntilReceiveIsBlocked()
+
+        transport.releaseBlockedSends(for: SMB2Commands.echo)
+        try await awaitWithTimeout("early-final caller succeeds after full send") { try await earlyFinalRequest.value }
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 1)
+        transport.releaseNextResponse(command: SMB2Commands.echo)
+        try await awaitWithTimeout("unrelated ECHO caller remains successful") { try await unrelatedRequest.value }
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 0)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 2)
+        assertAwaitedFalse(await session.isTransportClosedForTesting())
+        XCTAssertEqual(transport.closeCallCount, 0)
+        await session.closeTransportAndWait(cause: "test_duplicate_final_in_later_frame")
+    }
+
+    func testMalformedCompoundTailOrNextCommandCannotCommitFirstSlice() async throws {
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 2
+        )
+        let messageId: UInt64 = 0x50A
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("request registered") { await registered.wait() }
+
+        var first = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 11,
+            nextCommand: 72,
+            messageId: messageId
+        ).encode()
+        first.append(contentsOf: Array(repeating: 0, count: 8))
+        let shortTail = Array(repeating: UInt8(0), count: SMB2Header.encodedSize - 1)
+        do {
+            _ = try await session.processRawFrameForTesting(first + shortTail, generation: 1)
+            XCTFail("short later compound header must reject the complete chain")
+        } catch SMBCodecError.invalidValue {
+        }
+        let unaligned = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 11,
+            nextCommand: 70,
+            messageId: messageId
+        ).encode() + Array(repeating: 0, count: 6) + (try SMB2Header(command: SMB2Commands.echo, messageId: messageId).encode())
+        do {
+            _ = try await session.processRawFrameForTesting(unaligned, generation: 1)
+            XCTFail("unaligned NextCommand must reject the complete chain")
+        } catch SMBCodecError.invalidValue {
+        }
+        let shortOffset = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 11,
+            nextCommand: 32,
+            messageId: messageId
+        ).encode() + Array(repeating: UInt8(0), count: 32)
+        do {
+            _ = try await session.processRawFrameForTesting(shortOffset, generation: 1)
+            XCTFail("NextCommand shorter than a complete SMB2 header must reject the chain")
+        } catch SMBCodecError.invalidValue {
+        }
+        let outOfBounds = try SMB2Header(
+            command: SMB2Commands.echo,
+            credits: 11,
+            nextCommand: 256,
+            messageId: messageId
+        ).encode() + (try SMB2Header(command: SMB2Commands.echo, messageId: messageId).encode())
+        do {
+            _ = try await session.processRawFrameForTesting(outOfBounds, generation: 1)
+            XCTFail("out-of-bounds NextCommand must reject the complete chain")
+        } catch SMBCodecError.invalidValue {
+        }
+
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 2)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 0)
+        assertAwaitedEqual(await session.receivedPacketDispatchCountForTesting(), 0)
+        assertAwaitedFalse(await session.pendingFinalSeenForTesting(messageId: messageId))
+        assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+        await session.closeTransportAndWait(cause: "test_malformed_compound_chain")
+        do {
+            try await awaitWithTimeout("malformed-chain caller teardown") { _ = try await caller.value }
+            XCTFail("malformed chain must not complete its caller successfully")
+        } catch {
+        }
+    }
+
+    func testFinalAcceptancePrecedesCreditActorAcknowledgement() async throws {
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        let messageId: UInt64 = 0x50B
+        let registered = SMBRetirementEvent()
+        let caller = Task {
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { _ = Task { await registered.signal() } }
+            )
+        }
+        try await awaitWithTimeout("request registered") { await registered.wait() }
+
+        let grantGate = SMBContinuationAsyncGate()
+        let gateClock = ManualSMBSleeper()
+        await session.setCreditGrantActorHookForTesting {
+            try? await grantGate.suspend(timeout: .seconds(30), sleeper: { try await gateClock.sleep(for: $0) })
+        }
+        let processing = Task {
+            _ = try await session.processRawFrameForTesting(
+                SMB2Header(command: SMB2Commands.echo, credits: 1, messageId: messageId).encode(),
+                generation: 1
+            )
+        }
+        try await awaitWithTimeout("credit actor grant paused") {
+            try await grantGate.waitUntilSuspended(
+                timeout: .seconds(1),
+                sleeper: { try await Task.sleep(for: $0) }
+            )
+        }
+        let acceptedAt = try awaitUnwrap(await session.lastFinalAcceptanceForTesting())
+        try await awaitWithTimeout("caller completes while credit actor is paused") { _ = try await caller.value }
+        assertAwaitedEqual(await session.lastFinalAcceptanceForTesting(), acceptedAt)
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 0)
+
+        grantGate.release()
+        _ = try await processing.value
+        assertAwaitedEqual(await session.lastFinalAcceptanceForTesting(), acceptedAt)
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 1)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 1)
+        await session.closeTransportAndWait(cause: "test_final_acceptance_before_credit_ack")
+    }
+
+    func testOptionalSigningSessionRejectsUnsignedValidateNegotiateBeforeCommit() async throws {
+        let key = [UInt8](repeating: 0x75, count: 16)
+        let messageId: UInt64 = 0x50C
+        let sessionId: UInt64 = 0x1234_5678
+        let response = try SMB2Header(
+            command: SMB2Commands.ioctl,
+            credits: 13,
+            messageId: messageId,
+            treeId: 2,
+            sessionId: sessionId
+        ).encode()
+        let transport = SMBContinuationScriptTransport(inbound: try DirectTCPFraming.frame(response))
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: key,
+            signingRequired: false,
+            initialCredits: 4
+        )
+        await session.setSessionIdForTesting(sessionId)
+        let request = try SMB2Header(
+            command: SMB2Commands.ioctl,
+            messageId: messageId,
+            treeId: 2,
+            sessionId: sessionId
+        ).encode() + Array(repeating: UInt8(0), count: 86)
+        do {
+            _ = try await awaitWithTimeout("unsigned VALIDATE_NEGOTIATE_INFO rejection") {
+                try await session.validateNegotiateWireTransactionForTesting(packet: request)
+            }
+            XCTFail("unsigned plaintext VALIDATE_NEGOTIATE_INFO must be rejected")
+        } catch SMBCodecError.invalidValue(let message) {
+            XCTAssertTrue(message.contains("authenticated protection"), message)
+        }
+
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 3, "request charge remains consumed; response grant is not applied")
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 0)
+        assertAwaitedEqual(await session.receivedPacketDispatchCountForTesting(), 0, "the final is not committed")
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), 0, "terminal teardown removes the failed wire record")
+        assertAwaitedTrue(await session.isTransportClosedForTesting())
+        await session.closeTransportAndWait(cause: "test_unsigned_validate_negotiate_rejected")
+    }
+
+    func testOptionalSigningSessionAcceptsSignedValidateNegotiateFinal() async throws {
+        let key = [UInt8](repeating: 0x76, count: 16)
+        let messageId: UInt64 = 0x50D
+        let sessionId: UInt64 = 0x8765_4321
+        let unsigned = try SMB2Header(
+            command: SMB2Commands.ioctl,
+            credits: 7,
+            messageId: messageId,
+            treeId: 3,
+            sessionId: sessionId
+        ).encode()
+        let response = try signedTestPacket(unsigned, algorithm: .aesCMAC, key: key, sender: .server)
+        let transport = SMBContinuationScriptTransport(inbound: try DirectTCPFraming.frame(response))
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: key,
+            signingRequired: false,
+            initialCredits: 4
+        )
+        await session.setSessionIdForTesting(sessionId)
+        let request = try SMB2Header(
+            command: SMB2Commands.ioctl,
+            messageId: messageId,
+            treeId: 3,
+            sessionId: sessionId
+        ).encode() + Array(repeating: UInt8(0), count: 86)
+        let received = try await awaitWithTimeout("signed VALIDATE_NEGOTIATE_INFO accepted") {
+            try await session.validateNegotiateWireTransactionForTesting(packet: request)
+        }
+        XCTAssertEqual(try SMB2Header.decode(received).messageId, messageId)
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 10)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 1)
+        assertAwaitedEqual(await session.receivedPacketDispatchCountForTesting(), 1)
+        assertAwaitedFalse(await session.isTransportClosedForTesting())
+        await session.closeTransportAndWait(cause: "test_signed_validate_negotiate_accepted")
+    }
+
+    private func assertAwaitedEqual<T: Equatable>(
+        _ actual: T,
+        _ expected: T,
+        _ message: String? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual, expected, message ?? "", file: file, line: line)
+    }
+
+    private func assertAwaitedTrue(
+        _ actual: Bool,
+        _ message: String? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(actual, message ?? "", file: file, line: line)
+    }
+
+    private func assertAwaitedFalse(
+        _ actual: Bool,
+        _ message: String? = nil,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertFalse(actual, message ?? "", file: file, line: line)
+    }
+
+    private func awaitUnwrap<T>(
+        _ value: T?,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> T {
+        try XCTUnwrap(value, file: file, line: line)
+    }
+
+    private func encryptCompoundResponse(_ plaintext: [UInt8], key: [UInt8], sessionId: UInt64) throws -> [UInt8] {
+        let nonce = Array(repeating: UInt8(0x2A), count: 11)
+        var header = SMB3TransformHeader(
+            signature: Array(repeating: 0, count: 16),
+            nonce: nonce + Array(repeating: 0, count: 5),
+            originalMessageSize: UInt32(plaintext.count),
+            flags: SMB3TransformHeader.encryptedFlag,
+            sessionId: sessionId
+        )
+        let sealed = try AESCCM.seal(
+            key: key,
+            nonce: nonce,
+            plaintext: plaintext,
+            authenticatedData: header.authenticatedData(),
+            tagLength: 16
+        )
+        header.signature = sealed.tag
+        return try header.encode() + sealed.ciphertext
+    }
+
+    private func assertEncryptedResponseSessionMismatchDoesNotCommit(
+        outerSessionId: UInt64,
+        innerSessionIds: [UInt64],
+        credits: [UInt16]
+    ) async throws {
+        XCTAssertEqual(innerSessionIds.count, credits.count)
+        let key = [UInt8](repeating: 0xA6, count: 16)
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: SMBContinuationScriptTransport(inbound: []),
+            initialCredits: 0
+        )
+        await session.setSessionIdForTesting(outerSessionId)
+        await session.installEncryptionStateForTesting(encryptionKey: key, decryptionKey: key)
+
+        var messageIds: [UInt64] = []
+        var registrations: [SMBRetirementEvent] = []
+        var callers: [Task<Void, Error>] = []
+        for index in innerSessionIds.indices {
+            let messageId = UInt64(0x600 + index)
+            let registered = SMBRetirementEvent()
+            messageIds.append(messageId)
+            registrations.append(registered)
+            callers.append(Task {
+                try await session.parkPendingForTesting(
+                    messageId: messageId,
+                    command: SMB2Commands.echo,
+                    sent: true,
+                    onRegistered: { _ = Task { await registered.signal() } }
+                )
+            })
+        }
+        let registrationEvents = registrations
+        try await awaitWithTimeout("all encrypted requests registered") {
+            for registered in registrationEvents {
+                await registered.wait()
+            }
+        }
+
+        var plaintext: [UInt8] = []
+        for index in innerSessionIds.indices {
+            let header = try SMB2Header(
+                command: SMB2Commands.echo,
+                credits: credits[index],
+                nextCommand: index + 1 == innerSessionIds.count ? 0 : UInt32(SMB2Header.encodedSize),
+                messageId: messageIds[index],
+                sessionId: innerSessionIds[index]
+            ).encode()
+            plaintext.append(contentsOf: header)
+        }
+        let encrypted = try encryptCompoundResponse(plaintext, key: key, sessionId: outerSessionId)
+        do {
+            _ = try await session.processRawFrameForTesting(encrypted, generation: 1)
+            XCTFail("inner SessionId mismatch must reject the encrypted response before commit")
+        } catch SMBCodecError.invalidValue {
+        }
+
+        assertAwaitedEqual(await session.creditBalanceForTesting(), 0)
+        assertAwaitedEqual(await session.creditGrantReceiptCountForTesting(), 0)
+        assertAwaitedEqual(await session.receivedPacketDispatchCountForTesting(), 0)
+        assertAwaitedEqual(await session.wirePendingRecordCountForTesting(), innerSessionIds.count)
+        for messageId in messageIds {
+            assertAwaitedFalse(await session.pendingFinalSeenForTesting(messageId: messageId))
+            assertAwaitedFalse(await session.pendingContinuationResumedForTesting(messageId: messageId))
+        }
+        assertAwaitedFalse(await session.isTransportClosedForTesting())
+
+        await session.closeTransportAndWait(cause: "test_transform_inner_session_mismatch")
+        for caller in callers {
+            do {
+                try await awaitWithTimeout("mismatched encrypted caller teardown") { try await caller.value }
+                XCTFail("rejected encrypted response must not complete a caller")
+            } catch {
+            }
+        }
     }
 
     private func assertPendingIdentityCounts(
@@ -2730,6 +3919,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
     private var receiveFailure: Error?
     private var receiveStateWaiters: [CheckedContinuation<Void, Never>] = []
     private var commandStorage: [UInt16] = []
+    private var sentPacketStorage: [[UInt8]] = []
     private var messageIdStorage: [(command: UInt16, messageId: UInt64)] = []
     private var heldResponses: [(command: UInt16, frame: [UInt8])] = []
     private var sentWaiters: [SentWaiter] = []
@@ -2784,6 +3974,14 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         lock.withLock { messageIdStorage.filter { $0.command == command }.map(\.messageId) }
     }
 
+    func sentPacket(command: UInt16, occurrence: Int) -> [UInt8]? {
+        lock.withLock {
+            let packets = sentPacketStorage.filter { (try? SMB2Header.decode($0).command) == command }
+            guard occurrence > 0, occurrence <= packets.count else { return nil }
+            return packets[occurrence - 1]
+        }
+    }
+
     func connect(host: String, port: UInt16) async throws {
         try Task.checkCancellation()
         _ = host
@@ -2800,6 +3998,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         let state = lock.withLock { () -> (sent: Bool, blocked: Bool, waiters: [SentWaiter]) in
             guard !isClosed else { return (false, false, []) }
             commandStorage.append(header.command)
+            sentPacketStorage.append(Array(bytes.dropFirst(4)))
             messageIdStorage.append((header.command, header.messageId))
             return (true, blockedSendCommands.contains(header.command), removeReadySentWaitersLocked())
         }
@@ -2920,14 +4119,12 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
 
     func waitUntilReceiveIsBlocked() async {
         await withCheckedContinuation { continuation in
-            lock.lock()
-            if pendingReceive != nil {
-                lock.unlock()
-                continuation.resume()
-            } else {
+            let ready = lock.withLock { () -> Bool in
+                guard pendingReceive == nil, !isClosed else { return true }
                 receiveStateWaiters.append(continuation)
-                lock.unlock()
+                return false
             }
+            if ready { continuation.resume() }
         }
     }
 
@@ -2950,6 +4147,19 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         }
         if let (pending, chunk) = delivery {
             pending.continuation.resume(returning: chunk)
+        }
+    }
+
+    func enqueuePacket(_ packet: [UInt8]) throws {
+        let frame = try DirectTCPFraming.frame(packet)
+        let result = lock.withLock { () -> (Bool, (PendingReceive, [UInt8])?) in
+            guard !isClosed else { return (false, nil) }
+            inbound.append(contentsOf: frame)
+            return (true, takeReceiveDeliveryLocked())
+        }
+        guard result.0 else { throw SMBTransportError.connectionClosed }
+        if let (pending, bytes) = result.1 {
+            pending.continuation.resume(returning: bytes)
         }
     }
 

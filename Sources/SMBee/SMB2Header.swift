@@ -1,5 +1,3 @@
-import Foundation
-
 public struct SMB2Header: Equatable, Sendable {
     public static let encodedSize = 64
 
@@ -117,32 +115,35 @@ public struct SMB2Header: Equatable, Sendable {
 
     public static func decode(_ bytes: [UInt8]) throws -> SMB2Header {
         guard bytes.count >= encodedSize else { throw SMBCodecError.truncated }
-        guard bytes[0] == 0xfe, bytes[1] == 0x53, bytes[2] == 0x4d, bytes[3] == 0x42 else {
+        var reader = SMBByteReader(bytes: bytes)
+        let protocolId = try reader.readBytes(count: 4)
+        guard protocolId == [0xfe, 0x53, 0x4d, 0x42] else {
             throw SMBCodecError.invalidValue(
                 "invalid SMB2 protocol id: length=\(bytes.count)"
             )
         }
-        guard readUInt16LE(bytes, at: 4) == 64 else {
+        guard try reader.readUInt16LE() == 64 else {
             throw SMBCodecError.invalidValue("invalid SMB2 header size")
         }
-        let creditCharge = readUInt16LE(bytes, at: 6)
-        let status = readUInt32LE(bytes, at: 8)
-        let command = readUInt16LE(bytes, at: 12)
-        let credits = readUInt16LE(bytes, at: 14)
-        let flags = readUInt32LE(bytes, at: 16)
-        let nextCommand = readUInt32LE(bytes, at: 20)
-        let messageId = readUInt64LE(bytes, at: 24)
+        let creditCharge = try reader.readUInt16LE()
+        let status = try reader.readUInt32LE()
+        let command = try reader.readUInt16LE()
+        let credits = try reader.readUInt16LE()
+        let flags = try reader.readUInt32LE()
+        let nextCommand = try reader.readUInt32LE()
+        let messageId = try reader.readUInt64LE()
         let asyncId: UInt64?
         let treeId: UInt32
         if (flags & SMB2Flags.asyncCommand) != 0 {
-            asyncId = readUInt64LE(bytes, at: 32)
+            asyncId = try reader.readUInt64LE()
             treeId = 0
         } else {
-            treeId = readUInt32LE(bytes, at: 36)
+            try reader.skip(count: 4)
+            treeId = try reader.readUInt32LE()
             asyncId = nil
         }
-        let sessionId = readUInt64LE(bytes, at: 40)
-        let signature = Array(bytes[48..<64])
+        let sessionId = try reader.readUInt64LE()
+        let signature = try reader.readBytes(count: 16)
         return SMB2Header(
             creditCharge: creditCharge,
             status: status,
@@ -156,21 +157,6 @@ public struct SMB2Header: Equatable, Sendable {
             signature: signature,
             asyncId: asyncId
         )
-    }
-
-    private static func readUInt16LE(_ bytes: [UInt8], at offset: Int) -> UInt16 {
-        UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
-    }
-
-    private static func readUInt32LE(_ bytes: [UInt8], at offset: Int) -> UInt32 {
-        UInt32(bytes[offset])
-            | (UInt32(bytes[offset + 1]) << 8)
-            | (UInt32(bytes[offset + 2]) << 16)
-            | (UInt32(bytes[offset + 3]) << 24)
-    }
-
-    private static func readUInt64LE(_ bytes: [UInt8], at offset: Int) -> UInt64 {
-        UInt64(readUInt32LE(bytes, at: offset)) | (UInt64(readUInt32LE(bytes, at: offset + 4)) << 32)
     }
 }
 
@@ -226,129 +212,6 @@ enum SMB2Credit {
     }
 }
 
-private final class SMB2CreditWindowFastState: @unchecked Sendable {
-    struct Reservation: Sendable {
-        let charge: UInt16
-        let remainingBalance: UInt32
-    }
-
-    private let lock = NSLock()
-    private var available: UInt32
-    private var failed = false
-    private var waitersPending = false
-    private var servicingWaiters = false
-    private var acquisitionHookInstalled = false
-    private var grantHookInstalled = false
-    private var receivedGrantReceiptCount = 0
-
-    init(initialCredits: UInt32) {
-        available = initialCredits
-    }
-
-    var balance: UInt32 {
-        lock.withLock { available }
-    }
-
-    var grantReceiptCount: Int {
-        lock.withLock { receivedGrantReceiptCount }
-    }
-
-    func setAcquisitionHookInstalled(_ installed: Bool) {
-        lock.withLock { acquisitionHookInstalled = installed }
-    }
-
-    func setGrantHookInstalled(_ installed: Bool) {
-        lock.withLock { grantHookInstalled = installed }
-    }
-
-    func tryReserve(
-        upTo requestedCharge: UInt16,
-        minimumCharge: UInt16,
-        onlyWithoutHooks: Bool
-    ) -> Reservation? {
-        lock.withLock {
-            guard !failed, !servicingWaiters,
-                  !onlyWithoutHooks || !acquisitionHookInstalled,
-                  requestedCharge > 0, minimumCharge > 0,
-                  available >= UInt32(minimumCharge) else {
-                return nil
-            }
-            let charge = min(UInt32(requestedCharge), available)
-            available -= charge
-            return Reservation(charge: UInt16(charge), remainingBalance: available)
-        }
-    }
-
-    func reserveForWaiter(upTo requestedCharge: UInt16) -> Reservation? {
-        lock.withLock {
-            guard !failed, requestedCharge > 0, available > 0 else { return nil }
-            let charge = min(UInt32(requestedCharge), available)
-            available -= charge
-            return Reservation(charge: UInt16(charge), remainingBalance: available)
-        }
-    }
-
-    func grantSynchronously(totalCredits: UInt64, receiptCount: Int) -> UInt32? {
-        lock.withLock {
-            guard !failed, !waitersPending, !servicingWaiters, !grantHookInstalled else { return nil }
-            return applyGrant(totalCredits: totalCredits, receiptCount: receiptCount)
-        }
-    }
-
-    func grantFromActor(totalCredits: UInt64, receiptCount: Int) -> UInt32 {
-        lock.withLock {
-            guard !failed else { return available }
-            servicingWaiters = waitersPending
-            return applyGrant(totalCredits: totalCredits, receiptCount: receiptCount)
-        }
-    }
-
-    func refund(_ charge: UInt16) -> UInt32 {
-        lock.withLock {
-            guard !failed, charge > 0 else { return available }
-            servicingWaiters = waitersPending
-            available = SMB2Credit.balanceAfterReceiving(current: available, granted: charge)
-            return available
-        }
-    }
-
-    func setWaitersPending(_ pending: Bool) {
-        lock.withLock { waitersPending = pending }
-    }
-
-    func beginWaiterDrain() {
-        lock.withLock { servicingWaiters = waitersPending }
-    }
-
-    func endWaiterDrain(waitersPending: Bool) {
-        lock.withLock {
-            self.waitersPending = waitersPending
-            servicingWaiters = false
-        }
-    }
-
-    func markFailed() {
-        lock.withLock { failed = true }
-    }
-
-    func reset(initialCredits: UInt32) {
-        lock.withLock {
-            available = initialCredits
-            failed = false
-            waitersPending = false
-            servicingWaiters = false
-            receivedGrantReceiptCount = 0
-        }
-    }
-
-    private func applyGrant(totalCredits: UInt64, receiptCount: Int) -> UInt32 {
-        let (sum, overflow) = UInt64(available).addingReportingOverflow(totalCredits)
-        available = overflow || sum > UInt64(UInt32.max) ? UInt32.max : UInt32(sum)
-        receivedGrantReceiptCount += receiptCount
-        return available
-    }
-}
-
 actor SMB2CreditWindow {
     private enum State {
         case active
@@ -362,7 +225,12 @@ actor SMB2CreditWindow {
         let messageId: UInt64?
         let command: UInt16?
         let enqueuedAt: ContinuousClock.Instant?
-        let continuation: CheckedContinuation<SMB2CreditWindowFastState.Reservation, Error>
+        let continuation: CheckedContinuation<CreditReservation, Error>
+    }
+
+    private struct CreditReservation {
+        let charge: UInt16
+        let remainingBalance: UInt32
     }
 
     private struct PendingWaiterCountObserver {
@@ -371,7 +239,8 @@ actor SMB2CreditWindow {
         let continuation: CheckedContinuation<Void, Never>
     }
 
-    private nonisolated let fastState: SMB2CreditWindowFastState
+    private var available: UInt32
+    private var receivedGrantReceiptCount = 0
     private var grantActorHookForTesting: (@Sendable () async -> Void)?
     private let diagnosticSessionId: String
     private var waiters: [Waiter] = []
@@ -382,28 +251,12 @@ actor SMB2CreditWindow {
     private var reservationAcquiredHookForTesting: (@Sendable (UInt16) async -> Void)?
 
     init(initialCredits: UInt32 = 1, diagnosticSessionId: String) {
-        fastState = SMB2CreditWindowFastState(initialCredits: initialCredits)
+        self.available = initialCredits
         self.diagnosticSessionId = diagnosticSessionId
     }
 
     var balance: UInt32 {
-        fastState.balance
-    }
-
-    nonisolated var balanceSnapshot: UInt32 {
-        fastState.balance
-    }
-
-    nonisolated func reserveIfAvailable(charge: UInt16) -> UInt32? {
-        fastState.tryReserve(upTo: charge, minimumCharge: charge, onlyWithoutHooks: true)?.remainingBalance
-    }
-
-    nonisolated func reserveUpToIfAvailable(maximumCharge: UInt16) -> UInt16? {
-        fastState.tryReserve(upTo: maximumCharge, minimumCharge: 1, onlyWithoutHooks: true)?.charge
-    }
-
-    nonisolated func grantIfUncontended(totalCredits: UInt64, receiptCount: Int) -> UInt32? {
-        fastState.grantSynchronously(totalCredits: totalCredits, receiptCount: receiptCount)
+        available
     }
 
     var pendingWaiterCount: Int {
@@ -436,7 +289,6 @@ actor SMB2CreditWindow {
 
     func setReservationAcquiredHookForTesting(_ hook: (@Sendable (UInt16) async -> Void)?) {
         reservationAcquiredHookForTesting = hook
-        fastState.setAcquisitionHookInstalled(hook != nil)
     }
 
     func reserve(
@@ -478,19 +330,17 @@ actor SMB2CreditWindow {
         minimumCharge: UInt16,
         messageId: UInt64?,
         command: UInt16?
-    ) async throws -> SMB2CreditWindowFastState.Reservation {
+    ) async throws -> CreditReservation {
         if case .failed(let error) = state {
             throw error
         }
         guard requestedCharge > 0, minimumCharge > 0 else {
-            return SMB2CreditWindowFastState.Reservation(charge: 0, remainingBalance: balance)
+            return CreditReservation(charge: 0, remainingBalance: available)
         }
-        if let reservation = fastState.tryReserve(
-            upTo: requestedCharge,
-            minimumCharge: minimumCharge,
-            onlyWithoutHooks: false
-        ) {
-            return reservation
+        if available >= UInt32(minimumCharge) {
+            let charge = min(UInt32(requestedCharge), available)
+            available -= charge
+            return CreditReservation(charge: UInt16(charge), remainingBalance: available)
         }
         let id = nextWaiterId
         nextWaiterId += 1
@@ -508,7 +358,6 @@ actor SMB2CreditWindow {
                     return
                 }
                 let enqueuedAt = SMBPerfLog.effectiveIsEnabled ? ContinuousClock.now : nil
-                fastState.setWaitersPending(true)
                 waiters.append(Waiter(
                     charge: requestedCharge,
                     minimumCharge: minimumCharge,
@@ -522,7 +371,7 @@ actor SMB2CreditWindow {
                 SMBPerfLog.line(
                     "[wire] credit_wait session=\(diagnosticSessionId) " +
                         "\(Self.identityFields(messageId: messageId, command: command))" +
-                        "charge=\(requestedCharge) available=\(balance) waiters=\(waiters.count) " +
+                        "charge=\(requestedCharge) available=\(available) waiters=\(waiters.count) " +
                         "ts_ns=\(SMBPerfLog.timestampNanoseconds())"
                 )
                 resumeReadyWaiters()
@@ -537,11 +386,9 @@ actor SMB2CreditWindow {
     /// arrives from received responses, which stop on transport failure).
     func failAllWaiters(_ error: Error) {
         SMBPerfLog.line("[wire] victim_credit_waiters session=\(diagnosticSessionId) count=\(waiters.count)")
-        fastState.markFailed()
         state = .failed(error)
         let parked = waiters
         waiters.removeAll()
-        fastState.setWaitersPending(false)
         resumeAllWaiterCountObservers()
         for waiter in parked {
             waiter.continuation.resume(throwing: error)
@@ -551,18 +398,16 @@ actor SMB2CreditWindow {
     func reset(initialCredits: UInt32) {
         let parked = waiters
         waiters.removeAll()
-        fastState.setWaitersPending(false)
         resumeAllWaiterCountObservers()
         for waiter in parked {
             waiter.continuation.resume(throwing: CancellationError())
         }
-        fastState.reset(initialCredits: initialCredits)
+        available = initialCredits
         state = .active
     }
 
     private func cancelWaiter(id: UInt64) {
         guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
-        fastState.beginWaiterDrain()
         let waiter = waiters.remove(at: index)
         waiter.continuation.resume(throwing: CancellationError())
         resumeWaiterCountWaiters()
@@ -578,26 +423,28 @@ actor SMB2CreditWindow {
     /// batch is equivalent to applying them individually in wire order.
     func grant(totalCredits: UInt64, receiptCount: Int) async -> UInt32 {
         await grantActorHookForTesting?()
-        if case .failed = state { return balance }
-        _ = fastState.grantFromActor(totalCredits: totalCredits, receiptCount: receiptCount)
+        if case .failed = state { return available }
+        let (sum, overflow) = UInt64(available).addingReportingOverflow(totalCredits)
+        available = overflow || sum > UInt64(UInt32.max) ? UInt32.max : UInt32(sum)
+        receivedGrantReceiptCount += receiptCount
         resumeReadyWaiters()
-        return balance
+        return available
     }
 
     func grantReceiptCountForTesting() -> Int {
-        fastState.grantReceiptCount
+        receivedGrantReceiptCount
     }
 
     func setGrantActorHookForTesting(_ hook: (@Sendable () async -> Void)?) {
         grantActorHookForTesting = hook
-        fastState.setGrantHookInstalled(hook != nil)
     }
 
     func refund(charge requestedCharge: UInt16) -> UInt32 {
-        if case .failed = state { return balance }
-        let refundedBalance = fastState.refund(requestedCharge)
+        if case .failed = state { return available }
+        guard requestedCharge > 0 else { return available }
+        available = SMB2Credit.balanceAfterReceiving(current: available, granted: requestedCharge)
         resumeReadyWaiters()
-        return refundedBalance
+        return available
     }
 
     private func resumeReadyWaiters() {
@@ -605,22 +452,24 @@ actor SMB2CreditWindow {
         // smaller charge would fit the current balance. First-fit would let a stream of
         // small requests starve a large multi-credit READ/WRITE indefinitely; the cost is
         // head-of-line blocking while the window refills (issues/012 §3).
-        fastState.beginWaiterDrain()
-        while let waiter = waiters.first, balance >= UInt32(waiter.minimumCharge) {
+        while let waiter = waiters.first, available >= UInt32(waiter.minimumCharge) {
             waiters.removeFirst()
-            guard let reservation = fastState.reserveForWaiter(upTo: waiter.charge) else { break }
+            let charge = min(UInt32(waiter.charge), available)
+            available -= charge
             if let enqueuedAt = waiter.enqueuedAt {
                 SMBPerfLog.line(
                     "[wire] credit_granted session=\(diagnosticSessionId) " +
                         "\(Self.identityFields(messageId: waiter.messageId, command: waiter.command))" +
-                        "charge=\(reservation.charge) " +
+                        "charge=\(charge) " +
                         "waited_ms=\(SMBPerfLog.milliseconds(ContinuousClock.now - enqueuedAt)) " +
                         "ts_ns=\(SMBPerfLog.timestampNanoseconds())"
                 )
             }
-            waiter.continuation.resume(returning: reservation)
+            waiter.continuation.resume(returning: CreditReservation(
+                charge: UInt16(charge),
+                remainingBalance: available
+            ))
         }
-        fastState.endWaiterDrain(waitersPending: !waiters.isEmpty)
         resumeWaiterCountWaiters()
     }
 

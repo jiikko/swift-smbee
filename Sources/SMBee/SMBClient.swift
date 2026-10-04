@@ -983,14 +983,16 @@ public actor SMBClientSession {
         }
         await waitForTreeSetupsOrCloseDeadline()
         await keepAliveTask?.value
-        let cancelledRequestsDrained = await closingSession.drainCancelledRequestsBeforeDisconnect()
+        // On a drain timeout the shared transport is already closed, so children are still
+        // released here (their close sends nothing) and only the graceful disconnect is skipped.
+        let echoDrained = await closingSession.drainEchoResponsesBeforeDisconnect()
 
         let children = Array(childTrees.values)
         childTrees.removeAll()
         for child in children {
             await child.child.closeIfMatching(session: child.session, treeId: child.treeId)
         }
-        guard cancelledRequestsDrained else { return }
+        guard echoDrained else { return }
         await closingSession.disconnect(treeId: closingTreeId)
     }
 
@@ -5201,29 +5203,7 @@ private struct SMBResponseCorrelationState {
 }
 
 private struct SMBFileIdLedgerKey: Hashable {
-    // FileIds are fixed at 16 bytes. Keeping their two words inline avoids allocating a
-    // short Array every time a request is admitted or rechecked before MID commit.
-    let firstWord: UInt64
-    let secondWord: UInt64
-
-    init(bytes: [UInt8]) {
-        precondition(bytes.count == 16, "SMB FileId ledger keys must contain exactly 16 bytes")
-        (firstWord, secondWord) = bytes.withUnsafeBytes { rawBytes in
-            (
-                rawBytes.loadUnaligned(fromByteOffset: 0, as: UInt64.self),
-                rawBytes.loadUnaligned(fromByteOffset: 8, as: UInt64.self)
-            )
-        }
-    }
-
-    init(packet: [UInt8], offset: Int) {
-        (firstWord, secondWord) = packet.withUnsafeBytes { rawBytes in
-            (
-                rawBytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self),
-                rawBytes.loadUnaligned(fromByteOffset: offset + 8, as: UInt64.self)
-            )
-        }
-    }
+    let bytes: [UInt8]
 }
 
 private enum SMBCleanupAttemptState: Equatable {
@@ -5262,97 +5242,6 @@ private struct SMBPendingResponse {
     var cleanupDrainTask: Task<Void, Never>?
     var cleanupTimeoutIdentity: UUID?
     var cleanupDrainIdentity: UUID?
-    var wireDrainDeadline: ContinuousClock.Instant?
-    var wireDrainTask: Task<Void, Never>?
-    var wireDrainIdentity: UUID?
-    var wireDrainExpired = false
-    var wireDrainCompleted = false
-    var cancelQueued = false
-    var cancelSendOwned = false
-    var usesSenderLoop = false
-}
-
-private typealias SMBWireSendClosure = @Sendable ([UInt8], UInt64, UInt16?) async throws -> Void
-
-private enum SMBPostAuthSendKind {
-    case signed
-    case validateNegotiate(encrypt: Bool)
-}
-
-private struct SMBQueuedPostAuthRequest {
-    let identity: SMBRequestIdentity
-    var packet: [UInt8]
-    let command: UInt16
-    let sessionId: UInt64
-    let treeId: UInt32
-    let generation: UInt64
-    let responseLabel: String
-    let longPoll: Bool
-    let requestTimeoutPolicy: SMBRequestTimeoutPolicy
-    let responseProtectionPolicy: SMBResponseProtectionPolicy
-    let cleanupKey: SMBFileIdLedgerKey?
-    let reservedCharge: UInt16
-    let continuation: CheckedContinuation<SMBReceivedFrame, Error>
-    let sendKind: SMBPostAuthSendKind
-}
-
-private struct SMBQueuedControlSend {
-    let requestIdentity: SMBRequestIdentity
-    let generation: UInt64
-}
-
-/// The session actor's canonical state for a post-auth request. The pending-response
-/// dictionary remains the MessageId demux index; this actor-owned reference record keeps
-/// caller, send, wire, credit, deadline, and queue ownership without a per-request actor.
-private final class SMBSessionActiveRequestRecord {
-    let identity: SMBRequestIdentity
-    let command: UInt16
-    let sessionId: UInt64
-    let treeId: UInt32
-    let fileId: SMBFileIdLedgerKey?
-    let cleanupKey: SMBFileIdLedgerKey?
-    var messageId: UInt64?
-    let maximumCreditCharge: UInt16
-    let longPoll: Bool
-    let requestTimeoutPolicy: SMBRequestTimeoutPolicy
-    let responseProtectionPolicy: SMBResponseProtectionPolicy
-    var caller: SMBRequestCallerState = .pending
-    var send: SMBRequestSendState = .notStarted
-    var wire: SMBRequestWireState = .notApplicable
-    var credit: SMBRequestCreditState = .waiting
-    var queuedRequestOwned = false
-    var unselectedControlOwned = false
-    var originalSendOwned = false
-    var selectedCancelOwned = false
-    var wireDrainDeadline: ContinuousClock.Instant?
-    var wireDrainTask: Task<Void, Never>?
-    var wireDrainTimerIdentity: UUID?
-    var finalAcceptedAt: ContinuousClock.Instant?
-    var outstandingCreditGrantAcknowledgements = 0
-
-    init(
-        identity: SMBRequestIdentity,
-        command: UInt16,
-        sessionId: UInt64,
-        treeId: UInt32,
-        fileId: SMBFileIdLedgerKey?,
-        cleanupKey: SMBFileIdLedgerKey?,
-        maximumCreditCharge: UInt16,
-        longPoll: Bool,
-        requestTimeoutPolicy: SMBRequestTimeoutPolicy,
-        responseProtectionPolicy: SMBResponseProtectionPolicy
-    ) {
-        self.identity = identity
-        self.command = command
-        self.sessionId = sessionId
-        self.treeId = treeId
-        self.fileId = fileId
-        self.cleanupKey = cleanupKey
-        self.maximumCreditCharge = maximumCreditCharge
-        self.longPoll = longPoll
-        self.requestTimeoutPolicy = requestTimeoutPolicy
-        self.responseProtectionPolicy = responseProtectionPolicy
-    }
 }
 
 private enum SMBReaderLifecycle {
@@ -5382,21 +5271,17 @@ private enum SMBReaderLifecycle {
 
 private enum SMBTestingCountWaitKind: Equatable {
     case pendingResponses
-    case cancelledResponseDrainWaiters
+    case pendingCommandResponseDrainWaiters(UInt16)
     case requestSent
     case requestSentWaiterRegistrations
     case cleanupLedger
     case cleanupDrainTimeoutCallbacks
     case receivedPacketDispatches
-    case senderFrameCount
-    case senderLoopExitCount
-    case queuedPostAuthRequests
-    case queuedControlSends
-    case wireDrainTerminalizations
 }
 
-private struct SMBCancelledRequestDrainWaiter {
+private struct SMBPendingCommandResponseDrainWaiter {
     let id: UUID
+    let command: UInt16
     let continuation: CheckedContinuation<Void, Error>
 }
 
@@ -5418,8 +5303,6 @@ private struct SMBTestingCountWaiter {
 /// SMB server と呼び出し元の ordering に依存するため、共有 session API を公開する際に別途整理する。
 actor SMBSession {
     private static let defaultCleanupTimeout: Duration = .seconds(5)
-    private static let defaultWireDrainGrace: Duration = .seconds(60)
-    private static let postAuthMessageIdPlaceholder = UInt64.max
     private static let maxCleanupAttempts = 64
     private static let maxCancellationTombstones = 64
     private static let initialWireGeneration: UInt64 = 1
@@ -5471,19 +5354,10 @@ actor SMBSession {
     private var maxWriteSize: UInt32 = UInt32.max
     private let creditWindow: SMB2CreditWindow
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
-    private var activePostAuthRequestRecords: [SMBRequestIdentity: SMBSessionActiveRequestRecord] = [:]
-    private var pendingMessageIdByIdentity: [SMBRequestIdentity: UInt64] = [:]
-    private var queuedPostAuthRequests: [SMBQueuedPostAuthRequest] = []
-    private var queuedControlSends: [SMBQueuedControlSend] = []
-    private var cancelledBeforeEnqueue: Set<SMBRequestIdentity> = []
-    private var terminalWireDrainTimerIdentities: Set<UUID> = []
-    private var wireDrainTerminalizationCountForTestingStorage = 0
-    private var senderLoopTask: Task<Void, Never>?
-    private var senderLoopTaskID: UUID?
-    private var postAuthActive = false
+    private var activeRequestIdentities: Set<SMBRequestIdentity> = []
     private var nextRequestSequence: UInt64 = 0
     private var cleanupLedger: [SMBFileIdLedgerKey: SMBCleanupAttemptState] = [:]
-    private var cancelledRequestDrainWaiters: [SMBCancelledRequestDrainWaiter] = []
+    private var pendingCommandResponseDrainWaiters: [SMBPendingCommandResponseDrainWaiter] = []
     private var testingCountWaiters: [SMBTestingCountWaiter] = []
     private var nextTestingCountWaiterId: UInt64 = 0
     private var requestSentWaiterRegistrationCountForTestingStorage = 0
@@ -5493,7 +5367,6 @@ actor SMBSession {
     private var readerTasks: [UUID: Task<Void, Never>] = [:]
     private var readerHandle: UUID?
     private var readerTaskExitHookForTesting: (@Sendable (UUID) async -> Void)?
-    private var sessionDeinitHookForTesting: (@Sendable () -> Void)?
     private var readerTaskJoinSnapshotHookForTesting: (@Sendable (Int) -> Void)?
     private var readerTaskJoinWillAwaitHookForTesting: (@Sendable (UUID) -> Void)?
     private var creditFailureTask: Task<Void, Never>?
@@ -5503,11 +5376,6 @@ actor SMBSession {
     private var connectInFlight = false
     private var connectCompletionWaiters: [CheckedContinuation<Void, Never>] = []
     private var requestSentCountForTestingStorage = 0
-    private var senderWakeCountForTestingStorage = 0
-    private var senderLoopStartCountForTestingStorage = 0
-    private var senderLoopExitCountForTestingStorage = 0
-    private var senderFrameCountForTestingStorage = 0
-    private var failNextPostAuthFrameBuildForTestingStorage = false
     private var validateNegotiateSentCountForTestingStorage = 0
     private var validateNegotiateSuccessCountForTestingStorage = 0
     private var requestTimeoutCompletionCountForTestingStorage = 0
@@ -5518,7 +5386,6 @@ actor SMBSession {
     private var creditGrantAfterAwaitHookForTesting: (@Sendable () async -> Void)?
     private let cleanupTimeout: Duration
     private let requestTimeout: Duration?
-    private let wireDrainGrace: Duration
     private let requestTimeoutSleeper: @Sendable (Duration) async throws -> Void
     private let cleanupTimeoutSleeper: @Sendable (Duration) async throws -> Void
     private let sessionTime: SMBSessionMonotonicTime
@@ -5538,7 +5405,6 @@ actor SMBSession {
         initialCredits: UInt32 = 1,
         cleanupTimeout: Duration = SMBSession.defaultCleanupTimeout,
         requestTimeout: Duration? = nil,
-        wireDrainGrace: Duration = SMBSession.defaultWireDrainGrace,
         sessionTime: SMBSessionMonotonicTime = .production(),
         requestTimeoutSleeper: (@Sendable (Duration) async throws -> Void)? = nil,
         cleanupTimeoutSleeper: (@Sendable (Duration) async throws -> Void)? = nil,
@@ -5566,7 +5432,6 @@ actor SMBSession {
         )
         self.cleanupTimeout = cleanupTimeout
         self.requestTimeout = requestTimeout
-        self.wireDrainGrace = wireDrainGrace
         self.sessionTime = sessionTime
         self.requestTimeoutSleeper = requestTimeoutSleeper ?? sessionTime.sleep
         self.cleanupTimeoutSleeper = cleanupTimeoutSleeper ?? sessionTime.sleep
@@ -5580,7 +5445,6 @@ actor SMBSession {
             let creditWindow = creditWindow
             Task { await creditWindow.failAllWaiters(SMBTransportError.connectionClosed) }
         }
-        sessionDeinitHookForTesting?()
     }
 
     func connect() async throws {
@@ -5711,7 +5575,6 @@ actor SMBSession {
             // a server-specific fallback.
             authenticationCredential = nil
             try requireEncryptionKeyIfSessionDemandsEncryption(sessionFlags)
-            postAuthActive = true
             return
         }
         let isGuestOrNull = (sessionFlags & (SMB2SessionSetup.sessionFlagIsGuest | SMB2SessionSetup.sessionFlagIsNull)) != 0
@@ -5722,7 +5585,6 @@ actor SMBSession {
         if isGuestOrNull {
             authenticationCredential = nil
             try requireEncryptionKeyIfSessionDemandsEncryption(sessionFlags)
-            postAuthActive = true
             return
         }
         if result.dialect == SMBNegotiateConstants.dialect311 {
@@ -5752,7 +5614,6 @@ actor SMBSession {
         // session's owning reference here still bounds the plaintext credential lifetime instead of
         // retaining it for every subsequent operation.
         authenticationCredential = nil
-        postAuthActive = true
     }
 
     func retainsAuthenticationCredentialForTesting() -> Bool {
@@ -7051,24 +6912,19 @@ actor SMBSession {
         try SMB2Echo.decodeResponse(response)
     }
 
-    private func sendCancelWithoutGate(target: SMB2Cancel.Target, generation: UInt64) async throws -> Bool {
-        guard isGenerationActive(generation) else { return false }
-        let packet = try SMB2Cancel.encodeRequest(target: target, sessionId: sessionId)
-        debugDump("CANCEL request", packet)
-        try await sendSigned(packet, generation: generation)
-        return true
-    }
-
-    private func handleCancelSendFailure(_ error: Error, generation: UInt64) {
+    private func sendCancelWithoutGate(target: SMB2Cancel.Target, generation: UInt64) async {
         guard isGenerationActive(generation) else { return }
-        failWire(error: error)
-        closeTransport(cause: "cancel_send_failure", diagnosticError: error)
-        debugLine("CANCEL request failed: \(error)")
-    }
-
-    private func scheduleCancel(identity: SMBRequestIdentity, generation: UInt64) async {
-        guard isGenerationActive(generation), identity.generation == generation else { return }
-        await cancelPostAuthRequest(identity: identity)
+        do {
+            let packet = try SMB2Cancel.encodeRequest(target: target, sessionId: sessionId)
+            debugDump("CANCEL request", packet)
+            try await sendSigned(packet, generation: generation)
+        } catch {
+            if isGenerationActive(generation), !(error is CancellationError) {
+                failWire(error: error)
+                closeTransport(cause: "cancel_send_failure", diagnosticError: error)
+            }
+            debugLine("CANCEL request failed: \(error)")
+        }
     }
 
     private func scheduleCancel(messageId: UInt64, generation: UInt64, wait: Bool) async {
@@ -7089,11 +6945,7 @@ actor SMBSession {
     private func performScheduledCancel(operationID: UUID, messageId: UInt64, generation: UInt64) async {
         if let target = cancelInFlightRequest(messageId: messageId, generation: generation),
            isGenerationActive(generation) {
-            do {
-                _ = try await sendCancelWithoutGate(target: target, generation: generation)
-            } catch {
-                handleCancelSendFailure(error, generation: generation)
-            }
+            await sendCancelWithoutGate(target: target, generation: generation)
         }
         activeCancelTasks.removeValue(forKey: operationID)
     }
@@ -7159,7 +7011,6 @@ actor SMBSession {
             await reader.value
         }
         await creditFailureTask?.value
-        activePostAuthRequestRecords.removeAll()
     }
 
     private func finishConnectAttempt() {
@@ -7200,12 +7051,7 @@ actor SMBSession {
         let generation = generation ?? Self.initialWireGeneration
         for messageId in messageIds {
             guard let target = reconcileSuccessfulSend(messageId: messageId, generation: generation) else { continue }
-            do {
-                _ = try await sendCancelWithoutGate(target: target, generation: generation)
-            } catch {
-                handleCancelSendFailure(error, generation: generation)
-                break
-            }
+            await sendCancelWithoutGate(target: target, generation: generation)
         }
         return readerTasks.count
     }
@@ -7231,10 +7077,6 @@ actor SMBSession {
         readerTaskExitHookForTesting = hook
     }
 
-    func setSessionDeinitHookForTesting(_ hook: (@Sendable () -> Void)?) {
-        sessionDeinitHookForTesting = hook
-    }
-
     func setReaderTaskJoinSnapshotHookForTesting(_ hook: (@Sendable (Int) -> Void)?) {
         readerTaskJoinSnapshotHookForTesting = hook
     }
@@ -7253,28 +7095,6 @@ actor SMBSession {
 
     func setCreditGrantActorHookForTesting(_ hook: (@Sendable () async -> Void)?) async {
         await creditWindow.setGrantActorHookForTesting(hook)
-    }
-
-    func installPerformanceSigningStateForTesting(key: [UInt8]) throws {
-        guard postAuthActive,
-              negotiateResponseResult?.dialect == SMBNegotiateConstants.dialect302,
-              key.count == 16 else {
-            throw SMBCodecError.invalidValue("performance signing override requires an authenticated SMB 3.0.2 session and a 16-byte key")
-        }
-        signingKey = key
-        signingAlgorithm = .aesCMAC
-#if canImport(CryptoExtras) && !canImport(CommonCrypto)
-        signingCMACContext = try AESCMAC.Context(key: key)
-#endif
-    }
-
-    func performanceSigningStateForTesting() -> (dialect: UInt16?, algorithm: String, key: [UInt8]?) {
-        let algorithm: String
-        switch signingAlgorithm {
-        case .aesCMAC: algorithm = "AES-CMAC"
-        case .aesGMAC: algorithm = "AES-GMAC"
-        }
-        return (negotiateResponseResult?.dialect, algorithm, signingKey)
     }
 
     func parkPendingForTesting(
@@ -7311,28 +7131,7 @@ actor SMBSession {
     }
 
     func activeRequestIdentityCountForTesting() -> Int {
-        activePostAuthRequestRecords.values.filter { $0.wire != .sessionTerminal }.count
-            + pendingResponses.values.filter { !$0.usesSenderLoop }.count
-    }
-
-    func activePostAuthRequestRecordCountForTesting() -> Int {
-        activePostAuthRequestRecords.count
-    }
-
-    func postAuthRequestRecordSnapshotForTesting(messageId: UInt64) -> SMBRequestRecordSnapshot? {
-        let pendingIdentity = pendingResponses[messageId]?.requestIdentity
-        guard let record = pendingIdentity.flatMap({ activePostAuthRequestRecords[$0] })
-                ?? activePostAuthRequestRecords.values.first(where: { $0.messageId == messageId }) else {
-            return nil
-        }
-        return SMBRequestRecordSnapshot(
-            identity: record.identity,
-            caller: record.caller,
-            send: record.send,
-            wire: record.wire,
-            credit: record.credit,
-            outstandingAcknowledgements: record.outstandingCreditGrantAcknowledgements
-        )
+        activeRequestIdentities.count
     }
 
     func requestIdentityForTesting(messageId: UInt64) -> SMBRequestIdentity? {
@@ -7458,8 +7257,8 @@ actor SMBSession {
         pendingResponses.count
     }
 
-    func waitForCancelledResponseDrainWaiterCountForTesting(atLeast count: Int) async {
-        await waitForTestingCount(.cancelledResponseDrainWaiters, atLeast: count)
+    func waitForPendingCommandResponseDrainWaiterCountForTesting(command: UInt16, atLeast count: Int) async {
+        await waitForTestingCount(.pendingCommandResponseDrainWaiters(command), atLeast: count)
     }
 
     func cleanupTombstoneCountForTesting() -> Int {
@@ -7566,111 +7365,6 @@ actor SMBSession {
         requestSentCountForTestingStorage
     }
 
-    func senderLoopStatisticsForTesting() -> (
-        wakes: Int,
-        starts: Int,
-        exits: Int,
-        frames: Int,
-        queuedRequests: Int,
-        queuedControls: Int,
-        isRunning: Bool
-    ) {
-        (
-            senderWakeCountForTestingStorage,
-            senderLoopStartCountForTestingStorage,
-            senderLoopExitCountForTestingStorage,
-            senderFrameCountForTestingStorage,
-            queuedPostAuthRequests.count,
-            queuedControlSends.count,
-            senderLoopTask != nil
-        )
-    }
-
-    func waitForSenderFrameCountForTesting(atLeast count: Int) async {
-        await waitForTestingCount(.senderFrameCount, atLeast: count)
-    }
-
-    func waitForSenderLoopExitCountForTesting(atLeast count: Int) async {
-        await waitForTestingCount(.senderLoopExitCount, atLeast: count)
-    }
-
-    func waitForQueuedPostAuthRequestCountForTesting(atLeast count: Int) async {
-        await waitForTestingCount(.queuedPostAuthRequests, atLeast: count)
-    }
-
-    func waitForQueuedControlSendCountForTesting(atLeast count: Int) async {
-        await waitForTestingCount(.queuedControlSends, atLeast: count)
-    }
-
-    func waitForWireDrainTerminalizationCountForTesting(atLeast count: Int) async {
-        await waitForTestingCount(.wireDrainTerminalizations, atLeast: count)
-    }
-
-    func installSenderLoopStateForTesting(sessionId: UInt64 = 1, firstMessageId: UInt64 = 0) {
-        self.sessionId = sessionId
-        messageId = firstMessageId
-        postAuthActive = true
-    }
-
-    func echoThroughSenderLoopForTesting(treeId: UInt32 = 0, creditCharge: UInt16 = 1) async throws {
-        var packet = try SMB2Header(
-            creditCharge: creditCharge,
-            command: SMB2Commands.echo,
-            messageId: nextMessageId(),
-            treeId: treeId,
-            sessionId: sessionId
-        ).encode()
-        packet.append(contentsOf: [4, 0, 0, 0])
-        _ = try await signedWireTransaction(packet: packet, responseLabel: "testing ECHO response")
-    }
-
-    func treeDisconnectThroughSenderLoopForTesting(treeId: UInt32) async throws {
-        try await treeDisconnect(treeId: treeId)
-    }
-
-    func flushThroughSenderLoopForTesting(treeId: UInt32, fileId: [UInt8]) async throws {
-        try await flush(treeId: treeId, fileId: fileId)
-    }
-
-    func retireFileIdForTesting(_ fileId: [UInt8]) {
-        cleanupLedger[SMBFileIdLedgerKey(bytes: fileId)] = .retiredUnknown
-        resumeCleanupLedgerCountWaiters()
-    }
-
-    func grantCreditsForTesting(_ count: UInt16) async {
-        _ = await creditWindow.grant(count)
-    }
-
-    func refundCreditsForTesting(_ count: UInt16) async {
-        await refundCredit(charge: count)
-    }
-
-    func failNextPostAuthFrameBuildForTesting() {
-        failNextPostAuthFrameBuildForTestingStorage = true
-    }
-
-    func nextMessageIdForTesting() -> UInt64 {
-        messageId
-    }
-
-    func cancelPostAuthRequestForTesting(identity: SMBRequestIdentity) async {
-        await cancelPostAuthRequest(identity: identity)
-    }
-
-    func wireDrainDeadlineForTesting(messageId: UInt64) -> ContinuousClock.Instant? {
-        pendingResponses[messageId]?.wireDrainDeadline
-            ?? activePostAuthRequestRecords.values.first(where: { $0.messageId == messageId })?.wireDrainDeadline
-    }
-
-    func wireDrainTimerIdentityForTesting(messageId: UInt64) -> UUID? {
-        pendingResponses[messageId]?.wireDrainIdentity
-            ?? activePostAuthRequestRecords.values.first(where: { $0.messageId == messageId })?.wireDrainTimerIdentity
-    }
-
-    func terminalWireDrainTimerFenceForTesting(_ identity: UUID) -> Bool {
-        terminalWireDrainTimerIdentities.contains(identity)
-    }
-
     func requestTimeoutCompletionCountForTesting() -> Int {
         requestTimeoutCompletionCountForTestingStorage
     }
@@ -7769,8 +7463,8 @@ actor SMBSession {
         switch kind {
         case .pendingResponses:
             value = pendingResponses.values.filter { !$0.continuationResumed }.count
-        case .cancelledResponseDrainWaiters:
-            value = cancelledRequestDrainWaiters.count
+        case .pendingCommandResponseDrainWaiters(let command):
+            value = pendingCommandResponseDrainWaiters.filter { $0.command == command }.count
         case .requestSent:
             value = requestSentCountForTestingStorage
         case .requestSentWaiterRegistrations:
@@ -7781,16 +7475,6 @@ actor SMBSession {
             value = cleanupDrainTimeoutCallbackCountForTestingStorage
         case .receivedPacketDispatches:
             value = receivedPacketDispatchCountForTestingStorage
-        case .senderFrameCount:
-            value = senderFrameCountForTestingStorage
-        case .senderLoopExitCount:
-            value = senderLoopExitCountForTestingStorage
-        case .queuedPostAuthRequests:
-            value = queuedPostAuthRequests.count
-        case .queuedControlSends:
-            value = queuedControlSends.count
-        case .wireDrainTerminalizations:
-            value = wireDrainTerminalizationCountForTestingStorage
         }
         return isAtLeast ? value >= target : value == target
     }
@@ -7850,15 +7534,9 @@ actor SMBSession {
             responseLabel: responseLabel,
             longPoll: false,
             requestTimeoutPolicy: .eligible,
-            send: { [weak self] packet, messageId, preparedCreditCharge in
+            send: { [weak self] packet, messageId in
                 guard let self else { throw CancellationError() }
-                try await self.sendUnsigned(
-                    packet,
-                    messageId: messageId,
-                    generation: generation,
-                    preparedCreditCharge: preparedCreditCharge,
-                    creditRequestAlreadyApplied: preparedCreditCharge != nil
-                )
+                try await self.sendUnsigned(packet, messageId: messageId, generation: generation)
             }
         ).bytes
     }
@@ -7903,28 +7581,21 @@ actor SMBSession {
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        let requestIdentity = makeRequestIdentity(generation: generation)
         let response = try await withTaskCancellationHandler {
             try await demuxedWireTransaction(
                 packet: packet,
-                suppliedRequestHeader: requestHeader,
                 responseLabel: responseLabel,
                 longPoll: false,
                 requestTimeoutPolicy: requestTimeoutPolicy,
                 responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
                 cleanupFileId: cleanupFileId,
-                requestIdentity: requestIdentity,
-                creditReservation: creditReservation,
-                postAuthSendKind: .signed,
-                send: { [weak self] packet, messageId, preparedCreditCharge in
+                send: { [weak self] packet, messageId in
                     guard let self else { throw CancellationError() }
                     try await self.sendSigned(
                         packet,
                         messageId: messageId,
                         generation: generation,
-                        creditReservation: preparedCreditCharge == nil ? creditReservation : nil,
-                        preparedCreditCharge: preparedCreditCharge,
-                        creditRequestAlreadyApplied: preparedCreditCharge != nil
+                        creditReservation: creditReservation
                     )
                 }
             )
@@ -7933,14 +7604,8 @@ actor SMBSession {
             // response is drained. Sending SMB CANCEL here would introduce a second, ambiguous
             // FileId lifetime transition while the original CLOSE may still be in flight.
             guard cleanupFileId == nil else { return }
-            if requestHeader.messageId == Self.postAuthMessageIdPlaceholder {
-                Task { [weak self] in
-                    await self?.scheduleCancel(identity: requestIdentity, generation: generation)
-                }
-            } else {
-                Task { [weak self] in
-                    await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
-                }
+            Task { [weak self] in
+                await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
             }
         }
         return response.bytes
@@ -7951,45 +7616,33 @@ actor SMBSession {
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        let requestIdentity = makeRequestIdentity(generation: generation)
         let frame = try await withTaskCancellationHandler {
             try await demuxedWireTransaction(
                 packet: packet,
-                suppliedRequestHeader: requestHeader,
                 responseLabel: "VALIDATE_NEGOTIATE_INFO response",
                 longPoll: false,
                 requestTimeoutPolicy: .eligible,
                 responseProtectionPolicy: encrypt ? .encryptedRequest : .signatureOrAEADRequired,
-                requestIdentity: requestIdentity,
-                postAuthSendKind: .validateNegotiate(encrypt: encrypt),
-                send: { [weak self] packet, messageId, preparedCreditCharge in
+                send: { [weak self] packet, messageId in
                     guard let self else { throw CancellationError() }
                     try await self.sendValidateNegotiateSigned(
                         packet,
                         messageId: messageId,
                         encrypt: encrypt,
-                        generation: generation,
-                        preparedCreditCharge: preparedCreditCharge,
-                        creditRequestAlreadyApplied: preparedCreditCharge != nil
+                        generation: generation
                     )
                 }
             )
         } onCancel: {
-            if requestHeader.messageId == Self.postAuthMessageIdPlaceholder {
-                Task { [weak self] in
-                    await self?.scheduleCancel(identity: requestIdentity, generation: generation)
-                }
-            } else {
-                Task { [weak self] in
-                    await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
-                }
+            Task { [weak self] in
+                await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
             }
         }
         return frame
     }
 
-    func validateNegotiateWireTransactionForTesting(packet: [UInt8], encrypt: Bool = false) async throws -> [UInt8] {
-        try await validateNegotiateWireTransaction(packet: packet, encrypt: encrypt).bytes
+    func validateNegotiateWireTransactionForTesting(packet: [UInt8]) async throws -> [UInt8] {
+        try await validateNegotiateWireTransaction(packet: packet, encrypt: false).bytes
     }
 
     private func signedLongPollWireTransaction(packet: [UInt8], responseLabel: String) async throws -> [UInt8] {
@@ -7997,37 +7650,21 @@ actor SMBSession {
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        let requestIdentity = makeRequestIdentity(generation: generation)
         let response = try await withTaskCancellationHandler {
             try await demuxedWireTransaction(
                 packet: packet,
-                suppliedRequestHeader: requestHeader,
                 responseLabel: responseLabel,
                 longPoll: true,
                 requestTimeoutPolicy: .excluded(.longPoll),
                 responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
-                requestIdentity: requestIdentity,
-                postAuthSendKind: .signed,
-                send: { [weak self] packet, messageId, preparedCreditCharge in
+                send: { [weak self] packet, messageId in
                     guard let self else { throw CancellationError() }
-                    try await self.sendSigned(
-                        packet,
-                        messageId: messageId,
-                        generation: generation,
-                        preparedCreditCharge: preparedCreditCharge,
-                        creditRequestAlreadyApplied: preparedCreditCharge != nil
-                    )
+                    try await self.sendSigned(packet, messageId: messageId, generation: generation)
                 }
             )
         } onCancel: {
-            if requestHeader.messageId == Self.postAuthMessageIdPlaceholder {
-                Task { [weak self] in
-                    await self?.scheduleCancel(identity: requestIdentity, generation: generation)
-                }
-            } else {
-                Task { [weak self] in
-                    await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
-                }
+            Task { [weak self] in
+                await self?.scheduleCancel(messageId: requestHeader.messageId, generation: generation, wait: false)
             }
         }
         return response.bytes
@@ -8035,23 +7672,14 @@ actor SMBSession {
 
     private func demuxedWireTransaction(
         packet: [UInt8],
-        suppliedRequestHeader: SMB2Header? = nil,
         responseLabel: String,
         longPoll: Bool,
         requestTimeoutPolicy: SMBRequestTimeoutPolicy,
         responseProtectionPolicy: SMBResponseProtectionPolicy = .sessionDefault,
         cleanupFileId: [UInt8]? = nil,
-        requestIdentity suppliedIdentity: SMBRequestIdentity? = nil,
-        creditReservation: SMBPreReservedCredit? = nil,
-        postAuthSendKind: SMBPostAuthSendKind? = nil,
-        send: @escaping SMBWireSendClosure
+        send: @escaping @Sendable ([UInt8], UInt64) async throws -> Void
     ) async throws -> SMBReceivedFrame {
-        let requestHeader: SMB2Header
-        if let suppliedRequestHeader {
-            requestHeader = suppliedRequestHeader
-        } else {
-            requestHeader = try SMB2Header.decode(packet)
-        }
+        let requestHeader = try SMB2Header.decode(packet)
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
@@ -8066,25 +7694,6 @@ actor SMBSession {
         }
         try validateFileIdAdmission(packet: packet, command: requestHeader.command, cleanupFileId: cleanupFileId)
         let cleanupKey = cleanupFileId.map(SMBFileIdLedgerKey.init(bytes:))
-        let requestIdentity = suppliedIdentity ?? makeRequestIdentity(generation: generation)
-        if postAuthActive, requestHeader.messageId == Self.postAuthMessageIdPlaceholder {
-            guard let postAuthSendKind else {
-                throw SMBCodecError.invalidValue("post-auth request is missing its sender kind")
-            }
-            return try await enqueuePostAuthRequest(
-                identity: requestIdentity,
-                packet: packet,
-                header: requestHeader,
-                generation: generation,
-                responseLabel: responseLabel,
-                longPoll: longPoll,
-                requestTimeoutPolicy: requestTimeoutPolicy,
-                responseProtectionPolicy: responseProtectionPolicy,
-                cleanupKey: cleanupKey,
-                creditReservation: creditReservation,
-                sendKind: postAuthSendKind
-            )
-        }
         if let cleanupKey {
             guard cleanupLedger[cleanupKey] == nil else {
                 throw SMBCodecError.invalidValue("SMB FileId already has an unresolved CLOSE attempt")
@@ -8098,6 +7707,7 @@ actor SMBSession {
             resumeCleanupLedgerCountWaiters()
         }
         return try await withCheckedThrowingContinuation { continuation in
+            let requestIdentity = makeRequestIdentity(generation: generation)
             storePendingResponse(messageId: requestHeader.messageId, pending: SMBPendingResponse(
                 requestIdentity: requestIdentity,
                 generation: generation,
@@ -8151,617 +7761,6 @@ actor SMBSession {
         }
     }
 
-    private func enqueuePostAuthRequest(
-        identity: SMBRequestIdentity,
-        packet: [UInt8],
-        header: SMB2Header,
-        generation: UInt64,
-        responseLabel: String,
-        longPoll: Bool,
-        requestTimeoutPolicy: SMBRequestTimeoutPolicy,
-        responseProtectionPolicy: SMBResponseProtectionPolicy,
-        cleanupKey: SMBFileIdLedgerKey?,
-        creditReservation: SMBPreReservedCredit?,
-        sendKind: SMBPostAuthSendKind
-    ) async throws -> SMBReceivedFrame {
-        if let cleanupKey {
-            guard cleanupLedger[cleanupKey] == nil else {
-                throw SMBCodecError.invalidValue("SMB FileId already has an unresolved CLOSE attempt")
-            }
-            guard cleanupLedger.count < Self.maxCleanupAttempts else {
-                let error = SMBCodecError.invalidValue("SMB cleanup ledger limit exceeded")
-                closeTransport(cause: "cleanup_ledger_limit", diagnosticError: error)
-                throw SMBTransportError.connectionClosed
-            }
-            cleanupLedger[cleanupKey] = .sending
-            resumeCleanupLedgerCountWaiters()
-        }
-        let maximumCreditCharge = creditReservation?.charge ?? max(1, header.creditCharge)
-        let requestFileId: SMBFileIdLedgerKey?
-        if let offset = Self.fileIdOffsetInRequest(command: header.command), offset + 16 <= packet.count {
-            requestFileId = SMBFileIdLedgerKey(packet: packet, offset: offset)
-        } else {
-            requestFileId = nil
-        }
-        activePostAuthRequestRecords[identity] = SMBSessionActiveRequestRecord(
-            identity: identity,
-            command: header.command,
-            sessionId: header.sessionId,
-            treeId: header.treeId,
-            fileId: requestFileId,
-            cleanupKey: cleanupKey,
-            maximumCreditCharge: maximumCreditCharge,
-            longPoll: longPoll,
-            requestTimeoutPolicy: requestTimeoutPolicy,
-            responseProtectionPolicy: responseProtectionPolicy
-        )
-
-        var reservedCharge: UInt16 = 0
-        do {
-            reservedCharge = try await claimOrReserveCredit(
-                packet,
-                header: header,
-                generation: generation,
-                creditReservation: creditReservation
-            )
-            updateActivePostAuthRecord(identity) {
-                $0.credit = .reserved(maximumCharge: maximumCreditCharge)
-            }
-            var preparedPacket = packet
-            applyCreditRequest(to: &preparedPacket)
-            guard isGenerationActive(generation) else {
-                await refundCredit(charge: reservedCharge)
-                updateActivePostAuthRecord(identity) {
-                    $0.caller = .transportError
-                    $0.send = .neverSubmitted
-                    $0.credit = .refunded
-                }
-                throw wireFailure ?? SMBTransportError.connectionClosed
-            }
-            if cancelledBeforeEnqueue.remove(identity) != nil || Task.isCancelled {
-                await refundCredit(charge: reservedCharge)
-                updateActivePostAuthRecord(identity) {
-                    $0.caller = .cancelled
-                    $0.send = .neverSubmitted
-                    $0.credit = .refunded
-                }
-                activePostAuthRequestRecords.removeValue(forKey: identity)
-                if let cleanupKey { cleanupLedger.removeValue(forKey: cleanupKey) }
-                throw CancellationError()
-            }
-            updateActivePostAuthRecord(identity) {
-                $0.credit = .prepared(maximumCharge: maximumCreditCharge, actualCharge: reservedCharge)
-                $0.queuedRequestOwned = true
-            }
-            return try await withCheckedThrowingContinuation { continuation in
-                queuedPostAuthRequests.append(SMBQueuedPostAuthRequest(
-                    identity: identity,
-                    packet: preparedPacket,
-                    command: header.command,
-                    sessionId: header.sessionId,
-                    treeId: header.treeId,
-                    generation: generation,
-                    responseLabel: responseLabel,
-                    longPoll: longPoll,
-                    requestTimeoutPolicy: requestTimeoutPolicy,
-                    responseProtectionPolicy: responseProtectionPolicy,
-                    cleanupKey: cleanupKey,
-                    reservedCharge: reservedCharge,
-                    continuation: continuation,
-                    sendKind: sendKind
-                ))
-                resumeSatisfiedTestingCountWaiters()
-                SMBPerfLog.line(
-                    "[wire] queued session=\(diagnosticSessionId) request=\(identity.requestSequence) " +
-                        "command=\(header.command) label=\(responseLabel)"
-                )
-                startSenderLoopIfNeeded(generation: generation)
-            }
-        } catch {
-            if activePostAuthRequestRecords[identity]?.messageId == nil,
-               pendingMessageIdByIdentity[identity] == nil {
-                let activeRecord = activePostAuthRequestRecords[identity]
-                let isAwaitingLocalRetirementAck = activeRecord?.caller == .cancelled
-                    && reservedCharge > 0
-                    && activeRecord?.credit != .refunded
-                let hasOwnedWork = activeRecord.map {
-                    $0.queuedRequestOwned
-                        || $0.unselectedControlOwned
-                        || $0.originalSendOwned
-                        || $0.selectedCancelOwned
-                } ?? false
-                if !isAwaitingLocalRetirementAck, !hasOwnedWork {
-                    activePostAuthRequestRecords.removeValue(forKey: identity)
-                }
-                updateActivePostAuthRecord(identity) {
-                    if $0.caller == .pending {
-                        if error is CancellationError {
-                            $0.caller = .cancelled
-                        } else if error is SMBCodecError {
-                            $0.caller = .localRefusal
-                        } else {
-                            $0.caller = .transportError
-                        }
-                    }
-                    if case .notStarted = $0.send { $0.send = .neverSubmitted }
-                    if reservedCharge == 0 {
-                        $0.credit = wireFailure == nil ? .refunded : .discardedOnTerminal
-                    }
-                }
-            }
-            cancelledBeforeEnqueue.remove(identity)
-            if let cleanupKey, cleanupLedger[cleanupKey] == .sending {
-                cleanupLedger.removeValue(forKey: cleanupKey)
-                resumeCleanupLedgerCountWaiters()
-            }
-            throw error
-        }
-    }
-
-    private func startSenderLoopIfNeeded(generation: UInt64) {
-        guard senderLoopTask == nil,
-              !queuedPostAuthRequests.isEmpty || !queuedControlSends.isEmpty else {
-            return
-        }
-        let taskID = UUID()
-        senderLoopTaskID = taskID
-        senderWakeCountForTestingStorage += 1
-        senderLoopStartCountForTestingStorage += 1
-        SMBPerfLog.line(
-            "[wire] sender_wake session=\(diagnosticSessionId) wakes=\(senderWakeCountForTestingStorage) " +
-                "starts=\(senderLoopStartCountForTestingStorage)"
-        )
-        let task = Task { [self] in
-            await runSenderLoop(taskID: taskID, generation: generation)
-        }
-        senderLoopTask = task
-        activeSendTasks[taskID] = task
-        resumeSatisfiedTestingCountWaiters()
-    }
-
-    private func runSenderLoop(taskID: UUID, generation: UInt64) async {
-        while isGenerationActive(generation) {
-            if !queuedControlSends.isEmpty {
-                let control = queuedControlSends.removeFirst()
-                do {
-                    try await sendQueuedControl(control)
-                } catch {
-                    handleCancelSendFailure(error, generation: generation)
-                    break
-                }
-                continue
-            }
-            guard !queuedPostAuthRequests.isEmpty else { break }
-            var item = queuedPostAuthRequests.removeFirst()
-            resumeSatisfiedTestingCountWaiters()
-            guard item.generation == generation,
-                  let activeRecord = activePostAuthRequestRecords[item.identity],
-                  activeRecord.caller == .pending,
-                  case .notStarted = activeRecord.send else {
-                continue
-            }
-
-            var committedMessageId: UInt64?
-            do {
-                // Scope and generation admission are repeated at the final actor turn before
-                // MID allocation. A local refusal therefore cannot leave a sequence hole.
-                guard item.command == activeRecord.command,
-                      item.sessionId == activeRecord.sessionId,
-                      item.treeId == activeRecord.treeId else {
-                    throw SMBCodecError.invalidValue("post-auth request descriptor scope changed before commit")
-                }
-                if let registeredFileId = activeRecord.fileId {
-                    guard let offset = Self.fileIdOffsetInRequest(command: activeRecord.command),
-                          offset + 16 <= item.packet.count,
-                          SMBFileIdLedgerKey(packet: item.packet, offset: offset) == registeredFileId else {
-                        throw SMBCodecError.invalidValue("post-auth request FileId changed before commit")
-                    }
-                }
-                try validateFileIdAdmission(packet: item.packet, command: activeRecord.command, cleanupKey: activeRecord.cleanupKey)
-                guard isGenerationActive(generation) else {
-                    throw wireFailure ?? SMBTransportError.connectionClosed
-                }
-                let selectedMessageId = commitNextMessageId(charge: item.reservedCharge)
-                committedMessageId = selectedMessageId
-                updateActivePostAuthRecord(item.identity) {
-                    $0.send = .committed(messageId: selectedMessageId, charge: item.reservedCharge)
-                    $0.credit = .committed(actualCharge: item.reservedCharge)
-                    $0.wire = .waiting
-                    $0.queuedRequestOwned = false
-                    $0.originalSendOwned = true
-                }
-                activeRecord.messageId = selectedMessageId
-                Self.patchMessageId(&item.packet, to: selectedMessageId)
-                let pending = SMBPendingResponse(
-                    requestIdentity: item.identity,
-                    generation: generation,
-                    label: item.responseLabel,
-                    longPoll: activeRecord.longPoll,
-                    requestTimeoutPolicy: activeRecord.requestTimeoutPolicy,
-                    responseProtectionPolicy: activeRecord.responseProtectionPolicy,
-                    expectedCommand: item.command,
-                    expectedSessionId: item.sessionId,
-                    expectedTreeId: item.treeId,
-                    continuation: item.continuation,
-                    sendTask: nil,
-                    timeoutTask: nil,
-                    timeoutIdentity: nil,
-                    sendPhase: .sending,
-                    cancellationRequested: false,
-                    continuationResumed: false,
-                    cleanupFileId: activeRecord.cleanupKey,
-                    usesSenderLoop: true
-                )
-                pendingResponses[selectedMessageId] = pending
-                if activeRecord.cleanupKey != nil {
-                    let timerIdentity = UUID()
-                    pendingResponses[selectedMessageId]?.cleanupTimeoutIdentity = timerIdentity
-                    pendingResponses[selectedMessageId]?.cleanupTimeoutTask = startCleanupTimeout(
-                        messageId: selectedMessageId,
-                        generation: generation,
-                        identity: timerIdentity
-                    )
-                }
-                SMBPerfLog.line(
-                    "[wire] commit session=\(diagnosticSessionId) request=\(item.identity.requestSequence) " +
-                        "message_id=\(selectedMessageId) charge=\(item.reservedCharge) " +
-                        "command=\(item.command) label=\(item.responseLabel)"
-                )
-                startReaderIfNeeded(generation: generation)
-                if failNextPostAuthFrameBuildForTestingStorage {
-                    failNextPostAuthFrameBuildForTestingStorage = false
-                    throw SMBCodecError.invalidValue("injected post-auth frame build failure")
-                }
-
-                switch item.sendKind {
-                case .signed:
-                    try await sendSigned(
-                        item.packet,
-                        messageId: selectedMessageId,
-                        generation: generation,
-                        preparedCreditCharge: item.reservedCharge,
-                        creditRequestAlreadyApplied: true
-                    )
-                case .validateNegotiate(let encrypt):
-                    try await sendValidateNegotiateSigned(
-                        item.packet,
-                        messageId: selectedMessageId,
-                        encrypt: encrypt,
-                        generation: generation,
-                        preparedCreditCharge: item.reservedCharge,
-                        creditRequestAlreadyApplied: true
-                    )
-                }
-                senderFrameCountForTestingStorage += 1
-                SMBPerfLog.line(
-                    "[wire] sender_frame session=\(diagnosticSessionId) " +
-                        "frames=\(senderFrameCountForTestingStorage) message_id=\(selectedMessageId)"
-                )
-                await sendDidSucceed(messageId: selectedMessageId, generation: generation)
-                resumeSatisfiedTestingCountWaiters()
-            } catch {
-                if let messageId = committedMessageId {
-                    SMBPerfLog.line(
-                        "[wire] send_failed session=\(diagnosticSessionId) message_id=\(messageId) " +
-                            "error=\(Self.diagnosticError(error))"
-                    )
-                    failWire(error: error)
-                    closeTransport(cause: "post_auth_send_failure", diagnosticError: error)
-                    break
-                }
-                updateActivePostAuthRecord(item.identity) {
-                    if error is CancellationError {
-                        $0.caller = .cancelled
-                    } else if error is SMBCodecError {
-                        $0.caller = .localRefusal
-                    } else {
-                        $0.caller = .transportError
-                    }
-                    $0.send = .neverSubmitted
-                    $0.queuedRequestOwned = false
-                }
-                if let cleanupKey = item.cleanupKey {
-                    cleanupLedger.removeValue(forKey: cleanupKey)
-                    resumeCleanupLedgerCountWaiters()
-                }
-                await refundCredit(charge: item.reservedCharge)
-                updateActivePostAuthRecord(item.identity) { $0.credit = .refunded }
-                activePostAuthRequestRecords.removeValue(forKey: item.identity)
-                item.continuation.resume(throwing: error)
-            }
-        }
-        if senderLoopTaskID == taskID {
-            senderLoopTask = nil
-            senderLoopTaskID = nil
-            senderLoopExitCountForTestingStorage += 1
-            SMBPerfLog.line(
-                "[wire] sender_exit session=\(diagnosticSessionId) exits=\(senderLoopExitCountForTestingStorage)"
-            )
-            activeSendTasks.removeValue(forKey: taskID)
-            resumeSatisfiedTestingCountWaiters()
-            // A terminal transition or an enqueue racing with the idle edge can leave new
-            // work visible after the loop releases its running flag. Recheck in this same
-            // actor turn and start one replacement loop if needed.
-            if isGenerationActive(generation) {
-                startSenderLoopIfNeeded(generation: generation)
-            }
-        } else {
-            activeSendTasks.removeValue(forKey: taskID)
-        }
-    }
-
-    private func sendQueuedControl(_ control: SMBQueuedControlSend) async throws {
-        guard control.generation == control.requestIdentity.generation,
-              let messageId = messageId(for: control.requestIdentity),
-              var pending = pendingResponses[messageId],
-              pending.generation == control.generation,
-              let activeRecord = activePostAuthRequestRecords[control.requestIdentity] else {
-            return
-        }
-        guard activeRecord.wire != .finalAccepted, !pending.finalSeen else {
-            pending.cancelQueued = false
-            activeRecord.unselectedControlOwned = false
-            pendingResponses[messageId] = pending
-            completeOrdinaryDrainIfReady(messageId: messageId)
-            return
-        }
-        pending.cancelQueued = false
-        pending.cancelSendOwned = true
-        activeRecord.unselectedControlOwned = false
-        activeRecord.selectedCancelOwned = true
-        pendingResponses[messageId] = pending
-        let target: SMB2Cancel.Target
-        if let asyncId = pending.asyncId {
-            target = .async(messageId: messageId, asyncId: asyncId)
-        } else {
-            target = .sync(messageId: messageId)
-        }
-        guard try await sendCancelWithoutGate(target: target, generation: control.generation) else { return }
-        guard isGenerationActive(control.generation) else { return }
-        senderFrameCountForTestingStorage += 1
-        SMBPerfLog.line(
-            "[wire] sender_frame session=\(diagnosticSessionId) " +
-                "frames=\(senderFrameCountForTestingStorage) cancel_target=\(messageId)"
-        )
-        guard isGenerationActive(control.generation),
-              var current = pendingResponses[messageId],
-              current.requestIdentity == control.requestIdentity,
-              let currentRecord = activePostAuthRequestRecords[control.requestIdentity] else {
-            return
-        }
-        if let deadline = currentRecord.wireDrainDeadline, sessionTime.now() >= deadline {
-            current.wireDrainExpired = true
-            currentRecord.wire = .sessionTerminal
-            if let timerIdentity = currentRecord.wireDrainTimerIdentity {
-                terminalWireDrainTimerIdentities.insert(timerIdentity)
-            }
-            pendingResponses[messageId] = current
-            beginWireDrainTerminalization(
-                timerIdentity: currentRecord.wireDrainTimerIdentity,
-                cause: "wire_drain_cancel_owner_after_deadline",
-                error: SMBTransportError.timedOut
-            )
-            return
-        }
-        current.cancelSendOwned = false
-        currentRecord.selectedCancelOwned = false
-        pendingResponses[messageId] = current
-        completeOrdinaryDrainIfReady(messageId: messageId)
-    }
-
-    private func cancelPostAuthRequest(identity: SMBRequestIdentity) async {
-        guard activePostAuthRequestRecords[identity] != nil else { return }
-        if let index = queuedPostAuthRequests.firstIndex(where: { $0.identity == identity }) {
-            let item = queuedPostAuthRequests.remove(at: index)
-            resumeSatisfiedTestingCountWaiters()
-            cancelledBeforeEnqueue.remove(identity)
-            updateActivePostAuthRecord(identity) {
-                $0.caller = .cancelled
-                $0.send = .neverSubmitted
-                $0.queuedRequestOwned = false
-            }
-            item.continuation.resume(throwing: CancellationError())
-            if let cleanupKey = item.cleanupKey {
-                cleanupLedger.removeValue(forKey: cleanupKey)
-                resumeCleanupLedgerCountWaiters()
-            }
-            await refundCredit(charge: item.reservedCharge)
-            updateActivePostAuthRecord(identity) { $0.credit = .refunded }
-            activePostAuthRequestRecords.removeValue(forKey: identity)
-            return
-        }
-        guard let messageId = messageId(for: identity),
-              var pending = pendingResponses[messageId] else {
-            updateActivePostAuthRecord(identity) { $0.caller = .cancelled }
-            cancelledBeforeEnqueue.insert(identity)
-            return
-        }
-        guard pending.usesSenderLoop,
-              pending.generation == identity.generation,
-              let activeRecord = activePostAuthRequestRecords[identity] else { return }
-        guard !pending.continuationResumed, activeRecord.caller == .pending else { return }
-        pending.cancellationRequested = true
-        activeRecord.caller = .cancelled
-        pending.timeoutTask?.cancel()
-        pending.timeoutTask = nil
-        pending.timeoutIdentity = nil
-        pending.continuationResumed = true
-        pending.continuation.resume(throwing: CancellationError())
-        if activeRecord.wireDrainDeadline == nil {
-            let deadline = sessionTime.now().advanced(by: wireDrainGrace)
-            let timerIdentity = UUID()
-            pending.wireDrainDeadline = deadline
-            pending.wireDrainIdentity = timerIdentity
-            activeRecord.wireDrainDeadline = deadline
-            activeRecord.wireDrainTimerIdentity = timerIdentity
-            let timerTask = startWireDrainTimer(
-                requestIdentity: identity,
-                messageId: messageId,
-                generation: identity.generation,
-                timerIdentity: timerIdentity,
-                deadline: deadline
-            )
-            pending.wireDrainTask = timerTask
-            activeRecord.wireDrainTask = timerTask
-        }
-        if activeRecord.wire != .finalAccepted, !pending.finalSeen, !activeRecord.unselectedControlOwned {
-            pending.cancelQueued = true
-            activeRecord.unselectedControlOwned = true
-            queuedControlSends.append(SMBQueuedControlSend(
-                requestIdentity: identity,
-                generation: identity.generation
-            ))
-        }
-        pendingResponses[messageId] = pending
-        startSenderLoopIfNeeded(generation: identity.generation)
-        completeOrdinaryDrainIfReady(messageId: messageId)
-    }
-
-    private func startWireDrainTimer(
-        requestIdentity: SMBRequestIdentity,
-        messageId: UInt64,
-        generation: UInt64,
-        timerIdentity: UUID,
-        deadline: ContinuousClock.Instant
-    ) -> Task<Void, Never> {
-        let delay = max(.zero, sessionTime.now().duration(to: deadline))
-        let sleep = sessionTime.sleep
-        return Task { [weak self] in
-            do {
-                try await sleep(delay)
-            } catch {
-                return
-            }
-            await self?.wireDrainDeadlineDidFire(
-                requestIdentity: requestIdentity,
-                messageId: messageId,
-                generation: generation,
-                timerIdentity: timerIdentity
-            )
-        }
-    }
-
-    private func wireDrainDeadlineDidFire(
-        requestIdentity: SMBRequestIdentity,
-        messageId: UInt64,
-        generation: UInt64,
-        timerIdentity: UUID
-    ) {
-        guard isGenerationActive(generation),
-              var pending = pendingResponses[messageId],
-              pending.requestIdentity == requestIdentity,
-              pending.generation == generation,
-              let activeRecord = activePostAuthRequestRecords[requestIdentity],
-              activeRecord.wireDrainTimerIdentity == timerIdentity,
-              let deadline = activeRecord.wireDrainDeadline else {
-            return
-        }
-        let now = sessionTime.now()
-        if now < deadline {
-            let timerTask = startWireDrainTimer(
-                requestIdentity: requestIdentity,
-                messageId: messageId,
-                generation: generation,
-                timerIdentity: timerIdentity,
-                deadline: deadline
-            )
-            pending.wireDrainTask = timerTask
-            activeRecord.wireDrainTask = timerTask
-            pendingResponses[messageId] = pending
-            return
-        }
-        pending.wireDrainExpired = true
-        activeRecord.wire = .sessionTerminal
-        terminalWireDrainTimerIdentities.insert(timerIdentity)
-        pendingResponses[messageId] = pending
-        beginWireDrainTerminalization(
-            timerIdentity: timerIdentity,
-            cause: "wire_drain_deadline",
-            error: SMBTransportError.timedOut
-        )
-    }
-
-    private func completeOrdinaryDrainIfReady(messageId: UInt64) {
-        // Most requests reach this check once after send completion, before their final
-        // response exists. Inspect that flag before copying the large pending value.
-        guard pendingResponses[messageId]?.finalSeen == true else { return }
-        guard var pending = pendingResponses[messageId],
-              pending.usesSenderLoop,
-              pending.finalSeen,
-              pending.sendPhase == .sent,
-              !pending.cancelQueued,
-              !pending.cancelSendOwned,
-              let activeRecord = activePostAuthRequestRecords[pending.requestIdentity],
-              activeRecord.wire == .finalAccepted,
-              activeRecord.send == .fullySent,
-              !activeRecord.unselectedControlOwned,
-              !activeRecord.originalSendOwned,
-              !activeRecord.selectedCancelOwned else {
-            return
-        }
-        if let deadline = activeRecord.wireDrainDeadline {
-            let now = sessionTime.now()
-            guard now < deadline else {
-                pending.wireDrainExpired = true
-                activeRecord.wire = .sessionTerminal
-                if let timerIdentity = activeRecord.wireDrainTimerIdentity {
-                    terminalWireDrainTimerIdentities.insert(timerIdentity)
-                }
-                pendingResponses[messageId] = pending
-                beginWireDrainTerminalization(
-                    timerIdentity: activeRecord.wireDrainTimerIdentity,
-                    cause: "wire_drain_owner_after_deadline",
-                    error: SMBTransportError.timedOut
-                )
-                return
-            }
-            pending.wireDrainCompleted = true
-            activeRecord.wireDrainTask?.cancel()
-            activeRecord.wireDrainTask = nil
-            activeRecord.wireDrainTimerIdentity = nil
-            activeRecord.wireDrainDeadline = nil
-            pending.wireDrainTask?.cancel()
-            pending.wireDrainTask = nil
-            pending.wireDrainIdentity = nil
-            pending.wireDrainDeadline = nil
-        }
-        pendingResponses[messageId] = pending
-        if let frame = pending.acceptedFinalFrame,
-           let status = pending.acceptedFinalStatus {
-            finishAcceptedFinal(messageId: messageId, frame: frame, status: status)
-            if !hasReaderEligibleResponseOutstanding {
-                makeReaderDormantIfIdle(generation: pending.generation)
-            }
-        }
-    }
-
-    private func beginWireDrainTerminalization(timerIdentity: UUID?, cause: String, error: Error) {
-        let timerTask = timerIdentity.flatMap { identity in
-            activePostAuthRequestRecords.values.first(where: { $0.wireDrainTimerIdentity == identity })?.wireDrainTask
-        }
-        if let timerIdentity,
-           let identity = activePostAuthRequestRecords.first(where: { $0.value.wireDrainTimerIdentity == timerIdentity })?.key {
-            updateActivePostAuthRecord(identity) { $0.wire = .sessionTerminal }
-        }
-        closeTransport(cause: cause, diagnosticError: error)
-        Task { [self] in
-            await closeTransportAndWait(cause: cause, diagnosticError: error)
-            timerTask?.cancel()
-            if let timerIdentity {
-                terminalWireDrainTimerIdentities.remove(timerIdentity)
-            }
-            wireDrainTerminalizationCountForTestingStorage += 1
-            resumeSatisfiedTestingCountWaiters()
-        }
-    }
-
-    private static func patchMessageId(_ packet: inout [UInt8], to messageId: UInt64) {
-        guard packet.count >= SMB2Header.encodedSize else { return }
-        for byteIndex in 0..<MemoryLayout<UInt64>.size {
-            packet[24 + byteIndex] = UInt8(truncatingIfNeeded: messageId >> (byteIndex * 8))
-        }
-    }
-
     private func makeRequestIdentity(generation: UInt64) -> SMBRequestIdentity {
         nextRequestSequence &+= 1
         return SMBRequestIdentity(
@@ -8771,85 +7770,23 @@ actor SMBSession {
         )
     }
 
-    private func updateActivePostAuthRecord(
-        _ identity: SMBRequestIdentity,
-        _ update: (inout SMBSessionActiveRequestRecord) -> Void
-    ) {
-        guard var record = activePostAuthRequestRecords[identity] else { return }
-        update(&record)
-    }
-
-    private func messageId(for identity: SMBRequestIdentity) -> UInt64? {
-        activePostAuthRequestRecords[identity]?.messageId ?? pendingMessageIdByIdentity[identity]
-    }
-
     private func storePendingResponse(messageId: UInt64, pending: SMBPendingResponse) {
-        pendingMessageIdByIdentity[pending.requestIdentity] = messageId
+        activeRequestIdentities.insert(pending.requestIdentity)
         pendingResponses[messageId] = pending
     }
 
     @discardableResult
     private func removePendingResponse(messageId: UInt64) -> SMBPendingResponse? {
         guard let pending = pendingResponses.removeValue(forKey: messageId) else { return nil }
-        pendingMessageIdByIdentity.removeValue(forKey: pending.requestIdentity)
-        queuedControlSends.removeAll { $0.requestIdentity == pending.requestIdentity }
-        reapActivePostAuthRequestRecordIfEligible(pending.requestIdentity)
-        resumeCancelledRequestDrainWaiters()
+        activeRequestIdentities.remove(pending.requestIdentity)
+        resumePendingCommandResponseDrainWaiters()
         return pending
     }
 
-    private func reapActivePostAuthRequestRecordIfEligible(_ identity: SMBRequestIdentity) {
-        guard let record = activePostAuthRequestRecords[identity],
-              let messageId = record.messageId,
-              pendingResponses[messageId]?.requestIdentity != identity,
-              record.wire == .finalAccepted,
-              record.send == .fullySent,
-              record.wireDrainDeadline == nil,
-              record.outstandingCreditGrantAcknowledgements == 0,
-              !record.queuedRequestOwned,
-              !record.unselectedControlOwned,
-              !record.originalSendOwned,
-              !record.selectedCancelOwned else {
-            return
-        }
-        activePostAuthRequestRecords.removeValue(forKey: identity)
-    }
-
-    private func acknowledgeFinalCreditGrant(for effect: SMBValidatedResponseEffect) {
-        guard effect.credits != nil,
-              case .final = effect.kind,
-              let identity = effect.requestIdentity,
-              let record = activePostAuthRequestRecords[identity],
-              record.outstandingCreditGrantAcknowledgements > 0 else {
-            return
-        }
-        record.outstandingCreditGrantAcknowledgements -= 1
-        reapActivePostAuthRequestRecordIfEligible(identity)
-    }
-
-    func drainCancelledRequestsBeforeDisconnect() async -> Bool {
-        let hasCancelledRequests = pendingResponses.values.contains(where: {
-            $0.usesSenderLoop && $0.cancellationRequested
-        })
-        guard hasCancelledRequests else {
-            guard readerLifecycle.isTerminal else { return true }
-            await closeTransportAndWait(cause: "client_close_terminal_drain")
-            return false
-        }
-
-        let drained: Bool
-        do {
-            try await waitForCancelledRequestsToDrain()
-            drained = true
-        } catch {
-            drained = false
-        }
-        guard readerLifecycle.isTerminal else { return drained }
-        await closeTransportAndWait(cause: "client_close_terminal_drain")
-        return false
-    }
-
-    private func waitForCancelledRequestsToDrain() async throws {
+    /// Waits until no response record for `command` remains. Cancelled callers keep a
+    /// tombstone here until their final wire response is dispatched, so graceful teardown
+    /// cannot mistake caller cancellation for completion of the SMB request itself.
+    private func waitForPendingResponsesToDrain(command: UInt16) async throws {
         let waiterID = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -8857,42 +7794,63 @@ actor SMBSession {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
-                guard pendingResponses.values.contains(where: { $0.usesSenderLoop && $0.cancellationRequested }) else {
+                guard pendingResponses.values.contains(where: { $0.expectedCommand == command }) else {
                     continuation.resume()
                     return
                 }
-                cancelledRequestDrainWaiters.append(SMBCancelledRequestDrainWaiter(
+                pendingCommandResponseDrainWaiters.append(SMBPendingCommandResponseDrainWaiter(
                     id: waiterID,
+                    command: command,
                     continuation: continuation
                 ))
                 resumeSatisfiedTestingCountWaiters()
             }
         } onCancel: {
-            Task { await self.cancelCancelledRequestDrainWaiter(waiterID) }
+            Task { await self.cancelPendingCommandResponseDrainWaiter(waiterID) }
         }
     }
 
-    private func resumeCancelledRequestDrainWaiters() {
-        var remaining: [SMBCancelledRequestDrainWaiter] = []
+    /// Close is graceful only while an in-flight keepalive ECHO can still be drained.
+    /// If its server final never arrives, close the wire after the existing cleanup bound
+    /// instead of sending TREE_DISCONNECT/LOGOFF across an unresolved request.
+    func drainEchoResponsesBeforeDisconnect() async -> Bool {
+        // Preserve the existing close path when there is no ECHO to drain. In
+        // particular, avoid creating a deadline task group (and an extra actor
+        // suspension) for the common case.
+        guard pendingResponses.values.contains(where: { $0.expectedCommand == SMB2Commands.echo }) else {
+            return true
+        }
+        do {
+            try await SMBOperationDeadline.run(timeout: cleanupTimeout, sleeper: cleanupTimeoutSleeper) {
+                try await self.waitForPendingResponsesToDrain(command: SMB2Commands.echo)
+            }
+            return true
+        } catch {
+            await closeTransportAndWait(cause: "keepalive_echo_drain_timeout", diagnosticError: error)
+            return false
+        }
+    }
+
+    private func resumePendingCommandResponseDrainWaiters() {
+        var remaining: [SMBPendingCommandResponseDrainWaiter] = []
         var ready: [CheckedContinuation<Void, Error>] = []
-        for waiter in cancelledRequestDrainWaiters {
-            let stillPending = pendingResponses.values.contains { $0.usesSenderLoop && $0.cancellationRequested }
-            if stillPending {
+        for waiter in pendingCommandResponseDrainWaiters {
+            if pendingResponses.values.contains(where: { $0.expectedCommand == waiter.command }) {
                 remaining.append(waiter)
             } else {
                 ready.append(waiter.continuation)
             }
         }
-        cancelledRequestDrainWaiters = remaining
+        pendingCommandResponseDrainWaiters = remaining
         if !ready.isEmpty {
             resumeSatisfiedTestingCountWaiters()
         }
         ready.forEach { $0.resume() }
     }
 
-    private func cancelCancelledRequestDrainWaiter(_ id: UUID) {
-        guard let index = cancelledRequestDrainWaiters.firstIndex(where: { $0.id == id }) else { return }
-        let waiter = cancelledRequestDrainWaiters.remove(at: index)
+    private func cancelPendingCommandResponseDrainWaiter(_ id: UUID) {
+        guard let index = pendingCommandResponseDrainWaiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = pendingCommandResponseDrainWaiters.remove(at: index)
         resumeSatisfiedTestingCountWaiters()
         waiter.continuation.resume(throwing: CancellationError())
     }
@@ -8902,16 +7860,14 @@ actor SMBSession {
         messageId: UInt64,
         generation: UInt64,
         diagnosticSessionId: String,
-        send: @escaping SMBWireSendClosure
+        send: @escaping @Sendable ([UInt8], UInt64) async throws -> Void
     ) async {
         do {
             try await Self.sendAndLog(
                 packet: packet,
                 messageId: messageId,
                 diagnosticSessionId: diagnosticSessionId,
-                send: { packet, messageId in
-                    try await send(packet, messageId, nil)
-                }
+                send: send
             )
             await sendDidSucceed(messageId: messageId, generation: generation)
         } catch {
@@ -8945,30 +7901,6 @@ actor SMBSession {
         guard offset + 16 <= packet.count else { throw SMBCodecError.truncated }
         let fileId = Array(packet[offset..<offset + 16])
         try validateFileIdAdmission(command: command, fileId: fileId, cleanupFileId: cleanupFileId)
-    }
-
-    private func validateFileIdAdmission(
-        packet: [UInt8],
-        command: UInt16,
-        cleanupKey: SMBFileIdLedgerKey?
-    ) throws {
-        guard let offset = Self.fileIdOffsetInRequest(command: command) else {
-            if cleanupKey != nil {
-                throw SMBCodecError.invalidValue("cleanup CLOSE packet does not carry a FileId")
-            }
-            return
-        }
-        guard offset + 16 <= packet.count else { throw SMBCodecError.truncated }
-        let fileKey = SMBFileIdLedgerKey(packet: packet, offset: offset)
-        if let cleanupKey {
-            guard command == SMB2Commands.close, fileKey == cleanupKey else {
-                throw SMBCodecError.invalidValue("cleanup CLOSE FileId does not match its ledger key")
-            }
-            return
-        }
-        guard cleanupLedger[fileKey] == nil else {
-            throw SMBCodecError.invalidValue("SMB FileId is unresolved after CLOSE")
-        }
     }
 
     private func validateFileIdAdmission(command: UInt16, fileId: [UInt8], cleanupFileId: [UInt8]?) throws {
@@ -9143,9 +8075,7 @@ actor SMBSession {
         _ packet: [UInt8],
         messageId: UInt64? = nil,
         generation: UInt64,
-        creditReservation: SMBPreReservedCredit? = nil,
-        preparedCreditCharge: UInt16? = nil,
-        creditRequestAlreadyApplied: Bool = false
+        creditReservation: SMBPreReservedCredit? = nil
     ) async throws {
         // Deliberately NOT patched here. sendUnsigned carries the NEGOTIATE / SESSION_SETUP
         // preauth messages (via unsignedWireTransaction), whose exact sent bytes must match
@@ -9158,8 +8088,7 @@ actor SMBSession {
             packet,
             messageId: messageId,
             generation: generation,
-            creditReservation: creditReservation,
-            preparedCreditCharge: preparedCreditCharge
+            creditReservation: creditReservation
         )
     }
 
@@ -9176,18 +8105,14 @@ actor SMBSession {
         _ packet: [UInt8],
         messageId: UInt64? = nil,
         generation: UInt64,
-        creditReservation: SMBPreReservedCredit? = nil,
-        preparedCreditCharge: UInt16? = nil,
-        creditRequestAlreadyApplied: Bool = false
+        creditReservation: SMBPreReservedCredit? = nil
     ) async throws {
         // Single credit-patch point for all post-auth traffic: sendSigned handles every
         // signedWireTransaction op, so patching once here (before signing/sealing) covers signed,
         // encrypted, and anonymous paths while leaving the preauth NEGOTIATE/SESSION_SETUP messages
         // (sent directly via sendUnsigned) untouched for 3.1.1 preauth-integrity.
         var packet = packet
-        if !creditRequestAlreadyApplied {
-            applyCreditRequest(to: &packet)
-        }
+        await applyCreditRequest(to: &packet)
         guard isGenerationActive(generation) else { throw SMBTransportError.connectionClosed }
         try Task.checkCancellation()
         if encryptionKey != nil {
@@ -9195,8 +8120,7 @@ actor SMBSession {
                 packet,
                 messageId: messageId,
                 generation: generation,
-                creditReservation: creditReservation,
-                preparedCreditCharge: preparedCreditCharge
+                creditReservation: creditReservation
             )
             return
         }
@@ -9208,9 +8132,7 @@ actor SMBSession {
                 packet,
                 messageId: messageId,
                 generation: generation,
-                creditReservation: creditReservation,
-                preparedCreditCharge: preparedCreditCharge,
-                creditRequestAlreadyApplied: creditRequestAlreadyApplied
+                creditReservation: creditReservation
             )
             return
         }
@@ -9219,8 +8141,7 @@ actor SMBSession {
             packet,
             messageId: messageId,
             generation: generation,
-            creditReservation: creditReservation,
-            preparedCreditCharge: preparedCreditCharge
+            creditReservation: creditReservation
         )
     }
 
@@ -9228,14 +8149,10 @@ actor SMBSession {
         _ packet: [UInt8],
         messageId: UInt64,
         encrypt: Bool,
-        generation: UInt64,
-        preparedCreditCharge: UInt16? = nil,
-        creditRequestAlreadyApplied: Bool = false
+        generation: UInt64
     ) async throws {
         var packet = packet
-        if !creditRequestAlreadyApplied {
-            applyCreditRequest(to: &packet)
-        }
+        await applyCreditRequest(to: &packet)
         guard isGenerationActive(generation) else { throw SMBTransportError.connectionClosed }
         guard signingKey != nil else {
             throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO request requires a signing key")
@@ -9246,19 +8163,9 @@ actor SMBSession {
             guard encryptionKey != nil else {
                 throw SMBCodecError.invalidValue("VALIDATE_NEGOTIATE_INFO requires unavailable SMB encryption")
             }
-            try await sendEncrypted(
-                packet,
-                messageId: messageId,
-                generation: generation,
-                preparedCreditCharge: preparedCreditCharge
-            )
+            try await sendEncrypted(packet, messageId: messageId, generation: generation)
         } else {
-            try await sendPlaintext(
-                packet,
-                messageId: messageId,
-                generation: generation,
-                preparedCreditCharge: preparedCreditCharge
-            )
+            try await sendPlaintext(packet, messageId: messageId, generation: generation)
         }
         validateNegotiateSentCountForTestingStorage += 1
     }
@@ -9292,37 +8199,30 @@ actor SMBSession {
         _ packet: [UInt8],
         messageId: UInt64?,
         generation: UInt64,
-        creditReservation: SMBPreReservedCredit? = nil,
-        preparedCreditCharge: UInt16? = nil
+        creditReservation: SMBPreReservedCredit? = nil
     ) async throws {
-        let reservedCharge: UInt16
-        if let preparedCreditCharge {
-            reservedCharge = preparedCreditCharge
-        } else {
-            reservedCharge = try await claimOrReserveCredit(
-                packet,
-                generation: generation,
-                creditReservation: creditReservation
-            )
-        }
-        let committed = preparedCreditCharge != nil
+        let reservedCharge = try await claimOrReserveCredit(
+            packet,
+            generation: generation,
+            creditReservation: creditReservation
+        )
         guard isGenerationActive(generation) else {
-            if !committed { await refundCredit(charge: reservedCharge) }
+            await refundCredit(charge: reservedCharge)
             throw SMBTransportError.connectionClosed
         }
         guard !Task.isCancelled else {
-            if !committed { await refundCredit(charge: reservedCharge) }
+            await refundCredit(charge: reservedCharge)
             throw CancellationError()
         }
         if let messageId, !markSendStarted(messageId: messageId, generation: generation) {
-            if !committed { await refundCredit(charge: reservedCharge) }
+            await refundCredit(charge: reservedCharge)
             throw CancellationError()
         }
         do {
             try await transport.send(DirectTCPFraming.segments([packet]))
             guard isGenerationActive(generation) else { throw SMBTransportError.connectionClosed }
         } catch {
-            if !committed { await refundCredit(charge: reservedCharge) }
+            await refundCredit(charge: reservedCharge)
             throw error
         }
     }
@@ -9331,8 +8231,7 @@ actor SMBSession {
         _ packet: [UInt8],
         messageId: UInt64? = nil,
         generation: UInt64,
-        creditReservation: SMBPreReservedCredit? = nil,
-        preparedCreditCharge: UInt16? = nil
+        creditReservation: SMBPreReservedCredit? = nil
     ) async throws {
         // Callers patch credits before signing/sealing; do not patch the packet again here.
         guard let encryptionKey else { throw SMBCodecError.invalidValue("missing SMB encryption key") }
@@ -9366,34 +8265,28 @@ actor SMBSession {
         }
         header.signature = sealed.tag
         try Task.checkCancellation()
-        let reservedCharge: UInt16
-        if let preparedCreditCharge {
-            reservedCharge = preparedCreditCharge
-        } else {
-            reservedCharge = try await claimOrReserveCredit(
-                packet,
-                generation: generation,
-                creditReservation: creditReservation
-            )
-        }
-        let committed = preparedCreditCharge != nil
+        let reservedCharge = try await claimOrReserveCredit(
+            packet,
+            generation: generation,
+            creditReservation: creditReservation
+        )
         guard isGenerationActive(generation) else {
-            if !committed { await refundCredit(charge: reservedCharge) }
+            await refundCredit(charge: reservedCharge)
             throw SMBTransportError.connectionClosed
         }
         guard !Task.isCancelled else {
-            if !committed { await refundCredit(charge: reservedCharge) }
+            await refundCredit(charge: reservedCharge)
             throw CancellationError()
         }
         if let messageId, !markSendStarted(messageId: messageId, generation: generation) {
-            if !committed { await refundCredit(charge: reservedCharge) }
+            await refundCredit(charge: reservedCharge)
             throw CancellationError()
         }
         do {
             try await transport.send(DirectTCPFraming.segments([try header.encode(), sealed.ciphertext]))
             guard isGenerationActive(generation) else { throw SMBTransportError.connectionClosed }
         } catch {
-            if !committed { await refundCredit(charge: reservedCharge) }
+            await refundCredit(charge: reservedCharge)
             throw error
         }
     }
@@ -9460,7 +8353,7 @@ actor SMBSession {
                 // A dormant reader can remain scheduled after send completion retires its
                 // request. It must not read alongside a replacement reader for this epoch.
                 guard isCurrentReader(generation: generation, handle: handle) else { return nil }
-                guard hasReaderEligibleResponseOutstanding else {
+                guard hasSentResponseOutstanding else {
                     makeReaderDormantIfIdle(generation: generation, handle: handle)
                     return nil
                 }
@@ -9533,7 +8426,7 @@ actor SMBSession {
         // acceptance time or release an unvalidated slice.
         await recordCreditGrants(effects, generation: generation)
         guard isGenerationActive(generation) else { return false }
-        guard hasReaderEligibleResponseOutstanding else {
+        guard hasSentResponseOutstanding else {
             // Commit the stop and lifecycle transition in this actor turn, with no await
             // after the final dispatch. A send completion therefore sees either this reader
             // as running or the dormant state and starts a replacement; it cannot fall into
@@ -9567,30 +8460,24 @@ actor SMBSession {
         }
     }
 
-    /// An early final satisfies this request's response obligation even if the transport's
-    /// full-send callback has not returned yet. Keep the send owner in the pending ledger,
-    /// but stop reading before the next frame so a later response cannot be consumed before
-    /// its request is committed. A cancelled request remains eligible as a tombstone until
-    /// its final arrives, and STATUS_PENDING remains eligible until a final is accepted.
-    private var hasReaderEligibleResponseOutstanding: Bool {
-        pendingResponses.values.contains {
-            $0.sendPhase == .sent || ($0.usesSenderLoop && $0.sendPhase == .sending && !$0.finalSeen)
-        }
+    private var hasSentResponseOutstanding: Bool {
+        pendingResponses.values.contains { $0.sendPhase == .sent }
     }
 
-    /// Once the last response-eligible record is gone, the reader stops before another
-    /// receive. A duplicate or unsolicited frame arriving while dormant stays in the
-    /// transport until a later send. The caller gate is separate from response correlation
-    /// so a valid early final can be held without replay.
+    /// This is the master receiveLoop predicate. A cancelled request remains `.sent` as a
+    /// tombstone until its final response is consumed, so that late final is still read and
+    /// drained. Once the last sent record is gone, the reader stops before another receive;
+    /// a duplicate or unsolicited frame arriving while dormant stays in the transport until
+    /// a later send, just as it does with the master's idle receiveLoop. The caller gate is
+    /// separate from response correlation so a valid early final can be held without replay.
     private func makeReaderDormantIfIdle(generation: UInt64, handle: UUID? = nil) {
-        guard !hasReaderEligibleResponseOutstanding,
+        guard !hasSentResponseOutstanding,
               case .running(let currentGeneration, let currentHandle) = readerLifecycle,
               currentGeneration == generation,
               handle == nil || handle == currentHandle else {
             return
         }
         readerLifecycle = .dormant(generation: generation)
-        readerTasks[currentHandle]?.cancel()
         readerHandle = nil
     }
 
@@ -9997,49 +8884,10 @@ actor SMBSession {
             pending.asyncId = asyncId
             pending.pendingCount = pendingCount
             pendingResponses[effect.messageId] = pending
-            updateActivePostAuthRecord(identity) { $0.wire = .statusPending(asyncId: asyncId) }
             debugLine("\(pending.label) accepted interim STATUS_PENDING AsyncId=\(asyncId)")
         case .final(let asyncId, let pendingCount, let frame, let status, let sendPhase):
             let acceptedAt = sessionTime.now()
             lastFinalAcceptanceForTestingStorage = acceptedAt
-            if var pending = pendingResponses[effect.messageId],
-               pending.requestIdentity == identity,
-               pending.usesSenderLoop {
-                let activeRecord = activePostAuthRequestRecords[identity]
-                guard let activeRecord else { return }
-                if let deadline = activeRecord.wireDrainDeadline, acceptedAt >= deadline {
-                    pending.wireDrainExpired = true
-                    updateActivePostAuthRecord(identity) { $0.wire = .sessionTerminal }
-                    if let timerIdentity = activeRecord.wireDrainTimerIdentity {
-                        terminalWireDrainTimerIdentities.insert(timerIdentity)
-                    }
-                    pendingResponses[effect.messageId] = pending
-                    beginWireDrainTerminalization(
-                        timerIdentity: activeRecord.wireDrainTimerIdentity,
-                        cause: "wire_drain_final_at_or_after_deadline",
-                        error: SMBTransportError.timedOut
-                    )
-                    return
-                }
-                pending.asyncId = asyncId
-                pending.pendingCount = pendingCount
-                pending.finalSeen = true
-                pending.acceptedFinalFrame = frame
-                pending.acceptedFinalStatus = status
-                activeRecord.wire = .finalAccepted
-                activeRecord.finalAcceptedAt = acceptedAt
-                if effect.credits != nil {
-                    activeRecord.outstandingCreditGrantAcknowledgements += 1
-                }
-                if pending.cancelQueued {
-                    queuedControlSends.removeAll { $0.requestIdentity == identity }
-                    pending.cancelQueued = false
-                    updateActivePostAuthRecord(identity) { $0.unselectedControlOwned = false }
-                }
-                pendingResponses[effect.messageId] = pending
-                completeOrdinaryDrainIfReady(messageId: effect.messageId)
-                return
-            }
             if sendPhase == .sent {
                 finishAcceptedFinal(messageId: effect.messageId, frame: frame, status: status)
                 return
@@ -10056,25 +8904,10 @@ actor SMBSession {
     }
 
     private func finishAcceptedFinal(messageId: UInt64, frame: SMBReceivedFrame, status: UInt32) {
-        if let pending = pendingResponses[messageId], pending.usesSenderLoop {
-            guard let activeRecord = activePostAuthRequestRecords[pending.requestIdentity],
-                  pending.sendPhase == .sent,
-                  activeRecord.send == .fullySent,
-                  activeRecord.wire == .finalAccepted,
-                  !pending.cancelQueued,
-                  !pending.cancelSendOwned,
-                  !activeRecord.unselectedControlOwned,
-                  !activeRecord.originalSendOwned,
-                  !activeRecord.selectedCancelOwned,
-                  activeRecord.wireDrainDeadline == nil || pending.wireDrainCompleted else {
-                return
-            }
-        }
         guard var pending = removePendingResponse(messageId: messageId) else { return }
         pending.timeoutTask?.cancel()
         pending.cleanupTimeoutTask?.cancel()
         pending.cleanupDrainTask?.cancel()
-        pending.wireDrainTask?.cancel()
         if let cleanupFileId = pending.cleanupFileId {
             if status == SMB2Status.success {
                 cleanupLedger.removeValue(forKey: cleanupFileId)
@@ -10107,21 +8940,9 @@ actor SMBSession {
     }
 
     private func sendDidSucceed(messageId: UInt64, generation: UInt64) async {
-        if pendingResponses[messageId]?.usesSenderLoop == true {
-            _ = markRequestSent(messageId: messageId, generation: generation)
-            return
-        }
         let target = reconcileSuccessfulSend(messageId: messageId, generation: generation)
         guard let target else { return }
-        if let pending = pendingResponses[messageId], pending.usesSenderLoop {
-            completeOrdinaryDrainIfReady(messageId: messageId)
-            return
-        }
-        do {
-            _ = try await sendCancelWithoutGate(target: target, generation: generation)
-        } catch {
-            handleCancelSendFailure(error, generation: generation)
-        }
+        await sendCancelWithoutGate(target: target, generation: generation)
     }
 
     /// Reconcile the full-send callback with receive correlation already bound to this
@@ -10129,10 +8950,8 @@ actor SMBSession {
     private func reconcileSuccessfulSend(messageId: UInt64, generation: UInt64) -> SMB2Cancel.Target? {
         guard isGenerationActive(generation) else { return nil }
         let target = markRequestSent(messageId: messageId, generation: generation)
-        if hasReaderEligibleResponseOutstanding {
+        if hasSentResponseOutstanding {
             startReaderIfNeeded(generation: generation)
-        } else {
-            makeReaderDormantIfIdle(generation: generation)
         }
         return target
     }
@@ -10142,54 +8961,13 @@ actor SMBSession {
         guard isGenerationActive(generation),
               var pending = pendingResponses[messageId],
               pending.generation == generation else { return nil }
-        if pending.usesSenderLoop,
-           let activeRecord = activePostAuthRequestRecords[pending.requestIdentity],
-           let deadline = activeRecord.wireDrainDeadline,
-           sessionTime.now() >= deadline {
-            pending.wireDrainExpired = true
-            updateActivePostAuthRecord(pending.requestIdentity) { $0.wire = .sessionTerminal }
-            if let timerIdentity = activeRecord.wireDrainTimerIdentity {
-                terminalWireDrainTimerIdentities.insert(timerIdentity)
-            }
-            pendingResponses[messageId] = pending
-            beginWireDrainTerminalization(
-                timerIdentity: activeRecord.wireDrainTimerIdentity,
-                cause: "wire_drain_original_owner_after_deadline",
-                error: SMBTransportError.timedOut
-            )
-            return nil
-        }
-        if pending.usesSenderLoop,
-           pending.cleanupFileId == nil,
-           requestTimeout == nil {
-            requestSentCountForTestingStorage += 1
-            pending.sendPhase = .sent
-            if let activeRecord = activePostAuthRequestRecords[pending.requestIdentity] {
-                activeRecord.send = .fullySent
-                activeRecord.originalSendOwned = false
-            }
-            pendingResponses[messageId] = pending
-            resumeRequestSentCountWaiters()
-            completeOrdinaryDrainIfReady(messageId: messageId)
-            return nil
-        }
         requestSentCountForTestingStorage += 1
         pending.sendPhase = .sent
-        if pending.usesSenderLoop {
-            updateActivePostAuthRecord(pending.requestIdentity) {
-                $0.send = .fullySent
-                $0.originalSendOwned = false
-            }
-        }
         pendingResponses[messageId] = pending
         resumeRequestSentCountWaiters()
         if pending.finalSeen,
            let frame = pending.acceptedFinalFrame,
            let status = pending.acceptedFinalStatus {
-            if pending.usesSenderLoop {
-                completeOrdinaryDrainIfReady(messageId: messageId)
-                return nil
-            }
             finishAcceptedFinal(messageId: messageId, frame: frame, status: status)
             return nil
         }
@@ -10212,10 +8990,6 @@ actor SMBSession {
             )
         }
         pendingResponses[messageId] = pending
-        if pending.usesSenderLoop {
-            completeOrdinaryDrainIfReady(messageId: messageId)
-            return nil
-        }
         guard pendingResponses[messageId]?.cancellationRequested == true else {
             return nil
         }
@@ -10233,14 +9007,10 @@ actor SMBSession {
               current.generation == generation,
               current.timeoutIdentity == identity,
               !current.continuationResumed,
-              !current.cleanupTombstone else {
+              !current.cleanupTombstone,
+              var pending = removePendingResponse(messageId: messageId) else {
             return
         }
-        updateActivePostAuthRecord(current.requestIdentity) {
-            $0.caller = .timedOut
-            $0.wire = .sessionTerminal
-        }
-        guard var pending = removePendingResponse(messageId: messageId) else { return }
         pending.timeoutTask?.cancel()
         pending.timeoutTask = nil
         pending.timeoutIdentity = nil
@@ -10320,9 +9090,6 @@ actor SMBSession {
 
     private func failAllPendingResponses(error: Error) {
         let pending = pendingResponses
-        let queued = queuedPostAuthRequests
-        queuedPostAuthRequests.removeAll()
-        queuedControlSends.removeAll()
         let livePending = pending.filter { !$0.value.continuationResumed }
         if SMBPerfLog.effectiveIsEnabled {
             let details = livePending.sorted { $0.key < $1.key }.prefix(16).map {
@@ -10337,33 +9104,12 @@ actor SMBSession {
             SMBPerfLog.line("[wire] victim session=\(diagnosticSessionId) count=\(pending.count) resumed=\(resumed) pending=\(livePending.count) detail=\(detail)")
         }
         pendingResponses.removeAll()
-        pendingMessageIdByIdentity.removeAll()
-        resumeCancelledRequestDrainWaiters()
-        cancelledBeforeEnqueue.removeAll()
-        for identity in Array(activePostAuthRequestRecords.keys) {
-            updateActivePostAuthRecord(identity) { record in
-                if record.caller == .pending {
-                    record.caller = error is CancellationError ? .cancelled : .transportError
-                }
-                if case .notStarted = record.send { record.send = .neverSubmitted }
-                record.wire = .sessionTerminal
-                record.credit = .discardedOnTerminal
-                record.queuedRequestOwned = false
-                record.unselectedControlOwned = false
-            }
-        }
-        for item in queued {
-            item.continuation.resume(throwing: error)
-        }
+        resumePendingCommandResponseDrainWaiters()
+        activeRequestIdentities.removeAll()
         for var waiter in pending.values {
             waiter.timeoutTask?.cancel()
             waiter.cleanupTimeoutTask?.cancel()
             waiter.cleanupDrainTask?.cancel()
-            if waiter.wireDrainExpired, let timerIdentity = waiter.wireDrainIdentity {
-                terminalWireDrainTimerIdentities.insert(timerIdentity)
-            } else {
-                waiter.wireDrainTask?.cancel()
-            }
             // A cancelled tombstone may still own a blocked send task. It must be cancelled
             // even though its continuation has already been resumed.
             waiter.sendTask?.cancel()
@@ -10420,10 +9166,6 @@ actor SMBSession {
         // would let charge-0 requests inflate the window (each response still grants), so
         // the effective charge is what gets reserved and later refunded on send failure.
         let effectiveCharge = max(1, header.creditCharge)
-        if creditWindow.reserveIfAvailable(charge: effectiveCharge) != nil {
-            debugLine("SMB credit charge=\(effectiveCharge) balance=\(creditWindow.balanceSnapshot)")
-            return effectiveCharge
-        }
         let balance = try await creditWindow.reserve(
             charge: effectiveCharge,
             messageId: header.messageId,
@@ -10438,7 +9180,6 @@ actor SMBSession {
 
     private func claimOrReserveCredit(
         _ packet: [UInt8],
-        header suppliedHeader: SMB2Header? = nil,
         generation: UInt64,
         creditReservation: SMBPreReservedCredit?
     ) async throws -> UInt16 {
@@ -10448,12 +9189,7 @@ actor SMBSession {
         guard isGenerationActive(generation) else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        let header: SMB2Header
-        if let suppliedHeader {
-            header = suppliedHeader
-        } else {
-            header = try SMB2Header.decode(packet)
-        }
+        let header = try SMB2Header.decode(packet)
         guard header.command == SMB2Commands.read || header.command == SMB2Commands.write else {
             throw SMBCodecError.invalidValue("pre-reserved credits are valid only for variable-length READ/WRITE")
         }
@@ -10483,15 +9219,10 @@ actor SMBSession {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
         let maximumCharge = SMB2Credit.charge(forPayloadLength: UInt64(maximumPayloadLength))
-        let charge: UInt16
-        if let immediateCharge = creditWindow.reserveUpToIfAvailable(maximumCharge: maximumCharge) {
-            charge = immediateCharge
-        } else {
-            charge = try await creditWindow.reserveUpTo(
-                maximumCharge: maximumCharge,
-                command: command
-            )
-        }
+        let charge = try await creditWindow.reserveUpTo(
+            maximumCharge: maximumCharge,
+            command: command
+        )
         guard isGenerationActive(generation) else {
             await refundCredit(charge: charge)
             throw wireFailure ?? SMBTransportError.connectionClosed
@@ -10505,8 +9236,8 @@ actor SMBSession {
         }
     }
 
-    private func applyCreditRequest(to packet: inout [UInt8]) {
-        let balance = creditWindow.balanceSnapshot
+    private func applyCreditRequest(to packet: inout [UInt8]) async {
+        let balance = await creditWindow.balance
         SMB2Credit.patchCreditRequest(into: &packet, balance: balance, target: SMB2Credit.targetWindowCredits)
     }
 
@@ -10518,22 +9249,16 @@ actor SMBSession {
     private func recordCreditGrants(_ effects: [SMBValidatedResponseEffect], generation: UInt64) async {
         var totalCredits: UInt64 = 0
         var receiptCount = 0
-        var finalGrantEffects: [SMBValidatedResponseEffect] = []
         for effect in effects {
             guard let credits = effect.credits else { continue }
             totalCredits += UInt64(credits)
             receiptCount += 1
-            if case .final = effect.kind {
-                finalGrantEffects.append(effect)
-            }
         }
-        let balance = await applyCreditGrants(
+        guard let balance = await applyCreditGrants(
             totalCredits: totalCredits,
             receiptCount: receiptCount,
             generation: generation
-        )
-        finalGrantEffects.forEach(acknowledgeFinalCreditGrant)
-        guard let balance else { return }
+        ) else { return }
         for effect in effects {
             if let credits = effect.credits {
                 debugLine("SMB response credit grant=\(credits) balance=\(balance)")
@@ -10544,21 +9269,19 @@ actor SMBSession {
     private func recordCreditGrants(_ effects: SMBValidatedResponseBatch, generation: UInt64) async {
         switch effects {
         case .single(let effect):
-            await recordCreditGrant(effect, generation: generation)
+            await recordCreditGrant(effect.credits, generation: generation)
         case .compound(let compoundEffects):
             await recordCreditGrants(compoundEffects, generation: generation)
         }
     }
 
-    private func recordCreditGrant(_ effect: SMBValidatedResponseEffect, generation: UInt64) async {
-        guard let credits = effect.credits else { return }
-        let balance = await applyCreditGrants(
-            totalCredits: UInt64(credits),
-            receiptCount: 1,
-            generation: generation
-        )
-        acknowledgeFinalCreditGrant(for: effect)
-        guard let balance else { return }
+    private func recordCreditGrant(_ credits: UInt16?, generation: UInt64) async {
+        guard let credits,
+              let balance = await applyCreditGrants(
+                  totalCredits: UInt64(credits),
+                  receiptCount: 1,
+                  generation: generation
+              ) else { return }
         debugLine("SMB response credit grant=\(credits) balance=\(balance)")
     }
 
@@ -10568,16 +9291,8 @@ actor SMBSession {
         generation: UInt64
     ) async -> UInt32? {
         guard receiptCount > 0, isGenerationActive(generation) else { return nil }
-        let balance: UInt32
-        if let immediateBalance = creditWindow.grantIfUncontended(
-            totalCredits: totalCredits,
-            receiptCount: receiptCount
-        ) {
-            balance = immediateBalance
-        } else {
-            balance = await creditWindow.grant(totalCredits: totalCredits, receiptCount: receiptCount)
-        }
-        if let hook = creditGrantAfterAwaitHookForTesting { await hook() }
+        let balance = await creditWindow.grant(totalCredits: totalCredits, receiptCount: receiptCount)
+        await creditGrantAfterAwaitHookForTesting?()
         guard isGenerationActive(generation) else { return nil }
         return balance
     }
@@ -10625,17 +9340,8 @@ actor SMBSession {
     /// MS-SMB2 §3.2.4.1.6: the next MessageId must advance by the CreditCharge of the
     /// request being sent, so a multi-credit READ/WRITE consumes `charge` sequence numbers.
     private func nextMessageId(charge: UInt16 = 1) -> UInt64 {
-        if postAuthActive {
-            return Self.postAuthMessageIdPlaceholder
-        }
         defer { messageId += UInt64(max(1, charge)) }
         return messageId
-    }
-
-    private func commitNextMessageId(charge: UInt16) -> UInt64 {
-        let selected = messageId
-        messageId += UInt64(max(1, charge))
-        return selected
     }
 
     private func nextTransformNonce(length: Int = 11) -> [UInt8] {

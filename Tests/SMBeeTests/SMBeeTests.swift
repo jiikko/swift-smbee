@@ -6079,10 +6079,10 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(entries, [SMBDirectoryEntry(name: "a.txt", fileSize: 1, isDirectory: false, attributes: 0x80)])
     }
 
-    func testWatchAutoReconnectResubscribesAfterReconnectableFailureAndEmitsOverflow() async throws {
+    func testWatchAutoReconnectResubscribesAfterConnectionDropAndEmitsOverflow() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        // Transport #1: auth + tree + CREATE for the watch, then the CHANGE_NOTIFY receives
-        // STATUS_NETWORK_NAME_DELETED, triggering reconnect through a deterministic server error.
+        // Transport #1: auth + tree + CREATE for the watch, then drains — the CHANGE_NOTIFY
+        // long-poll receive hits connectionClosed, triggering reconnect.
         // Transport #2: fresh auth + tree + CREATE + a real ADDED notification.
         // Transport #2 parks after delivering the notification (rather than draining) so the
         // resubscribed watch stays blocked on its next long-poll until the test cancels,
@@ -6099,19 +6099,7 @@ final class SMBeeTests: XCTestCase {
         let factory = TransportFactorySequence([
             SMBValidateNegotiateScriptTransport(
                 inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
-                    smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
-                    smb2StatusResponse(
-                        status: SMB2Status.networkNameDeleted,
-                        command: SMB2Commands.changeNotify,
-                        messageId: 5,
-                        treeId: 0x3344
-                    ),
-                    smb2StatusResponse(
-                        status: SMB2Status.success,
-                        command: SMB2Commands.close,
-                        messageId: 6,
-                        treeId: 0x3344
-                    )
+                    smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344)
                 ]),
                 blockWhenDrained: false
             ),
@@ -10631,7 +10619,6 @@ final class SMBeeTests: XCTestCase {
             credential: SMBCredential(username: "user", password: "pass"),
             transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
         )
-        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
 
         try await clientSession.startKeepAlive(interval: .milliseconds(50))
@@ -10643,8 +10630,11 @@ final class SMBeeTests: XCTestCase {
         let echoHeader = try SMB2Header.decode(echoRequest)
         let closeTask = Task { await clientSession.close() }
 
-        try await awaitWithTimeout("close registers the cancelled request drain") {
-            await session.waitForCancelledResponseDrainWaiterCountForTesting(atLeast: 1)
+        try await awaitWithTimeout("close registers the in-flight ECHO drain") {
+            await session.waitForPendingCommandResponseDrainWaiterCountForTesting(
+                command: SMB2Commands.echo,
+                atLeast: 1
+            )
         }
         try await waitForOutboundFrameCount(2, transport: transport)
         let outboundBeforeEchoFinal = try unframed(transport.outbound)
@@ -10684,16 +10674,14 @@ final class SMBeeTests: XCTestCase {
 
     func testClientSessionCloseSkipsGracefulTeardownWhenKeepAliveEchoNeverDrains() async throws {
         let transport = ControlledReceiveTransport()
-        let clock = SMBActivationTestClock()
+        let clock = ManualSMBSleeper()
         let session = SMBSession(
             host: "server", port: 445,
             credential: SMBCredential(username: "user", password: "pass"),
             transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16),
             cleanupTimeout: .seconds(5),
-            wireDrainGrace: .seconds(5),
-            sessionTime: clock.source
+            cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
         )
-        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
 
         try await clientSession.startKeepAlive(interval: .milliseconds(50))
@@ -10702,15 +10690,22 @@ final class SMBeeTests: XCTestCase {
             await session.waitForRequestSentCountForTesting(atLeast: 1)
         }
         let closeTask = Task { await clientSession.close() }
-        try await awaitWithTimeout("close registers the cancelled request drain") {
-            await session.waitForCancelledResponseDrainWaiterCountForTesting(atLeast: 1)
+        try await awaitWithTimeout("close registers the in-flight ECHO drain") {
+            await session.waitForPendingCommandResponseDrainWaiterCountForTesting(
+                command: SMB2Commands.echo,
+                atLeast: 1
+            )
         }
         try await awaitWithTimeout("ECHO drain deadline armed") {
-            await clock.waitForSleepCount(atLeast: 1)
+            try await clock.waitUntilCallCount(
+                atLeast: 1,
+                timeout: .seconds(1),
+                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
+            )
         }
         // The ECHO final never arrives: the deadline closes the wire instead of sending
         // TREE_DISCONNECT / LOGOFF across the unresolved request.
-        clock.advance(by: .seconds(5), resumeDueSleeps: true)
+        clock.fireNext()
         try await awaitWithTimeout("close after ECHO drain timeout") { await closeTask.value }
 
         let transportClosed = await session.isTransportClosedForTesting()
@@ -10718,79 +10713,6 @@ final class SMBeeTests: XCTestCase {
         let commands = try unframed(transport.outbound).map { try SMB2Header.decode($0).command }
         XCTAssertFalse(commands.contains(SMB2Commands.treeDisconnect), "\(commands)")
         XCTAssertFalse(commands.contains(SMB2Commands.logoff), "\(commands)")
-    }
-
-    func testClientCloseJoinsReaderWhenCancelledDrainTurnsTerminal() async throws {
-        let transport = ControlledReceiveTransport()
-        let clock = SMBActivationTestClock()
-        let session = SMBSession(
-            host: "server", port: 445,
-            credential: SMBCredential(username: "user", password: "pass"),
-            transport: transport,
-            signingKey: Array(repeating: UInt8(0x11), count: 16),
-            cleanupTimeout: .seconds(5),
-            wireDrainGrace: .seconds(5),
-            sessionTime: clock.source
-        )
-        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
-        let exitGate = SMBReaderTaskExitGate()
-        defer { exitGate.releaseAll() }
-        await session.setReaderTaskExitHookForTesting { handle in await exitGate.hold(handle) }
-        let closeJoinSnapshots = SMBContinuationCountBarrier()
-        await session.setReaderTaskJoinSnapshotHookForTesting { _ in closeJoinSnapshots.signal() }
-        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
-
-        try await clientSession.startKeepAlive(interval: .milliseconds(10))
-        try await waitForOutboundFrameCount(1, transport: transport)
-        let closeCompletions = SMBContinuationCountBarrier()
-        let firstClose = Task {
-            await clientSession.close()
-            closeCompletions.signal()
-        }
-        try await awaitWithTimeout("client close waits for its cancelled ECHO drain") {
-            await session.waitForCancelledResponseDrainWaiterCountForTesting(atLeast: 1)
-        }
-        try await awaitWithTimeout("client close arms the ECHO drain deadline") {
-            await clock.waitForSleepCount(atLeast: 1)
-        }
-
-        let secondCloseJoined = SMBContinuationCountBarrier()
-        let secondClose = Task {
-            await clientSession.closeForTesting { event in
-                if event == .joinedExistingCleanup { secondCloseJoined.signal() }
-            }
-            closeCompletions.signal()
-        }
-        try await awaitWithTimeout("second client close joins the in-flight cleanup") {
-            try await secondCloseJoined.waitForCount(1)
-        }
-
-        clock.advance(by: .seconds(5), resumeDueSleeps: true)
-        try await awaitWithTimeout("terminal reader reaches the controlled exit hook") {
-            try await exitGate.waitForCount(
-                1,
-                timeout: .seconds(1),
-                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
-            )
-        }
-        try await awaitWithTimeout("terminalizer and client close both snapshot the reader join") {
-            try await closeJoinSnapshots.waitForCount(
-                2,
-                timeout: .seconds(1),
-                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
-            )
-        }
-        XCTAssertEqual(closeCompletions.currentCount, 0, "both client closes must remain pending while reader exit is held")
-
-        exitGate.releaseAll()
-        try await awaitWithTimeout("both client close calls finish after reader exit") {
-            try await closeCompletions.waitForCount(2)
-        }
-        await firstClose.value
-        await secondClose.value
-        XCTAssertEqual(transport.closeCount, 1)
-        await session.setReaderTaskExitHookForTesting(nil)
-        await session.setReaderTaskJoinSnapshotHookForTesting(nil)
     }
 
     func testCancelledParkedEchoDoesNotSendStaleFrameAfterCreditGrant() async throws {

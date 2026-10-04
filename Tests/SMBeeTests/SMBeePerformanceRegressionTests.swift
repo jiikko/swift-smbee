@@ -311,20 +311,7 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
     private let fileId = Array(UInt8(0)..<UInt8(16))
     private let credential = SMBCredential(username: "user", password: "pass")
     private let signingKey = Array(repeating: UInt8(0x11), count: 16)
-    private let benchmarkSessionId: UInt64 = 0x1122_3344_5566_7788
     private let initialCredits: UInt32 = 1
-
-    func testPerformanceConnectFixtureUsesSMB302FixedCMACBeforeMeasuredIO() async throws {
-        let inbound = try framed(benchmarkConnectionResponses())
-        let transport = PerformanceInMemoryTransport(inbound: inbound)
-        let client = try await makeAuthenticatedPerformanceSession(transport: transport)
-        let wireSession = await client.wireSessionForTesting()
-        let signingState = await wireSession.performanceSigningStateForTesting()
-        XCTAssertEqual(signingState.dialect, SMBNegotiateConstants.dialect302)
-        XCTAssertEqual(signingState.algorithm, "AES-CMAC")
-        XCTAssertEqual(signingState.key, signingKey)
-        try assertBenchmarkConnectionCompletedBeforeMeasuredIO(transport)
-    }
 
     func testSyntheticReadStreamResourceUsage() async throws {
         try requireReleaseConfiguration()
@@ -506,31 +493,30 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         let chunkSize = 64 * 1024
         let lengths = chunkLengths(fileSize: size, chunkSize: chunkSize)
         let inbound = try framed(
-            benchmarkConnectionResponses() + [
-                try smb2CreateResponse(fileId: fileId, messageId: 5, treeId: treeId, sessionId: benchmarkSessionId),
-                try smb2QueryInfoResponse(
-                    size: UInt64(size), messageId: 6, treeId: treeId, sessionId: benchmarkSessionId
-                )
+            [
+                try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId),
+                try smb2QueryInfoResponse(size: UInt64(size), messageId: 1, treeId: treeId)
             ] + lengths.enumerated().map { index, length in
                 try smb2ReadResponse(
                     Array(repeating: UInt8(index & 0xff), count: length),
-                    messageId: UInt64(index + 7),
-                    treeId: treeId,
-                    sessionId: benchmarkSessionId
+                    messageId: UInt64(index + 2),
+                    treeId: treeId
                 )
             } + [
                 try smb2StatusResponse(
                     status: SMB2Status.success,
                     command: SMB2Commands.close,
-                    messageId: UInt64(lengths.count + 7),
-                    treeId: treeId,
-                    sessionId: benchmarkSessionId
+                    messageId: UInt64(lengths.count + 2),
+                    treeId: treeId
                 )
             ]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound)
-        let client = try await makeAuthenticatedPerformanceSession(transport: transport)
-        try assertBenchmarkConnectionCompletedBeforeMeasuredIO(transport)
+        let session = SMBSession(
+            host: "server", port: 445, credential: credential, transport: transport,
+            signingKey: signingKey, initialCredits: initialCredits
+        )
+        let client = SMBClientSession(session: session, treeId: treeId)
         let sink = CountingChunkSink()
         let before = ResourceUsageSnapshot.current()
         let start = ContinuousClock.now
@@ -555,32 +541,30 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         let chunkSize = 64 * 1024
         let lengths = chunkLengths(fileSize: size, chunkSize: chunkSize)
         let inbound = try framed(
-            benchmarkConnectionResponses() + [
-                try smb2CreateResponse(fileId: fileId, messageId: 5, treeId: treeId, sessionId: benchmarkSessionId)
-            ] + lengths.enumerated().map { index, length in
-                    try smb2WriteResponse(
-                        count: length, messageId: UInt64(index + 6), treeId: treeId, sessionId: benchmarkSessionId
-                    )
+            [try smb2CreateResponse(fileId: fileId, messageId: 0, treeId: treeId)]
+                + lengths.enumerated().map { index, length in
+                    try smb2WriteResponse(count: length, messageId: UInt64(index + 1), treeId: treeId)
                 } + [
                     try smb2StatusResponse(
                         status: SMB2Status.success,
                         command: SMB2Commands.flush,
-                        messageId: UInt64(lengths.count + 6),
-                        treeId: treeId,
-                        sessionId: benchmarkSessionId
+                        messageId: UInt64(lengths.count + 1),
+                        treeId: treeId
                     ),
                     try smb2StatusResponse(
                         status: SMB2Status.success,
                         command: SMB2Commands.close,
-                        messageId: UInt64(lengths.count + 7),
-                        treeId: treeId,
-                        sessionId: benchmarkSessionId
+                        messageId: UInt64(lengths.count + 2),
+                        treeId: treeId
                     )
                 ]
         )
         let transport = PerformanceInMemoryTransport(inbound: inbound, retainOutbound: retainOutbound)
-        let client = try await makeAuthenticatedPerformanceSession(transport: transport)
-        try assertBenchmarkConnectionCompletedBeforeMeasuredIO(transport)
+        let session = SMBSession(
+            host: "server", port: 445, credential: credential, transport: transport,
+            signingKey: signingKey, initialCredits: initialCredits
+        )
+        let client = SMBClientSession(session: session, treeId: treeId)
         let payload = Array(repeating: UInt8(0xa5), count: size)
         let before = ResourceUsageSnapshot.current()
         let start = ContinuousClock.now
@@ -589,53 +573,6 @@ final class SMBeeResourcePerformanceTests: XCTestCase {
         let after = ResourceUsageSnapshot.current()
         XCTAssertGreaterThan(transport.sentByteCount, size)
         return ResourcePerformanceSample(size: size, elapsedSeconds: elapsed, before: before, after: after)
-    }
-
-    private func makeAuthenticatedPerformanceSession(
-        transport: PerformanceInMemoryTransport
-    ) async throws -> SMBClientSession {
-        // Keep negotiation, authentication, and tree setup on the real session path. Install the
-        // fixed benchmark key after SESSION_SETUP and before TREE_CONNECT's signed validation
-        // exchange so the measured requests use the same AES-CMAC key and algorithm as master.
-        let session = SMBSession(
-            host: "server",
-            port: 445,
-            credential: credential,
-            transport: transport,
-            initialCredits: initialCredits
-        )
-        try await session.connect()
-        try await session.installPerformanceSigningStateForTesting(key: signingKey)
-        let connectedTreeId = try await session.treeConnect(share: "share")
-        return SMBClientSession(session: session, treeId: connectedTreeId)
-    }
-
-    private func benchmarkConnectionResponses() throws -> [[UInt8]] {
-        [
-            try smb302NegotiateResponse(messageId: 0),
-            try sessionSetupChallengeResponse(messageId: 1, sessionId: benchmarkSessionId),
-            try sessionSetupSuccessResponse(messageId: 2, sessionId: benchmarkSessionId),
-            try smb2TreeConnectResponse(treeId: treeId, sessionId: benchmarkSessionId),
-            try signedPerformanceValidateNegotiateResponse(
-                messageId: 4,
-                treeId: treeId,
-                sessionId: benchmarkSessionId,
-                signingKey: signingKey
-            )
-        ]
-    }
-
-    private func assertBenchmarkConnectionCompletedBeforeMeasuredIO(
-        _ transport: PerformanceInMemoryTransport
-    ) throws {
-        let commands = try unframed(transport.endSetupRecording()).map { try SMB2Header.decode($0).command }
-        XCTAssertEqual(commands, [
-            SMBNegotiateConstants.commandNegotiate,
-            SMB2Commands.sessionSetup,
-            SMB2Commands.sessionSetup,
-            SMB2Commands.treeConnect,
-            SMB2Commands.ioctl
-        ], "NEGOTIATE, SESSION_SETUP, TREE_CONNECT, and SMB 3.0.x validation must finish before measured I/O")
     }
 
     private func printWriteProfile(stage: String, samples: [Double]) {
@@ -807,10 +744,6 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
     private var inbound: [UInt8]
     private var inboundOffset = 0
     private var outboundStorage: [UInt8] = []
-    // Connection setup is recorded separately so the setup check also works when the timed
-    // I/O does not retain outbound bytes; recording stops before measurement starts.
-    private var setupStorage: [UInt8] = []
-    private var recordingSetup = true
     private var sentBytes = 0
     private let retainOutbound: Bool
 
@@ -822,14 +755,6 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
 
     var sentByteCount: Int {
         lock.withLock { sentBytes }
-    }
-
-    /// Returns the bytes sent so far during connection setup and stops recording them.
-    func endSetupRecording() -> [UInt8] {
-        lock.withLock {
-            recordingSetup = false
-            return setupStorage
-        }
     }
 
     init(inbound: [UInt8], retainOutbound: Bool = true) {
@@ -847,9 +772,6 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
         try Task.checkCancellation()
         lock.withLock {
             sentBytes += bytes.count
-            if recordingSetup {
-                setupStorage.append(contentsOf: bytes)
-            }
             if retainOutbound {
                 outboundStorage.append(contentsOf: bytes)
             }
@@ -860,11 +782,6 @@ private final class PerformanceInMemoryTransport: SMBTransport, @unchecked Senda
         try Task.checkCancellation()
         lock.withLock {
             sentBytes += segments.reduce(0) { $0 + $1.count }
-            if recordingSetup {
-                for segment in segments {
-                    setupStorage.append(contentsOf: segment)
-                }
-            }
             if retainOutbound {
                 for segment in segments {
                     outboundStorage.append(contentsOf: segment)
@@ -1004,24 +921,16 @@ private func hexBytes(_ string: String) -> [UInt8] {
     return bytes
 }
 
-private func smb2CreateResponse(
-    fileId: [UInt8], messageId: UInt64, treeId: UInt32, sessionId: UInt64 = 0
-) throws -> [UInt8] {
-    var response = try SMB2Header(
-        command: SMB2Commands.create, messageId: messageId, treeId: treeId, sessionId: sessionId
-    ).encode()
+private func smb2CreateResponse(fileId: [UInt8], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+    var response = try SMB2Header(command: SMB2Commands.create, messageId: messageId, treeId: treeId).encode()
     response.append(contentsOf: Array(repeating: UInt8(0), count: 88))
     writeUInt16LE(89, to: &response, at: 64)
     response.replaceSubrange(128..<144, with: fileId)
     return response
 }
 
-private func smb2ReadResponse(
-    _ payload: [UInt8], messageId: UInt64, treeId: UInt32, sessionId: UInt64 = 0
-) throws -> [UInt8] {
-    var response = try SMB2Header(
-        command: SMB2Commands.read, messageId: messageId, treeId: treeId, sessionId: sessionId
-    ).encode()
+private func smb2ReadResponse(_ payload: [UInt8], messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+    var response = try SMB2Header(command: SMB2Commands.read, messageId: messageId, treeId: treeId).encode()
     response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
     writeUInt16LE(17, to: &response, at: 64)
     response[66] = 80
@@ -1030,26 +939,18 @@ private func smb2ReadResponse(
     return response
 }
 
-private func smb2WriteResponse(
-    count: Int, messageId: UInt64, treeId: UInt32, sessionId: UInt64 = 0
-) throws -> [UInt8] {
-    var response = try SMB2Header(
-        command: SMB2Commands.write, messageId: messageId, treeId: treeId, sessionId: sessionId
-    ).encode()
+private func smb2WriteResponse(count: Int, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+    var response = try SMB2Header(command: SMB2Commands.write, messageId: messageId, treeId: treeId).encode()
     response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
     writeUInt16LE(17, to: &response, at: 64)
     writeUInt32LE(UInt32(count), to: &response, at: 68)
     return response
 }
 
-private func smb2QueryInfoResponse(
-    size: UInt64, messageId: UInt64, treeId: UInt32, sessionId: UInt64 = 0
-) throws -> [UInt8] {
+private func smb2QueryInfoResponse(size: UInt64, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
     var payload = Array(repeating: UInt8(0), count: 56)
     writeUInt64LE(size, to: &payload, at: 40)
-    var response = try SMB2Header(
-        command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId, sessionId: sessionId
-    ).encode()
+    var response = try SMB2Header(command: SMB2Commands.queryInfo, messageId: messageId, treeId: treeId).encode()
     response.append(contentsOf: Array(repeating: UInt8(0), count: 8))
     writeUInt16LE(9, to: &response, at: 64)
     writeUInt16LE(72, to: &response, at: 66)
@@ -1060,75 +961,14 @@ private func smb2QueryInfoResponse(
 
 // SESSION_SETUP success response body (MS-SMB2 §2.2.6): StructureSize=9, SessionFlags,
 // SecurityBufferOffset, SecurityBufferLength. The client decodes SessionFlags from the final response.
-private func sessionSetupSuccessResponse(
-    messageId: UInt64, sessionFlags: UInt16 = 0, sessionId: UInt64 = 0
-) throws -> [UInt8] {
-    var response = try SMB2Header(
-        command: SMB2Commands.sessionSetup, messageId: messageId, sessionId: sessionId
-    ).encode()
+private func sessionSetupSuccessResponse(messageId: UInt64, sessionFlags: UInt16 = 0) throws -> [UInt8] {
+    var response = try SMB2Header(command: SMB2Commands.sessionSetup, messageId: messageId).encode()
     response.append(contentsOf: [9, 0, UInt8(sessionFlags & 0xff), UInt8(sessionFlags >> 8), 72, 0, 0, 0])
     return response
 }
 
-private func smb302NegotiateResponse(messageId: UInt64) throws -> [UInt8] {
-    var response = try SMB2Header(command: SMBNegotiateConstants.commandNegotiate, messageId: messageId).encode()
-    response.append(contentsOf: Array(repeating: 0, count: 65))
-    writeUInt16LE(65, to: &response, at: 64)
-    writeUInt16LE(SMBNegotiateConstants.signingEnabled, to: &response, at: 66)
-    writeUInt16LE(SMBNegotiateConstants.dialect302, to: &response, at: 68)
-    response.replaceSubrange(72..<88, with: Array(repeating: 0x42, count: 16))
-    writeUInt32LE(0, to: &response, at: 88)
-    writeUInt32LE(1_048_576, to: &response, at: 92)
-    writeUInt32LE(1_048_576, to: &response, at: 96)
-    writeUInt32LE(1_048_576, to: &response, at: 100)
-    return response
-}
-
-private func signedPerformanceValidateNegotiateResponse(
-    messageId: UInt64,
-    treeId: UInt32,
-    sessionId: UInt64,
-    signingKey: [UInt8]
-) throws -> [UInt8] {
-    var response = try SMB2Header(
-        command: SMB2Commands.ioctl,
-        flags: 0x0000_0009,
-        messageId: messageId,
-        treeId: treeId,
-        sessionId: sessionId
-    ).encode()
-    var body = Array(repeating: UInt8(0), count: 48)
-    writeUInt16LE(49, to: &body, at: 0)
-    writeUInt32LE(SMB2ValidateNegotiateInfo.ctlCode, to: &body, at: 4)
-    body.replaceSubrange(8..<24, with: SMB2ValidateNegotiateInfo.fileId)
-    writeUInt32LE(112, to: &body, at: 32)
-    writeUInt32LE(24, to: &body, at: 36)
-    response.append(contentsOf: body)
-    var output = Array(repeating: UInt8(0), count: 24)
-    writeUInt32LE(0, to: &output, at: 0)
-    output.replaceSubrange(4..<20, with: Array(repeating: 0x42, count: 16))
-    writeUInt16LE(SMBNegotiateConstants.signingEnabled, to: &output, at: 20)
-    writeUInt16LE(SMBNegotiateConstants.dialect302, to: &output, at: 22)
-    response.append(contentsOf: output)
-
-    var normalized = response
-    normalized.replaceSubrange(48..<64, with: Array(repeating: 0, count: 16))
-    let signature = try SMBSessionSigning.signatureForNormalizedPacket(
-        algorithm: .aesCMAC,
-        key: signingKey,
-        packet: normalized,
-        sender: .server
-    )
-    response.replaceSubrange(48..<64, with: signature)
-    return response
-}
-
-private func smb2StatusResponse(
-    status: UInt32, command: UInt16, messageId: UInt64, treeId: UInt32, sessionId: UInt64 = 0
-) throws -> [UInt8] {
-    try SMB2Header(
-        status: status, command: command, messageId: messageId, treeId: treeId, sessionId: sessionId
-    ).encode()
+private func smb2StatusResponse(status: UInt32, command: UInt16, messageId: UInt64, treeId: UInt32) throws -> [UInt8] {
+    try SMB2Header(status: status, command: command, messageId: messageId, treeId: treeId).encode()
 }
 
 private func negotiateResponse(messageId: UInt64) throws -> [UInt8] {
@@ -1190,10 +1030,8 @@ private func sessionSetupChallengeResponse(messageId: UInt64, sessionId: UInt64)
     return response
 }
 
-private func smb2TreeConnectResponse(treeId: UInt32, sessionId: UInt64 = 0) throws -> [UInt8] {
-    var response = try SMB2Header(
-        command: SMB2Commands.treeConnect, messageId: 3, treeId: treeId, sessionId: sessionId
-    ).encode()
+private func smb2TreeConnectResponse(treeId: UInt32) throws -> [UInt8] {
+    var response = try SMB2Header(command: SMB2Commands.treeConnect, messageId: 3, treeId: treeId).encode()
     response.append(contentsOf: Array(repeating: UInt8(0), count: 16))
     writeUInt16LE(16, to: &response, at: 64)
     response[66] = 1

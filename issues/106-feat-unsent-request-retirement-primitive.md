@@ -141,9 +141,17 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - source の形を見るテスト（`testSourceShapeSenderLoopHasNoNestedTasksOrGlobalExecutorHops`）は射程が狭い。
 - codex の週の枠が 99%（2026-10-05）で、10-10 までは Claude で進める。
 
-### 次
+### 次（2026-10-05 にいったん停止。ユーザー判断）
 
-- Commit 3: 新しい送信経路の有効化、取消、wire の drain の期限、reader の後始末（設計の §2.3・§4・Commit 3 節。issue 010 の P2-2 を含む）。
+- Commit 3 を入れ直す。条件は上の「Commit 3」節の「入れ直しの条件」。
+  - 実装は 3d6eace に残っている（master の履歴の中。revert は 5b0d6c9）。
+  - 再開の手順:
+    1. `git revert 5b0d6c9` 相当で戻した差分を worktree に取り出す。
+    2. CI の Linux x86 で user CPU +46% の原因を profile で特定して削る。
+    3. flaky なテストを直す。
+  - x86 で測る手段が要る。branch に push して workflow_dispatch で Performance を回す案は、branch を切るので
+    ユーザーの許可が要る（この repo は指示なしに branch を切らない）。
+- Commit 4（069 M2）と Commit 5（pipelining）は、Commit 3 の上に積むので待つ。
 
 ## 関連
 

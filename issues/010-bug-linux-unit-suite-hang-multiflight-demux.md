@@ -730,3 +730,7 @@ actor の中で reader を回す試作は改善せず戻した。
     - テスト: fake が「送信を試みた」を「送信が保留に登録された」と取り違えていた。
   - 直した後の stress は macOS 60 回・Linux 10 回で失敗 0。CI は Test / E2E / Performance とも success。
   - cancel 済みの他の request の drain は、issue 106 の Commit 3 で一般化する。
+- 2026-10-05: issue 106 の Commit 3 は revert した（CI の Linux x86 で read −22% / user CPU +46%）。
+  そのため、M3 の P2-2（cancel の後に final が来ないと、reader が session を保持し続ける）は**未対応のまま**。
+  - いま master にあるのは、keepalive の ECHO だけを close で待つ修正（上の fix）まで。
+  - 状態: M3 は master に入っている。残りは M4（上の「M4 の残り」）と P2-2（issue 106 の Commit 3 の入れ直しで閉じる）。

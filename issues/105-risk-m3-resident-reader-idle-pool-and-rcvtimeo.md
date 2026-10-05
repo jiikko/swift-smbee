@@ -71,6 +71,10 @@ M3 の入れ直しの前提条件にするかは、下の再現テストで実�
   - 2（SO_RCVTIMEO）は、idle 中の切断は消えて master と同じ状態に戻る。long-poll が outstanding の間に `.timedOut` になる根は
     master にもあり、残る。
 
-- [ ] 1 の再現テスト
+- 2026-10-05: 需要駆動の reader（受信ループは session actor 上で、応答待ちがある間だけ動く）は M3 の入れ直し（b809c9b）で master に入った。
+  - idle 中は transport.receive に入らない。docs/architecture.md の「session の reader」節にも書いた。
+  - 1 は構造上は起きない見込みだが、再現テストで確かめてはいない。
+  - 2 の idle 中の切断は起きない（idle 中に受信しない）。long-poll 中の `.timedOut` は master と同じで残る。
+- [ ] 1 の再現テスト（需要駆動の reader の下で、idle の session が pool のスレッドを占有しないことの確認）
 - [ ] 2 の再現テスト
 - [ ] 扱いの決定

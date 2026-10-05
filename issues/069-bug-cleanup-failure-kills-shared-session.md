@@ -155,3 +155,11 @@ CANCEL request failed: connectionClosed
 ### 再開の条件（M2）
 
 TREE_DISCONNECT の期限切れで共有 session が落ちたことが観測されたとき、または `withTree` の後始末の結果を API に反映する要求が出たとき。
+
+## 2026-10-05: M2 は issue 106 の Commit 4 として設計に統合した
+
+- issue 106 の承認済み設計（§4.2 の cleanup の soft / hard の期限、§6 の 069 M2 との依存・順序）が、M2 の設計
+  （TreeId の隔離、Tree 単位の credit waiter の解除、File の CLOSE と Tree の隔離の ledger）を取り込んだ。
+  - 元の M2 の設計と敵対レビューの指摘 N1〜N5 も、ここに反映済み。
+- M2 は issue 106 の Commit 4 で実装する。Commit 4 は Commit 3（新しい送信経路）の上に積む。
+- Commit 3 は 2026-10-05 に revert して、いったん停止した。M2 もそれまで待つ。

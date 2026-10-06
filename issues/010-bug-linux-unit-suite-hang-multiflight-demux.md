@@ -377,7 +377,7 @@ D3 が出した改訂 13 件は `[D2 v2]` として設計に反映済み（設�
 | M2 | `sendPhase` 導入・`sentResponseMessageIds` 撤去（reader は現行のまま） | **完了**（2026-09-09） |
 | M3 | long-lived reader 導入（生存条件の切断・weak 捕捉・generation・close/deinit） | 一度 master に入れたが **revert**（2026-10-03、Linux の性能退行。下の「進捗チェックポイント — M3」） |
 | M4 | transport 契約 + fixture 移行 + credit 循環の回帰テスト | **完了**（2026-10-06。下の「M4 の残り」） |
-| M5 | 全体検証（macOS / Linux / E2E smoke / verify-agent-push） | 未完（M3 の入れ直しの後） |
+| M5 | 全体検証（macOS / Linux / E2E smoke / verify-agent-push） | **完了**（2026-10-06。M4 の tip で verify-agent-push rc=0） |
 
 M2 で最初に触るべき箇所（D3 + Claude の実測）: `pendingResponses` に tombstone を混在させると
 意味が変わる **5 箇所** — `:5471` `:5480` `:5488` `:5515`（count ベースの待機・観測）と
@@ -567,8 +567,9 @@ commit `feat(session): issue 010 M3 — session が所有する常駐 reader で
 - [x] fixture: `InMemoryTransportMode.waitUntilClosed` は M3 で入っている。既定は `.sendGatedWaitUntilClosed`
   （設計時の「既定は `.eofWhenDrained`」から変わった）。`ControlledReceiveTransport`（`SMBeeTests.swift`）の receive は
   `withTaskCancellationHandler` を持つ。
-- [ ] M5: push 後の `verify-agent-push`（性能の対応比較の gate を含む）
-  - 2026-10-06: strict SwiftLint（変更したファイル）と `make smoke`（3 profile）は通過。Linux unit は CI の Test job で見る。
+- [x] M5: push 後の `verify-agent-push`（性能の対応比較の gate を含む）
+  - 2026-10-06: strict SwiftLint（変更したファイル）と `make smoke`（3 profile）は通過。
+  - `bin/ci/verify-agent-push`（commit `docs(issue): 010 — M4 の完了 …` の tip）が rc=0。Test（Linux unit を含む）/ E2E / Performance とも success。
 - P2-2（cancel の後に final が来ないと reader が session を保持し続ける）は、この M4 では扱わない。
   issue 106 の Commit 3（revert 済み、再開はユーザー判断待ち）の drain の期限で閉じる予定のまま。
 

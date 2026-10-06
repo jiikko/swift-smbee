@@ -21,10 +21,16 @@ public protocol SMBTransport: Sendable {
     /// Sends the concatenation of all segments as one logical byte stream. It has the same
     /// non-interleaving and unspecified concurrent-order contract as `send(_:)`.
     func send(_ segments: [[UInt8]]) async throws
+
+    /// Returns up to `maxLength` bytes, waiting until at least one byte is available. An empty
+    /// array means peer EOF. `SMBSession` keeps a receive pending while responses are
+    /// outstanding and relies on `close()` to wake it, so a receive that is waiting when
+    /// `close()` is called must return (empty or throwing) without waiting for the peer.
     func receive(maxLength: Int) async throws -> [UInt8]
 
     /// Terminal and idempotent. Closing must make already-issued connect, send, and receive
     /// operations return without depending on a peer response, and future I/O must fail.
+    /// A closed transport is never reopened; reconnecting uses a new transport instance.
     func close()
 }
 

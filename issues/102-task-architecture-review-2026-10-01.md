@@ -129,3 +129,37 @@ VALIDATE_NEGOTIATE_INFO の匿名の例外と同じ方針）。#7 の設計・�
 - #18 R7: 旧シグネチャを function value として参照するとコンパイルできなくなる。docs/api-stability.md が保証しないと明記済み
 - #17: setup の期限切れで共有 transport を閉じると進行中の他の操作も巻き込む。親の close が始まった後に限られ、close は既存操作の完了を保証しない契約なので不具合としない
 - RTT 計測の P2-5（測定中に外部プロセスが tc を変えて戻す）: 脅威モデルの外として script のヘッダと docs に記録
+
+## 進捗チェックポイント — #14 #15 #16 READ / WRITE の pipelining（2026-10-07 着手、codex-drive）
+
+before の実測は `docs/performance-resource-baseline.md` の「2026-10-02: 追加 RTT ごとの Samba 転送 baseline（パイプライン化前）」
+（RTT 20 ms の 64 MiB read 45.0 MiB/s = 1 MiB / 1 往復の上限）。
+
+承認済みの設計（2026-10-07、ユーザー承認。D1 の独立 4 案 → D1.5 のクロス批評 → D2 の詳細設計 → D3 の発見型 + 敵対レビューを統合）:
+- 転送ごとに最大 4 request を同時に outstanding にする（1 request は既存の上限 1 MiB 以下なので合計 4 MiB 以下）。session 合計の上限は置かない
+  （`onChunk` / supplier が同じ session の別操作を待つと循環待ちになるため）。上限は内部定数で、公開 API は変えない。
+- 状態は `SMBSession` actor 上の同期の状態機械（window）に置き、ループ（driver）は呼び出し側の Task で回す。`onChunk` / `onProgress` / supplier は actor の外で呼ぶ
+  （actor の中でユーザーの callback を待つと reader・timer・close が止まる）。新しい actor・request ごとの Task は作らず、既存の sendTask と需要駆動の reader を使う。
+- 失敗・cancel・期限切れの後は新しい request を commit（MID の採番と pending の登録）しない。commit 済みの request は送って final まで drain する
+  （SMB CANCEL や tombstone を増やさない。commit 済み・未送信の request を捨てる経路は issue 106 の退役 primitive で、保留中なので使わない）。
+- drain の期限は min(stop 時刻 + cleanupTimeout, 各 request の期限, operation の絶対期限)。回収できなければ既存の closeTransportAndWait。drain と close は呼び出し側が行い、reader に join させない。
+- credit: 自分の committed slot があるときは待たない予約を試し、取れなければ自分の slot の完了を待つ。credit を待機するのは自分の slot が 0 件のときだけ。credit の FIFO の規則は変えない。
+- WRITE は supplier を呼んでから credit を予約する（逆順は supplier が同じ session を使うと deadlock）。
+- 返すエラー: caller の cancel・operation の期限 > session を落とす失敗 > offset が最小の失敗（直列版なら最初に出したはずのエラー）。short READ は手前まで配送し、送信済みを drain してから続きの offset で再開する。
+- 失敗時は、失敗した offset より後ろも書かれていることがある。進捗は READ は配送済み、`upload(data:)` は成功応答の連続 prefix、supplier は供給済み。`docs/api-stability.md` に書く。
+- #16: `receiveBlocking` は受信した分だけ初期化する（全域のゼロ埋めと prefix のコピーを除く）。
+- 採らなかったもの: session 合計の上限 / 汎用の送信 permit / credit の availability receipt / admission handle / ack debt / byte 枠の独立管理（D3 で過剰と判断）。
+
+マイルストーン:
+
+| M | 内容 | 状態 |
+|---|---|---|
+| M1 | 共通の下地（window の状態機械、pending の completion の宛先、待たない予約、operation の絶対期限）。転送はまだ直列 | 着手 |
+| M2 | READ の pipelining | 未着手 |
+| M3 | WRITE の pipelining | 未着手 |
+| M4 | POSIX の受信バッファ（#16）と総合検証（CI の性能 gate・RTT study の after） | 未着手 |
+
+未確認のリスク: CI の Linux x86 の synthetic benchmark（`initialCredits=1` で実質 1 flight）での user CPU。手元の macOS / arm64 container で master と交互に測ってから push し、
+gate が落ちたら上書きせず相談する。
+
+再開するとき: 設計の正本は `tmp/cdpipe/d2-design.md` と `tmp/codex-drive-design.pipelining.md`（一時領域。消えていたら上の要点から再構成する）。

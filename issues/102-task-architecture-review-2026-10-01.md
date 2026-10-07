@@ -154,7 +154,7 @@ before の実測は `docs/performance-resource-baseline.md` の「2026-10-02: �
 
 | M | 内容 | 状態 |
 |---|---|---|
-| M1 | 共通の下地（window の状態機械、pending の completion の宛先、待たない予約、operation の絶対期限）。転送はまだ直列 | 着手 |
+| M1 | 共通の下地（window の状態機械、pending の completion の宛先、待たない予約、operation の絶対期限）。転送はまだ直列 | **完了**（2026-10-07、commit `feat(session): issue 102 #14 #15 の pipelining M1 — …`。未 push。レビュー: 発見型 12 件・敵対の反例 2 件を対応） |
 | M2 | READ の pipelining | 未着手 |
 | M3 | WRITE の pipelining | 未着手 |
 | M4 | POSIX の受信バッファ（#16）と総合検証（CI の性能 gate・RTT study の after） | 未着手 |

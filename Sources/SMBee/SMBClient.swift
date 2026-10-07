@@ -5212,6 +5212,12 @@ private enum SMBCleanupAttemptState: Equatable {
     case retiredUnknown
 }
 
+private enum SMBPendingResponseCompletionTarget {
+    case transaction(CheckedContinuation<SMBReceivedFrame, Error>)
+    // M2 supplies this ticket for transfer responses so the session can update its window.
+    case transfer(SMBTransferTicket)
+}
+
 private struct SMBPendingResponse {
     let requestIdentity: SMBRequestIdentity
     let generation: UInt64
@@ -5229,7 +5235,7 @@ private struct SMBPendingResponse {
     var finalSeen = false
     var acceptedFinalFrame: SMBReceivedFrame?
     var acceptedFinalStatus: UInt32?
-    let continuation: CheckedContinuation<SMBReceivedFrame, Error>
+    let completionTarget: SMBPendingResponseCompletionTarget
     var sendTask: Task<Void, Never>?
     var timeoutTask: Task<Void, Never>?
     var timeoutIdentity: UUID?
@@ -7117,7 +7123,7 @@ actor SMBSession {
                 expectedCommand: command,
                 expectedSessionId: sessionId,
                 expectedTreeId: 0,
-                continuation: continuation,
+                completionTarget: .transaction(continuation),
                 sendTask: nil,
                 timeoutTask: nil,
                 timeoutIdentity: nil,
@@ -7230,7 +7236,7 @@ actor SMBSession {
                 expectedCommand: SMB2Commands.close,
                 expectedSessionId: sessionId,
                 expectedTreeId: treeId,
-                continuation: continuation,
+                completionTarget: .transaction(continuation),
                 sendTask: nil,
                 timeoutTask: nil,
                 timeoutIdentity: nil,
@@ -7718,7 +7724,7 @@ actor SMBSession {
                 expectedCommand: requestHeader.command,
                 expectedSessionId: requestHeader.sessionId,
                 expectedTreeId: requestHeader.treeId,
-                continuation: continuation,
+                completionTarget: .transaction(continuation),
                 sendTask: nil,
                 timeoutTask: nil,
                 timeoutIdentity: nil,
@@ -8013,7 +8019,10 @@ actor SMBSession {
             cleanupLedger[fileId] = .retiredUnknown
             resumeCleanupLedgerCountWaiters()
             pending.continuationResumed = true
-            pending.continuation.resume(throwing: SMBTransportError.timedOut)
+            resolvePendingCompletion(
+                pending.completionTarget,
+                with: .failure(SMBTransportError.timedOut)
+            )
             resumePendingCountWaiters()
         case .sending:
             // The transport has no complete-frame send acknowledgement. At this point a CLOSE
@@ -8034,7 +8043,10 @@ actor SMBSession {
                 )
             }
             pendingResponses[messageId] = pending
-            pending.continuation.resume(throwing: SMBTransportError.timedOut)
+            resolvePendingCompletion(
+                pending.completionTarget,
+                with: .failure(SMBTransportError.timedOut)
+            )
         }
     }
 
@@ -8903,6 +8915,24 @@ actor SMBSession {
         }
     }
 
+    private func resolvePendingCompletion(
+        _ target: SMBPendingResponseCompletionTarget,
+        with result: Result<SMBReceivedFrame, Error>
+    ) {
+        switch target {
+        case .transaction(let continuation):
+            switch result {
+            case .success(let frame):
+                continuation.resume(returning: frame)
+            case .failure(let error):
+                continuation.resume(throwing: error)
+            }
+        case .transfer(let ticket):
+            // M2 dispatches this ticket to the transfer window on the session actor.
+            _ = ticket
+        }
+    }
+
     private func finishAcceptedFinal(messageId: UInt64, frame: SMBReceivedFrame, status: UInt32) {
         guard var pending = removePendingResponse(messageId: messageId) else { return }
         pending.timeoutTask?.cancel()
@@ -8918,7 +8948,7 @@ actor SMBSession {
         }
         if !pending.continuationResumed {
             pending.continuationResumed = true
-            pending.continuation.resume(returning: frame)
+            resolvePendingCompletion(pending.completionTarget, with: .success(frame))
         }
     }
 
@@ -9019,7 +9049,10 @@ actor SMBSession {
             "[wire] request_timeout session=\(diagnosticSessionId) message_id=\(messageId) " +
                 "command=\(command) send_started=\(pending.sendPhase == .registered ? 0 : 1)"
         )
-        pending.continuation.resume(throwing: SMBTransportError.timedOut)
+        resolvePendingCompletion(
+            pending.completionTarget,
+            with: .failure(SMBTransportError.timedOut)
+        )
         // A timed-out sent MessageId cannot be abandoned while the connection remains usable:
         // closing the whole session avoids creating a CommandSequenceWindow hole. Credits are
         // deliberately not refunded because the request reached the wire.
@@ -9047,7 +9080,7 @@ actor SMBSession {
         // same record until its final response so it can keep correlating late frames.
         if !pending.continuationResumed {
             pending.continuationResumed = true
-            pending.continuation.resume(throwing: error)
+            resolvePendingCompletion(pending.completionTarget, with: .failure(error))
             if pending.sendPhase != .registered, pending.cancellationRequested {
                 pendingResponses[messageId] = pending
                 if ordinaryCancellationTombstoneCount > Self.maxCancellationTombstones {
@@ -9121,7 +9154,7 @@ actor SMBSession {
             // declared the shared wire dead. Cancelling a send that already started
             // is therefore safe: the transport/socket is being torn down as a unit,
             // and it prevents a blocked send task from surviving session failure.
-            waiter.continuation.resume(throwing: error)
+            resolvePendingCompletion(waiter.completionTarget, with: .failure(error))
         }
         // Credit waiters are only ever resumed by grants from received responses; once the
         // receive path is dead they must be drained too (issues/010 §B invariant: every

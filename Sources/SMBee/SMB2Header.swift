@@ -315,13 +315,34 @@ actor SMB2CreditWindow {
         messageId: UInt64? = nil,
         command: UInt16? = nil
     ) async throws -> UInt16 {
+        try await reserveUpTo(
+            maximumCharge: maximumCharge,
+            waitIfUnavailable: true,
+            messageId: messageId,
+            command: command
+        )
+    }
+
+    /// Performs the same immediate reservation as `reserveUpTo`, but optionally returns
+    /// charge zero instead of joining the FIFO waiter queue. A non-waiting attempt does not
+    /// consume credits ahead of an already parked waiter.
+    func reserveUpTo(
+        maximumCharge: UInt16,
+        waitIfUnavailable: Bool,
+        messageId: UInt64? = nil,
+        command: UInt16? = nil
+    ) async throws -> UInt16 {
         let reservation = try await reserveCredits(
             upTo: maximumCharge,
             minimumCharge: 1,
             messageId: messageId,
-            command: command
+            command: command,
+            waitIfUnavailable: waitIfUnavailable,
+            preserveWaiterFIFO: !waitIfUnavailable
         )
-        await reservationAcquiredHookForTesting?(reservation.charge)
+        if waitIfUnavailable || reservation.charge > 0 {
+            await reservationAcquiredHookForTesting?(reservation.charge)
+        }
         return reservation.charge
     }
 
@@ -329,7 +350,9 @@ actor SMB2CreditWindow {
         upTo requestedCharge: UInt16,
         minimumCharge: UInt16,
         messageId: UInt64?,
-        command: UInt16?
+        command: UInt16?,
+        waitIfUnavailable: Bool = true,
+        preserveWaiterFIFO: Bool = false
     ) async throws -> CreditReservation {
         if case .failed(let error) = state {
             throw error
@@ -337,10 +360,15 @@ actor SMB2CreditWindow {
         guard requestedCharge > 0, minimumCharge > 0 else {
             return CreditReservation(charge: 0, remainingBalance: available)
         }
-        if available >= UInt32(minimumCharge) {
-            let charge = min(UInt32(requestedCharge), available)
-            available -= charge
-            return CreditReservation(charge: UInt16(charge), remainingBalance: available)
+        if let reservation = reserveImmediatelyIfAvailable(
+            upTo: requestedCharge,
+            minimumCharge: minimumCharge,
+            preserveWaiterFIFO: preserveWaiterFIFO
+        ) {
+            return reservation
+        }
+        guard waitIfUnavailable else {
+            return CreditReservation(charge: 0, remainingBalance: available)
         }
         let id = nextWaiterId
         nextWaiterId += 1
@@ -379,6 +407,20 @@ actor SMB2CreditWindow {
         } onCancel: {
             Task { await self.cancelWaiter(id: id) }
         }
+    }
+
+    private func reserveImmediatelyIfAvailable(
+        upTo requestedCharge: UInt16,
+        minimumCharge: UInt16,
+        preserveWaiterFIFO: Bool
+    ) -> CreditReservation? {
+        guard !preserveWaiterFIFO || waiters.isEmpty,
+              available >= UInt32(minimumCharge) else {
+            return nil
+        }
+        let charge = min(UInt32(requestedCharge), available)
+        available -= charge
+        return CreditReservation(charge: UInt16(charge), remainingBalance: available)
     }
 
     /// Teardown drain: every parked waiter is resumed with `error`. Without this, waiters

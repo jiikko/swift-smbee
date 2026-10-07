@@ -1315,7 +1315,7 @@ private final class SMBDeadlineResumeOnce<T: Sendable>: @unchecked Sendable {
     }
 }
 
-private func awaitWithDeadlineHangGuard<T: Sendable>(
+func awaitWithDeadlineHangGuard<T: Sendable>(
     _ label: String,
     timeout: Duration = .seconds(3),
     operation: @escaping @Sendable () async throws -> T

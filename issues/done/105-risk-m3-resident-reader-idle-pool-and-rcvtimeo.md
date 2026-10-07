@@ -75,6 +75,18 @@ M3 の入れ直しの前提条件にするかは、下の再現テストで実�
   - idle 中は transport.receive に入らない。docs/architecture.md の「session の reader」節にも書いた。
   - 1 は構造上は起きない見込みだが、再現テストで確かめてはいない。
   - 2 の idle 中の切断は起きない（idle 中に受信しない）。long-poll 中の `.timedOut` は master と同じで残る。
-- [ ] 1 の再現テスト（需要駆動の reader の下で、idle の session が pool のスレッドを占有しないことの確認）
-- [ ] 2 の再現テスト
-- [ ] 扱いの決定
+- [x] 1 の再現テスト（需要駆動の reader の下で、idle の session が pool のスレッドを占有しないことの確認）
+  - 既存の `SMBeeTests.testSessionReaderStartsAfterEachFullSendAndStopsWhenNoResponseIsOutstanding` が、idle 中に transport.receive を
+    新しく呼ばないこと（receiveCount が増えない）と reader task が 0 本になることを固定している。
+    `POSIXSocketTransport.receive` は呼ばれたときだけ detached task で blocking recv するので、receive を呼ばなければ pool のスレッドは塞がらない。
+  - 2026-10-07 に変異で確かめた: `runActorRawReader` と `processRawFrame` の `guard hasSentResponseOutstanding` を常に偽にする
+    （応答待ちが無くても読み続ける = revert した常駐 reader の形）と、このテストは red（`reader exits when the final response is dispatched` の待ちが timeout）。
+  - pool を実際に埋める別プロセスの試験は書いていない。上の固定で「idle の session は recv を持たない」が言えるので、pool の飽和を作る試験は要らないと判断した。
+- [x] 2 の再現テスト
+  - commit `test(session): issue 105 — SO_RCVTIMEO より長く idle にした session が次の request を処理できることを本物の socket で固定する`。
+    `SMBIdleReceiveTimeoutTests`: 本物の POSIX socket（loopback）で `timeout: 100 ms` の session に ECHO → 400 ms idle → ECHO が成功する。
+  - 同じ変異で red（`timedOut`）。macOS swift test 652 件（skip 37）失敗 0、新しいテストは 3 回連続 green。
+- [x] 扱いの決定（2026-10-07）
+  - 1 と 2 の idle の切断は、需要駆動の reader（M3 の入れ直し）で起きなくなり、上のテストで固定した。この issue は閉じる。
+  - long-poll（CHANGE_NOTIFY）が outstanding の間の `.timedOut` は M3 より前からある既存の問題なので、[`108`](../108-bug-watch-with-socket-timeout-tears-down-session-on-quiet-directory.md) に切り出した。
+    `watch` を `timeout:` 付きで使うと、変化の無いディレクトリで timeout ごとに session が落ちて再接続と `.overflow` が起きる。

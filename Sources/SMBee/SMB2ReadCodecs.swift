@@ -778,6 +778,20 @@ enum SMB2Read {
         let dataLength = Int(rawDataLength)
         return Array(bytes[dataOffset..<dataOffset + dataLength])
     }
+
+    static func responsePayloadLength(_ bytes: [UInt8]) throws -> Int {
+        let bodyOffset = SMB2Header.encodedSize
+        guard bytes.count >= bodyOffset + 2 else { throw SMBCodecError.truncated }
+        guard readUInt16LE(bytes, at: bodyOffset) == 17 else {
+            throw SMBCodecError.invalidValue("invalid READ response structure size")
+        }
+        guard bytes.count >= bodyOffset + 4 else { throw SMBCodecError.truncated }
+        let dataOffset = UInt64(bytes[bodyOffset + 2])
+        guard bytes.count >= bodyOffset + 8 else { throw SMBCodecError.truncated }
+        let dataLength = UInt64(readUInt32LE(bytes, at: bodyOffset + 4))
+        guard dataOffset + dataLength <= UInt64(bytes.count) else { throw SMBCodecError.truncated }
+        return Int(dataLength)
+    }
 }
 
 enum SMB2Write {

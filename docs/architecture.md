@@ -83,6 +83,22 @@ protocol SMBTransport            // TCP 445 上の双方向バイトストリー
   共有 wire を terminal にして全 pending / credit waiter を解放する。close は通常 send と SMB CANCEL send
   の双方を cancel して join し、close 後に遅れて戻る connect が transport candidate を公開しても再 close する。
 
+### 転送ごとの READ window（M2）
+
+- 各 `withReadStream` 転送は、呼び出し側の Task が drive する独立した window を持つ。session actor は
+  window の slot、MessageId 採番、pending 登録、response 完了、停止理由、drain 状態を記録し、共有 reader は
+  これまでどおり応答を相関する。
+- window は最大4 slot を持ち、各 READ は最大1 MiB。request offset は commit 時に進み、completion の順序に
+  関係なく `onChunk` は offset 順に一度だけ呼ぶ。callback と progress 通知は session actor の外で実行する。
+- credit は各 request の実予約 charge から payload 長を決める。転送に committed slot があれば予約を待たずに
+  試し、取れない場合はその転送の slot 変化を待つ。committed slot がない場合は credit 予約を待てるため、
+  1 credit の接続では従来と同じ逐次 READ になる。
+- short READ / EOF は新規 commit を止める。short data を手前まで配送し、送信済み request の final と send owner
+  の完了を drain してから、受信長分だけ進んだ offset で次の epoch を始める。EOF と空成功は rebase せず失敗する。
+- cancel、callback error、operation deadline、通常の READ error は新規 commit を止め、送信済み request の final
+  を待つ。転送 owner が window の drain deadline までに drain できないときは session を閉じて reader / send を join
+  する。READ pipelining は SMB CANCEL や transfer 専用 tombstone を作らない。
+
 ### プラットフォーム条件
 
 - `SMBSession` / protocol / crypto / auth は **Linux でもビルド可能**に保つ（swift-crypto は

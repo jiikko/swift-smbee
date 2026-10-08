@@ -332,6 +332,38 @@ actor SMB2CreditWindow {
         messageId: UInt64? = nil,
         command: UInt16? = nil
     ) async throws -> UInt16 {
+        try await reserveUpToResult(
+            maximumCharge: maximumCharge,
+            waitIfUnavailable: waitIfUnavailable,
+            messageId: messageId,
+            command: command
+        ).charge
+    }
+
+    /// Reserves credits and returns the remaining shared balance from the same actor turn.
+    /// READ admission uses the balance to avoid a second, empty reservation after consuming
+    /// the last credit in a single-credit stream.
+    func reserveUpToWithBalance(
+        maximumCharge: UInt16,
+        waitIfUnavailable: Bool,
+        messageId: UInt64? = nil,
+        command: UInt16? = nil
+    ) async throws -> (charge: UInt16, balance: UInt32) {
+        let reservation = try await reserveUpToResult(
+            maximumCharge: maximumCharge,
+            waitIfUnavailable: waitIfUnavailable,
+            messageId: messageId,
+            command: command
+        )
+        return (reservation.charge, reservation.remainingBalance)
+    }
+
+    private func reserveUpToResult(
+        maximumCharge: UInt16,
+        waitIfUnavailable: Bool,
+        messageId: UInt64?,
+        command: UInt16?
+    ) async throws -> CreditReservation {
         let reservation = try await reserveCredits(
             upTo: maximumCharge,
             minimumCharge: 1,
@@ -343,7 +375,7 @@ actor SMB2CreditWindow {
         if waitIfUnavailable || reservation.charge > 0 {
             await reservationAcquiredHookForTesting?(reservation.charge)
         }
-        return reservation.charge
+        return reservation
     }
 
     private func reserveCredits(

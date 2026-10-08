@@ -3836,11 +3836,11 @@ final class ManualSMBSleeper: @unchecked Sendable {
 
     private let lock = NSLock()
     private var callCountStorage = 0
+    private var requestedDurationsStorage: [Duration] = []
     private var waiters: [Waiter] = []
     private let callCountBarrier = SMBContinuationCountBarrier()
 
     func sleep(for duration: Duration) async throws {
-        _ = duration
         let id = UUID()
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -3848,6 +3848,7 @@ final class ManualSMBSleeper: @unchecked Sendable {
                 let cancelled: Bool
                 lock.lock()
                 callCountStorage += 1
+                requestedDurationsStorage.append(duration)
                 cancelled = Task.isCancelled
                 if !cancelled {
                     waiters.append(Waiter(id: id, continuation: continuation))
@@ -3859,6 +3860,10 @@ final class ManualSMBSleeper: @unchecked Sendable {
         } onCancel: {
             self.cancel(id: id)
         }
+    }
+
+    var requestedDurations: [Duration] {
+        lock.withLock { requestedDurationsStorage }
     }
 
     func waitUntilCallCount(

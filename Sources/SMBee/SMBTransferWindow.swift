@@ -20,12 +20,13 @@ struct SMBTransferTicket: Hashable, Sendable {
     let requestedLength: UInt32
 }
 
-enum SMBTransferFinalResult {
+enum SMBTransferFinalResult: @unchecked Sendable {
+    case pendingReadDecode
     case success(payload: [UInt8])
     case failure(error: Error, isSessionFatal: Bool)
 }
 
-struct SMBTransferRetirement {
+struct SMBTransferRetirement: Sendable {
     let ticket: SMBTransferTicket
     let result: SMBTransferFinalResult
     let kind: SMBTransferRetirementKind
@@ -54,33 +55,28 @@ final class SMBTransferWindow {
         let candidateLength: UInt32
     }
 
-    private enum WireState {
-        case waiting
-        case final(SMBTransferFinalResult)
-    }
-
-    private struct Committed {
-        let ticket: SMBTransferTicket
-        var sendPhase: SMBTransferSendPhase
-        var wireState: WireState
-        var sendOwnerFinished: Bool
-        var responseDeadline: ContinuousClock.Instant?
-    }
-
-    private enum SlotStorage {
+    private enum SlotPhase: Equatable {
         case vacant
-        case preparing(Preparation)
-        case committed(Committed)
-        case completed(ticket: SMBTransferTicket, result: SMBTransferFinalResult)
-        case delivering(ticket: SMBTransferTicket, result: SMBTransferFinalResult)
-        case retiring(ticket: SMBTransferTicket, result: SMBTransferFinalResult)
-        case retired(SMBTransferTicket)
+        case preparing
+        case committed
+        case completed
+        case delivering
+        case retiring
+        case retired
     }
 
     private struct Slot {
         var nextSequence: UInt64 = 0
-        var storage: SlotStorage = .vacant
+        var phase: SlotPhase = .vacant
+        var preparation: Preparation?
+        var ticket: SMBTransferTicket?
+        var result: SMBTransferFinalResult?
+        var sendPhase: SMBTransferSendPhase?
+        var sendOwnerFinished = false
+        var responseDeadline: ContinuousClock.Instant?
     }
+
+    private static let allSlotBits = UInt8((1 << maximumSlotCount) - 1)
 
     private struct StopCandidate {
         let reason: SMBTransferStopReason
@@ -101,6 +97,10 @@ final class SMBTransferWindow {
 
     private var admissionStopped = false
     private var slots = Array(repeating: Slot(), count: maximumSlotCount)
+    private var vacantSlotBits = allSlotBits
+    private var preparingSlotIndex: Int?
+    private var committedSlotCountStorage = 0
+    private var readyRetirementSlotIndex: Int?
     private var stopCandidates: [StopCandidate] = []
 
     init(transferIdentifier: UInt64, direction: SMBTransferDirection, startingOffset: UInt64 = 0) {
@@ -114,31 +114,55 @@ final class SMBTransferWindow {
         admissionStopped || terminallyClosed
     }
 
+    var committedSlotCount: Int {
+        committedSlotCountStorage
+    }
+
+    var completedTickets: [SMBTransferTicket] {
+        slots.compactMap { slot in
+            guard slot.phase == .completed else { return nil }
+            return slot.ticket
+        }
+    }
+
+    var hasReadyRetirement: Bool {
+        readyRetirementSlotIndex != nil
+    }
+
     /// Preparing is local ownership only; no MID or pending response exists yet.
     func beginPreparing(candidateLength: UInt32) -> Int? {
         guard !isStopped,
               candidateLength > 0,
               candidateLength <= Self.maximumSlotLength,
-              !slots.contains(where: { if case .preparing = $0.storage { true } else { false } }),
-              let index = slots.firstIndex(where: { if case .vacant = $0.storage { true } else { false } }) else {
+              preparingSlotIndex == nil,
+              vacantSlotBits != 0 else {
             return nil
         }
-        slots[index].storage = .preparing(Preparation(
+        let index = vacantSlotBits.trailingZeroBitCount
+        let bit = UInt8(1 << index)
+        vacantSlotBits &= ~bit
+        slots[index].phase = .preparing
+        slots[index].preparation = Preparation(
             offset: requestFrontier,
             candidateLength: candidateLength
-        ))
+        )
+        preparingSlotIndex = index
         wireDrainedAt = nil
         return index
     }
 
     @discardableResult
-    func revokePreparing(slotIndex: Int, at time: ContinuousClock.Instant) -> Bool {
+    func revokePreparing(slotIndex: Int, at time: ContinuousClock.Instant?) -> Bool {
         guard slots.indices.contains(slotIndex),
-              case .preparing = slots[slotIndex].storage else {
+              slots[slotIndex].phase == .preparing else {
             return false
         }
-        slots[slotIndex].storage = .vacant
-        recordWireDrainedIfReady(at: time)
+        setPhase(.vacant, for: slotIndex)
+        slots[slotIndex].preparation = nil
+        preparingSlotIndex = nil
+        if let time {
+            recordWireDrainedIfReady(at: time)
+        }
         return true
     }
 
@@ -148,11 +172,12 @@ final class SMBTransferWindow {
         requestIdentity: SMBRequestIdentity,
         messageID: UInt64,
         requestedLength: UInt32,
-        at time: ContinuousClock.Instant
+        at time: ContinuousClock.Instant?
     ) -> SMBTransferTicket? {
         guard !isStopped,
               slots.indices.contains(slotIndex),
-              case .preparing(let preparation) = slots[slotIndex].storage,
+              slots[slotIndex].phase == .preparing,
+              let preparation = slots[slotIndex].preparation,
               preparation.offset == requestFrontier,
               requestedLength > 0,
               requestedLength <= Self.maximumSlotLength,
@@ -174,28 +199,29 @@ final class SMBTransferWindow {
             offset: preparation.offset,
             requestedLength: requestedLength
         )
-        slots[slotIndex].storage = .committed(Committed(
-            ticket: ticket,
-            sendPhase: .registered,
-            wireState: .waiting,
-            sendOwnerFinished: false,
-            responseDeadline: nil
-        ))
+        slots[slotIndex].preparation = nil
+        slots[slotIndex].ticket = ticket
+        slots[slotIndex].result = nil
+        slots[slotIndex].sendPhase = .registered
+        slots[slotIndex].sendOwnerFinished = false
+        slots[slotIndex].responseDeadline = nil
+        setPhase(.committed, for: slotIndex)
+        preparingSlotIndex = nil
         wireDrainedAt = nil
         requestFrontier = nextFrontier
-        recordWireDrainedIfReady(at: time)
+        if let time {
+            recordWireDrainedIfReady(at: time)
+        }
         return ticket
     }
 
     @discardableResult
     func markSendStarted(_ ticket: SMBTransferTicket) -> Bool {
         guard let index = matchingCommittedSlot(for: ticket),
-              case .committed(var committed) = slots[index].storage,
-              committed.sendPhase == .registered else {
+              slots[index].sendPhase == .registered else {
             return false
         }
-        committed.sendPhase = .sending
-        slots[index].storage = .committed(committed)
+        slots[index].sendPhase = .sending
         return true
     }
 
@@ -203,35 +229,35 @@ final class SMBTransferWindow {
     func markFullySent(
         _ ticket: SMBTransferTicket,
         responseDeadline: ContinuousClock.Instant? = nil,
-        at time: ContinuousClock.Instant
+        at time: ContinuousClock.Instant?
     ) -> Bool {
         guard let index = matchingCommittedSlot(for: ticket),
-              case .committed(var committed) = slots[index].storage,
-              committed.sendPhase == .sending else {
+              slots[index].sendPhase == .sending else {
             return false
         }
-        committed.sendPhase = .fullySent
-        committed.responseDeadline = responseDeadline
-        slots[index].storage = .committed(committed)
+        slots[index].sendPhase = .fullySent
+        slots[index].responseDeadline = responseDeadline
         if isStopped, let responseDeadline {
             shortenDrainDeadline(to: responseDeadline)
         }
         completeIfReady(slotIndex: index)
-        recordWireDrainedIfReady(at: time)
+        if let time {
+            recordWireDrainedIfReady(at: time)
+        }
         return true
     }
 
     @discardableResult
-    func markSendOwnerFinished(_ ticket: SMBTransferTicket, at time: ContinuousClock.Instant) -> Bool {
+    func markSendOwnerFinished(_ ticket: SMBTransferTicket, at time: ContinuousClock.Instant?) -> Bool {
         guard let index = matchingCommittedSlot(for: ticket),
-              case .committed(var committed) = slots[index].storage,
-              !committed.sendOwnerFinished else {
+              !slots[index].sendOwnerFinished else {
             return false
         }
-        committed.sendOwnerFinished = true
-        slots[index].storage = .committed(committed)
+        slots[index].sendOwnerFinished = true
         completeIfReady(slotIndex: index)
-        recordWireDrainedIfReady(at: time)
+        if let time {
+            recordWireDrainedIfReady(at: time)
+        }
         return true
     }
 
@@ -240,33 +266,63 @@ final class SMBTransferWindow {
     func acceptFinal(
         _ result: SMBTransferFinalResult,
         for ticket: SMBTransferTicket,
-        at time: ContinuousClock.Instant
+        at time: ContinuousClock.Instant?
     ) -> Bool {
         guard let index = matchingCommittedSlot(for: ticket),
-              case .committed(var committed) = slots[index].storage,
-              case .waiting = committed.wireState else {
+              case nil = slots[index].result else {
             return false
         }
-        committed.wireState = .final(result)
-        slots[index].storage = .committed(committed)
+        slots[index].result = result
         completeIfReady(slotIndex: index)
-        recordWireDrainedIfReady(at: time)
+        if let time {
+            recordWireDrainedIfReady(at: time)
+        }
+        return true
+    }
+
+    @discardableResult
+    func finishPendingReadDecode(
+        _ result: SMBTransferFinalResult,
+        for ticket: SMBTransferTicket,
+        at time: ContinuousClock.Instant?
+    ) -> Bool {
+        if case .pendingReadDecode = result { return false }
+        guard direction == .read,
+              let index = matchingCommittedSlot(for: ticket),
+              case .pendingReadDecode? = slots[index].result else {
+            return false
+        }
+        slots[index].result = result
+        completeIfReady(slotIndex: index)
+        if let time {
+            recordWireDrainedIfReady(at: time)
+        }
+        return true
+    }
+
+    func isPendingReadDecode(for ticket: SMBTransferTicket) -> Bool {
+        guard direction == .read,
+              let index = matchingCommittedSlot(for: ticket),
+              case .pendingReadDecode? = slots[index].result else {
+            return false
+        }
         return true
     }
 
     /// Starts only the completed request at the retire frontier.
     func beginNextRetirement() -> SMBTransferRetirement? {
-        guard let index = slots.firstIndex(where: { slot in
-            guard case .completed(let ticket, _) = slot.storage else { return false }
-            return ticket.offset == retireFrontier
-        }), case .completed(let ticket, let result) = slots[index].storage else {
+        guard let index = readyRetirementSlotIndex,
+              slots[index].phase == .completed,
+              let ticket = slots[index].ticket,
+              let result = slots[index].result else {
             return nil
         }
+        readyRetirementSlotIndex = nil
         switch direction {
         case .read:
-            slots[index].storage = .delivering(ticket: ticket, result: result)
+            setPhase(.delivering, for: index)
         case .write:
-            slots[index].storage = .retiring(ticket: ticket, result: result)
+            setPhase(.retiring, for: index)
         }
         let kind: SMBTransferRetirementKind = direction == .read ? .deliverRead : .retireWrite
         return SMBTransferRetirement(ticket: ticket, result: result, kind: kind)
@@ -276,15 +332,13 @@ final class SMBTransferWindow {
     @discardableResult
     func finishRetirement(_ ticket: SMBTransferTicket, advanceFrontier: Bool) -> Bool {
         guard slots.indices.contains(ticket.slotIndex),
-              ticket.offset == retireFrontier else {
+              ticket.offset == retireFrontier,
+              let result = slots[ticket.slotIndex].result else {
             return false
         }
-        let result: SMBTransferFinalResult
-        switch (direction, slots[ticket.slotIndex].storage) {
-        case (.read, .delivering(let current, let currentResult)), (.write, .retiring(let current, let currentResult)):
-            guard current == ticket else { return false }
-            result = currentResult
-        default:
+        let expectedPhase: SlotPhase = direction == .read ? .delivering : .retiring
+        guard slots[ticket.slotIndex].phase == expectedPhase,
+              slots[ticket.slotIndex].ticket == ticket else {
             return false
         }
         if advanceFrontier {
@@ -294,25 +348,30 @@ final class SMBTransferWindow {
                 advancedLength = UInt64(payload.count)
             case (.write, .success):
                 advancedLength = UInt64(ticket.requestedLength)
-            case (_, .failure):
+            case (_, .pendingReadDecode), (_, .failure):
                 return false
             }
             let (nextFrontier, overflow) = retireFrontier.addingReportingOverflow(advancedLength)
             guard !overflow else { return false }
             retireFrontier = nextFrontier
         }
-        slots[ticket.slotIndex].storage = .retired(ticket)
+        slots[ticket.slotIndex].result = nil
+        setPhase(.retired, for: ticket.slotIndex)
+        if advanceFrontier {
+            refreshReadyRetirementIndex()
+        }
         return true
     }
 
     @discardableResult
     func releaseRetiredSlot(_ ticket: SMBTransferTicket) -> Bool {
         guard slots.indices.contains(ticket.slotIndex),
-              case .retired(let current) = slots[ticket.slotIndex].storage,
-              current == ticket else {
+              slots[ticket.slotIndex].phase == .retired,
+              slots[ticket.slotIndex].ticket == ticket else {
             return false
         }
-        slots[ticket.slotIndex].storage = .vacant
+        clearSlotPayload(at: ticket.slotIndex)
+        setPhase(.vacant, for: ticket.slotIndex)
         return true
     }
 
@@ -321,12 +380,43 @@ final class SMBTransferWindow {
     func discardCompletedSlot(_ ticket: SMBTransferTicket) -> Bool {
         guard slots.indices.contains(ticket.slotIndex),
               ticket.offset > retireFrontier,
-              case .completed(let current, _) = slots[ticket.slotIndex].storage,
-              current == ticket else {
+              slots[ticket.slotIndex].phase == .completed,
+              slots[ticket.slotIndex].ticket == ticket else {
             return false
         }
-        slots[ticket.slotIndex].storage = .retired(ticket)
+        slots[ticket.slotIndex].result = nil
+        setPhase(.retired, for: ticket.slotIndex)
         return true
+    }
+
+    /// Stop paths that outrank ordered delivery may discard any completed slot, including
+    /// the current retirement frontier. The owner still releases it exactly once.
+    @discardableResult
+    func discardCompletedSlotForStop(_ ticket: SMBTransferTicket) -> Bool {
+        guard slots.indices.contains(ticket.slotIndex),
+              slots[ticket.slotIndex].phase == .completed,
+              slots[ticket.slotIndex].ticket == ticket else {
+            return false
+        }
+        if readyRetirementSlotIndex == ticket.slotIndex {
+            readyRetirementSlotIndex = nil
+        }
+        slots[ticket.slotIndex].result = nil
+        setPhase(.retired, for: ticket.slotIndex)
+        return true
+    }
+
+    /// Once terminal teardown has joined every send owner, no committed slot can receive a
+    /// final on this session. Clearing those tickets prevents a dead transfer from retaining
+    /// response buffers while preserving stale-ticket rejection through `terminallyClosed`.
+    func reclaimSlotsAfterTerminalJoin() {
+        guard terminallyClosed, terminalSendOwnersJoined else { return }
+        for index in slots.indices {
+            clearSlotPayload(at: index)
+            setPhase(.vacant, for: index)
+        }
+        preparingSlotIndex = nil
+        readyRetirementSlotIndex = nil
     }
 
     /// The first stop fixes S + cleanupTimeout; later facts can only shorten that deadline.
@@ -347,9 +437,9 @@ final class SMBTransferWindow {
             shortenDrainDeadline(to: operationDeadline)
         }
         for slot in slots {
-            guard case .committed(let committed) = slot.storage,
-                  case .waiting = committed.wireState,
-                  let responseDeadline = committed.responseDeadline else { continue }
+            guard slot.phase == .committed,
+                  case nil = slot.result,
+                  let responseDeadline = slot.responseDeadline else { continue }
             shortenDrainDeadline(to: responseDeadline)
         }
         if drainDeadlineHasWireWork {
@@ -436,10 +526,7 @@ final class SMBTransferWindow {
 
     var wireDrained: Bool {
         guard !hasPreparingSlot else { return false }
-        return (terminallyClosed && terminalSendOwnersJoined) || slots.allSatisfy { slot in
-            if case .committed = slot.storage { return false }
-            return true
-        }
+        return (terminallyClosed && terminalSendOwnersJoined) || !hasUnsettledWireSlot
     }
 
     /// A deadline wins at equality. The recorded drain fact survives a delayed timer callback.
@@ -465,7 +552,7 @@ final class SMBTransferWindow {
         guard !terminallyClosed,
               wireDrained,
               !hasHigherPriorityStopThanReadBoundary,
-              slots.allSatisfy({ if case .vacant = $0.storage { true } else { false } }),
+              vacantSlotBits == Self.allSlotBits,
               epoch < UInt64.max else {
             return false
         }
@@ -486,21 +573,84 @@ final class SMBTransferWindow {
               ticket.transferIdentifier == transferIdentifier,
               ticket.epoch == epoch,
               slots.indices.contains(ticket.slotIndex),
-              case .committed(let committed) = slots[ticket.slotIndex].storage,
-              committed.ticket == ticket else {
+              slots[ticket.slotIndex].phase == .committed,
+              slots[ticket.slotIndex].ticket == ticket else {
             return nil
         }
         return ticket.slotIndex
     }
 
     private func completeIfReady(slotIndex: Int) {
-        guard case .committed(let committed) = slots[slotIndex].storage,
-              committed.sendPhase == .fullySent,
-              committed.sendOwnerFinished,
-              case .final(let result) = committed.wireState else {
+        guard slots[slotIndex].phase == .committed,
+              slots[slotIndex].sendPhase == .fullySent,
+              slots[slotIndex].sendOwnerFinished,
+              let ticket = slots[slotIndex].ticket,
+              let result = slots[slotIndex].result else {
             return
         }
-        slots[slotIndex].storage = .completed(ticket: committed.ticket, result: result)
+        if case .pendingReadDecode = result { return }
+        setPhase(.completed, for: slotIndex)
+        if ticket.offset == retireFrontier {
+            readyRetirementSlotIndex = slotIndex
+        }
+    }
+
+    private var hasPreparingSlot: Bool {
+        preparingSlotIndex != nil
+    }
+
+    private var hasUnsettledWireWork: Bool {
+        hasPreparingSlot || hasUnsettledWireSlot
+    }
+
+    private var hasUnsettledWireSlot: Bool {
+        slots.contains { slot in
+            guard slot.phase == .committed else { return false }
+            guard slot.sendPhase == .fullySent, slot.sendOwnerFinished else { return true }
+            guard case nil = slot.result else { return false }
+            return true
+        }
+    }
+
+    private func refreshReadyRetirementIndex() {
+        readyRetirementSlotIndex = slots.firstIndex { slot in
+            slot.phase == .completed && slot.ticket?.offset == retireFrontier
+        }
+    }
+
+    private func clearSlotPayload(at index: Int) {
+        slots[index].preparation = nil
+        slots[index].ticket = nil
+        slots[index].result = nil
+        slots[index].sendPhase = nil
+        slots[index].sendOwnerFinished = false
+        slots[index].responseDeadline = nil
+    }
+
+    private func setPhase(_ phase: SlotPhase, for index: Int) {
+        let previousPhase = slots[index].phase
+        let slotBit = UInt8(1 << index)
+        if previousPhase == .vacant {
+            vacantSlotBits &= ~slotBit
+        }
+        if phase == .vacant {
+            vacantSlotBits |= slotBit
+        }
+        if previousPhase == .preparing, phase == .committed {
+            committedSlotCountStorage += 1
+        } else if Self.ownsCommittedTicket(previousPhase), phase == .vacant {
+            committedSlotCountStorage -= 1
+        }
+        slots[index].phase = phase
+    }
+
+    private static func ownsCommittedTicket(_ phase: SlotPhase) -> Bool {
+        switch phase {
+        case .committed, .completed, .delivering, .retiring, .retired:
+            true
+        case .vacant, .preparing:
+            false
+        }
     }
 
     private func insertStopCandidate(_ candidate: StopCandidate) {
@@ -559,24 +709,6 @@ final class SMBTransferWindow {
             return
         }
         wireDrainedAt = time
-    }
-
-    private var hasPreparingSlot: Bool {
-        slots.contains { slot in
-            if case .preparing = slot.storage { return true }
-            return false
-        }
-    }
-
-    private var hasUnsettledWireWork: Bool {
-        slots.contains { slot in
-            switch slot.storage {
-            case .preparing, .committed:
-                true
-            default:
-                false
-            }
-        }
     }
 
     private static func offset(of reason: SMBTransferStopReason) -> UInt64? {

@@ -441,6 +441,7 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     private var pendingReceive: SMBContinuationPendingReceive?
     private var closed = false
     private var closeCountStorage = 0
+    private let closeCountBarrier = SMBContinuationCountBarrier()
     private var commandCounts: [UInt16: Int] = [:]
     private var commandWaiters: [(id: UUID, command: UInt16, target: Int, continuation: CheckedContinuation<Void, Error>)] = []
 
@@ -541,10 +542,15 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
         }
         result.0?.continuation.resume(throwing: SMBTransportError.connectionClosed)
         result.1.forEach { $0.resume(throwing: SMBTransportError.connectionClosed) }
+        closeCountBarrier.signal()
     }
 
     func failConnection() {
         close()
+    }
+
+    func waitForCloseCount(_ target: Int) async throws {
+        try await closeCountBarrier.waitForCount(target)
     }
 
     fileprivate func enqueue(_ packet: [UInt8]) throws {
@@ -583,10 +589,11 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     }
 }
 
-final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked Sendable {
+class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked Sendable {
     private let watchLock = NSLock()
     private let autoRespondChangeNotify: Bool
-    private var createRequest: SMB2Header?
+    private var createRequests: [SMB2Header] = []
+    private var completedCreateCount = 0
     private var treeConnectRequest: SMB2Header?
     private var treeDisconnectRequest: SMB2Header?
     private var changeNotifyRequest: SMB2Header?
@@ -608,7 +615,7 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
         watchLock.withLock {
             watchedCommands.append(header.command)
             switch header.command {
-            case SMB2Commands.create: createRequest = header
+            case SMB2Commands.create: createRequests.append(header)
             case SMB2Commands.treeConnect: treeConnectRequest = header
             case SMB2Commands.treeDisconnect:
                 treeDisconnectRequest = header
@@ -641,12 +648,17 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
         watchLock.withLock { afterCommandSignalHook = hook }
     }
 
-    func completeCreate() throws {
-        guard let request = watchLock.withLock({ createRequest }) else {
+    func completeCreate(credits: UInt16 = 1) throws {
+        guard let request = watchLock.withLock({ () -> SMB2Header? in
+            guard createRequests.indices.contains(completedCreateCount) else { return nil }
+            defer { completedCreateCount += 1 }
+            return createRequests[completedCreateCount]
+        }) else {
             throw SMBCodecError.invalidValue("test transport has no CREATE request")
         }
         var response = try SMB2Header(
             command: SMB2Commands.create,
+            credits: credits,
             messageId: request.messageId,
             treeId: request.treeId,
             sessionId: request.sessionId
@@ -699,6 +711,129 @@ final class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unch
             sessionId: request.sessionId
         ).encode()
         try enqueue(response)
+    }
+}
+
+class SMBReadPipelineScriptTransport: SMBContinuationWatchTransport, @unchecked Sendable {
+    struct ReadRequest: Equatable, Sendable {
+        let header: SMB2Header
+        let offset: UInt64
+        let length: UInt32
+    }
+
+    private let readLock = NSLock()
+    private var readRequestsStorage: [ReadRequest] = []
+    private var errorResponseBodiesStorage: [[UInt8]] = []
+    private let readRequestBarrier = SMBContinuationCountBarrier()
+
+    override func send(_ bytes: [UInt8]) async throws {
+        if let packet = try smbPacketInDirectTCPStream(bytes) {
+            let header = try SMB2Header.decode(packet)
+            if header.command == SMB2Commands.read {
+                var lengthReader = SMBByteReader(bytes: Array(packet[68..<72]))
+                var offsetReader = SMBByteReader(bytes: Array(packet[72..<80]))
+                let request = ReadRequest(
+                    header: header,
+                    offset: try offsetReader.readUInt64LE(),
+                    length: try lengthReader.readUInt32LE()
+                )
+                readLock.withLock { readRequestsStorage.append(request) }
+                readRequestBarrier.signal()
+            }
+        }
+        try await super.send(bytes)
+    }
+
+    var readRequests: [ReadRequest] {
+        readLock.withLock { readRequestsStorage }
+    }
+
+    var errorResponseBodies: [[UInt8]] {
+        readLock.withLock { errorResponseBodiesStorage }
+    }
+
+    func waitForReadCount(_ count: Int) async throws {
+        try await readRequestBarrier.waitForCount(count)
+    }
+
+    func respond(
+        to request: ReadRequest,
+        payload: [UInt8] = [],
+        status: UInt32 = SMB2Status.success,
+        credits: UInt16 = 1
+    ) throws {
+        var response = try SMB2Header(
+            status: status,
+            command: SMB2Commands.read,
+            credits: credits,
+            messageId: request.header.messageId,
+            treeId: request.header.treeId,
+            sessionId: request.header.sessionId
+        ).encode()
+        if status == SMB2Status.success {
+            response.append(contentsOf: [17, 0, 80, 0])
+            response.append(contentsOf: Self.littleEndian(UInt32(payload.count)))
+            response.append(contentsOf: [0, 0, 0, 0, 0, 0, 0, 0])
+            response.append(contentsOf: payload)
+        } else {
+            let errorBody: [UInt8] = [9, 0, 0, 0, 0, 0, 0, 0]
+            readLock.withLock { errorResponseBodiesStorage.append(errorBody) }
+            response.append(contentsOf: errorBody)
+        }
+        try enqueue(response)
+    }
+
+    func respondTogether(_ responses: [(request: ReadRequest, payload: [UInt8])]) throws {
+        var packet: [UInt8] = []
+        for (index, item) in responses.enumerated() {
+            let start = packet.count
+            var response = try SMB2Header(
+                command: SMB2Commands.read,
+                credits: 1,
+                messageId: item.request.header.messageId,
+                treeId: item.request.header.treeId,
+                sessionId: item.request.header.sessionId
+            ).encode()
+            response.append(contentsOf: [17, 0, 80, 0])
+            response.append(contentsOf: Self.littleEndian(UInt32(item.payload.count)))
+            response.append(contentsOf: [0, 0, 0, 0, 0, 0, 0, 0])
+            response.append(contentsOf: item.payload)
+
+            if index < responses.count - 1 {
+                let nextStart = (start + response.count + 7) & ~7
+                writeUInt32LE(UInt32(nextStart - start), to: &response, at: 20)
+                packet.append(contentsOf: response)
+                packet.append(contentsOf: Array(repeating: 0, count: nextStart - start - response.count))
+            } else {
+                packet.append(contentsOf: response)
+            }
+        }
+        try enqueue(packet)
+    }
+
+    private static func littleEndian(_ value: UInt32) -> [UInt8] {
+        [
+            UInt8(truncatingIfNeeded: value),
+            UInt8(truncatingIfNeeded: value >> 8),
+            UInt8(truncatingIfNeeded: value >> 16),
+            UInt8(truncatingIfNeeded: value >> 24)
+        ]
+    }
+}
+
+final class SMBReadPipelineCancellationSendTransport: SMBReadPipelineScriptTransport, @unchecked Sendable {
+    private let failureLock = NSLock()
+    private var didFailReadSend = false
+
+    override func send(_ bytes: [UInt8]) async throws {
+        let header = try smbPacketInDirectTCPStream(bytes).flatMap { try? SMB2Header.decode($0) }
+        try await super.send(bytes)
+        let shouldFail = failureLock.withLock { () -> Bool in
+            guard header?.command == SMB2Commands.read, !didFailReadSend else { return false }
+            didFailReadSend = true
+            return true
+        }
+        if shouldFail { throw CancellationError() }
     }
 }
 

@@ -89,6 +89,77 @@ final class SMBTransferWindowTests: XCTestCase {
         XCTAssertFalse(window.drainDeadlineHasWon(at: deadline))
     }
 
+    func testPreparingRevocationUsesTimeAfterRefundForDrainDeadline() throws {
+        let start = ContinuousClock.now
+        let deadline = start.advanced(by: .seconds(5))
+        let finalAcceptedAt = start.advanced(by: .milliseconds(5_050))
+        let reservationObservedAt = start.advanced(by: .milliseconds(4_900))
+        let refundReturnedAt = start.advanced(by: .milliseconds(5_100))
+        let window = SMBTransferWindow(transferIdentifier: 133, direction: .read)
+        let readSlot = try XCTUnwrap(window.beginPreparing(candidateLength: 4))
+        let ticket = try XCTUnwrap(window.commit(
+            slotIndex: readSlot,
+            requestIdentity: makeIdentity(1),
+            messageID: 1,
+            requestedLength: 4,
+            at: start
+        ))
+        XCTAssertTrue(window.markSendStarted(ticket))
+        XCTAssertTrue(window.markFullySent(ticket, at: start))
+        XCTAssertTrue(window.markSendOwnerFinished(ticket, at: start))
+
+        let refundSlot = try XCTUnwrap(window.beginPreparing(candidateLength: 4))
+        window.stop(
+            for: .readBoundary(offset: 0, requestedLength: 4, receivedLength: 1),
+            at: start,
+            cleanupTimeout: .seconds(5)
+        )
+        XCTAssertEqual(window.drainDeadline, deadline)
+        XCTAssertTrue(window.acceptFinal(
+            .success(payload: [0x41]),
+            for: ticket,
+            at: finalAcceptedAt
+        ))
+        XCTAssertNil(window.wireDrainedAt, "the preparing reservation still owns the wire")
+
+        XCTAssertTrue(window.revokePreparing(slotIndex: refundSlot, at: refundReturnedAt))
+        XCTAssertEqual(window.wireDrainedAt, refundReturnedAt)
+        XCTAssertTrue(
+            window.drainDeadlineHasWon(at: refundReturnedAt),
+            "refund completion after the deadline must not be backdated to reservation time"
+        )
+
+        let staleTimestampWindow = SMBTransferWindow(transferIdentifier: 134, direction: .read)
+        let staleReadSlot = try XCTUnwrap(staleTimestampWindow.beginPreparing(candidateLength: 4))
+        let staleTicket = try XCTUnwrap(staleTimestampWindow.commit(
+            slotIndex: staleReadSlot,
+            requestIdentity: makeIdentity(2),
+            messageID: 2,
+            requestedLength: 4,
+            at: start
+        ))
+        XCTAssertTrue(staleTimestampWindow.markSendStarted(staleTicket))
+        XCTAssertTrue(staleTimestampWindow.markFullySent(staleTicket, at: start))
+        XCTAssertTrue(staleTimestampWindow.markSendOwnerFinished(staleTicket, at: start))
+        let staleRefundSlot = try XCTUnwrap(staleTimestampWindow.beginPreparing(candidateLength: 4))
+        staleTimestampWindow.stop(
+            for: .readBoundary(offset: 0, requestedLength: 4, receivedLength: 1),
+            at: start,
+            cleanupTimeout: .seconds(5)
+        )
+        XCTAssertTrue(staleTimestampWindow.acceptFinal(
+            .success(payload: [0x41]),
+            for: staleTicket,
+            at: finalAcceptedAt
+        ))
+        XCTAssertTrue(staleTimestampWindow.revokePreparing(slotIndex: staleRefundSlot, at: reservationObservedAt))
+        XCTAssertEqual(staleTimestampWindow.wireDrainedAt, reservationObservedAt)
+        XCTAssertFalse(
+            staleTimestampWindow.drainDeadlineHasWon(at: refundReturnedAt),
+            "the pre-refund timestamp incorrectly makes a late drain look timely"
+        )
+    }
+
     func testEmptyWindowStopDoesNotWinDrainDeadline() {
         let deadline = ContinuousClock.now
         let window = SMBTransferWindow(transferIdentifier: 131, direction: .write)
@@ -136,6 +207,51 @@ final class SMBTransferWindowTests: XCTestCase {
         XCTAssertTrue(window.markSendOwnerFinished(ticket, at: now))
         XCTAssertTrue(window.wireDrained)
         XCTAssertEqual(window.beginNextRetirement()?.ticket, ticket)
+    }
+
+    func testPendingReadDecodeDoesNotKeepWireOwnershipOpen() throws {
+        let start = ContinuousClock.now
+        let window = SMBTransferWindow(transferIdentifier: 31, direction: .read)
+        let ticket = try makeTicket(window, sequence: 1, length: 4)
+        XCTAssertTrue(window.markSendStarted(ticket))
+        XCTAssertTrue(window.markFullySent(ticket, at: start))
+        XCTAssertTrue(window.markSendOwnerFinished(ticket, at: start))
+        window.stop(for: .callerCancelled, at: start, cleanupTimeout: .seconds(5))
+
+        let finalAcceptedAt = start.advanced(by: .seconds(1))
+        XCTAssertTrue(window.acceptFinal(.pendingReadDecode, for: ticket, at: finalAcceptedAt))
+
+        XCTAssertTrue(window.wireDrained, "the response is on hand; payload decoding is local work")
+        XCTAssertEqual(window.wireDrainedAt, finalAcceptedAt)
+        XCTAssertFalse(window.drainDeadlineHasWon(at: start.advanced(by: .seconds(5))))
+    }
+
+    func testReadOffsetFailureRetiresWithoutAdvancingDeliveryFrontier() throws {
+        let window = SMBTransferWindow(transferIdentifier: 32, direction: .read)
+        let now = ContinuousClock.now
+        let ticket = try makeTicket(window, sequence: 1, length: 4)
+        XCTAssertTrue(window.markSendStarted(ticket))
+        XCTAssertTrue(window.markFullySent(ticket, at: now))
+        XCTAssertTrue(window.markSendOwnerFinished(ticket, at: now))
+        XCTAssertTrue(window.acceptFinal(
+            .failure(error: SMBCodecError.truncated, isSessionFatal: false),
+            for: ticket,
+            at: now
+        ))
+        window.stop(
+            for: .offsetFailure(offset: ticket.offset, error: SMBCodecError.truncated),
+            at: now,
+            cleanupTimeout: .seconds(5)
+        )
+
+        let retirement = try XCTUnwrap(window.beginNextRetirement())
+        guard case .failure(let error, let isSessionFatal) = retirement.result else {
+            return XCTFail("decode failure must remain a failure through retirement")
+        }
+        XCTAssertEqual(error as? SMBCodecError, .truncated)
+        XCTAssertFalse(isSessionFatal)
+        XCTAssertFalse(window.finishRetirement(ticket, advanceFrontier: true))
+        XCTAssertEqual(window.retireFrontier, 0, "failed payloads do not become READ delivery")
     }
 
     func testRetirementWaitsForOffsetOrder() throws {
@@ -243,17 +359,22 @@ final class SMBTransferWindowTests: XCTestCase {
             let tickets = try (1...4).map { sequence in
                 try makeTicket(window, sequence: UInt64(sequence), length: 4)
             }
+            XCTAssertEqual(window.committedSlotCount, 4)
             for ticket in tickets {
                 complete(window, ticket: ticket)
             }
+            XCTAssertEqual(window.committedSlotCount, 4, "completed requests remain committed until release")
             XCTAssertNil(window.beginPreparing(candidateLength: 4), "completed requests still own all four slots")
 
             let retirement = try XCTUnwrap(window.beginNextRetirement())
             XCTAssertEqual(retirement.kind, direction == .read ? .deliverRead : .retireWrite)
+            XCTAssertEqual(window.committedSlotCount, 4, "delivery and retirement remain charged")
             XCTAssertNil(window.beginPreparing(candidateLength: 4), "delivery and retirement still own their slot")
             XCTAssertTrue(window.finishRetirement(retirement.ticket, advanceFrontier: true))
+            XCTAssertEqual(window.committedSlotCount, 4, "retired storage remains charged until release")
             XCTAssertNil(window.beginPreparing(candidateLength: 4), "retired storage remains charged until release")
             XCTAssertTrue(window.releaseRetiredSlot(retirement.ticket))
+            XCTAssertEqual(window.committedSlotCount, 3)
             XCTAssertFalse(window.releaseRetiredSlot(retirement.ticket), "double release must be rejected")
             XCTAssertEqual(window.beginPreparing(candidateLength: 4), retirement.ticket.slotIndex)
         }

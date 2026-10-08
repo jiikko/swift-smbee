@@ -368,7 +368,7 @@ reader exit・join・session deinit を別 event として確認する。test tr
 
 同じ MID の STATUS_PENDING → async final は、同一 chain／別 frame の両方で request が sending 中に到着しても AsyncId を引き継ぐ。AsyncId を sent gate まで遅らせない。CANCEL の MID／AsyncId も確定済み相関 state から作る。
 
-必須 oracle: cancelled R + live X の chain、sent R + sending X、同一 MID の interim＋finalを同一 chain／別 frame の sending 中に返す、同一 chain duplicate final の grant 前拒否、plaintext signed slice ごとの署名／padding、encrypted compound、後続 malformed NextCommand、未知将来 MID discard 後に同 MID の request を送っても過去 response が結び付かない、signing optional で無署名・非暗号化 VALIDATE_NEGOTIATE_INFO を final／grant／pending removal なしで拒否する。caller／send／wire outcome、grant 回数、credit await 後 balance、pending 数を確認する。単独 response test は first-slice-only mutation を検出しない。仕様背景は issues/104-bug-compound-response-chain-not-split.md。
+必須 oracle: cancelled R + live X の chain、sent R + sending X、同一 MID の interim＋finalを同一 chain／別 frame の sending 中に返す、同一 chain duplicate final の grant 前拒否、plaintext signed slice ごとの署名／padding、encrypted compound、後続 malformed NextCommand、未知将来 MID discard 後に同 MID の request を送っても過去 response が結び付かない、signing optional で無署名・非暗号化 VALIDATE_NEGOTIATE_INFO を final／grant／pending removal なしで拒否する。caller／send／wire outcome、grant 回数、credit await 後 balance、pending 数を確認する。単独 response test は first-slice-only mutation を検出しない。仕様背景は issue 104。
 
 ## 6. issue 069 M2 との依存・順序
 

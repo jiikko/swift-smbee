@@ -52,10 +52,22 @@ compound にすることを許す）には反するので潜在的な互換性�
 
 ## 進捗
 
-- [ ] 実サーバが compound 応答を返す条件を調べる（Samba の設定・Windows の挙動）
+- [x] 実サーバが compound 応答を返す条件を調べる（Samba の設定・Windows の挙動）— 2026-10-09 の観測は下
 - [x] 分割の実装とテスト（issue 106 の Commit 2。slice ごとの AEAD・署名・相関を wire 順の仮状態で検証し、全 slice が通ったときだけ確定する）
 - [x] container Samba の smoke（Commit 2 で 3 profile とも pass）
 
 - 2026-10-04: 分割は issue 106 の Commit 2（`feat(session): 未送信 request 退役 primitive の Commit 2 — 受信の土台と compound の相関 (issue 104 を含む)`）で入った。
   合成した compound の応答（平文の署名つき・暗号化・不正な NextCommand・duplicate final）のテストで固定した。
   - 残り: 実サーバが compound 応答を返す条件の調査（Samba の設定・Windows）。調べて実サーバで確かめたら done にする。
+
+- 2026-10-09: 実 Samba で compound の応答が出るかを wire trace で観測した（READ / WRITE のパイプライン化 = issue 102 M2〜M4 の後）。
+  - 方法: `SMBEE_TRACE_WIRE=1 bin/e2e/container-samba.sh`（container の Samba は `ubuntu:24.04` の distro 版）。各 `SMB response` の
+    hex dump の SMB2 header の bytes 20〜23（NextCommand）を数えた。trace は応答だけを出し、request は出さない
+  - smb311-signing-required（平文で署名つき）: 応答 967 件（READ 37 件のうち 1 MiB が 11 件、4 MiB の upload を含む）で
+    **NextCommand ≠ 0 は 0 件**
+  - smb302-encrypted-required: 平文の応答 294 件で 0 件。transform で包んだ 1135 件は中の header が暗号化されていて trace からは数えられない
+  - 結論: SMBee は送信を compound にしないので、この Samba は compound の応答を返さなかった。§6 の注記が書く Windows の挙動
+    （compound の応答は compound の request に対してだけ）とも矛盾しない。
+    分割の実装（issue 106 Commit 2）は仕様が要求する互換のために残す。
+  - 未確認: パイプライン化した READ / WRITE が同時に何本 in flight だったかは trace からは測れない（request の dump が無い）。
+    Windows / macOS SMBX の実機は観測していない（Tier 3 の手動 smoke の範囲）

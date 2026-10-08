@@ -373,18 +373,26 @@ public final class POSIXSocketTransport: SMBTransport, @unchecked Sendable {
         let descriptor = try acquireOpenDescriptorLease()
         defer { releaseDescriptorLease(descriptor) }
 
-        var buffer = [UInt8](repeating: 0, count: maxLength)
-        guard descriptorAllowsSyscall(descriptor) else {
-            throw SMBTransportError.connectionClosed
+        return try [UInt8](unsafeUninitializedCapacity: maxLength) { buffer, initializedCount in
+            initializedCount = 0
+            guard descriptorAllowsSyscall(descriptor) else {
+                throw SMBTransportError.connectionClosed
+            }
+            let count = reader(
+                descriptor,
+                buffer.baseAddress.map { UnsafeMutableRawPointer($0) },
+                maxLength
+            )
+            let errnoValue = DarwinOrGlibc.errnoValue
+            guard count > 0 else {
+                if count == 0 { throw SMBTransportError.connectionClosed }
+                throw socketError(operation: "recv", descriptor: descriptor, errnoValue: errnoValue)
+            }
+            guard count <= maxLength else {
+                throw SMBTransportError.socketFailure("recv returned invalid byte count")
+            }
+            initializedCount = count
         }
-        let count = buffer.withUnsafeMutableBytes { rawBuffer in
-            reader(descriptor, rawBuffer.baseAddress, maxLength)
-        }
-        guard count > 0 else {
-            if count == 0 { throw SMBTransportError.connectionClosed }
-            throw socketError(operation: "recv")
-        }
-        return Array(buffer.prefix(count))
     }
 
     private func connectInstalledCandidate(

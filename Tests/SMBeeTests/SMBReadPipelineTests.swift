@@ -68,6 +68,323 @@ final class SMBReadPipelineTests: XCTestCase {
         await session.closeTransportAndWait(cause: "read_pipeline_test_complete")
     }
 
+    func testClientSessionReadUsesFourPipelinedReadsAndReturnsOffsetOrderedBytes() async throws {
+        let testChunkSize = chunkSize
+        let totalSize = testChunkSize * 5
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let progress = SMBReadPipelineProgressCollector()
+        defer { transport.failConnection() }
+
+        let operation = Task {
+            try await client.read(
+                path: "file.bin",
+                knownSize: UInt64(totalSize),
+                onProgress: progress.append
+            )
+        }
+        try await waitForCommand(transport, SMB2Commands.create, label: "readAll CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 4)
+
+        let firstEpoch = transport.readRequests
+        XCTAssertEqual(firstEpoch.count, 4)
+        XCTAssertEqual(firstEpoch.map(\.offset), (0..<4).map { UInt64($0 * testChunkSize) })
+        XCTAssertEqual(firstEpoch.map { $0.header.messageId }, [1, 17, 33, 49])
+        let pendingFirstEpoch = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingFirstEpoch, 4)
+
+        for request in firstEpoch.reversed() {
+            let chunkNumber = Int(request.offset / UInt64(testChunkSize)) + 1
+            try transport.respond(
+                to: request,
+                payload: Array(repeating: UInt8(chunkNumber), count: testChunkSize),
+                credits: 16
+            )
+        }
+        try await waitForReadCount(transport, 5)
+        let fifthRequest = transport.readRequests[4]
+        XCTAssertEqual(fifthRequest.offset, UInt64(testChunkSize * 4))
+        XCTAssertEqual(fifthRequest.header.messageId, 65)
+        try transport.respond(
+            to: fifthRequest,
+            payload: Array(repeating: 5, count: testChunkSize),
+            credits: 16
+        )
+
+        let data = try await smbIssue102AwaitWithTimeout("pipelined readAll completion") {
+            try await operation.value
+        }
+        XCTAssertEqual(data, (1...5).flatMap { Array(repeating: UInt8($0), count: testChunkSize) })
+        let snapshots = progress.snapshots
+        XCTAssertFalse(snapshots.isEmpty)
+        XCTAssertEqual(snapshots.last?.bytesTransferred, UInt64(totalSize))
+        XCTAssertEqual(snapshots.last?.totalBytes, UInt64(totalSize))
+        XCTAssertTrue(snapshots.allSatisfy { $0.bytesTransferred > 0 && $0.bytesTransferred <= UInt64(totalSize) })
+        XCTAssertTrue(zip(snapshots, snapshots.dropFirst()).allSatisfy {
+            $0.bytesTransferred <= $1.bytesTransferred
+        })
+        XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
+        let pendingAfterSuccess = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterSuccess, 0)
+    }
+
+    func testClientSessionReadShortChunkThenEOFKeepsShortReadErrorAndProgress() async throws {
+        let requested = 64 * 1024
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 1)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let progress = SMBReadPipelineProgressCollector()
+        defer { transport.failConnection() }
+
+        let operation = Task {
+            try await client.read(path: "short.bin", knownSize: UInt64(requested), onProgress: progress.append)
+        }
+        try await waitForCommand(transport, SMB2Commands.create, label: "short readAll CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 1)
+        let first = transport.readRequests[0]
+        XCTAssertEqual(first.offset, 0)
+        XCTAssertEqual(first.length, UInt32(requested))
+        try transport.respond(to: first, payload: Array(repeating: 0x5a, count: 8), credits: 1)
+
+        try await waitForReadCount(transport, 2)
+        let second = transport.readRequests[1]
+        XCTAssertEqual(second.offset, 8)
+        XCTAssertEqual(second.length, UInt32(requested - 8))
+        try transport.respond(to: second, status: SMB2Status.endOfFile, credits: 1)
+
+        do {
+            _ = try await smbIssue102AwaitWithTimeout("short readAll EOF result") { try await operation.value }
+            XCTFail("EOF after a partial READ must preserve the short-read error")
+        } catch let SMBCodecError.invalidValue(message) {
+            XCTAssertEqual(message, "short SMB read: expected \(requested) bytes, got 8")
+        }
+        XCTAssertEqual(transport.readRequests.map(\.offset), [0, 8])
+        XCTAssertEqual(progress.snapshots.last?.bytesTransferred, 8)
+        XCTAssertEqual(progress.snapshots.last?.totalBytes, UInt64(requested))
+        let pendingAfterShortRead = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterShortRead, 0)
+    }
+
+    func testClientSessionReadShortResponseDrainsBeforeRebasing() async throws {
+        let testChunkSize = chunkSize
+        let totalSize = testChunkSize * 4
+        let partialSize = testChunkSize / 2
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        let client = SMBClientSession(session: session, treeId: 1)
+        defer { transport.failConnection() }
+
+        let operation = Task {
+            try await client.read(path: "short-rebase.bin", knownSize: UInt64(totalSize))
+        }
+        try await waitForCommand(transport, SMB2Commands.create, label: "short readAll CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 4)
+        let firstEpoch = transport.readRequests
+        try transport.respond(
+            to: firstEpoch[0],
+            payload: Array(repeating: 0x10, count: partialSize),
+            credits: 16
+        )
+        try await smbIssue102AwaitWithTimeout("short readAll early final dispatch") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 2)
+        }
+        let pendingDuringShortDrain = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingDuringShortDrain, 3)
+
+        for request in firstEpoch.dropFirst().reversed() {
+            let marker = UInt8((request.offset / UInt64(testChunkSize)) + 0x20)
+            try transport.respond(
+                to: request,
+                payload: Array(repeating: marker, count: testChunkSize),
+                credits: 16
+            )
+        }
+        try await waitForReadCount(transport, 8)
+        let rebased = Array(transport.readRequests.dropFirst(4))
+        XCTAssertEqual(
+            rebased.map(\.offset),
+            [
+                UInt64(partialSize),
+                UInt64(testChunkSize + partialSize),
+                UInt64(testChunkSize * 2 + partialSize),
+                UInt64(testChunkSize * 3 + partialSize)
+            ]
+        )
+        XCTAssertEqual(rebased.map(\.length), [
+            UInt32(testChunkSize),
+            UInt32(testChunkSize),
+            UInt32(testChunkSize),
+            UInt32(testChunkSize - partialSize)
+        ])
+        for (index, request) in rebased.enumerated().reversed() {
+            try transport.respond(
+                to: request,
+                payload: Array(repeating: UInt8(0x50 + index), count: Int(request.length)),
+                credits: 16
+            )
+        }
+
+        let data = try await smbIssue102AwaitWithTimeout("short readAll rebase completion") {
+            try await operation.value
+        }
+        let expected: [UInt8] = Array(repeating: 0x10, count: partialSize)
+            + Array(repeating: 0x50, count: testChunkSize)
+            + Array(repeating: 0x51, count: testChunkSize)
+            + Array(repeating: 0x52, count: testChunkSize)
+            + Array(repeating: 0x53, count: testChunkSize - partialSize)
+        XCTAssertEqual(data, expected)
+        let pendingAfterRebase = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterRebase, 0)
+    }
+
+    func testClientSessionReadEOFAndEmptySuccessKeepShortReadError() async throws {
+        let requested = 64 * 1024
+        for status in [SMB2Status.endOfFile, SMB2Status.success] {
+            let transport = SMBReadPipelineScriptTransport()
+            let session = makeSession(transport: transport, credits: 1)
+            let client = SMBClientSession(session: session, treeId: 1)
+            defer { transport.failConnection() }
+
+            let operation = Task {
+                try await client.read(path: "empty.bin", knownSize: UInt64(requested))
+            }
+            try await waitForCommand(transport, SMB2Commands.create, label: "EOF readAll CREATE")
+            try transport.completeCreate()
+            try await waitForReadCount(transport, 1)
+            try transport.respond(to: transport.readRequests[0], status: status, credits: 1)
+
+            do {
+                _ = try await smbIssue102AwaitWithTimeout("readAll EOF short-read result") { try await operation.value }
+                XCTFail("EOF and empty success must preserve the short-read error")
+            } catch let SMBCodecError.invalidValue(message) {
+                XCTAssertEqual(message, "short SMB read: expected \(requested) bytes, got 0")
+            }
+            XCTAssertEqual(transport.readRequests.count, 1)
+            let pendingAfterEOF = await session.pendingCountForTesting()
+            XCTAssertEqual(pendingAfterEOF, 0)
+        }
+    }
+
+    func testClientSessionReadErrorDrainsCommittedReads() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        let client = SMBClientSession(session: session, treeId: 1)
+        defer { transport.failConnection() }
+
+        let operation = Task {
+            try await client.read(path: "denied.bin", knownSize: UInt64(testChunkSize * 4))
+        }
+        try await waitForCommand(transport, SMB2Commands.create, label: "readAll access-denied CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 4)
+        let committed = transport.readRequests
+
+        try transport.respond(to: committed[0], status: SMB2Status.accessDenied, credits: 16)
+        try await smbIssue102AwaitWithTimeout("readAll access-denied final dispatch") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 2)
+        }
+        let pendingDuringErrorDrain = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingDuringErrorDrain, 3)
+        for request in committed.dropFirst().reversed() {
+            try transport.respond(
+                to: request,
+                payload: Array(repeating: 0x33, count: testChunkSize),
+                credits: 16
+            )
+        }
+        do {
+            _ = try await smbIssue102AwaitWithTimeout("readAll access-denied drain") { try await operation.value }
+            XCTFail("access-denied READ unexpectedly succeeded")
+        } catch SMBError.accessDenied(status: SMB2Status.accessDenied, operation: "READ") {
+            // The READ error remains the public result after committed requests drain.
+        }
+
+        XCTAssertEqual(transport.readRequests.count, 4)
+        XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
+        let pendingAfterError = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterError, 0)
+    }
+
+    func testClientSessionReadCancellationDrainsCommittedReads() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        let client = SMBClientSession(session: session, treeId: 1)
+        defer { transport.failConnection() }
+
+        let operation = Task {
+            try await client.read(path: "cancel.bin", knownSize: UInt64(testChunkSize * 8))
+        }
+        try await waitForCommand(transport, SMB2Commands.create, label: "readAll cancellation CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 4)
+        let committed = transport.readRequests
+        let pendingBeforeCancel = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingBeforeCancel, 4)
+
+        operation.cancel()
+        for request in committed.reversed() {
+            try transport.respond(
+                to: request,
+                payload: Array(repeating: 0x5a, count: testChunkSize),
+                credits: 16
+            )
+        }
+        do {
+            _ = try await smbIssue102AwaitWithTimeout("readAll cancellation drain") { try await operation.value }
+            XCTFail("cancelled readAll unexpectedly succeeded")
+        } catch is CancellationError {
+            // The operation reports cancellation after all committed READs drain.
+        }
+
+        XCTAssertEqual(transport.readRequests.count, 4)
+        XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
+        let pendingAfterCancel = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterCancel, 0)
+    }
+
+    func testClientSessionReadWithOneCreditSendsOneReadAtATime() async throws {
+        let chunkLength = 65_536
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 1)
+        let client = SMBClientSession(session: session, treeId: 1)
+        defer { transport.failConnection() }
+
+        let operation = Task {
+            try await client.read(path: "credit-one.bin", knownSize: UInt64(chunkLength * 2))
+        }
+        try await waitForCommand(transport, SMB2Commands.create, label: "one-credit readAll CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 1)
+        let first = transport.readRequests[0]
+        XCTAssertEqual(first.offset, 0)
+        XCTAssertEqual(first.length, UInt32(chunkLength))
+        XCTAssertEqual(first.header.messageId, 1)
+        let pendingWithOneCredit = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingWithOneCredit, 1)
+        try transport.respond(to: first, payload: Array(repeating: 0x11, count: chunkLength), credits: 1)
+
+        try await waitForReadCount(transport, 2)
+        let second = transport.readRequests[1]
+        XCTAssertEqual(second.offset, UInt64(chunkLength))
+        XCTAssertEqual(second.length, UInt32(chunkLength))
+        XCTAssertEqual(second.header.messageId, 2)
+        try transport.respond(to: second, payload: Array(repeating: 0x22, count: chunkLength), credits: 1)
+
+        let data = try await smbIssue102AwaitWithTimeout("one-credit readAll completion") {
+            try await operation.value
+        }
+        XCTAssertEqual(data, Array(repeating: 0x11, count: chunkLength) + Array(repeating: 0x22, count: chunkLength))
+        XCTAssertEqual(transport.readRequests.count, 2)
+        let pendingAfterRead = await session.pendingCountForTesting()
+        XCTAssertEqual(pendingAfterRead, 0)
+    }
+
     func testShortReadDrainsThenRebasesAndOutranksLaterStatusError() async throws {
         let testChunkSize = chunkSize
         let transport = SMBReadPipelineScriptTransport()
@@ -1418,6 +1735,19 @@ private final class SMBReadPipelineChunkCollector: @unchecked Sendable {
     }
 
     var chunks: [[UInt8]] {
+        lock.withLock { storage }
+    }
+}
+
+private final class SMBReadPipelineProgressCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBTransferProgress] = []
+
+    func append(_ progress: SMBTransferProgress) {
+        lock.withLock { storage.append(progress) }
+    }
+
+    var snapshots: [SMBTransferProgress] {
         lock.withLock { storage }
     }
 }

@@ -2146,6 +2146,17 @@ public actor SMBClientTreeSession {
     }
 }
 
+/// A READ transfer stopped at EOF / a short read before `expected` bytes. Internal: streamRead
+/// converts it to the public `SMBCodecError` unless its caller (readAll) reports short reads itself.
+struct SMBReadTransferShortRead: Error {
+    let expected: UInt64
+    let received: UInt64
+
+    var codecError: SMBCodecError {
+        .invalidValue("short SMB read: expected \(expected) bytes, got \(received)")
+    }
+}
+
 public enum SMBClient {
     private static let dfsReferralCache = SMBDfsReferralCache()
 
@@ -3683,27 +3694,22 @@ public enum SMBClient {
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws -> [UInt8] {
         let result = SMBReadAccumulator()
-        let progress = SMBTransferProgressEmitter(totalBytes: length, onProgress: onProgress)
-        var cursor = offset
-        var remaining = length
-        var received: UInt64 = 0
-        while remaining > 0 {
-            try Task.checkCancellation()
-            let chunk = try await session.readChunk(treeId: treeId, fileId: fileId, offset: cursor, length: remaining)
-            if chunk.isEmpty { break }
-            let advanced = try SMBChunkedTransfer.advancedReadPosition(
-                cursor: cursor,
-                remaining: remaining,
-                receivedCount: chunk.count
-            )
-            try Task.checkCancellation()
+        let progress = SMBReadStreamProgress()
+        // readAll historically returns the bytes received at EOF and lets its caller report
+        // the short-read error after progress has finished. Keep that boundary behavior while
+        // sharing streamRead's pipelined READ driver.
+        try await streamRead(
+            session: session,
+            treeId: treeId,
+            fileId: fileId,
+            offset: offset,
+            length: length,
+            progress: progress,
+            onProgress: onProgress,
+            allowsShortRead: true
+        ) { chunk in
             result.append(chunk)
-            received += UInt64(chunk.count)
-            progress.emit(bytesTransferred: received)
-            cursor = advanced.cursor
-            remaining = advanced.remaining
         }
-        await progress.finish()
         return result.bytes
     }
 
@@ -3765,6 +3771,7 @@ public enum SMBClient {
         length: UInt64,
         progress: SMBReadStreamProgress,
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil,
+        allowsShortRead: Bool = false,
         onChunk: @escaping @Sendable ([UInt8]) async throws -> Void
     ) async throws {
         let transferProgress = SMBTransferProgressEmitter(totalBytes: length, onProgress: onProgress)
@@ -3866,12 +3873,24 @@ public enum SMBClient {
             }
         }
 
-        try await withTaskCancellationHandler {
-            try await readBody()
-        } onCancel: {
-            Task { await session.stopReadTransferForCancellation(handle) }
+        var readError: Error?
+        do {
+            try await withTaskCancellationHandler {
+                try await readBody()
+            } onCancel: {
+                Task { await session.stopReadTransferForCancellation(handle) }
+            }
+        } catch {
+            readError = error
         }
         let received = progress.received
+        if let readError {
+            if let shortRead = readError as? SMBReadTransferShortRead {
+                if !allowsShortRead { throw shortRead.codecError }
+            } else {
+                throw readError
+            }
+        }
         if SMBPerfLog.isEnabled {
             let elapsed = ContinuousClock.now - perfStart
             let seconds = Double(elapsed.components.seconds)
@@ -3881,7 +3900,7 @@ public enum SMBClient {
                 "stream total=\(received) elapsed=\(SMBPerfLog.milliseconds(elapsed))ms throughput=\(String(format: "%.2f", throughput))MB/s chunks=\(progress.chunks)"
             )
         }
-        guard received == length else {
+        if received != length && !allowsShortRead {
             throw SMBCodecError.invalidValue("short SMB read: expected \(length) bytes, got \(received)")
         }
         await transferProgress.finish()
@@ -10884,9 +10903,7 @@ extension SMBSession {
             let received = state.window.retireFrontier >= state.startingOffset
                 ? state.window.retireFrontier - state.startingOffset
                 : 0
-            error = SMBCodecError.invalidValue(
-                "short SMB read: expected \(state.endOffset - state.startingOffset) bytes, got \(received)"
-            )
+            error = SMBReadTransferShortRead(expected: state.endOffset - state.startingOffset, received: received)
         } else {
             // Not `??`: its autoclosure would capture the non-Sendable `state` (see the admission check).
             if let selected = state.window.selectedError() {

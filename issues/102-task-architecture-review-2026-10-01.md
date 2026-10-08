@@ -157,7 +157,7 @@ before の実測は `docs/performance-resource-baseline.md` の「2026-10-02: �
 | M1 | 共通の下地（window の状態機械、pending の completion の宛先、待たない予約、operation の絶対期限）。転送はまだ直列 | **完了**（2026-10-07、commit `feat(session): issue 102 #14 #15 の pipelining M1 — …`。未 push。レビュー: 発見型 12 件・敵対の反例 2 件を対応） |
 | M2 | READ の pipelining | **完了**（2026-10-08、commit `feat(read): issue 102 #14 の pipelining M2 — …`。下の M2 の節） |
 | M3 | WRITE の pipelining | **完了**（2026-10-08、commit `feat(write): issue 102 #15 の pipelining M3 — …`。CI は下の M3 の節） |
-| M4 | POSIX の受信バッファ（#16）と総合検証（CI の性能 gate・RTT study の after） | 未着手 |
+| M4 | POSIX の受信バッファ（#16）と総合検証（CI の性能 gate・RTT study の after） | **完了**（2026-10-09。下の M4 の節） |
 
 未確認のリスク: CI の Linux x86 の synthetic benchmark（`initialCredits=1` で実質 1 flight）での user CPU。手元の macOS / arm64 container で master と交互に測ってから push し、
 gate が落ちたら上書きせず相談する。
@@ -194,4 +194,17 @@ gate が落ちたら上書きせず相談する。
   - 送信失敗（cancellation 以外）は request の種類によらず refund より先に session を terminal にするように広げた（単発の request / CLOSE の送信失敗の refund で、credit 待ちの転送が commit する反例があった）。
   - 未確認: credit の通知の取りこぼし（balance の await の後に revision を取っていた）は 20 回で再現しなかった。await の前に取る形に直した。
 - 未確認のリスク: supplier の size の hint は、送信中の WRITE があっても credit がある限り今の残高で決まるので、credit が少ない server では直列版より小さい WRITE になることがある（credit 0 のときは直列版と同じに戻した）。
+
+### M4 と総合検証の記録（2026-10-09）
+
+- #16: commit `perf(transport): issue 102 #16 — POSIXSocketTransport の受信で、recv が書いた分だけを初期化して返す`。効果は未実測（synthetic は in-memory の transport でこの経路を通らない）。
+- M2 の取りこぼし: `read(path:)` などファイル全体を読む `SMBClient.readAll` が直列のループのまま残っていた（RTT study で read だけ伸びずに見つけた）。
+  commit `feat(read): issue 102 #14 — read(path:) などファイル全体を読む readAll も READ の pipelining の driver に載せる` で同じ driver に載せた。
+- 実 Samba の RTT study（同じ runner で 26fd9d7 と交互、`docs/performance-resource-baseline.md` の「2026-10-09」節）:
+  RTT 20 ms の 64 MiB で read 43.7 → 133.8 MiB/s（+206%）、write 37.9 → 91.2 MiB/s（+141%）。1 MiB は noise の内。
+- CI の性能 gate（Linux x86、synthetic、initialCredits=1）はすべて PASS。M2 の read は −5.4% / user CPU +11.5%、M3 の write は −5.5% / +6.3%（いずれも上限の内側）。
+- 途中で見つけて直したテストの同期の誤り（M2・M3 の前からあったものを含む）: 送信の到着順・到着件数への依存、closed generation の pending の待ち、blocked send の bytes の読み出し、file supplier の進捗の回数。
+- 未確認: CI の macos-tsan で `SMBeePendingResponseStateTests.testClosingCancelsBlockedSendOwnedByCancelledTombstone` が 1 回落ちた（CancellationError）。手元の TSan では 15 回で再現しない。
+  この test の経路（単発の READ の send の cancellation）は M3 の変更で挙動が変わらない（非 transfer の cancellation は refund の前に閉じない）。再実行で様子を見る。
+- #14 #15 #16 はこれで完了。102 に残るのは #9（069 M2。issue 106 の Commit 3 待ち）だけ。
 

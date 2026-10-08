@@ -425,3 +425,22 @@ GitHub-hosted ubuntu runner、Samba 4.19.5、SMB 3.1.1 signing（AES-GMAC）。�
 各 cell は 100 samples。RTT 20 ms の 64 MiB read（45.0 MiB/s）は、1 MiB の READ を 1 往復に 1 本ずつ送る場合の
 上限（1 MiB / 20 ms ≒ 50 MiB/s）にほぼ一致し、現状は READ / WRITE が往復ごとに直列であることを示す。
 READ / WRITE のパイプライン化（issue 102 #14 #15 #16）の効果は、この表を before として同じ条件で測る。
+
+## 2026-10-09: READ / WRITE のパイプライン化の後（issue 102 #14 #15）
+
+`Network performance study` run 37817508192（commit c492c24、`experiment=fix-ab`、`baseline_ref=26fd9d7`（パイプライン化の前）、
+`profiles=smb311-signing-required`、`rtt_levels=0,5,20`、`sizes_mib=1,64`、10 invocations × 5 samples、warm-up 2）。
+同じ runner で baseline と current を交互に測った（日付・runner の違いを含まない比較）。値は throughput の median（MiB/s）。
+
+| 追加 RTT | サイズ | read baseline → current | write baseline → current |
+|---|---|---|---|
+| 0 ms | 1 MiB | 338.9 → 336.0（−0.9%、noise の内） | 248.4 → 253.0（+1.9%、noise の内） |
+| 0 ms | 64 MiB | 484.1 → 897.4（+85.4%） | 197.9 → 223.2（+12.8%） |
+| 5 ms | 1 MiB | 42.9 → 42.4（noise の内） | 41.1 → 40.7（noise の内） |
+| 5 ms | 64 MiB | 142.2 → 405.6（+185%） | 95.0 → 173.7（+83%） |
+| 20 ms | 1 MiB | 11.89 → 11.87（noise の内） | 11.73 → 11.72（noise の内） |
+| 20 ms | 64 MiB | 43.7 → 133.8（+206%） | 37.9 → 91.2（+141%） |
+
+RTT 20 ms の 64 MiB read は、1 往復 1 本の上限（約 50 MiB/s）を超えた。1 MiB は 1 本の request なのでパイプライン化の余地が無く、変化は noise の内。
+別の日の run 37807094939（commit 502ffb5、`experiment=profiles`）と 2026-10-02 の baseline を並べると 0 ms の 1 MiB が −29% に見えたが、
+同じ runner の上の比較では差が無く、runner の違いだった。この run の時点では read(path:) がまだ直列だった（commit c492c24 で直した）。

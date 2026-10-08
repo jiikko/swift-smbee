@@ -2759,13 +2759,23 @@ final class SMBeeTests: XCTestCase {
         )
         await session.closeTransportAndWait(cause: "test_stale_callback_setup_close")
 
+        // A terminal wire makes the pending-count helper return before this Task registers.
+        // Synchronize on the insertion callback so the stale callbacks have a record to test.
+        let registration = POSIXAsyncCounter()
         let responseWaiter = Task {
-            try await session.parkPendingForTesting(messageId: 0x88, command: SMB2Commands.echo, sent: true)
+            try await session.parkPendingForTesting(
+                messageId: 0x88,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { registration.increment() }
+            )
         }
         try await awaitWithTimeout("sent record installed behind terminal fence") {
-            await session.waitForPendingCountForTesting(atLeast: 1)
+            await registration.wait(until: 1)
         }
         try await session.dispatchReceivedPacketForTesting(smb2EchoResponse(messageId: 0x88))
+        let pendingAfterStaleReceive = await session.wirePendingRecordCountForTesting()
+        XCTAssertEqual(pendingAfterStaleReceive, 1, "a stale receive cannot remove a terminal-generation record")
         if let handle = await session.readerHandleForTesting() {
             await session.readerDidExitForTesting(
                 generation: 1,
@@ -2779,7 +2789,11 @@ final class SMBeeTests: XCTestCase {
                 error: SMBTransportError.socketFailure("stale reader completion")
             )
         }
+        let pendingAfterStaleReaderExit = await session.wirePendingRecordCountForTesting()
+        XCTAssertEqual(pendingAfterStaleReaderExit, 1, "a stale reader exit cannot remove a terminal-generation record")
         await session.sendDidSucceedForTesting(messageId: 0x88)
+        let pendingAfterStaleSend = await session.wirePendingRecordCountForTesting()
+        XCTAssertEqual(pendingAfterStaleSend, 1, "a stale send completion cannot remove a terminal-generation record")
 
         let pending = await session.wirePendingRecordCountForTesting()
         let orphanCount = await session.orphanResponseCountForTesting()
@@ -2811,11 +2825,19 @@ final class SMBeeTests: XCTestCase {
         await session.closeTransportAndWait(cause: "test_stale_timer_setup_close")
 
         let messageId: UInt64 = 0x89
+        // A terminal wire makes the pending-count helper return before this Task registers
+        // (same race as testStaleCallbacksCannotMutateAClosedGeneration). Wait for insertion.
+        let registration = POSIXAsyncCounter()
         let pending = Task {
-            try await session.parkPendingForTesting(messageId: messageId, command: SMB2Commands.echo, sent: true)
+            try await session.parkPendingForTesting(
+                messageId: messageId,
+                command: SMB2Commands.echo,
+                sent: true,
+                onRegistered: { registration.increment() }
+            )
         }
         try await awaitWithTimeout("terminal-generation test record installed") {
-            await session.waitForPendingCountForTesting(atLeast: 1)
+            await registration.wait(until: 1)
         }
         let identity = UUID()
         await session.setRequestTimeoutIdentityForTesting(messageId: messageId, identity: identity)

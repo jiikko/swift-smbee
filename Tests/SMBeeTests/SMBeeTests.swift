@@ -3465,8 +3465,10 @@ final class SMBeeTests: XCTestCase {
         transport.blockNextSend()
         let second = Task { try await session.echo() }
         try await awaitWithTimeout("second ECHO send blocks") {
-            try await transport.waitForSendAttemptCount(
-                atLeast: 2,
+            try await transport.waitForBlockedSendCount(
+                // The attempt counter is signalled before the blocked bytes are stored; wait for the
+                // blocked send itself so firstBlockedSendBytes is set.
+                atLeast: 1,
                 timeout: .seconds(1),
                 sleeper: { try await clock.sleep(for: $0) }
             )
@@ -3536,8 +3538,10 @@ final class SMBeeTests: XCTestCase {
         let blockedEcho = Task { try await session.echo() }
         defer { blockedEcho.cancel() }
         try await awaitWithTimeout("second ECHO is blocked before send completion") {
-            try await transport.waitForSendAttemptCount(
-                atLeast: 2,
+            try await transport.waitForBlockedSendCount(
+                // The attempt counter is signalled before the blocked bytes are stored; wait for the
+                // blocked send itself so firstBlockedSendBytes is set.
+                atLeast: 1,
                 timeout: .seconds(1),
                 sleeper: { try await clock.sleep(for: $0) }
             )
@@ -9163,8 +9167,9 @@ final class SMBeeTests: XCTestCase {
         let earlyFinalRequest = Task { try await session.echo() }
         let sendClock = ManualSMBSleeper()
         try await awaitWithTimeout("encrypted X send is held") {
-            try await transport.waitForSendAttemptCount(
-                atLeast: 2,
+            try await transport.waitForBlockedSendCount(
+                // The attempt counter is signalled before the blocked bytes are stored.
+                atLeast: 1,
                 timeout: .seconds(1),
                 sleeper: { try await sendClock.sleep(for: $0) }
             )

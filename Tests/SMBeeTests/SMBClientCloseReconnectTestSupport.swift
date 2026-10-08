@@ -656,6 +656,10 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
         }) else {
             throw SMBCodecError.invalidValue("test transport has no CREATE request")
         }
+        try respondToCreate(request, credits: credits)
+    }
+
+    func respondToCreate(_ request: SMB2Header, credits: UInt16) throws {
         var response = try SMB2Header(
             command: SMB2Commands.create,
             credits: credits,
@@ -831,6 +835,174 @@ class SMBReadPipelineScriptTransport: SMBContinuationWatchTransport, @unchecked 
             UInt8(truncatingIfNeeded: value >> 16),
             UInt8(truncatingIfNeeded: value >> 24)
         ]
+    }
+}
+
+class SMBWritePipelineScriptTransport: SMBReadPipelineScriptTransport, @unchecked Sendable {
+    struct WriteRequest: Equatable, Sendable {
+        let header: SMB2Header
+        let offset: UInt64
+        let length: UInt32
+        let data: [UInt8]
+    }
+
+    private let writeLock = NSLock()
+    private var writeRequestsStorage: [WriteRequest] = []
+    private let writeRequestBarrier = SMBContinuationCountBarrier()
+
+    override func send(_ bytes: [UInt8]) async throws {
+        let command = try smbPacketInDirectTCPStream(bytes).flatMap { try? SMB2Header.decode($0).command }
+        if let packet = try smbPacketInDirectTCPStream(bytes) {
+            let header = try SMB2Header.decode(packet)
+            if header.command == SMB2Commands.write {
+                var lengthReader = SMBByteReader(bytes: Array(packet[68..<72]))
+                var offsetReader = SMBByteReader(bytes: Array(packet[72..<80]))
+                var dataOffsetReader = SMBByteReader(bytes: Array(packet[66..<68]))
+                let length = try lengthReader.readUInt32LE()
+                let offset = try offsetReader.readUInt64LE()
+                let dataOffset = Int(try dataOffsetReader.readUInt16LE())
+                guard dataOffset >= SMB2Header.encodedSize + 48,
+                      dataOffset <= packet.count,
+                      UInt64(dataOffset) + UInt64(length) <= UInt64(packet.count) else {
+                    throw SMBCodecError.invalidValue("test transport received malformed WRITE data range")
+                }
+                let request = WriteRequest(
+                    header: header,
+                    offset: offset,
+                    length: length,
+                    data: Array(packet[dataOffset..<(dataOffset + Int(length))])
+                )
+                writeLock.withLock { writeRequestsStorage.append(request) }
+                writeRequestBarrier.signal()
+            }
+        }
+        try await super.send(bytes)
+        if command == SMB2Commands.queryInfo,
+           let packet = try smbPacketInDirectTCPStream(bytes),
+           let header = try? SMB2Header.decode(packet) {
+            try respondToQueryInfo(header)
+        }
+        if command == SMB2Commands.flush,
+           let packet = try smbPacketInDirectTCPStream(bytes),
+           let header = try? SMB2Header.decode(packet) {
+            try respondToStatus(header, command: SMB2Commands.flush)
+        }
+    }
+
+    /// Sorted by MessageId (commit order), independent of concurrent transport send arrival.
+    var writeRequests: [WriteRequest] {
+        writeLock.withLock { writeRequestsStorage }.sorted { $0.header.messageId < $1.header.messageId }
+    }
+
+    func waitForWrite(atOffset offset: UInt64) async throws -> WriteRequest {
+        while true {
+            if let request = writeLock.withLock({ writeRequestsStorage.first { $0.offset == offset } }) {
+                return request
+            }
+            let nextSignal = writeRequestBarrier.currentCount + 1
+            try await writeRequestBarrier.waitForCount(nextSignal)
+        }
+    }
+
+    func respond(
+        to request: WriteRequest,
+        count: UInt32? = nil,
+        status: UInt32 = SMB2Status.success,
+        credits: UInt16 = 1
+    ) throws {
+        var response = try SMB2Header(
+            status: status,
+            command: SMB2Commands.write,
+            credits: credits,
+            messageId: request.header.messageId,
+            treeId: request.header.treeId,
+            sessionId: request.header.sessionId
+        ).encode()
+        if status == SMB2Status.success {
+            response.append(contentsOf: [17, 0, 0, 0])
+            response.append(contentsOf: Self.littleEndian(count ?? request.length))
+            response.append(contentsOf: [0, 0, 0, 0, 0, 0, 0, 0])
+            guard response.count == SMB2Header.encodedSize + 16 else {
+                throw SMBCodecError.invalidValue("test fake generated a truncated successful WRITE response")
+            }
+        } else {
+            response.append(contentsOf: [9, 0, 0, 0, 0, 0, 0, 0])
+        }
+        try enqueue(response)
+    }
+
+    private func respondToQueryInfo(_ request: SMB2Header) throws {
+        var response = try SMB2Header(
+            command: SMB2Commands.queryInfo,
+            credits: 1,
+            messageId: request.messageId,
+            treeId: request.treeId,
+            sessionId: request.sessionId
+        ).encode()
+        response.append(contentsOf: [9, 0, 72, 0, 56, 0, 0, 0])
+        var info = Array(repeating: UInt8(0), count: 56)
+        writeUInt64LE(1_234, to: &info, at: 40)
+        writeUInt64LE(4_096, to: &info, at: 32)
+        response.append(contentsOf: info)
+        try enqueue(response)
+    }
+
+    private func respondToStatus(_ request: SMB2Header, command: UInt16) throws {
+        let response = try SMB2Header(
+            command: command,
+            credits: 1,
+            messageId: request.messageId,
+            treeId: request.treeId,
+            sessionId: request.sessionId
+        ).encode()
+        try enqueue(response)
+    }
+
+    private static func littleEndian(_ value: UInt32) -> [UInt8] {
+        [
+            UInt8(truncatingIfNeeded: value),
+            UInt8(truncatingIfNeeded: value >> 8),
+            UInt8(truncatingIfNeeded: value >> 16),
+            UInt8(truncatingIfNeeded: value >> 24)
+        ]
+    }
+}
+
+final class SMBWritePipelineGatedSendTransport: SMBWritePipelineScriptTransport, @unchecked Sendable {
+    private let gatedOffset: UInt64
+    private let sendGate = SMBContinuationAsyncGate()
+
+    init(gatedOffset: UInt64) {
+        self.gatedOffset = gatedOffset
+    }
+
+    override func send(_ bytes: [UInt8]) async throws {
+        guard let packet = try smbPacketInDirectTCPStream(bytes),
+              let header = try? SMB2Header.decode(packet),
+              header.command == SMB2Commands.write else {
+            try await super.send(bytes)
+            return
+        }
+        var offsetReader = SMBByteReader(bytes: Array(packet[72..<80]))
+        let offset = try offsetReader.readUInt64LE()
+        try await super.send(bytes)
+        if offset == gatedOffset {
+            try await sendGate.suspend(
+                timeout: .seconds(60),
+                sleeper: { try await Task.sleep(for: $0) }
+            )
+        }
+    }
+
+    func waitUntilGatedSend() async throws {
+        try await sendGate.waitUntilSuspended(
+            timeout: .seconds(60),
+            sleeper: { try await Task.sleep(for: $0) }
+        )
+    }
+
+    func releaseGatedSend() {
+        sendGate.release()
     }
 }
 

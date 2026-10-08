@@ -10077,7 +10077,13 @@ final class SMBeeTests: XCTestCase {
             onProgress: progress.append
         )
 
-        XCTAssertEqual(supplier.requestedSizes, [65_536, 196_608, 196_608])
+        let requestedSizes = supplier.requestedSizes
+        XCTAssertEqual(requestedSizes.count, 3)
+        XCTAssertEqual(requestedSizes.first, 65_536, "the first hint uses the one initial credit")
+        XCTAssertGreaterThanOrEqual(requestedSizes[1], secondChunk.count)
+        XCTAssertLessThanOrEqual(requestedSizes[1], 1_048_576)
+        XCTAssertGreaterThan(requestedSizes[2], 0, "the EOF probe receives a positive negotiated hint")
+        XCTAssertLessThanOrEqual(requestedSizes[2], 1_048_576)
         let writes = try unframed(transport.outbound).filter {
             try SMB2Header.decode($0).command == SMB2Commands.write
         }

@@ -53,6 +53,34 @@ private struct SMBLocalFileSnapshot: Equatable {
     }
 }
 
+/// Serialized file-backed WRITE source. The transfer owner invokes `nextChunk` one at a time.
+private final class SMBLocalUploadSource: @unchecked Sendable {
+    let handle: FileHandle
+    let totalBytes: UInt64
+    let progress: SMBTransferProgressEmitter
+    private(set) var bytesTransferred: UInt64
+
+    init(handle: FileHandle, totalBytes: UInt64, initialOffset: UInt64, progress: SMBTransferProgressEmitter) {
+        self.handle = handle
+        self.totalBytes = totalBytes
+        self.bytesTransferred = initialOffset
+        self.progress = progress
+    }
+
+    func nextChunk(maximumLength: Int) throws -> [UInt8] {
+        let remaining = totalBytes - bytesTransferred
+        guard remaining > 0 else { return [] }
+        let length = min(maximumLength, SMBClientSession.localWriteChunkLimit, Int(clamping: remaining))
+        let data = try handle.read(upToCount: length) ?? Data()
+        guard !data.isEmpty else {
+            throw SMBCodecError.invalidValue("local source file ended before its initial size")
+        }
+        bytesTransferred += UInt64(data.count)
+        progress.emit(bytesTransferred: bytesTransferred)
+        return Array(data)
+    }
+}
+
 /// Replaces `destination` (file or directory) with `source`. `replaceItemAt` gives an atomic swap on
 /// Darwin, but swift-corelibs-foundation implements it unreliably on Linux — it non-deterministically
 /// either throws "file doesn't exist" or returns without actually swapping, leaving the old content.
@@ -1812,7 +1840,12 @@ public actor SMBClientSession {
             fileId = try await session.create(treeId: treeId, request: .upload(path: path, overwrite: overwrite))
         }
         let progress = SMBTransferProgressEmitter(totalBytes: totalBytes, onProgress: onProgress)
-        var bytesTransferred = remoteSize
+        let source = SMBLocalUploadSource(
+            handle: handle,
+            totalBytes: totalBytes,
+            initialOffset: remoteSize,
+            progress: progress
+        )
         do {
             if remoteSize > 0 {
                 try handle.seek(toOffset: 0)
@@ -1838,19 +1871,10 @@ public actor SMBClientSession {
             }
             try handle.seek(toOffset: remoteSize)
             try await session.write(treeId: treeId, fileId: fileId, offset: remoteSize) { maxLength in
-                let remaining = totalBytes - bytesTransferred
-                guard remaining > 0 else { return [] }
-                let length = min(maxLength, Self.localWriteChunkLimit, Int(clamping: remaining))
-                let data = try handle.read(upToCount: length) ?? Data()
-                guard !data.isEmpty else {
-                    throw SMBCodecError.invalidValue("local source file ended before its initial size")
-                }
-                bytesTransferred += UInt64(data.count)
-                progress.emit(bytesTransferred: bytesTransferred)
-                return Array(data)
+                try source.nextChunk(maximumLength: maxLength)
             }
             await progress.finish()
-            guard bytesTransferred == totalBytes else {
+            guard source.bytesTransferred == totalBytes else {
                 throw SMBCodecError.invalidValue("local source file ended before its initial size")
             }
             guard try SMBLocalFileSnapshot(handle: handle) == sourceSnapshot else {
@@ -5308,6 +5332,7 @@ private struct SMBPendingResponse {
     var acceptedFinalFrame: SMBReceivedFrame?
     var acceptedFinalStatus: UInt32?
     var earlyReadPayloadLength: UInt32?
+    var earlyWriteResult: SMBTransferFinalResult?
     let completionTarget: SMBPendingResponseCompletionTarget
     var sendTask: Task<Void, Never>?
     var timeoutTask: Task<Void, Never>?
@@ -5353,12 +5378,91 @@ private struct SMBReadTransferHandle: Sendable {
     let generation: UInt64
 }
 
+private struct SMBWriteTransferHandle: Sendable {
+    let identifier: UInt64
+    let generation: UInt64
+}
+
 private enum SMBReadTransferAdmissionResult: Sendable {
     case committed(creditBalance: UInt32, creditRevision: UInt64)
     case retry
     case wait(revision: UInt64, creditRevision: UInt64?)
     case stopped(revision: UInt64)
     case complete
+}
+
+private struct SMBWriteTransferPreparation: Sendable {
+    let slotIndex: Int
+    let offset: UInt64
+    let candidateLength: UInt32
+    let supplierLength: Int?
+}
+
+private enum SMBWriteTransferCommitResult: Sendable {
+    case committed(length: UInt32, creditBalance: UInt32, creditRevision: UInt64)
+    case wait(revision: UInt64, creditRevision: UInt64)
+    case stopped(revision: UInt64)
+    case complete
+}
+
+private enum SMBWriteTransferDriverFinish: @unchecked Sendable {
+    case retired(ticket: SMBTransferTicket, advanceFrontier: Bool)
+    case protocolFailure(ticket: SMBTransferTicket, error: Error)
+    case sourceEOF(slotIndex: Int)
+    case sourceFailure(slotIndex: Int, offset: UInt64, error: Error)
+    case suppliedChunk(slotIndex: Int, offset: UInt64, maximumLength: Int)
+}
+
+private enum SMBWriteTransferDriverAction: @unchecked Sendable {
+    case preparation(SMBWriteTransferPreparation)
+    case committed(length: Int)
+    case retirement(SMBTransferRetirement)
+    case complete
+    case failed(Error)
+}
+
+/// WRITE protocol state lives on the session actor; the API task owns source callbacks,
+/// ordered ACK retirement, drain, and any terminal join.
+private final class SMBSessionWriteTransfer {
+    let handle: SMBWriteTransferHandle
+    let generation: UInt64
+    let treeId: UInt32
+    let fileId: [UInt8]
+    let startingOffset: UInt64
+    let operationDeadline: ContinuousClock.Instant?
+    let window: SMBTransferWindow
+    let retireSuccessfulWritesInline: Bool
+    var sourceEOF = false
+    var operationDeadlineStopRecorded = false
+    var revision: UInt64 = 0
+    var creditRevision: UInt64 = 0
+    var eventWaiters: [CheckedContinuation<Void, Never>] = []
+    var drainTimerIdentity: UUID?
+    var drainTimerDeadline: ContinuousClock.Instant?
+    var drainTimer: Task<Void, Never>?
+
+    init(
+        handle: SMBWriteTransferHandle,
+        generation: UInt64,
+        treeId: UInt32,
+        fileId: [UInt8],
+        startingOffset: UInt64,
+        operationDeadline: ContinuousClock.Instant?,
+        retireSuccessfulWritesInline: Bool
+    ) {
+        self.handle = handle
+        self.generation = generation
+        self.treeId = treeId
+        self.fileId = fileId
+        self.startingOffset = startingOffset
+        self.operationDeadline = operationDeadline
+        self.retireSuccessfulWritesInline = retireSuccessfulWritesInline
+        self.window = SMBTransferWindow(
+            transferIdentifier: handle.identifier,
+            direction: .write,
+            startingOffset: startingOffset
+        )
+    }
 }
 
 private struct SMBReadTransferRetirementFinish: @unchecked Sendable {
@@ -5520,7 +5624,8 @@ actor SMBSession {
     private let creditWindow: SMB2CreditWindow
     private var pendingResponses: [UInt64: SMBPendingResponse] = [:]
     private var readTransfers: [UInt64: SMBSessionReadTransfer] = [:]
-    private var nextReadTransferIdentifier: UInt64 = 0
+    private var writeTransfers: [UInt64: SMBSessionWriteTransfer] = [:]
+    private var nextTransferIdentifier: UInt64 = 0
     private var activeRequestIdentities: Set<SMBRequestIdentity> = []
     private var nextRequestSequence: UInt64 = 0
     private var cleanupLedger: [SMBFileIdLedgerKey: SMBCleanupAttemptState] = [:]
@@ -6267,53 +6372,60 @@ actor SMBSession {
         onProgress: (@Sendable (SMBTransferProgress) -> Void)? = nil
     ) async throws {
         let progress = SMBTransferProgressEmitter(totalBytes: UInt64(data.count), onProgress: onProgress)
-        try await writeChunk(
+        let acknowledgementProgress: (@Sendable (UInt64) -> Void)?
+        if onProgress == nil {
+            acknowledgementProgress = nil
+        } else {
+            acknowledgementProgress = { bytesTransferred in
+                progress.emit(bytesTransferred: bytesTransferred)
+            }
+        }
+        try await smbWriteTransfer(
+            session: self,
             treeId: treeId,
             fileId: fileId,
             offset: 0,
-            data: data,
-            onProgress: { progress.emit(bytesTransferred: UInt64($0)) }
+            source: SMBWriteTransferSourceBox(
+                usesCreditAwareHint: false,
+                initialData: data,
+                nextChunk: { _ in [] }
+            ),
+            onAcknowledged: acknowledgementProgress
         )
         await progress.finish()
-    }
-
-    func write(treeId: UInt32, fileId: [UInt8], offset startOffset: UInt64, nextChunk: (Int) throws -> [UInt8]) async throws {
-        var offset = startOffset
-        while true {
-            try Task.checkCancellation()
-            let chunkSize = await creditAwareWriteChunkSize()
-            let chunk = try nextChunk(chunkSize)
-            if chunk.isEmpty { break }
-            try await writeChunk(treeId: treeId, fileId: fileId, offset: offset, data: chunk)
-            let nextOffset = offset.addingReportingOverflow(UInt64(chunk.count))
-            guard !nextOffset.overflow else {
-                throw SMBCodecError.invalidValue("SMB write offset overflow")
-            }
-            offset = nextOffset.partialValue
-        }
     }
 
     func write(
         treeId: UInt32,
         fileId: [UInt8],
         offset startOffset: UInt64,
-        nextChunk: @Sendable (Int) async throws -> [UInt8],
+        nextChunk: @escaping @Sendable (Int) throws -> [UInt8]
+    ) async throws {
+        let source = SMBWriteTransferSourceBox(nextChunk: { maximumLength in try nextChunk(maximumLength) })
+        try await smbWriteTransfer(
+            session: self,
+            treeId: treeId,
+            fileId: fileId,
+            offset: startOffset,
+            source: source
+        )
+    }
+
+    func write(
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset startOffset: UInt64,
+        nextChunk: @escaping @Sendable (Int) async throws -> [UInt8],
         onProgress: (@Sendable (UInt64) -> Void)? = nil
     ) async throws {
-        var offset = startOffset
-        while true {
-            try Task.checkCancellation()
-            let chunkSize = await creditAwareWriteChunkSize()
-            let chunk = try await nextChunk(chunkSize)
-            if chunk.isEmpty { break }
-            let nextOffset = offset.addingReportingOverflow(UInt64(chunk.count))
-            guard !nextOffset.overflow else {
-                throw SMBCodecError.invalidValue("SMB write offset overflow")
-            }
-            onProgress?(nextOffset.partialValue)
-            try await writeChunk(treeId: treeId, fileId: fileId, offset: offset, data: chunk)
-            offset = nextOffset.partialValue
-        }
+        try await smbWriteTransfer(
+            session: self,
+            treeId: treeId,
+            fileId: fileId,
+            offset: startOffset,
+            source: SMBWriteTransferSourceBox(nextChunk: { maximumLength in try await nextChunk(maximumLength) }),
+            onSupplied: onProgress
+        )
     }
 
     func copyFile(treeId: UInt32, fromPath: String, toPath: String, overwrite: Bool) async throws {
@@ -7155,7 +7267,9 @@ actor SMBSession {
         for task in readerTasks.values { task.cancel() }
         transport.close()
         failWire(error: SMBTransportError.connectionClosed, recordFirstFault: false)
-        markReadTransfersTerminalClose(wireFailure ?? diagnosticError ?? SMBTransportError.connectionClosed)
+        let terminalError = wireFailure ?? diagnosticError ?? SMBTransportError.connectionClosed
+        markReadTransfersTerminalClose(terminalError)
+        markWriteTransfersTerminalClose(terminalError)
         cleanupLedger.removeAll()
         resumeCleanupLedgerCountWaiters()
     }
@@ -7180,6 +7294,7 @@ actor SMBSession {
         }
         await creditFailureTask?.value
         markReadTransfersTerminalJoinComplete()
+        markWriteTransfersTerminalJoinComplete()
     }
 
     private func finishConnectAttempt() {
@@ -7956,9 +8071,7 @@ actor SMBSession {
                 diagnosticSessionId: diagnosticID,
                 send: send
             )
-            if let transferTicket {
-                self.readTransferSendOwnerFinished(transferTicket)
-            }
+            if let transferTicket { self.transferSendOwnerFinished(transferTicket) }
             self.activeSendTasks.removeValue(forKey: sendOperationID)
         }
         activeSendTasks[sendOperationID] = sendTask
@@ -8437,7 +8550,7 @@ actor SMBSession {
             try await transport.send(DirectTCPFraming.segments([packet]))
             guard isGenerationActive(generation) else { throw SMBTransportError.connectionClosed }
         } catch {
-            closeReadTransferAfterSendFailure(messageId: messageId, error: error)
+            terminalizeSendFailureBeforeCreditRefund(messageId: messageId, error: error)
             await refundCredit(charge: reservedCharge)
             throw error
         }
@@ -8502,17 +8615,30 @@ actor SMBSession {
             try await transport.send(DirectTCPFraming.segments([try header.encode(), sealed.ciphertext]))
             guard isGenerationActive(generation) else { throw SMBTransportError.connectionClosed }
         } catch {
-            closeReadTransferAfterSendFailure(messageId: messageId, error: error)
+            terminalizeSendFailureBeforeCreditRefund(messageId: messageId, error: error)
             await refundCredit(charge: reservedCharge)
             throw error
         }
     }
 
-    private func closeReadTransferAfterSendFailure(messageId: UInt64?, error: Error) {
-        guard let messageId,
-              let pending = pendingResponses[messageId],
-              case .transfer = pending.completionTarget else { return }
-        closeTransport(cause: "transfer_send_failure", diagnosticError: error)
+    private func terminalizeSendFailureBeforeCreditRefund(messageId: UInt64?, error: Error) {
+        let isCancellation = error is CancellationError
+        var isTransferSend = false
+        if let messageId,
+           let pending = pendingResponses[messageId],
+           case .transfer = pending.completionTarget {
+            isTransferSend = true
+        }
+        if isCancellation {
+            if !isTransferSend { return }
+        }
+        if messageId == nil {
+            // Untracked sends (CANCEL) previously recorded the transport error as the wire's
+            // first fault before closing; keep that error for the other in-flight requests.
+            failWire(error: error)
+        }
+        let cause = isTransferSend ? "transfer_send_failure" : "send_failure"
+        closeTransport(cause: cause, diagnosticError: error)
     }
 
     private func verifySigned(_ frame: SMBReceivedFrame) throws {
@@ -9144,6 +9270,12 @@ actor SMBSession {
                     status: status,
                     at: acceptedAt
                 )
+                pending.earlyWriteResult = stopWriteTransferForEarlyFinal(
+                    pending.completionTarget,
+                    frame: frame,
+                    status: status,
+                    at: acceptedAt
+                )
             }
             pendingResponses[effect.messageId] = pending
         }
@@ -9231,7 +9363,7 @@ actor SMBSession {
             case .success:
                 break
             case .failure(let error):
-                failReadTransferRequest(ticket, error: error)
+                failTransferRequest(ticket, error: error)
             }
         }
     }
@@ -9241,7 +9373,8 @@ actor SMBSession {
         frame: SMBReceivedFrame,
         status: UInt32,
         deferReadPayloadDecode: Bool = false,
-        prevalidatedReadPayloadLength: UInt32? = nil
+        prevalidatedReadPayloadLength: UInt32? = nil,
+        prevalidatedWriteResult: SMBTransferFinalResult? = nil
     ) {
         guard var pending = removePendingResponse(messageId: messageId) else { return }
         pending.timeoutTask?.cancel()
@@ -9258,13 +9391,22 @@ actor SMBSession {
         if !pending.continuationResumed {
             pending.continuationResumed = true
             if case .transfer(let ticket) = pending.completionTarget {
-                completeReadTransferRequest(
-                    ticket,
-                    frame: frame,
-                    status: status,
-                    deferPayloadDecode: deferReadPayloadDecode,
-                    prevalidatedPayloadLength: prevalidatedReadPayloadLength
-                )
+                if writeTransfers[ticket.transferIdentifier] != nil {
+                    completeWriteTransferRequest(
+                        ticket,
+                        frame: frame,
+                        status: status,
+                        prevalidatedResult: prevalidatedWriteResult ?? pending.earlyWriteResult
+                    )
+                } else {
+                    completeReadTransferRequest(
+                        ticket,
+                        frame: frame,
+                        status: status,
+                        deferPayloadDecode: deferReadPayloadDecode,
+                        prevalidatedPayloadLength: prevalidatedReadPayloadLength
+                    )
+                }
             } else {
                 resolvePendingCompletion(pending.completionTarget, with: .success(frame))
             }
@@ -9286,7 +9428,7 @@ actor SMBSession {
         pending.sendPhase = .sending
         pendingResponses[messageId] = pending
         if case .transfer(let ticket) = pending.completionTarget {
-            readTransferSendStarted(ticket)
+            transferSendStarted(ticket)
         }
         return true
     }
@@ -9318,9 +9460,10 @@ actor SMBSession {
         pendingResponses[messageId] = pending
         resumeRequestSentCountWaiters()
         if case .transfer(let ticket) = pending.completionTarget {
-            let state = readTransfers[ticket.transferIdentifier]
+            let transferStopped = readTransfers[ticket.transferIdentifier]?.window.isStopped
+                ?? writeTransfers[ticket.transferIdentifier]?.window.isStopped
             let acceptedAt: ContinuousClock.Instant?
-            if requestTimeout != nil || state?.window.isStopped == true {
+            if requestTimeout != nil || transferStopped == true {
                 acceptedAt = sessionTime.now()
             } else {
                 acceptedAt = nil
@@ -9329,23 +9472,23 @@ actor SMBSession {
                 guard !pending.finalSeen else { return nil }
                 return acceptedAt.map { $0.advanced(by: timeout) }
             }
-            readTransferFullySent(ticket, responseDeadline: responseDeadline, at: acceptedAt)
+            transferFullySent(ticket, responseDeadline: responseDeadline, at: acceptedAt)
         }
         if pending.finalSeen,
            let frame = pending.acceptedFinalFrame,
            let status = pending.acceptedFinalStatus {
             let deferReadPayloadDecode: Bool
-            if case .transfer = pending.completionTarget {
+            if case .transfer(let ticket) = pending.completionTarget,
+               readTransfers[ticket.transferIdentifier] != nil {
                 deferReadPayloadDecode = true
-            } else {
-                deferReadPayloadDecode = false
-            }
+            } else { deferReadPayloadDecode = false }
             finishAcceptedFinal(
                 messageId: messageId,
                 frame: frame,
                 status: status,
                 deferReadPayloadDecode: deferReadPayloadDecode,
-                prevalidatedReadPayloadLength: pending.earlyReadPayloadLength
+                prevalidatedReadPayloadLength: pending.earlyReadPayloadLength,
+                prevalidatedWriteResult: pending.earlyWriteResult
             )
             return nil
         }
@@ -9523,6 +9666,18 @@ actor SMBSession {
         resumeAllTestingCountWaiters()
         failAllPendingResponses(error: failure)
         markReadTransfersSessionFailure(failure)
+        markWriteTransfersSessionFailure(failure)
+    }
+
+    /// Reads the non-Sendable write transfer state outside `||`: its autoclosures would capture
+    /// `state`, which the Linux Swift 6.2 compiler rejects (SendingRisksDataRace).
+    private func isWriteTransferAdmissionBlocked(
+        _ state: SMBSessionWriteTransfer,
+        at now: ContinuousClock.Instant
+    ) -> Bool {
+        if state.window.isStopped { return true }
+        if let deadline = state.operationDeadline, now >= deadline { return true }
+        return !isGenerationActive(state.generation)
     }
 
     private func isGenerationActive(_ generation: UInt64) -> Bool {
@@ -9626,7 +9781,10 @@ actor SMBSession {
     private func refundCredit(charge: UInt16) async {
         let balance = await creditWindow.refund(charge: charge)
         debugLine("SMB credit refund=\(charge) balance=\(balance)")
-        if charge > 0 { signalReadTransfersForCreditAvailability() }
+        if charge > 0 {
+            signalReadTransfersForCreditAvailability()
+            signalWriteTransfersForCreditAvailability()
+        }
     }
 
     private func recordCreditGrants(_ effects: [SMBValidatedResponseEffect], generation: UInt64) async {
@@ -9677,7 +9835,10 @@ actor SMBSession {
         let balance = await creditWindow.grant(totalCredits: totalCredits, receiptCount: receiptCount)
         await creditGrantAfterAwaitHookForTesting?()
         guard isGenerationActive(generation) else { return nil }
-        if totalCredits > 0 { signalReadTransfersForCreditAvailability() }
+        if totalCredits > 0 {
+            signalReadTransfersForCreditAvailability()
+            signalWriteTransfersForCreditAvailability()
+        }
         return balance
     }
 
@@ -9763,10 +9924,6 @@ actor SMBSession {
         return SMBTransferLimits.negotiatedChunkSize(localLimit: Self.localReadChunkLimit, negotiatedLimit: maxReadSize, transformOverhead: transformOverhead)
     }
 
-    private func creditAwareWriteChunkSize() async -> Int {
-        Int(clamping: await creditCappedLength(UInt32(min(negotiatedWriteChunkSize(), Int(clamping: UInt32.max)))))
-    }
-
     private func negotiatedWriteChunkSize() -> Int {
         let transformOverhead = encryptionKey == nil ? 0 : SMB3TransformHeader.encodedSize
         return SMBTransferLimits.negotiatedChunkSize(
@@ -9807,6 +9964,476 @@ actor SMBSession {
 }
 
 extension SMBSession {
+    fileprivate func beginWriteTransfer(
+        treeId: UInt32,
+        fileId: [UInt8],
+        offset: UInt64,
+        operationDeadline: ContinuousClock.Instant?,
+        retireSuccessfulWritesInline: Bool
+    ) throws -> SMBWriteTransferHandle {
+        guard let generation = readerLifecycle.activeGeneration else {
+            throw wireFailure ?? SMBTransportError.connectionClosed
+        }
+        try validateFileIdAdmission(command: SMB2Commands.write, fileId: fileId, cleanupFileId: nil)
+        nextTransferIdentifier &+= 1
+        let handle = SMBWriteTransferHandle(identifier: nextTransferIdentifier, generation: generation)
+        writeTransfers[handle.identifier] = SMBSessionWriteTransfer(
+            handle: handle,
+            generation: generation,
+            treeId: treeId,
+            fileId: fileId,
+            startingOffset: offset,
+            operationDeadline: operationDeadline,
+            retireSuccessfulWritesInline: retireSuccessfulWritesInline
+        )
+        return handle
+    }
+
+    fileprivate func stopWriteTransferForCancellation(_ handle: SMBWriteTransferHandle) {
+        guard let state = writeTransfers[handle.identifier] else { return }
+        stopWriteTransferForOwnerCancellation(state, at: sessionTime.now())
+    }
+
+    fileprivate func stepWriteTransfer(
+        _ handle: SMBWriteTransferHandle,
+        sourceBuffer: [UInt8]?,
+        sourceCursor: Int,
+        sourceNeedsCreditHint: Bool,
+        finishing: SMBWriteTransferDriverFinish?
+    ) async -> SMBWriteTransferDriverAction {
+        var creditWaitRevision: UInt64?
+        var committedBytesFromBuffer = 0
+        var bufferCursor = sourceCursor
+        switch finishing {
+        case .retired(let ticket, let advanceFrontier):
+            guard let state = writeTransfers[handle.identifier] else { return .complete }
+            _ = state.window.finishRetirement(ticket, advanceFrontier: advanceFrontier)
+            _ = state.window.releaseRetiredSlot(ticket)
+        case .protocolFailure(let ticket, let error):
+            guard let state = writeTransfers[handle.identifier] else { return .complete }
+            stopWriteTransfer(
+                state,
+                for: .offsetFailure(offset: ticket.offset, error: error),
+                at: sessionTime.now()
+            )
+        case .sourceEOF(let slotIndex):
+            guard let state = writeTransfers[handle.identifier] else { return .complete }
+            _ = state.window.revokePreparingForSourceEOF(slotIndex: slotIndex, at: sessionTime.now())
+            state.sourceEOF = true
+            signalWriteTransfer(state)
+        case .sourceFailure(let slotIndex, let offset, let error):
+            guard let state = writeTransfers[handle.identifier] else { return .complete }
+            let now = sessionTime.now()
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+            if Task.isCancelled {
+                stopWriteTransferForOwnerCancellation(state, at: now)
+            } else if let deadline = state.operationDeadline, now >= deadline {
+                stopWriteTransfer(state, for: .operationDeadline, at: now)
+            } else {
+                stopWriteTransfer(state, for: .offsetFailure(offset: offset, error: error), at: now)
+            }
+        case .suppliedChunk(let slotIndex, let offset, let maximumLength):
+            guard let sourceBuffer else {
+                return .failed(SMBCodecError.invalidValue("WRITE source buffer was not retained by its owner"))
+            }
+            let commit = await commitWriteTransferRequest(
+                handle,
+                slotIndex: slotIndex,
+                offset: offset,
+                sourceBuffer: sourceBuffer,
+                sourceIndex: bufferCursor,
+                maximumLength: maximumLength
+            )
+            switch commit {
+            case .committed(let length, let balance, let reservationCreditRevision):
+                creditWaitRevision = balance == 0 ? reservationCreditRevision : nil
+                committedBytesFromBuffer += Int(length)
+                bufferCursor += Int(length)
+            case .wait(_, let reservationCreditRevision):
+                creditWaitRevision = reservationCreditRevision
+            case .stopped:
+                break
+            case .complete:
+                return .complete
+            }
+        case nil:
+            break
+        }
+
+        while true {
+            guard let state = writeTransfers[handle.identifier] else { return .complete }
+            if Task.isCancelled {
+                stopWriteTransferForOwnerCancellation(state, at: sessionTime.now())
+                creditWaitRevision = nil
+            } else if let deadline = state.operationDeadline,
+                      sessionTime.now() >= deadline,
+                      !state.operationDeadlineStopRecorded {
+                stopWriteTransfer(state, for: .operationDeadline, at: sessionTime.now())
+                creditWaitRevision = nil
+            }
+
+            let hasReadyRetirement = state.window.hasReadyRetirement
+            let terminalPriorityStop = state.window.selectedStopReason().map(Self.isTransferStopTerminalPriority) == true
+            if committedBytesFromBuffer > 0, hasReadyRetirement, !terminalPriorityStop {
+                return .committed(length: committedBytesFromBuffer)
+            }
+            if let retirement = nextWriteTransferRetirement(handle) {
+                return .retirement(retirement)
+            }
+            if state.window.terminallyClosed {
+                if committedBytesFromBuffer > 0 {
+                    return .committed(length: committedBytesFromBuffer)
+                }
+                await closeTransportAndWait(cause: "write_transfer_terminal_drain")
+                if let error = await finishWriteTransferAfterDrain(handle) { return .failed(error) }
+                return .complete
+            }
+            if state.window.isStopped, state.window.wireDrained {
+                if committedBytesFromBuffer > 0 {
+                    return .committed(length: committedBytesFromBuffer)
+                }
+                if let error = await finishWriteTransferAfterDrain(handle) { return .failed(error) }
+                return .complete
+            }
+            if state.sourceEOF, state.window.wireDrained {
+                if committedBytesFromBuffer > 0 {
+                    return .committed(length: committedBytesFromBuffer)
+                }
+                if let error = await finishWriteTransferAfterDrain(handle) { return .failed(error) }
+                return .complete
+            }
+            if let creditWaitRevision {
+                if creditWaitRevision == state.creditRevision {
+                    if !state.window.isStopped {
+                        if state.window.committedSlotCount > 0 {
+                            if committedBytesFromBuffer > 0,
+                               sourceBuffer.map({ bufferCursor >= $0.count }) ?? true {
+                                return .committed(length: committedBytesFromBuffer)
+                            }
+                            await waitForWriteTransferEvent(handle, after: state.revision)
+                            continue
+                        }
+                    }
+                }
+            }
+            creditWaitRevision = nil
+
+            if committedBytesFromBuffer > 0,
+               sourceBuffer.map({ bufferCursor >= $0.count }) ?? true {
+                return .committed(length: committedBytesFromBuffer)
+            }
+
+            if !state.window.isStopped, !state.sourceEOF,
+               !state.window.hasReadyRetirement,
+               state.window.committedSlotCount < SMBTransferWindow.maximumSlotCount {
+                let candidateLength = min(
+                    negotiatedWriteChunkSize(),
+                    Int(SMBTransferWindow.maximumSlotLength)
+                )
+                guard candidateLength > 0 else {
+                    let error = SMBCodecError.invalidValue("SMB negotiated write size is zero")
+                    stopWriteTransfer(
+                        state,
+                        for: .offsetFailure(offset: state.window.requestFrontier, error: error),
+                        at: sessionTime.now()
+                    )
+                    continue
+                }
+                let supplierPreparation = sourceBuffer == nil && sourceNeedsCreditHint
+                guard let slotIndex = state.window.beginPreparing(
+                    candidateLength: UInt32(candidateLength),
+                    countsTowardWireDrain: !supplierPreparation
+                ) else {
+                    await waitForWriteTransferEvent(handle, after: state.revision)
+                    continue
+                }
+                let supplierLength: Int?
+                if let sourceBuffer, bufferCursor < sourceBuffer.count {
+                    let length = min(sourceBuffer.count - bufferCursor, candidateLength)
+                    let commit = await commitWriteTransferRequest(
+                        handle,
+                        slotIndex: slotIndex,
+                        offset: state.window.requestFrontier,
+                        sourceBuffer: sourceBuffer,
+                        sourceIndex: bufferCursor,
+                        maximumLength: length
+                    )
+                    switch commit {
+                    case .committed(let length, let balance, let reservationCreditRevision):
+                        creditWaitRevision = balance == 0 ? reservationCreditRevision : nil
+                        committedBytesFromBuffer += Int(length)
+                        bufferCursor += Int(length)
+                        if bufferCursor >= sourceBuffer.count {
+                            return .committed(length: committedBytesFromBuffer)
+                        }
+                        continue
+                    case .wait(_, let reservationCreditRevision):
+                        if committedBytesFromBuffer > 0,
+                           bufferCursor >= sourceBuffer.count {
+                            return .committed(length: committedBytesFromBuffer)
+                        }
+                        creditWaitRevision = reservationCreditRevision
+                        continue
+                    case .stopped:
+                        creditWaitRevision = nil
+                        continue
+                    case .complete:
+                        return .complete
+                    }
+                } else if sourceNeedsCreditHint {
+                    // Snapshot the revision before awaiting the balance: a grant processed while this
+                    // read is suspended bumps creditRevision, and waiting on the post-await value
+                    // would miss that wakeup.
+                    let revisionBeforeBalance = state.creditRevision
+                    let balance = await creditWindow.balance
+                    let now = sessionTime.now()
+                    let admissionBlocked = isWriteTransferAdmissionBlocked(state, at: now)
+                    if Task.isCancelled || admissionBlocked {
+                        _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+                        if Task.isCancelled {
+                            stopWriteTransferForOwnerCancellation(state, at: now)
+                        } else if let deadline = state.operationDeadline, now >= deadline {
+                            stopWriteTransfer(state, for: .operationDeadline, at: now)
+                        } else if !state.window.isStopped {
+                            stopWriteTransfer(
+                                state,
+                                for: .sessionFailure(wireFailure ?? SMBTransportError.connectionClosed),
+                                at: now
+                            )
+                        }
+                        continue
+                    }
+                    if balance == 0 {
+                        if state.window.committedSlotCount == 0 {
+                            supplierLength = min(candidateLength, SMB2Credit.unitSize)
+                        } else {
+                            _ = state.window.revokePreparing(slotIndex: slotIndex, at: nil)
+                            creditWaitRevision = revisionBeforeBalance
+                            continue
+                        }
+                    } else {
+                        let creditLimit = min(
+                            UInt64(balance) * UInt64(SMB2Credit.unitSize),
+                            UInt64(UInt32.max)
+                        )
+                        let length = Int(min(UInt64(candidateLength), creditLimit))
+                        supplierLength = length
+                    }
+                } else {
+                    supplierLength = candidateLength
+                }
+                let preparation = SMBWriteTransferPreparation(
+                    slotIndex: slotIndex,
+                    offset: state.window.requestFrontier,
+                    candidateLength: UInt32(candidateLength),
+                    supplierLength: supplierLength
+                )
+                if committedBytesFromBuffer > 0 {
+                    return .committed(length: committedBytesFromBuffer)
+                }
+                return .preparation(preparation)
+            }
+            if committedBytesFromBuffer > 0 {
+                return .committed(length: committedBytesFromBuffer)
+            }
+            await waitForWriteTransferEvent(handle, after: state.revision)
+        }
+    }
+
+    private func commitWriteTransferRequest(
+        _ handle: SMBWriteTransferHandle,
+        slotIndex: Int,
+        offset: UInt64,
+        sourceBuffer: [UInt8],
+        sourceIndex: Int,
+        maximumLength: Int
+    ) async -> SMBWriteTransferCommitResult {
+        guard let state = writeTransfers[handle.identifier] else { return .complete }
+        guard let preparation = state.window.preparingOffsetAndLength(slotIndex: slotIndex),
+              preparation.offset == offset,
+              sourceIndex >= 0,
+              sourceIndex < sourceBuffer.count,
+              maximumLength > 0,
+              maximumLength <= sourceBuffer.count - sourceIndex,
+              maximumLength <= Int(preparation.candidateLength) else {
+            let now = sessionTime.now()
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+            let error = SMBCodecError.invalidValue("invalid SMB WRITE transfer preparation")
+            stopWriteTransfer(state, for: .offsetFailure(offset: offset, error: error), at: now)
+            return .stopped(revision: state.revision)
+        }
+        let admissionCheckTime = sessionTime.now()
+        let deadlineReachedBeforeReservation = state.operationDeadline.map { admissionCheckTime >= $0 } ?? false
+        let windowStopped = state.window.isStopped
+        let generationActive = isGenerationActive(state.generation)
+        if Task.isCancelled || windowStopped || deadlineReachedBeforeReservation || !generationActive {
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: admissionCheckTime)
+            if Task.isCancelled {
+                stopWriteTransferForOwnerCancellation(state, at: admissionCheckTime)
+            } else if deadlineReachedBeforeReservation {
+                stopWriteTransfer(state, for: .operationDeadline, at: admissionCheckTime)
+            } else if !state.window.isStopped {
+                stopWriteTransfer(
+                    state,
+                    for: .sessionFailure(wireFailure ?? SMBTransportError.connectionClosed),
+                    at: admissionCheckTime
+                )
+            }
+            return .stopped(revision: state.revision)
+        }
+        guard let generation = readerLifecycle.activeGeneration,
+              generation == state.generation else {
+            let now = sessionTime.now()
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+            stopWriteTransfer(
+                state,
+                for: .sessionFailure(wireFailure ?? SMBTransportError.connectionClosed),
+                at: now
+            )
+            return .stopped(revision: state.revision)
+        }
+
+        let maximumCharge = SMB2Credit.charge(forPayloadLength: UInt64(maximumLength))
+        let waitIfUnavailable = state.window.committedSlotCount == 0
+        let revisionBeforeReservation = state.revision
+        let creditRevisionBeforeReservation = state.creditRevision
+        state.window.markPreparingReservationPending(slotIndex: slotIndex)
+        let reserved: (charge: UInt16, balance: UInt32)
+        do {
+            reserved = try await creditWindow.reserveUpToWithBalance(
+                maximumCharge: maximumCharge,
+                waitIfUnavailable: waitIfUnavailable,
+                command: SMB2Commands.write
+            )
+        } catch {
+            let failureTime = sessionTime.now()
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: failureTime)
+            if Task.isCancelled {
+                stopWriteTransferForOwnerCancellation(state, at: failureTime)
+            } else {
+                stopWriteTransfer(
+                    state,
+                    for: .sessionFailure(wireFailure ?? error),
+                    at: failureTime
+                )
+            }
+            return .stopped(revision: state.revision)
+        }
+
+        let afterReservationTime = sessionTime.now()
+        let operationDeadlineReached = state.operationDeadline.map { afterReservationTime >= $0 } ?? false
+        let reservationCancelled = Task.isCancelled
+        let windowStoppedAfterReservation = state.window.isStopped
+        let generationActiveAfterReservation = isGenerationActive(state.generation)
+        if reservationCancelled || windowStoppedAfterReservation || operationDeadlineReached
+            || !generationActiveAfterReservation {
+            if reserved.charge > 0 { await refundCredit(charge: reserved.charge) }
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: sessionTime.now())
+            if reservationCancelled {
+                stopWriteTransferForOwnerCancellation(state, at: afterReservationTime)
+            } else if operationDeadlineReached {
+                stopWriteTransfer(state, for: .operationDeadline, at: afterReservationTime)
+            } else if !state.window.isStopped {
+                stopWriteTransfer(
+                    state,
+                    for: .sessionFailure(wireFailure ?? SMBTransportError.connectionClosed),
+                    at: afterReservationTime
+                )
+            }
+            return .stopped(revision: state.revision)
+        }
+
+        guard reserved.charge > 0 else {
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: nil)
+            return .wait(
+                revision: revisionBeforeReservation,
+                creditRevision: creditRevisionBeforeReservation
+            )
+        }
+
+        let requestLength = min(
+            maximumLength,
+            Int(clamping: UInt64(reserved.charge) * UInt64(SMB2Credit.unitSize))
+        )
+        let requestData = Array(sourceBuffer[sourceIndex..<(sourceIndex + requestLength)])
+        let creditReservation = SMBPreReservedCredit(charge: reserved.charge)
+        let requestMessageID = messageId
+        let packet: [UInt8]
+        let requestHeader: SMB2Header
+        do {
+            try validateFileIdAdmission(command: SMB2Commands.write, fileId: state.fileId, cleanupFileId: nil)
+            packet = try SMB2Write.encodeRequest(
+                messageId: requestMessageID,
+                sessionId: sessionId,
+                treeId: state.treeId,
+                fileId: state.fileId,
+                offset: offset,
+                data: requestData
+            )
+            requestHeader = try SMB2Header.decode(packet)
+        } catch {
+            await refundUnclaimedCredit(creditReservation)
+            let failureTime = sessionTime.now()
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: failureTime)
+            stopWriteTransfer(
+                state,
+                for: .offsetFailure(offset: offset, error: error),
+                at: failureTime
+            )
+            return .stopped(revision: state.revision)
+        }
+
+        let requestIdentity = makeRequestIdentity(generation: generation)
+        guard let ticket = state.window.commit(
+            slotIndex: slotIndex,
+            requestIdentity: requestIdentity,
+            messageID: requestMessageID,
+            requestedLength: UInt32(requestLength),
+            at: nil
+        ) else {
+            await refundUnclaimedCredit(creditReservation)
+            let now = sessionTime.now()
+            _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+            if !state.window.isStopped {
+                stopWriteTransfer(
+                    state,
+                    for: .sessionFailure(wireFailure ?? SMBTransportError.connectionClosed),
+                    at: now
+                )
+            }
+            return .stopped(revision: state.revision)
+        }
+
+        let assignedMessageID = nextMessageId(charge: SMB2Credit.charge(forPayloadLength: UInt64(requestLength)))
+        precondition(assignedMessageID == requestMessageID)
+        debugDump("WRITE request", packet)
+        registerPendingResponse(
+            packet: packet,
+            requestHeader: requestHeader,
+            requestIdentity: requestIdentity,
+            generation: generation,
+            label: "WRITE transfer response",
+            requestTimeoutPolicy: .eligible,
+            responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
+            completionTarget: .transfer(ticket),
+            send: { [weak self] packet, messageId in
+                guard let self else { throw CancellationError() }
+                try await self.sendSigned(
+                    packet,
+                    messageId: messageId,
+                    generation: generation,
+                    creditReservation: creditReservation
+                )
+            }
+        )
+        signalWriteTransfer(state)
+        return .committed(
+            length: UInt32(requestLength),
+            creditBalance: reserved.balance,
+            creditRevision: creditRevisionBeforeReservation
+        )
+    }
+
     fileprivate func stepReadTransfer(
         _ handle: SMBReadTransferHandle,
         finishing: SMBReadTransferDriverFinish?
@@ -9916,8 +10543,8 @@ extension SMBSession {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
         try validateFileIdAdmission(command: SMB2Commands.read, fileId: fileId, cleanupFileId: nil)
-        nextReadTransferIdentifier &+= 1
-        let handle = SMBReadTransferHandle(identifier: nextReadTransferIdentifier, generation: generation)
+        nextTransferIdentifier &+= 1
+        let handle = SMBReadTransferHandle(identifier: nextTransferIdentifier, generation: generation)
         readTransfers[handle.identifier] = SMBSessionReadTransfer(
             handle: handle,
             generation: generation,
@@ -10519,6 +11146,353 @@ extension SMBSession {
         await cancelReadTransferDrainTimer(state)
     }
 
+    private func completeWriteTransferRequest(
+        _ ticket: SMBTransferTicket,
+        frame: SMBReceivedFrame,
+        status: UInt32,
+        prevalidatedResult: SMBTransferFinalResult?
+    ) {
+        guard let state = writeTransfers[ticket.transferIdentifier],
+              ticket.epoch == state.window.epoch else { return }
+        let result = prevalidatedResult ?? decodeWriteTransferFinal(
+            ticket,
+            frame: frame,
+            status: status
+        )
+        let completionTime = state.window.isStopped ? sessionTime.now() : nil
+        guard state.window.acceptFinal(result, for: ticket, at: completionTime) else { return }
+        if case .failure(let error, _) = result {
+            stopWriteTransfer(
+                state,
+                for: .offsetFailure(offset: ticket.offset, error: error),
+                at: completionTime ?? sessionTime.now()
+            )
+        }
+        if state.retireSuccessfulWritesInline {
+            retireWritePrefixWithoutCallback(state)
+        }
+        signalWriteTransfer(state)
+    }
+
+    private func retireWritePrefixWithoutCallback(_ state: SMBSessionWriteTransfer) {
+        while let retirement = state.window.beginNextRetirement() {
+            let advanceFrontier: Bool
+            if case .success = retirement.result {
+                advanceFrontier = true
+            } else {
+                advanceFrontier = false
+            }
+            _ = state.window.finishRetirement(
+                retirement.ticket,
+                advanceFrontier: advanceFrontier
+            )
+            _ = state.window.releaseRetiredSlot(retirement.ticket)
+            guard advanceFrontier else { break }
+        }
+    }
+
+    private func decodeWriteTransferFinal(
+        _ ticket: SMBTransferTicket,
+        frame: SMBReceivedFrame,
+        status: UInt32
+    ) -> SMBTransferFinalResult {
+        do {
+            guard status == SMB2Status.success else {
+                try SMBErrorMapper.throwIfFailure(status: status, operation: "WRITE")
+                throw SMBCodecError.invalidValue("WRITE final response was not successful")
+            }
+            let count = try SMB2Write.decodeResponseCount(frame.bytes)
+            guard count == ticket.requestedLength else {
+                throw SMBCodecError.invalidValue(
+                    "short SMB write: expected \(ticket.requestedLength) bytes, got \(count)"
+                )
+            }
+            return .success(payload: [])
+        } catch {
+            return .failure(error: error, isSessionFatal: false)
+        }
+    }
+
+    private func stopWriteTransferForEarlyFinal(
+        _ target: SMBPendingResponseCompletionTarget,
+        frame: SMBReceivedFrame,
+        status: UInt32,
+        at acceptedAt: ContinuousClock.Instant
+    ) -> SMBTransferFinalResult? {
+        guard case .transfer(let ticket) = target,
+              let state = writeTransfers[ticket.transferIdentifier],
+              ticket.epoch == state.window.epoch else {
+            return nil
+        }
+        let result = decodeWriteTransferFinal(ticket, frame: frame, status: status)
+        if case .failure(let error, _) = result {
+            stopWriteTransfer(
+                state,
+                for: .offsetFailure(offset: ticket.offset, error: error),
+                at: acceptedAt
+            )
+        }
+        return result
+    }
+
+    private func failTransferRequest(_ ticket: SMBTransferTicket, error: Error) {
+        if readTransfers[ticket.transferIdentifier] != nil {
+            failReadTransferRequest(ticket, error: error)
+            return
+        }
+        guard let state = writeTransfers[ticket.transferIdentifier],
+              ticket.epoch == state.window.epoch else { return }
+        let failureTime = sessionTime.now()
+        _ = state.window.acceptFinal(
+            .failure(error: error, isSessionFatal: true),
+            for: ticket,
+            at: failureTime
+        )
+        stopWriteTransfer(state, for: .sessionFailure(error), at: failureTime)
+    }
+
+    private func transferSendStarted(_ ticket: SMBTransferTicket) {
+        if readTransfers[ticket.transferIdentifier] != nil {
+            readTransferSendStarted(ticket)
+        } else if let state = writeTransfers[ticket.transferIdentifier],
+                  state.window.markSendStarted(ticket), state.window.isStopped {
+            signalWriteTransfer(state)
+        }
+    }
+
+    private func transferFullySent(
+        _ ticket: SMBTransferTicket,
+        responseDeadline: ContinuousClock.Instant?,
+        at time: ContinuousClock.Instant?
+    ) {
+        if readTransfers[ticket.transferIdentifier] != nil {
+            readTransferFullySent(ticket, responseDeadline: responseDeadline, at: time)
+        } else if let state = writeTransfers[ticket.transferIdentifier],
+                  state.window.markFullySent(ticket, responseDeadline: responseDeadline, at: time) {
+            if state.window.isStopped {
+                scheduleWriteTransferDrainTimer(state)
+                signalWriteTransfer(state)
+            }
+        }
+    }
+
+    private func transferSendOwnerFinished(_ ticket: SMBTransferTicket) {
+        if readTransfers[ticket.transferIdentifier] != nil {
+            readTransferSendOwnerFinished(ticket)
+        } else if let state = writeTransfers[ticket.transferIdentifier] {
+            let time = state.window.isStopped ? sessionTime.now() : nil
+            if state.window.markSendOwnerFinished(ticket, at: time), state.window.isStopped {
+                signalWriteTransfer(state)
+            }
+        }
+    }
+
+    private func nextWriteTransferRetirement(
+        _ handle: SMBWriteTransferHandle
+    ) -> SMBTransferRetirement? {
+        guard let state = writeTransfers[handle.identifier] else { return nil }
+        if state.window.selectedStopReason().map(Self.isTransferStopTerminalPriority) == true {
+            discardCompletedWriteTransferSlots(state)
+            return nil
+        }
+        return state.window.beginNextRetirement()
+    }
+
+    private func waitForWriteTransferEvent(_ handle: SMBWriteTransferHandle, after revision: UInt64) async {
+        guard let state = writeTransfers[handle.identifier], state.revision == revision else { return }
+        await withCheckedContinuation { continuation in
+            guard let current = writeTransfers[handle.identifier], current.revision == revision else {
+                continuation.resume()
+                return
+            }
+            current.eventWaiters.append(continuation)
+        }
+    }
+
+    private func stopWriteTransferForOwnerCancellation(
+        _ state: SMBSessionWriteTransfer,
+        at time: ContinuousClock.Instant
+    ) {
+        if let deadline = state.operationDeadline, time >= deadline {
+            stopWriteTransfer(state, for: .operationDeadline, at: time)
+        } else {
+            stopWriteTransfer(state, for: .callerCancelled, at: time)
+        }
+    }
+
+    private func stopWriteTransfer(
+        _ state: SMBSessionWriteTransfer,
+        for reason: SMBTransferStopReason,
+        at time: ContinuousClock.Instant
+    ) {
+        if case .operationDeadline = reason { state.operationDeadlineStopRecorded = true }
+        state.window.stop(
+            for: reason,
+            at: time,
+            cleanupTimeout: cleanupTimeout,
+            operationDeadline: state.operationDeadline
+        )
+        scheduleWriteTransferDrainTimer(state)
+        signalWriteTransfer(state)
+    }
+
+    private func scheduleWriteTransferDrainTimer(_ state: SMBSessionWriteTransfer) {
+        guard state.window.isStopped, !state.window.wireDrained,
+              let deadline = state.window.drainDeadline else { return }
+        if state.drainTimer != nil,
+           let scheduledDeadline = state.drainTimerDeadline,
+           scheduledDeadline <= deadline {
+            return
+        }
+        state.drainTimer?.cancel()
+        let identity = UUID()
+        state.drainTimerIdentity = identity
+        state.drainTimerDeadline = deadline
+        let now = sessionTime.now()
+        let duration = now < deadline ? now.duration(to: deadline) : .zero
+        let sleeper = cleanupTimeoutSleeper
+        let transferIdentifier = state.handle.identifier
+        state.drainTimer = Task.detached { [weak self] in
+            do {
+                try await sleeper(duration)
+            } catch {
+                return
+            }
+            await self?.writeTransferDrainDeadlineDidFire(transferIdentifier, identity: identity)
+        }
+    }
+
+    private func writeTransferDrainDeadlineDidFire(_ identifier: UInt64, identity: UUID) {
+        guard let state = writeTransfers[identifier], state.drainTimerIdentity == identity else { return }
+        state.drainTimer = nil
+        state.drainTimerIdentity = nil
+        state.drainTimerDeadline = nil
+        let now = sessionTime.now()
+        if state.window.drainDeadlineHasWon(at: now) {
+            state.window.stop(
+                for: .sessionFailure(SMBTransportError.timedOut),
+                at: now,
+                cleanupTimeout: cleanupTimeout,
+                operationDeadline: state.operationDeadline
+            )
+            signalWriteTransfer(state)
+            closeTransport(cause: "write_transfer_drain_timeout", diagnosticError: SMBTransportError.timedOut)
+        }
+        signalWriteTransfer(state)
+    }
+
+    private func finishWriteTransferAfterDrain(_ handle: SMBWriteTransferHandle) async -> Error? {
+        guard let state = writeTransfers[handle.identifier] else { return nil }
+        guard state.window.wireDrained else { return nil }
+        let drainedAt = sessionTime.now()
+        if state.window.drainDeadlineHasWon(at: drainedAt) {
+            state.window.stop(
+                for: .sessionFailure(SMBTransportError.timedOut),
+                at: drainedAt,
+                cleanupTimeout: cleanupTimeout,
+                operationDeadline: state.operationDeadline
+            )
+            await closeTransportAndWait(
+                cause: "write_transfer_drain_timeout",
+                diagnosticError: SMBTransportError.timedOut
+            )
+        }
+        if state.window.terminallyClosed {
+            state.window.reclaimSlotsAfterTerminalJoin()
+        } else {
+            discardCompletedWriteTransferSlots(state)
+        }
+        let error: Error?
+        if let selected = state.window.selectedError() {
+            error = selected
+        } else if state.window.terminallyClosed {
+            error = wireFailure
+        } else {
+            error = nil
+        }
+        await removeWriteTransfer(state)
+        return error
+    }
+
+    private func discardCompletedWriteTransferSlots(_ state: SMBSessionWriteTransfer) {
+        for ticket in state.window.completedTickets where state.window.discardCompletedSlotForStop(ticket) {
+            _ = state.window.releaseRetiredSlot(ticket)
+        }
+    }
+
+    private func signalWriteTransfer(_ state: SMBSessionWriteTransfer) {
+        state.revision &+= 1
+        let waiters = state.eventWaiters
+        state.eventWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func signalWriteTransfersForCreditAvailability() {
+        for state in writeTransfers.values {
+            state.creditRevision &+= 1
+            signalWriteTransfer(state)
+        }
+    }
+
+    private func cancelWriteTransferDrainTimer(_ state: SMBSessionWriteTransfer) async {
+        let timer = state.drainTimer
+        state.drainTimer = nil
+        state.drainTimerIdentity = nil
+        state.drainTimerDeadline = nil
+        timer?.cancel()
+        await timer?.value
+    }
+
+    private func removeWriteTransfer(_ state: SMBSessionWriteTransfer) async {
+        writeTransfers.removeValue(forKey: state.handle.identifier)
+        let waiters = state.eventWaiters
+        state.eventWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await cancelWriteTransferDrainTimer(state)
+    }
+
+    private func markWriteTransfersSessionFailure(_ error: Error) {
+        let now = sessionTime.now()
+        for state in writeTransfers.values {
+            if !state.window.isStopped {
+                stopWriteTransfer(state, for: .sessionFailure(error), at: now)
+            } else {
+                state.window.stop(
+                    for: .sessionFailure(error),
+                    at: now,
+                    cleanupTimeout: cleanupTimeout,
+                    operationDeadline: state.operationDeadline
+                )
+                signalWriteTransfer(state)
+            }
+        }
+    }
+
+    private func markWriteTransfersTerminalClose(_ error: Error) {
+        markWriteTransfersSessionFailure(error)
+        for state in writeTransfers.values {
+            state.window.markTerminalClose()
+            signalWriteTransfer(state)
+        }
+    }
+
+    private func markWriteTransfersTerminalJoinComplete() {
+        for state in writeTransfers.values {
+            state.window.markTerminalSendOwnersJoined(at: sessionTime.now())
+            state.window.reclaimSlotsAfterTerminalJoin()
+            signalWriteTransfer(state)
+        }
+    }
+
+    private static func isTransferStopTerminalPriority(_ reason: SMBTransferStopReason) -> Bool {
+        switch reason {
+        case .callerCancelled, .operationDeadline, .sessionFailure:
+            true
+        case .offsetFailure, .readBoundary:
+            false
+        }
+    }
+
     private func markReadTransfersSessionFailure(_ error: Error) {
         let now = sessionTime.now()
         for state in readTransfers.values {
@@ -10551,6 +11525,142 @@ extension SMBSession {
             state.window.reclaimSlotsAfterTerminalJoin()
             signalReadTransfer(state)
         }
+    }
+}
+
+private final class SMBWriteTransferSourceBox: @unchecked Sendable {
+    let nextChunk: (Int) async throws -> [UInt8]
+    let usesCreditAwareHint: Bool
+    let initialData: [UInt8]?
+
+    init(
+        usesCreditAwareHint: Bool = true,
+        initialData: [UInt8]? = nil,
+        nextChunk: @escaping (Int) async throws -> [UInt8]
+    ) {
+        self.usesCreditAwareHint = usesCreditAwareHint
+        self.initialData = initialData
+        self.nextChunk = nextChunk
+    }
+}
+
+private func smbWriteTransfer(
+    session: SMBSession,
+    treeId: UInt32,
+    fileId: [UInt8],
+    offset: UInt64,
+    source: SMBWriteTransferSourceBox,
+    onSupplied: (@Sendable (UInt64) -> Void)? = nil,
+    onAcknowledged: (@Sendable (UInt64) -> Void)? = nil
+) async throws {
+    let operationDeadline = SMBOperationDeadline.operationContext?.deadline
+    let handle = try await session.beginWriteTransfer(
+        treeId: treeId,
+        fileId: fileId,
+        offset: offset,
+        operationDeadline: operationDeadline,
+        retireSuccessfulWritesInline: onAcknowledged == nil
+    )
+    let writeBody: @Sendable () async throws -> Void = {
+        var buffer: [UInt8] = []
+        var cursor = 0
+        if let initialData = source.initialData {
+            buffer = initialData
+        }
+        var suppliedOffset = offset
+        var acknowledgedBytes: UInt64 = 0
+        var finishing: SMBWriteTransferDriverFinish?
+        while true {
+            let action = await session.stepWriteTransfer(
+                handle,
+                sourceBuffer: cursor < buffer.count ? buffer : nil,
+                sourceCursor: cursor,
+                sourceNeedsCreditHint: source.usesCreditAwareHint,
+                finishing: finishing
+            )
+            finishing = nil
+            switch action {
+            case .preparation(let preparation):
+                if cursor < buffer.count {
+                    let length = min(
+                        buffer.count - cursor,
+                        Int(preparation.candidateLength)
+                    )
+                    finishing = .suppliedChunk(
+                        slotIndex: preparation.slotIndex,
+                        offset: preparation.offset,
+                        maximumLength: length
+                    )
+                    continue
+                }
+                guard let supplierLength = preparation.supplierLength else {
+                    finishing = .sourceFailure(
+                        slotIndex: preparation.slotIndex,
+                        offset: preparation.offset,
+                        error: SMBCodecError.invalidValue("WRITE supplier length was not prepared")
+                    )
+                    continue
+                }
+                do {
+                    let supplied = try await source.nextChunk(supplierLength)
+                    guard !supplied.isEmpty else {
+                        finishing = .sourceEOF(slotIndex: preparation.slotIndex)
+                        continue
+                    }
+                    let nextOffset = preparation.offset.addingReportingOverflow(UInt64(supplied.count))
+                    guard !nextOffset.overflow else {
+                        finishing = .sourceFailure(
+                            slotIndex: preparation.slotIndex,
+                            offset: preparation.offset,
+                            error: SMBCodecError.invalidValue("SMB write offset overflow")
+                        )
+                        continue
+                    }
+                    suppliedOffset = nextOffset.partialValue
+                    onSupplied?(suppliedOffset)
+                    buffer = supplied
+                    cursor = 0
+                    let length = min(buffer.count, Int(preparation.candidateLength))
+                    finishing = .suppliedChunk(
+                        slotIndex: preparation.slotIndex,
+                        offset: preparation.offset,
+                        maximumLength: length
+                    )
+                } catch {
+                    finishing = .sourceFailure(
+                        slotIndex: preparation.slotIndex,
+                        offset: preparation.offset,
+                        error: error
+                    )
+                }
+            case .committed(let length):
+                cursor += Int(length)
+            case .retirement(let retirement):
+                switch retirement.result {
+                case .success:
+                    acknowledgedBytes += UInt64(retirement.ticket.requestedLength)
+                    onAcknowledged?(acknowledgedBytes)
+                    finishing = .retired(ticket: retirement.ticket, advanceFrontier: true)
+                case .failure:
+                    finishing = .retired(ticket: retirement.ticket, advanceFrontier: false)
+                case .pendingReadDecode:
+                    finishing = .protocolFailure(
+                        ticket: retirement.ticket,
+                        error: SMBCodecError.invalidValue("WRITE response reached retirement before decode")
+                    )
+                }
+            case .complete:
+                return
+            case .failed(let error):
+                throw error
+            }
+        }
+    }
+
+    try await withTaskCancellationHandler {
+        try await writeBody()
+    } onCancel: {
+        Task { await session.stopWriteTransferForCancellation(handle) }
     }
 }
 

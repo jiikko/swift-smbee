@@ -349,6 +349,69 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         })
     }
 
+    func testFailedUntrackedCancelSendPreservesOriginalFaultForOtherPendingRequests() async throws {
+        let pendingCommands: Set<UInt16> = [SMB2Commands.read, SMB2Commands.changeNotify]
+        let transport = CommandAwareCloseTimeoutTransport(
+            heldCommands: pendingCommands,
+            sendFailures: [SMB2Commands.cancel: .socketFailure("cancel failed")]
+        )
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 2
+        )
+        let fileId = [UInt8](repeating: 0x31, count: 16)
+        let read = Task {
+            try await session.readChunk(treeId: 0x3344, fileId: fileId, offset: 0, length: 1)
+        }
+        let changeNotify = Task {
+            try await session.changeNotify(
+                treeId: 0x3344,
+                fileId: fileId,
+                filter: .default,
+                watchTree: false
+            ) { _ in }
+        }
+
+        try await awaitWithTimeout("READ send") {
+            try await transport.waitUntilSent(command: SMB2Commands.read, count: 1)
+        }
+        try await awaitWithTimeout("CHANGE_NOTIFY send") {
+            try await transport.waitUntilSent(command: SMB2Commands.changeNotify, count: 1)
+        }
+        try await awaitWithTimeout("both request sent transitions") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
+        }
+        XCTAssertEqual(transport.heldResponseCount(for: pendingCommands), 2, "both finals stay held")
+
+        changeNotify.cancel()
+        try await awaitWithTimeout("CANCEL send fails") {
+            try await transport.waitUntilSent(command: SMB2Commands.cancel, count: 1)
+        }
+
+        do {
+            _ = try await awaitWithTimeout("READ receives the CANCEL send fault") {
+                try await read.value
+            }
+            XCTFail("READ should fail when the CANCEL send closes the session")
+        } catch {
+            XCTAssertEqual(error as? SMBTransportError, .socketFailure("cancel failed"))
+        }
+
+        _ = try await awaitWithTimeout("cancelled CHANGE_NOTIFY settles") {
+            do {
+                try await changeNotify.value
+            } catch {
+                // The wire failure and caller cancellation can race for this caller.
+            }
+        }
+        try await awaitWithTimeout("failed session shutdown joins") {
+            await session.closeTransportAndWait(cause: "test_cancel_send_failure_preserves_first_fault")
+        }
+    }
+
     func testBestEffortCloseTimeoutLeavesUnrelatedPendingOperationsAliveUntilWireClose() async throws {
         // This used to pin the issue 065 contract that the first cleanup deadline tears
         // down the whole session. The 069 contract keeps these unrelated requests live.
@@ -3936,6 +3999,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
     private var isClosed = false
     private var closeCallCountStorage = 0
     private let heldCommands: Set<UInt16>
+    private let sendFailures: [UInt16: SMBTransportError]
     private let closeStatus: UInt32
     private let closeTreeIdOverride: UInt32?
     private let closeSessionIdOverride: UInt64?
@@ -3947,6 +4011,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
 
     init(
         heldCommands: Set<UInt16> = [SMB2Commands.read, SMB2Commands.close],
+        sendFailures: [UInt16: SMBTransportError] = [:],
         closeStatus: UInt32 = SMB2Status.success,
         closeTreeIdOverride: UInt32? = nil,
         closeSessionIdOverride: UInt64? = nil,
@@ -3957,6 +4022,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         closeFinalAsyncIdOverride: UInt64? = nil
     ) {
         self.heldCommands = heldCommands
+        self.sendFailures = sendFailures
         self.closeStatus = closeStatus
         self.closeTreeIdOverride = closeTreeIdOverride
         self.closeSessionIdOverride = closeSessionIdOverride
@@ -4010,6 +4076,10 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         guard state.sent else { throw SMBTransportError.connectionClosed }
         for waiter in state.waiters {
             waiter.continuation.resume()
+        }
+
+        if let failure = sendFailures[header.command] {
+            throw failure
         }
 
         if state.blocked {
@@ -4263,6 +4333,15 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
                 treeId: request.treeId,
                 status: SMB2Status.success,
                 body: body + [0]
+            )]
+        case SMB2Commands.changeNotify:
+            return [try responseFrame(
+                command: request.command,
+                messageId: request.messageId,
+                sessionId: request.sessionId,
+                treeId: request.treeId,
+                status: SMB2Status.success,
+                body: [9, 0, 64, 0, 0, 0, 0, 0]
             )]
         case SMB2Commands.write:
             var body = Array(repeating: UInt8(0), count: 16)

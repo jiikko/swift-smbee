@@ -69,6 +69,109 @@ final class SMBTransferWindowTests: XCTestCase {
         XCTAssertTrue(window.drainDeadlineHasWon(at: revokedAt), "settlement after the deadline loses the race")
     }
 
+    func testUnreservedSupplierPreparationDoesNotHoldWireDrain() throws {
+        let start = ContinuousClock.now
+        let deadline = start.advanced(by: .seconds(5))
+        let window = SMBTransferWindow(transferIdentifier: 131, direction: .write)
+        _ = try XCTUnwrap(window.beginPreparing(candidateLength: 4, countsTowardWireDrain: false))
+
+        window.stop(for: .callerCancelled, at: start, cleanupTimeout: .seconds(5))
+
+        XCTAssertTrue(window.wireDrained, "a supplier waiting before credit reservation owns no wire request")
+        XCTAssertNil(window.wireDrainedAt, "there was no wire work to drain")
+        XCTAssertFalse(window.drainDeadlineHasWon(at: deadline))
+    }
+
+    func testSupplierReservationIsIncludedInWriteDrainAfterSupplierReturns() async throws {
+        let start = ContinuousClock.now
+        let deadline = start.advanced(by: .seconds(5))
+        let failureAcceptedAt = start.advanced(by: .milliseconds(10))
+        let refundReturnedAt = deadline.advanced(by: .milliseconds(1))
+        let window = SMBTransferWindow(transferIdentifier: 135, direction: .write)
+        let credits = SMB2CreditWindow(initialCredits: 2, diagnosticSessionId: "write-supplier-reservation")
+        let firstSlot = try XCTUnwrap(window.beginPreparing(candidateLength: 4))
+        let firstCharge = try await credits.reserveUpTo(maximumCharge: 1, waitIfUnavailable: false)
+        XCTAssertEqual(firstCharge, 1)
+        let first = try XCTUnwrap(window.commit(
+            slotIndex: firstSlot,
+            requestIdentity: makeIdentity(1),
+            messageID: 1,
+            requestedLength: 4,
+            at: start
+        ))
+        XCTAssertTrue(window.markSendStarted(first))
+        XCTAssertTrue(window.markFullySent(first, at: start))
+        XCTAssertTrue(window.markSendOwnerFinished(first, at: start))
+
+        let supplierSlot = try XCTUnwrap(
+            window.beginPreparing(candidateLength: 4, countsTowardWireDrain: false)
+        )
+        let suppliedBytes: [UInt8] = [0x41]
+        XCTAssertFalse(suppliedBytes.isEmpty)
+        window.markPreparingReservationPending(slotIndex: supplierSlot)
+        let reservedCharge = try await credits.reserveUpTo(maximumCharge: 1, waitIfUnavailable: false)
+        XCTAssertEqual(reservedCharge, 1)
+
+        window.stop(
+            for: .offsetFailure(offset: first.offset, error: SMBTransferWindowTestError.serverFailure),
+            at: start,
+            cleanupTimeout: .seconds(5)
+        )
+        XCTAssertTrue(window.acceptFinal(
+            .failure(error: SMBTransferWindowTestError.serverFailure, isSessionFatal: false),
+            for: first,
+            at: failureAcceptedAt
+        ))
+
+        XCTAssertFalse(window.wireDrained, "a reserved supplier slot is unsettled until its credit is refunded")
+        XCTAssertNil(window.wireDrainedAt, "the final response cannot drain an outstanding supplier reservation")
+        XCTAssertTrue(window.drainDeadlineHasWon(at: deadline))
+
+        _ = await credits.refund(charge: reservedCharge)
+        XCTAssertTrue(window.revokePreparing(slotIndex: supplierSlot, at: refundReturnedAt))
+        XCTAssertEqual(window.wireDrainedAt, refundReturnedAt)
+        XCTAssertTrue(window.drainDeadlineHasWon(at: refundReturnedAt))
+    }
+
+    func testWriteEOFRevocationRecordsOnTimeDrainForStoppedTransfer() throws {
+        let start = ContinuousClock.now
+        let deadline = start.advanced(by: .seconds(5))
+        let firstFinalAt = start.advanced(by: .milliseconds(10))
+        let secondFinalAt = start.advanced(by: .milliseconds(20))
+        let eofReturnedAt = start.advanced(by: .seconds(4))
+        let ownerResumedAt = deadline.advanced(by: .milliseconds(1))
+        let window = SMBTransferWindow(transferIdentifier: 136, direction: .write)
+        let first = try makeTicket(window, sequence: 1, length: 4)
+        let second = try makeTicket(window, sequence: 2, length: 4)
+        XCTAssertTrue(window.markSendStarted(first))
+        XCTAssertTrue(window.markFullySent(first, at: start))
+        XCTAssertTrue(window.markSendOwnerFinished(first, at: start))
+        XCTAssertTrue(window.markSendStarted(second))
+        XCTAssertTrue(window.markFullySent(second, at: start))
+        XCTAssertTrue(window.markSendOwnerFinished(second, at: start))
+        let eofSlot = try XCTUnwrap(window.beginPreparing(candidateLength: 4))
+
+        XCTAssertTrue(window.acceptFinal(.success(payload: []), for: first, at: firstFinalAt))
+        XCTAssertTrue(window.acceptFinal(
+            .failure(error: SMBTransferWindowTestError.serverFailure, isSessionFatal: false),
+            for: second,
+            at: secondFinalAt
+        ))
+        window.stop(
+            for: .offsetFailure(offset: second.offset, error: SMBTransferWindowTestError.serverFailure),
+            at: secondFinalAt,
+            cleanupTimeout: .seconds(5)
+        )
+        XCTAssertFalse(window.wireDrained, "EOF preparation remains unsettled while the owner evaluates it")
+
+        XCTAssertTrue(window.revokePreparingForSourceEOF(slotIndex: eofSlot, at: eofReturnedAt))
+        XCTAssertEqual(window.wireDrainedAt, eofReturnedAt, "EOF retraction must record when the source returned empty")
+        XCTAssertFalse(
+            window.drainDeadlineHasWon(at: ownerResumedAt),
+            "the source EOF completed the drain before the cleanup deadline"
+        )
+    }
+
     func testPreparingCycleReplacesEarlierWireDrainTimestamp() throws {
         let start = ContinuousClock.now
         let window = SMBTransferWindow(transferIdentifier: 132, direction: .read)

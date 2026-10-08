@@ -53,6 +53,7 @@ final class SMBTransferWindow {
     private struct Preparation {
         let offset: UInt64
         let candidateLength: UInt32
+        let countsTowardWireDrain: Bool
     }
 
     private enum SlotPhase: Equatable {
@@ -129,8 +130,17 @@ final class SMBTransferWindow {
         readyRetirementSlotIndex != nil
     }
 
+    func preparingOffsetAndLength(slotIndex: Int) -> (offset: UInt64, candidateLength: UInt32)? {
+        guard slots.indices.contains(slotIndex),
+              slots[slotIndex].phase == .preparing,
+              let preparation = slots[slotIndex].preparation else {
+            return nil
+        }
+        return (preparation.offset, preparation.candidateLength)
+    }
+
     /// Preparing is local ownership only; no MID or pending response exists yet.
-    func beginPreparing(candidateLength: UInt32) -> Int? {
+    func beginPreparing(candidateLength: UInt32, countsTowardWireDrain: Bool = true) -> Int? {
         guard !isStopped,
               candidateLength > 0,
               candidateLength <= Self.maximumSlotLength,
@@ -144,11 +154,27 @@ final class SMBTransferWindow {
         slots[index].phase = .preparing
         slots[index].preparation = Preparation(
             offset: requestFrontier,
-            candidateLength: candidateLength
+            candidateLength: candidateLength,
+            countsTowardWireDrain: countsTowardWireDrain
         )
         preparingSlotIndex = index
-        wireDrainedAt = nil
+        if countsTowardWireDrain { wireDrainedAt = nil }
         return index
+    }
+
+    func markPreparingReservationPending(slotIndex: Int) {
+        guard slots.indices.contains(slotIndex),
+              slots[slotIndex].phase == .preparing,
+              let preparation = slots[slotIndex].preparation,
+              !preparation.countsTowardWireDrain else {
+            return
+        }
+        slots[slotIndex].preparation = Preparation(
+            offset: preparation.offset,
+            candidateLength: preparation.candidateLength,
+            countsTowardWireDrain: true
+        )
+        wireDrainedAt = nil
     }
 
     @discardableResult
@@ -164,6 +190,11 @@ final class SMBTransferWindow {
             recordWireDrainedIfReady(at: time)
         }
         return true
+    }
+
+    @discardableResult
+    func revokePreparingForSourceEOF(slotIndex: Int, at time: ContinuousClock.Instant) -> Bool {
+        revokePreparing(slotIndex: slotIndex, at: time)
     }
 
     /// Commit advances the request frontier by the actual wire length, not the candidate length.
@@ -525,7 +556,7 @@ final class SMBTransferWindow {
     }
 
     var wireDrained: Bool {
-        guard !hasPreparingSlot else { return false }
+        guard !hasPreparingWireWork else { return false }
         return (terminallyClosed && terminalSendOwnersJoined) || !hasUnsettledWireSlot
     }
 
@@ -595,12 +626,16 @@ final class SMBTransferWindow {
         }
     }
 
-    private var hasPreparingSlot: Bool {
-        preparingSlotIndex != nil
+    private var hasPreparingWireWork: Bool {
+        guard let preparingSlotIndex,
+              let preparation = slots[preparingSlotIndex].preparation else {
+            return false
+        }
+        return preparation.countsTowardWireDrain
     }
 
     private var hasUnsettledWireWork: Bool {
-        hasPreparingSlot || hasUnsettledWireSlot
+        hasPreparingWireWork || hasUnsettledWireSlot
     }
 
     private var hasUnsettledWireSlot: Bool {

@@ -73,6 +73,11 @@ duration. Work already appended to a resume destination is not rolled back.
 - `operationTimeout` is also cooperative. It reports `SMBTransportError.timedOut` only
   after the operation task finishes, so elapsed wall-clock time may exceed the duration.
 - Cancellation and timeout do not roll back completed local or remote side effects.
+- WRITE pipelining can leave data at offsets after the failing WRITE when an earlier offset
+  fails; the API does not roll back the remote file. `upload(data:)` progress counts only the
+  contiguous prefix confirmed by successful WRITE responses. Supplier-based uploads report
+  bytes supplied to the transfer, so that progress can include bytes whose WRITE has not yet
+  been acknowledged when the operation fails.
 - File/tree/session cleanup has a bounded internal deadline. A missing cleanup response
   invalidates and closes the transport because the server-side resource state is unknown;
   callers must establish a new session before continuing.

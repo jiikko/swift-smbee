@@ -200,6 +200,11 @@ gate が落ちたら上書きせず相談する。
 - #16: commit `perf(transport): issue 102 #16 — POSIXSocketTransport の受信で、recv が書いた分だけを初期化して返す`。効果は未実測（synthetic は in-memory の transport でこの経路を通らない）。
 - M2 の取りこぼし: `read(path:)` などファイル全体を読む `SMBClient.readAll` が直列のループのまま残っていた（RTT study で read だけ伸びずに見つけた）。
   commit `feat(read): issue 102 #14 — read(path:) などファイル全体を読む readAll も READ の pipelining の driver に載せる` で同じ driver に載せた。
+  - 受容（その commit のレビューの P3）: `SMBEE_PERF=1` の READ ごとの `read req= got= wire= credits=` の行は、driver に載せた streamRead / readAll では出ない。
+    残るのは stream ごとの `stream total=` の行と、request ごとの `[wire] pending` / `[wire] sent` の行（message_id と ts_ns）。
+    失うのは READ ごとの要求長・受信長と、送る前の credit の残高だけ。debug の出力なので戻さない。
+    trigger: READ の長さの縮退（64 KiB への縮退など）を perf log で追う必要が出たら、driver の完了の側に READ ごとの行を足す。
+    理由は `SMBClient.streamRead` の `stream total=` の直前のコメントにも残した
 - 実 Samba の RTT study（同じ runner で 26fd9d7 と交互、`docs/performance-resource-baseline.md` の「2026-10-09」節）:
   RTT 20 ms の 64 MiB で read 43.7 → 133.8 MiB/s（+206%）、write 37.9 → 91.2 MiB/s（+141%）。1 MiB は noise の内。
 - CI の性能 gate（Linux x86、synthetic、initialCredits=1）はすべて PASS。M2 の read は −5.4% / user CPU +11.5%、M3 の write は −5.5% / +6.3%（いずれも上限の内側）。

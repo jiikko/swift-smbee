@@ -3891,6 +3891,10 @@ public enum SMBClient {
                 throw readError
             }
         }
+        // The pipelined driver logs only this per-stream line. The old per-READ
+        // "read req= got= credits=" line is gone; per-request timing is still in the
+        // "[wire] pending/sent" lines (message_id + ts_ns). Re-add per-READ lengths in
+        // the driver only if a regression needs them (issue 102 M2b review P3).
         if SMBPerfLog.isEnabled {
             let elapsed = ContinuousClock.now - perfStart
             let seconds = Double(elapsed.components.seconds)

@@ -724,9 +724,11 @@ class SMBReadPipelineScriptTransport: SMBContinuationWatchTransport, @unchecked 
     private let readLock = NSLock()
     private var readRequestsStorage: [ReadRequest] = []
     private var errorResponseBodiesStorage: [[UInt8]] = []
+    private var afterReadSendHook: (@Sendable (ReadRequest) async -> Void)?
     private let readRequestBarrier = SMBContinuationCountBarrier()
 
     override func send(_ bytes: [UInt8]) async throws {
+        var readRequestForHook: ReadRequest?
         if let packet = try smbPacketInDirectTCPStream(bytes) {
             let header = try SMB2Header.decode(packet)
             if header.command == SMB2Commands.read {
@@ -738,10 +740,15 @@ class SMBReadPipelineScriptTransport: SMBContinuationWatchTransport, @unchecked 
                     length: try lengthReader.readUInt32LE()
                 )
                 readLock.withLock { readRequestsStorage.append(request) }
+                readRequestForHook = request
                 readRequestBarrier.signal()
             }
         }
         try await super.send(bytes)
+        if let readRequestForHook {
+            let hook = readLock.withLock { afterReadSendHook }
+            await hook?(readRequestForHook)
+        }
     }
 
     /// Ordered by MessageId, i.e. commit order. Concurrent full sends reach the transport in an
@@ -756,6 +763,10 @@ class SMBReadPipelineScriptTransport: SMBContinuationWatchTransport, @unchecked 
 
     func waitForReadCount(_ count: Int) async throws {
         try await readRequestBarrier.waitForCount(count)
+    }
+
+    func installAfterReadSendHook(_ hook: (@Sendable (ReadRequest) async -> Void)?) {
+        readLock.withLock { afterReadSendHook = hook }
     }
 
     func respond(

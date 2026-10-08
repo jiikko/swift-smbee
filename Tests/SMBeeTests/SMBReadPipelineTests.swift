@@ -739,10 +739,9 @@ final class SMBReadPipelineTests: XCTestCase {
         let firstSendGate = SMBContinuationAsyncGate()
         let laterSendGate = SMBContinuationAsyncGate()
         let sendGateClock = ManualSMBSleeper()
-        transport.installAfterCommandSignalHook { command in
-            guard command == SMB2Commands.read else { return }
-            switch transport.readRequests.count {
-            case 2:
+        transport.installAfterReadSendHook { request in
+            switch request.offset {
+            case UInt64(testChunkSize):
                 do {
                     try await firstSendGate.suspend(
                         timeout: .seconds(60),
@@ -751,7 +750,7 @@ final class SMBReadPipelineTests: XCTestCase {
                 } catch {
                     // Teardown releases this synthetic send gate.
                 }
-            case 3, 4:
+            case UInt64(testChunkSize * 2), UInt64(testChunkSize * 3):
                 do {
                     try await laterSendGate.suspend(
                         timeout: .seconds(60),
@@ -780,13 +779,14 @@ final class SMBReadPipelineTests: XCTestCase {
         try transport.completeCreate()
         try await waitForReadCount(transport, 4)
         let requests = transport.readRequests
-        try await smbIssue102AwaitWithTimeout("R1 send is in sending phase") {
+        XCTAssertEqual(requests.map(\.offset), [0, 1, 2, 3].map { UInt64($0 * testChunkSize) })
+        try await smbIssue102AwaitWithTimeout("READ at offset one chunk remains in sending phase") {
             try await firstSendGate.waitUntilSuspended(
                 timeout: .seconds(60),
                 sleeper: { try await Task.sleep(for: $0) }
             )
         }
-        try await smbIssue102AwaitWithTimeout("R2 and R3 sends remain in sending phase") {
+        try await smbIssue102AwaitWithTimeout("READs at offsets two and three chunks remain in sending phase") {
             try await laterSendGate.waitUntilSuspended(
                 timeout: .seconds(60),
                 sleeper: { try await Task.sleep(for: $0) }
@@ -854,20 +854,16 @@ final class SMBReadPipelineTests: XCTestCase {
         let sendGateClock = ManualSMBSleeper()
         let callbackGate = SMBContinuationAsyncGate()
         let callbackGateClock = ManualSMBSleeper()
-        let readSendCount = SMBContinuationCountBarrier()
         let callbackCount = SMBContinuationCountBarrier()
-        transport.installAfterCommandSignalHook { command in
-            guard command == SMB2Commands.read else { return }
-            readSendCount.signal()
-            if readSendCount.currentCount == 4 {
-                do {
-                    try await sendGate.suspend(
-                        timeout: .seconds(30),
-                        sleeper: { try await sendGateClock.sleep(for: $0) }
-                    )
-                } catch {
-                    // The transport's teardown releases this synthetic send gate.
-                }
+        transport.installAfterReadSendHook { request in
+            guard request.offset == UInt64(testChunkSize * 3) else { return }
+            do {
+                try await sendGate.suspend(
+                    timeout: .seconds(30),
+                    sleeper: { try await sendGateClock.sleep(for: $0) }
+                )
+            } catch {
+                // The transport's teardown releases this synthetic send gate.
             }
         }
         let collector = SMBReadPipelineChunkCollector()
@@ -893,7 +889,7 @@ final class SMBReadPipelineTests: XCTestCase {
         try await waitForCommand(transport, SMB2Commands.create, label: "early-short READ CREATE")
         try transport.completeCreate()
         try await waitForReadCount(transport, 4)
-        try await smbIssue102AwaitWithTimeout("fourth READ send remains gated") {
+        try await smbIssue102AwaitWithTimeout("READ at offset three chunks remains gated") {
             try await sendGate.waitUntilSuspended(
                 timeout: .seconds(60),
                 sleeper: { try await sendGateClock.sleep(for: $0) }
@@ -1008,9 +1004,8 @@ final class SMBReadPipelineTests: XCTestCase {
         let callbackGateClock = ManualSMBSleeper()
         let sendGate = SMBContinuationAsyncGate()
         let sendGateClock = ManualSMBSleeper()
-        transport.installAfterCommandSignalHook { command in
-            guard command == SMB2Commands.read else { return }
-            if transport.readRequests.count == 4 {
+        transport.installAfterReadSendHook { request in
+            if request.offset == UInt64(testChunkSize * 3) {
                 do {
                     try await sendGate.suspend(
                         timeout: .seconds(60),
@@ -1019,10 +1014,10 @@ final class SMBReadPipelineTests: XCTestCase {
                 } catch {
                     // Teardown releases this synthetic send gate.
                 }
-            } else if transport.readRequests.count > 4, let extraRequest = transport.readRequests.last {
+            } else if request.offset >= UInt64(testChunkSize * 4) {
                 try? transport.respond(
-                    to: extraRequest,
-                    payload: patternedPayload(seed: 0x4b, count: Int(extraRequest.length)),
+                    to: request,
+                    payload: patternedPayload(seed: 0x4b, count: Int(request.length)),
                     credits: 16
                 )
             }
@@ -1046,13 +1041,14 @@ final class SMBReadPipelineTests: XCTestCase {
         try await waitForCommand(transport, SMB2Commands.create, label: "early-error READ CREATE")
         try transport.completeCreate()
         try await waitForReadCount(transport, 4)
-        try await smbIssue102AwaitWithTimeout("fourth error READ send remains gated") {
+        try await smbIssue102AwaitWithTimeout("error READ at offset three chunks remains gated") {
             try await sendGate.waitUntilSuspended(
                 timeout: .seconds(60),
                 sleeper: { try await sendGateClock.sleep(for: $0) }
             )
         }
         let firstEpoch = transport.readRequests
+        XCTAssertEqual(firstEpoch.map(\.offset), [0, 1, 2, 3].map { UInt64($0 * testChunkSize) })
         try transport.respond(
             to: firstEpoch[0],
             payload: patternedPayload(seed: 0x18, count: testChunkSize),

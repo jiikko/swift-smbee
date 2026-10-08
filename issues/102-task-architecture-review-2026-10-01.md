@@ -179,5 +179,10 @@ gate が落ちたら上書きせず相談する。
   - 最初の push では Linux の build が落ちた（`||` / `??` の autoclosure が非 Sendable の state を捕捉するのを Linux の Swift 6.2 が SendingRisksDataRace として拒否。macOS の Xcode では出ない）。
     テストの fake も、並行する送信の到着順に依存していた。両方を直して push し直した。
   - Performance の gate（Linux x86、20 組）は PASS: read throughput −5.4%（95% CI −6.7〜−4.1%）、user CPU +11.5%（+9.1〜+14.0%、上限 +25% の内側）、write は変化なし。
-  - Test の macos-tsan job で、SMBReadPipelineTests の 2 本が TSan の下でだけ間欠的に落ちる（data race の警告は無い。手元でも 5 回に 1 回再現）。調査中。
+  - Test の macos-tsan job で、SMBReadPipelineTests の 2 本が TSan の下でだけ間欠的に落ちた（data race の警告は無い。手元でも 5 回に 1 回再現）。
+    原因はテストの fake の同期（送信を止める READ を到着件数で選んでいた）で、offset で選ぶように直した（commit `test(read): issue 102 M2 — READ の送信を止める gate を到着件数ではなく offset で選ぶ …`）。
+  - 続く push で、Linux の testStaleCallbacksCannotMutateAClosedGeneration が間欠的に落ちた。M2 の前（26fd9d7）からあったテストの同期の誤り
+    （session を閉じた後は waitForPendingCountForTesting が件数 0 でも返る）で、同じ形の 2 本を onRegistered で待つように直した
+    （commit `test(session): closed generation のテスト 2 本で、pending の登録を onRegistered で待つ …`）。
+  - その push（c4c691d）の CI は Test / E2E / Performance / Issues とも success、`verify-agent-push` rc=0。**M2 は CI でも完了**。
 

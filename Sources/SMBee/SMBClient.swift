@@ -10051,7 +10051,11 @@ extension SMBSession {
         } else {
             deadlineReachedBeforeSend = false
         }
-        if Task.isCancelled || state.window.isStopped || !isGenerationActive(state.generation) || deadlineReachedBeforeSend {
+        // Read the non-Sendable transfer state before the condition: `||` takes autoclosures, and
+        // the Linux Swift 6.2 compiler rejects capturing `state` in them (SendingRisksDataRace).
+        let windowStopped = state.window.isStopped
+        let generationActive = isGenerationActive(state.generation)
+        if Task.isCancelled || windowStopped || !generationActive || deadlineReachedBeforeSend {
             await refundUnclaimedCredit(reservation)
             let observedAt = sessionTime.now()
             _ = state.window.revokePreparing(slotIndex: slotIndex, at: observedAt)
@@ -10257,7 +10261,14 @@ extension SMBSession {
                 "short SMB read: expected \(state.endOffset - state.startingOffset) bytes, got \(received)"
             )
         } else {
-            error = state.window.selectedError() ?? (state.window.terminallyClosed ? wireFailure : nil)
+            // Not `??`: its autoclosure would capture the non-Sendable `state` (see the admission check).
+            if let selected = state.window.selectedError() {
+                error = selected
+            } else if state.window.terminallyClosed {
+                error = wireFailure
+            } else {
+                error = nil
+            }
         }
         await removeReadTransfer(state)
         return .finished(error)

@@ -744,8 +744,10 @@ class SMBReadPipelineScriptTransport: SMBContinuationWatchTransport, @unchecked 
         try await super.send(bytes)
     }
 
+    /// Ordered by MessageId, i.e. commit order. Concurrent full sends reach the transport in an
+    /// unspecified order (`SMBTransport.send` contract), so arrival order is not deterministic.
     var readRequests: [ReadRequest] {
-        readLock.withLock { readRequestsStorage }
+        readLock.withLock { readRequestsStorage }.sorted { $0.header.messageId < $1.header.messageId }
     }
 
     var errorResponseBodies: [[UInt8]] {

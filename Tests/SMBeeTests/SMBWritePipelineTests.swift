@@ -583,9 +583,11 @@ final class SMBWritePipelineTests: XCTestCase {
         try await waitForCommand(transport, SMB2Commands.create, occurrence: 1)
         try transport.completeCreate()
         try await waitForWrites(transport, offsets: [0, UInt64(chunkSize), UInt64(chunkSize * 2)])
-        // The file source reports once per read (1 MiB, 2 MiB, 2 MiB + 23); wait for all three
-        // reads before reading the last value instead of the first report.
-        try await waitForProgress(progress, count: 3, label: "file supplier progress before final responses")
+        // The file source reports once per read, and how many reads it takes depends on the credit
+        // hint at each read; wait for the report that reaches the full size.
+        try await smbIssue102AwaitWithTimeout("file supplier progress before final responses") {
+            try await progress.waitForValue(atLeast: UInt64(data.count))
+        }
         XCTAssertEqual(progress.values.last, UInt64(data.count), "file progress reports bytes read from the source")
         for offset in [UInt64(chunkSize * 2), UInt64(chunkSize), 0] {
             try transport.respond(to: request(at: offset, in: transport))
@@ -1201,6 +1203,16 @@ private final class SMBWritePipelineProgressCollector: @unchecked Sendable {
 
     func waitForCount(_ count: Int) async throws {
         try await progressBarrier.waitForCount(count)
+    }
+
+    /// Waits for a report of at least `target` bytes. The number of reports depends on how the
+    /// source is read (credit-sized hints), so tests that care about the final value wait on it.
+    func waitForValue(atLeast target: UInt64) async throws {
+        while true {
+            let snapshot = lock.withLock { storage }
+            if let last = snapshot.last, last >= target { return }
+            try await progressBarrier.waitForCount(snapshot.count + 1)
+        }
     }
 }
 

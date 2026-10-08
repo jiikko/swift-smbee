@@ -175,4 +175,9 @@ gate が落ちたら上書きせず相談する。
   - 送信失敗の後、refund された credit で新しい READ が commit される（敵対の反例 #2）: 実行では再現しなかった。設計の契約（送信失敗の後は session を terminal に・到達しうる request の credit を live な session に返さない）に合わせ、close を refund の前に移した。close と refund の順序を独立に観測する gate は無い。
   - refund の前の時刻で drain を記録する（敵対の反例 #4）: 状態機械のテストで固定して直した。session の refund の再入まで含めた統合の再現は、refund の await を止める gate が無いので書いていない。
   - final 時の軽い parser（`SMB2Read.responsePayloadLength`）と `decodeResponse` の食い違い: packet 長・data offset・data 長の組み合わせを網羅して食い違いは無かった。食い違ったときに retirement の失敗として配送しないことはテストで固定した。
+- push（commit `fix(read): issue 102 M2 の Linux ビルドと順序に依存したテストを直す`）の CI:
+  - 最初の push では Linux の build が落ちた（`||` / `??` の autoclosure が非 Sendable の state を捕捉するのを Linux の Swift 6.2 が SendingRisksDataRace として拒否。macOS の Xcode では出ない）。
+    テストの fake も、並行する送信の到着順に依存していた。両方を直して push し直した。
+  - Performance の gate（Linux x86、20 組）は PASS: read throughput −5.4%（95% CI −6.7〜−4.1%）、user CPU +11.5%（+9.1〜+14.0%、上限 +25% の内側）、write は変化なし。
+  - Test の macos-tsan job で、SMBReadPipelineTests の 2 本が TSan の下でだけ間欠的に落ちる（data race の警告は無い。手元でも 5 回に 1 回再現）。調査中。
 

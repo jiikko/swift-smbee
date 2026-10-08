@@ -583,7 +583,9 @@ final class SMBWritePipelineTests: XCTestCase {
         try await waitForCommand(transport, SMB2Commands.create, occurrence: 1)
         try transport.completeCreate()
         try await waitForWrites(transport, offsets: [0, UInt64(chunkSize), UInt64(chunkSize * 2)])
-        try await waitForProgress(progress, count: 1, label: "file supplier progress before final responses")
+        // The file source reports once per read (1 MiB, 2 MiB, 2 MiB + 23); wait for all three
+        // reads before reading the last value instead of the first report.
+        try await waitForProgress(progress, count: 3, label: "file supplier progress before final responses")
         XCTAssertEqual(progress.values.last, UInt64(data.count), "file progress reports bytes read from the source")
         for offset in [UInt64(chunkSize * 2), UInt64(chunkSize), 0] {
             try transport.respond(to: request(at: offset, in: transport))

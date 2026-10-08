@@ -156,7 +156,7 @@ before の実測は `docs/performance-resource-baseline.md` の「2026-10-02: �
 |---|---|---|
 | M1 | 共通の下地（window の状態機械、pending の completion の宛先、待たない予約、operation の絶対期限）。転送はまだ直列 | **完了**（2026-10-07、commit `feat(session): issue 102 #14 #15 の pipelining M1 — …`。未 push。レビュー: 発見型 12 件・敵対の反例 2 件を対応） |
 | M2 | READ の pipelining | **完了**（2026-10-08、commit `feat(read): issue 102 #14 の pipelining M2 — …`。下の M2 の節） |
-| M3 | WRITE の pipelining | 未着手 |
+| M3 | WRITE の pipelining | **完了**（2026-10-08、commit `feat(write): issue 102 #15 の pipelining M3 — …`。CI は下の M3 の節） |
 | M4 | POSIX の受信バッファ（#16）と総合検証（CI の性能 gate・RTT study の after） | 未着手 |
 
 未確認のリスク: CI の Linux x86 の synthetic benchmark（`initialCredits=1` で実質 1 flight）での user CPU。手元の macOS / arm64 container で master と交互に測ってから push し、
@@ -185,4 +185,13 @@ gate が落ちたら上書きせず相談する。
     （session を閉じた後は waitForPendingCountForTesting が件数 0 でも返る）で、同じ形の 2 本を onRegistered で待つように直した
     （commit `test(session): closed generation のテスト 2 本で、pending の登録を onRegistered で待つ …`）。
   - その push（c4c691d）の CI は Test / E2E / Performance / Issues とも success、`verify-agent-push` rc=0。**M2 は CI でも完了**。
+
+### M3（WRITE の pipelining）の記録（2026-10-08）
+
+- M2 と同じ window と作法。supplier を呼んでから credit を予約、credit 0 で自分の WRITE が送信中なら supplier を先に呼ばず credit を待つ（直列版と同じ size の hint と request 数）。
+- 性能（macOS の synthetic WRITE、initialCredits=1、M2 と AB/BA 6 組）: throughput −2.0% / user CPU +1.2%。macOS では既存の「1 sample 100 ms 以上」の検査が M2 の側も含めて落ちるので目安。
+- レビュー: 発見型 3 観点で 10 件、敵対 2 周で 6 件。再現テストを先に red にしてから直した。
+  - 送信失敗（cancellation 以外）は request の種類によらず refund より先に session を terminal にするように広げた（単発の request / CLOSE の送信失敗の refund で、credit 待ちの転送が commit する反例があった）。
+  - 未確認: credit の通知の取りこぼし（balance の await の後に revision を取っていた）は 20 回で再現しなかった。await の前に取る形に直した。
+- 未確認のリスク: supplier の size の hint は、送信中の WRITE があっても credit がある限り今の残高で決まるので、credit が少ない server では直列版より小さい WRITE になることがある（credit 0 のときは直列版と同じに戻した）。
 

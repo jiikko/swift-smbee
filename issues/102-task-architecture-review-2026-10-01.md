@@ -155,7 +155,7 @@ before の実測は `docs/performance-resource-baseline.md` の「2026-10-02: �
 | M | 内容 | 状態 |
 |---|---|---|
 | M1 | 共通の下地（window の状態機械、pending の completion の宛先、待たない予約、operation の絶対期限）。転送はまだ直列 | **完了**（2026-10-07、commit `feat(session): issue 102 #14 #15 の pipelining M1 — …`。未 push。レビュー: 発見型 12 件・敵対の反例 2 件を対応） |
-| M2 | READ の pipelining | 未着手 |
+| M2 | READ の pipelining | **完了**（2026-10-08、commit `feat(read): issue 102 #14 の pipelining M2 — …`。下の M2 の節） |
 | M3 | WRITE の pipelining | 未着手 |
 | M4 | POSIX の受信バッファ（#16）と総合検証（CI の性能 gate・RTT study の after） | 未着手 |
 
@@ -163,3 +163,16 @@ before の実測は `docs/performance-resource-baseline.md` の「2026-10-02: �
 gate が落ちたら上書きせず相談する。
 
 再開するとき: 設計の正本は `tmp/cdpipe/d2-design.md` と `tmp/codex-drive-design.pipelining.md`（一時領域。消えていたら上の要点から再構成する）。
+
+### M2（READ の pipelining）の記録（2026-10-08）
+
+- 性能（macOS release の synthetic READ、initialCredits=1 で 1 本ずつ、M1 と AB/BA 6 組の中央値）: 最初の実装は throughput −28.7% / user CPU +40.2%。
+  - `sample` の profile と codex の分析で、actor の出入りの回数は M1 と同じで、増えた thread の起床は XCTWaiter の待ちだと分かった（hop の数が原因という最初の仮説は外れ）。
+  - slot の状態の分割・時刻の取得の削減・payload の decode を credit grant の後へ移す、で −8.7% / +11.2% まで縮めた（credit 待ちと retirement 待ちの分離は悪化したので戻した）。
+  - 目標の ±5% には届いていない。残りは slot の管理の費用と見ている（内訳は数値で分けられていない）。CI の Linux x86 の gate は push で確かめる。
+- レビュー: 発見型 3 観点で 12 件、敵対 2 周で 4 件。再現テストを先に red にしてから直した。
+- 未確認のリスク（直していない、または実行で再現できていないもの）:
+  - 送信失敗の後、refund された credit で新しい READ が commit される（敵対の反例 #2）: 実行では再現しなかった。設計の契約（送信失敗の後は session を terminal に・到達しうる request の credit を live な session に返さない）に合わせ、close を refund の前に移した。close と refund の順序を独立に観測する gate は無い。
+  - refund の前の時刻で drain を記録する（敵対の反例 #4）: 状態機械のテストで固定して直した。session の refund の再入まで含めた統合の再現は、refund の await を止める gate が無いので書いていない。
+  - final 時の軽い parser（`SMB2Read.responsePayloadLength`）と `decodeResponse` の食い違い: packet 長・data offset・data 長の組み合わせを網羅して食い違いは無かった。食い違ったときに retirement の失敗として配送しないことはテストで固定した。
+

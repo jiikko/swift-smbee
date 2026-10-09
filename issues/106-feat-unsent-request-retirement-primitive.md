@@ -172,6 +172,16 @@ commit の分け方（各 commit が単独で契約を満たす）:
 - 途中で見つけて master で直した、別のテストの不安定さ:
   - WRITE の pipelining のテスト 2 本が request の Task を `.background` で起こしていて、macOS の単独実行で 5/10 失敗（issue 102 に記録）
   - `testReservationGrantedAfterOperationDeadlineIsRefunded` が CLOSE の応答の前に残高を読んでいて、CI の Linux で 1 回失敗
+- M1 の観測（2026-10-09）:
+  - callgrind（Linux container arm64、read_stream / write_stream の synthetic）の総命令数は read が master 75.06M → M0 78.71M（+4.9%）、
+    write が 120.95M → 123.77M（+2.3%）。x86 の user CPU +39% / system CPU +34% を命令数では説明できない
+  - codex が命令数を削った 4 段（m1〜m1d）は read を 77.52M（M0 比 −1.5%）までしか減らせなかった。差分は `tmp/c3/m1-partial-instr.patch`
+    に退避して worktree からは戻した（codex の 5h 枠切れで途中終了）
+  - CI の x86 の計測ログ（`/usr/bin/time -v`、テストの実行 19 回ずつ）の voluntary context switch の中央値は master 131,814 / M0 255,314（+94%、
+    ばらつき ±0.4% 以内）。CPU の増分は命令の量ではなく、スレッドの待ちと起床の回数から来ていると見る
+    （callgrind はスレッドを直列に走らせるので、起床・futex・context switch のコストを数えない）
+- 次: 手元の Linux container で context switch の比が再現するかを確かめ、再現するなら M1 の指標にする。
+  削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 
 ## 関連

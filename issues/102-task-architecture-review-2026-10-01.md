@@ -193,6 +193,11 @@ gate が落ちたら上書きせず相談する。
 - レビュー: 発見型 3 観点で 10 件、敵対 2 周で 6 件。再現テストを先に red にしてから直した。
   - 送信失敗（cancellation 以外）は request の種類によらず refund より先に session を terminal にするように広げた（単発の request / CLOSE の送信失敗の refund で、credit 待ちの転送が commit する反例があった）。
   - 未確認: credit の通知の取りこぼし（balance の await の後に revision を取っていた）は 20 回で再現しなかった。await の前に取る形に直した。
+    - 2026-10-09: `testCreditGrantBetweenBalanceReadAndRevisionSnapshotDoesNotLoseWakeup` はこの退行を検出しない。WRITE の driver の
+      `creditRevision: creditRevisionBeforeReservation` を await の後の `state.creditRevision` に戻す変異を `mutate-verify` で当てても green（rc=6）。
+      名前どおりの窓（予約の await の最中の grant）をゲートで作れていない。テストを検出できる形にするのは残課題。
+    - 同じ日に、このテストと `testNonTransferSendFailureClosesBeforeRefundingCredit` が request の Task を `.background` で起こしていたため、
+      macOS で単独実行すると 10 回中 5 回落ちていたのを直した（commit `test(write): WRITE の pipelining のテスト 2 本で、request の Task を `.background` で起こさない`）。
 - 未確認のリスク: supplier の size の hint は、送信中の WRITE があっても credit がある限り今の残高で決まるので、credit が少ない server では直列版より小さい WRITE になることがある（credit 0 のときは直列版と同じに戻した）。
 
 ### M4 と総合検証の記録（2026-10-09）

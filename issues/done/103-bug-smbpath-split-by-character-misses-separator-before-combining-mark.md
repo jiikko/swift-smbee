@@ -76,3 +76,5 @@ share の外へは Samba が拒否する。Windows / macOS SMBX は未実測。
   - lint を有効にしたままでは 13 本中 12 本が build の段で `no_character_based_smb_path_separator` に止められた（lint が退行を止める証拠。残り 1 本は helper の中で lint の対象外）
   - 変異の行だけ lint を外すと 13 本すべてが狙ったテストで red（normalize / share / entry / canonical / dfsShare / dfsPathSuffix /
     treeConnectPath / helper の contains / directoryEntry(matching:) / 親ディレクトリ作成 / remoteRelativePath / localRelativePath / glob の切り出し）
+- 2026-10-09: push（tip `docs: issue 103 — 実装後のレビュー 2 周と変異検証 13 本の結果を書く`）。`bin/ci/verify-agent-push` で Test / E2E / Performance が green。
+  受け入れ条件が揃ったので done へ移す。範囲外として残したもの: DFS の直接入口の `.` / `..` 検査の欠如、DFS キャッシュの鍵の `/` と `\` の不一致（性能のみ）

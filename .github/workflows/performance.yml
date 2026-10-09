@@ -7,6 +7,11 @@ on:
         description: Number of paired current/reference benchmark invocations
         required: false
         default: "20"
+      reference_sha:
+        # Lets a candidate on a branch be gated against a chosen commit (usually master) before it lands.
+        description: Commit to measure as the reference (empty = no reference; push to master always uses the previous successful master)
+        required: false
+        default: ""
   # issues/ だけの変更では起動しない (issue の規約検査は issues.yml)。bin/ci/verify-agent-push は
   # この除外を前提に、issue だけの commit を直近のコードを含む祖先の run で検証する。
   push:
@@ -50,12 +55,20 @@ jobs:
           restore-keys: |
             performance-spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.swift-version', '.swift-image-digest', 'Package.resolved') }}-
       - name: Prepare previous successful master
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/master') || (github.event_name == 'workflow_dispatch' && inputs.reference_sha != '')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REFERENCE_SHA: ${{ inputs.reference_sha }}
         run: |
           set -euo pipefail
           reference_dir="${RUNNER_TEMP}/resource-performance-reference-${GITHUB_RUN_ID}"
+          if [ -n "${REFERENCE_SHA:-}" ]; then
+            git fetch --no-tags origin "${REFERENCE_SHA}"
+            echo "Preparing requested reference ${REFERENCE_SHA}."
+            git worktree add --detach "${reference_dir}" "${REFERENCE_SHA}"
+            echo "PERFORMANCE_REFERENCE_DIR=${reference_dir}" >> "${GITHUB_ENV}"
+            exit 0
+          fi
           previous_sha="$(gh api \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/performance.yml/runs?branch=master&event=push&status=success&per_page=100" \
             --jq ".workflow_runs[] | select(.id != ${GITHUB_RUN_ID}) | .head_sha" \

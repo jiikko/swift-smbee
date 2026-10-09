@@ -60,5 +60,19 @@ share の外へは Samba が拒否する。Windows / macOS SMBX は未実測。
   - 検証: macOS の unit 711 件・Linux container（swift:6.2）の unit 718 件が green、strict lint / lint-analyze 0 件、signing profile の E2E が green
 - 範囲外として記録（直していない）: DFS の直接入口 `SMBSession.dfsReferral(share:path:)` と `resolveDFS` の解決結果には `.` / `..` の検査そのものが無い
   （区切りの隠蔽ではなく既存の穴。設計の敵対レビューの指摘）
-- 残り: 実装後のレビュー（回帰・壊す・素通り）、smbcli の変更箇所（相対パス・親ディレクトリの作成・glob の切り出し）のテスト、変異検証、smoke、push
-  - 2026-10-09 10:10: レビューの 3 本が codex の 5h 枠切れで出力の途中に止まった。12:37 のリセット後に再開する
+- 2026-10-09: 実装後のレビュー（codex sol-high、回帰・壊す・素通りの 3 lens + merger）
+  - 壊す: 新しい迂回は見つからなかった（既知の DFS の直接入口だけ）
+  - 素通り（採用）: smbcli の変更箇所・helper の各操作・DFS / TREE_CONNECT は、旧実装に戻しても red になるテストが無かった。
+    lint は `split { $0 == Character("\\") }` を拾っていなかった
+  - 回帰（採用）: DFS で `/` を拒否したのは過剰（`\\server\share\dir/file` が通らなくなる）。実 Samba は `/` を区切りとして扱うので、DFS の分割を `/` と `\` の両方にした
+  - commit `test(path): issue 103 — 実装後レビューの指摘で、区切りの判定の各経路にテストを足し DFS の `/` 拒否をやめる`
+    （smbcli の親ディレクトリ作成の重複を `remoteParentDirectoryPaths(for:)` に抽出して試験した）
+- 2026-10-09: 直した差分への 2 周目の敵対レビュー
+  - P2（採用）: PathConsumed の UNC 補正の先頭判定が `.backslash` のままで、`//server/share/leaf` の suffix が 1 文字ずれた。
+    commit `fix(dfs): issue 103 — PathConsumed の UNC 補正の先頭判定を…`。実サーバが `//` の入力に同じ PathConsumed を返すかは未実測
+  - P3（記録のみ）: DFS キャッシュの鍵が `dir/file` と `dir\file` を別に数え、referral を重複して取る。結果は誤らず性能だけで、入力も稀なので直さない
+  - 親ディレクトリ作成の抽出・lint の regex は壊せなかった
+- 2026-10-09: 変異検証（`mutate-verify-list`、13 本。各箇所を旧実装の Character 単位の判定に戻す）
+  - lint を有効にしたままでは 13 本中 12 本が build の段で `no_character_based_smb_path_separator` に止められた（lint が退行を止める証拠。残り 1 本は helper の中で lint の対象外）
+  - 変異の行だけ lint を外すと 13 本すべてが狙ったテストで red（normalize / share / entry / canonical / dfsShare / dfsPathSuffix /
+    treeConnectPath / helper の contains / directoryEntry(matching:) / 親ディレクトリ作成 / remoteRelativePath / localRelativePath / glob の切り出し）

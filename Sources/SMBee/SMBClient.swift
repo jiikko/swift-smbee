@@ -2189,7 +2189,7 @@ public enum SMBClient {
         // Samba reports PathConsumed from the first server-name character and
         // excludes one of the two UNC leading separators. Restore that UTF-16
         // code unit before slicing the caller's canonical UNC string.
-        let uncAdjustment = SMBPathSeparator.hasLeadingSeparators(path, kind: .backslash, count: 2) ? 1 : 0
+        let uncAdjustment = SMBPathSeparator.hasLeadingSeparators(path, kind: .smb, count: 2) ? 1 : 0
         let consumedUnits = consumedUTF16Bytes / 2 + uncAdjustment
         guard consumedUnits <= units.count else {
             throw SMBCodecError.invalidValue("DFS PathConsumed exceeds referral path length")

@@ -98,4 +98,9 @@ final class SMBPathSeparatorTests: XCTestCase {
         let path = "\\\\\u{0301}server\\share\\leaf"
         XCTAssertEqual(try SMBClient.dfsPathSuffix(path, consumedUTF16Bytes: 28), "\\leaf")
     }
+
+    func testDfsPathSuffixTreatsLeadingSlashesLikeTheDfsSplit() throws {
+        // dfsShare / dfsRelativePath split on both separators, so `//server/share` is a UNC prefix too.
+        XCTAssertEqual(try SMBClient.dfsPathSuffix("//server/share/leaf", consumedUTF16Bytes: 26), "/leaf")
+    }
 }

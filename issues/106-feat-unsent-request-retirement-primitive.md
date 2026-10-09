@@ -235,6 +235,13 @@ commit の分け方（各 commit が単独で契約を満たす）:
     通常 request の timeout の勝敗が job の順で決まる（絶対の応答期限を保存して同じ clock で比べる）、cancel の drain 期限に外側の操作の期限が入らない（登録時に捕まえる）。
     後の 2 件は executor と無関係な M0 の契約の穴
   - 実装の分割: M1a executor の製品化 → M1b callback の境界と lease → M1c 期限と後始末 → M2 flaky なテストと P3
+- M1a（executor の製品化、macOS 15）: x86（run 38000931264、20 組、比較の相手は master 1857fe1）で read throughput +34.0%・user CPU −36.9%・system CPU −54.0%、
+  write +12.1%・user CPU −21.3%。macOS 740 件 / Linux 747 件が green
+- M1b（callback を executor の外の C へ）: 手元 arm64 の read が M1a 約 3,510 → 約 1,275 MiB/s（−63%、chunk あたり約 31.5 µs）。C を `globalConcurrentExecutor` に替えても
+  約 1,250〜1,300 で変わらない（S を出て戻る往復そのものが高い）。write は変わらない
+- 2026-10-10 ユーザー判断: **利用者の callback は session の executor の上で走らせ、契約を明記する**（「短く。重い処理は利用者が自分の Task / actor へ」を doc に書き、
+  debug build で長い callback を診断する）。同期の callback が走る間は同じ session の cancel・close・期限が待たされる（master より悪い点として受け入れる）。
+  M1b の lease の分離（callback の実行中に close されても配送中の slot を callback の後に一回だけ精算）は残す
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

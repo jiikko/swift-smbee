@@ -183,7 +183,7 @@ final class SMBWritePipelineTests: XCTestCase {
         let first = try await waitForWrite(transport, offset: 0)
         XCTAssertEqual(first.length, 65_536)
 
-        let failingRequest = Task(priority: .background) {
+        let failingRequest = Task {
             try await session.queryDirectory(treeId: 1, fileId: fileId) { _ in }
         }
         await session.waitForCreditWaiterCountForTesting(atLeast: 1)
@@ -255,7 +255,7 @@ final class SMBWritePipelineTests: XCTestCase {
         try await waitForCommand(transport, SMB2Commands.create, occurrence: 2)
         let creditRequestHeader = try XCTUnwrap(transport.createRequest(path: "credit-source.bin"))
 
-        let write = Task(priority: .background) {
+        let write = Task {
             try await session.write(
                 treeId: 1,
                 fileId: fileId,

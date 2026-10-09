@@ -153,6 +153,27 @@ commit の分け方（各 commit が単独で契約を満たす）:
     ユーザーの許可が要る（この repo は指示なしに branch を切らない）。
 - Commit 4（069 M2）と Commit 5（pipelining）は、Commit 3 の上に積むので待つ。
 
+### Commit 3 の入れ直し（2026-10-09〜、codex-drive）
+
+- 計測の手段: `performance.yml` の workflow_dispatch に `reference_sha` を足した（commit `ci(performance): workflow_dispatch で比較の相手 (reference_sha) を指定できるようにする`）。
+  候補を branch `perf/106-commit3` に push し、master の先端を比較の相手にして同じ 20 組の gate を回せる。branch はユーザーの許可を得て作った（計測が済んだら消す）。
+  - 同じ commit に手動起動の run が並ぶと verifier が掴んでいたので、`verify-agent-push` / `verify-agent-performance` を push の run だけ見るように直した
+  - 🚨 master の ref で手動起動すると、concurrency で push の Performance の run が取り消される。手動起動は branch で行う
+- M0: 3d6eace を今の master に載せ替えた（衝突 10 か所。pipelining の READ / WRITE の transfer ticket も post-auth の sequencer に載せた）。
+  macOS 737 件 / Linux container 744 件が green、smoke 3 profile が通過。worktree の commit は branch `perf/106-commit3`（2ef2a6c）
+- M0 の x86 の計測（run 37916870148、20 組、比較の相手は master dfe6815）:
+
+  | | throughput | user CPU | system CPU |
+  |---|---|---|---|
+  | read | −19.2%（95% CI −19.9〜−18.9%） | +39.3% | +34.0% |
+  | write | −6.0% | +18.5% | +5.9% |
+
+  gate（−15% / +25%）は read が両方で超える。前回（−22% / +46%）と同じ傾向で、pipelining の後でも新しい送信経路のコストはほぼ変わらない
+- 途中で見つけて master で直した、別のテストの不安定さ:
+  - WRITE の pipelining のテスト 2 本が request の Task を `.background` で起こしていて、macOS の単独実行で 5/10 失敗（issue 102 に記録）
+  - `testReservationGrantedAfterOperationDeadlineIsRefunded` が CLOSE の応答の前に残高を読んでいて、CI の Linux で 1 回失敗
+- 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
+
 ## 関連
 
 - issue 010（M3 と P2-2）、069（M2）、104（compound）、105（M3 の reader の idle 時の懸念）

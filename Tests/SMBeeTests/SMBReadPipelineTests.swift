@@ -871,6 +871,16 @@ final class SMBReadPipelineTests: XCTestCase {
         }
 
         XCTAssertEqual(transport.readRequests.count, 2, "the expired transfer does not commit another READ")
+        // The stream's error can reach the caller while its CLOSE is still on the wire holding one credit,
+        // so wait for the CLOSE responses before reading the balance (a missing refund times out here).
+        try await smbIssue102AwaitWithTimeout("CLOSE responses and the expired reservation refund") {
+            while true {
+                let balance = await session.creditBalanceForTesting()
+                let pending = await session.pendingCountForTesting()
+                if balance >= 3, pending == 0 { return }
+                await Task.yield()
+            }
+        }
         let finalCreditBalance = await session.creditBalanceForTesting()
         XCTAssertEqual(finalCreditBalance, 3, "the unused acquired credit is refunded after both CLOSE requests")
         let pendingAfterReservation = await session.pendingCountForTesting()

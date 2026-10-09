@@ -191,6 +191,11 @@ commit の分け方（各 commit が単独で契約を満たす）:
   | write_stream M0 | 約 31,500 | 0.15 秒 | 約 850 MiB/s |
 
   READ の経路で request ごとにスレッドを眠らせて起こしている。この数を M1 の指標にする（目標は master の桁）
+  - request 1 本あたり: read は 1 回の実行で READ 約 51,200 本（8 MiB を 64 KiB ずつ × 400 回）→ 約 3.5 回 / READ。
+    write は WRITE 約 8,960 本 → 約 3.5 回 / WRITE。master は約 0.01 回 / request
+  - 見立て（未検証）: 呼び出し元 → sender loop → 呼び出し元の受け渡しのたびに、眠っている worker thread を起こしている。
+    第一候補の直し方は、競合が無いとき（queue が空で送り手がいない）に呼び出し元が送り手を兼ねる形（flat combining）。
+    承認済み設計が sender loop を分けた理由（cancel の隔離・送信の所有）に触れるので、実装の前に設計レビューに通す
   - 🚨 フィルタは `SMBeeResourcePerformanceTests/<test>`（ファイル名の `SMBeePerformanceRegressionTests` ではない）。最初の 2 回は 0 件実行の空振りだった
 - 次: context switch の数を指標に M1 を進める。
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）

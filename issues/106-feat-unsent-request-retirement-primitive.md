@@ -212,8 +212,16 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - context switch を減らした変更は、どれも throughput を大きく落とした。**context switch の数は性能の向きの指標にならない**。主な指標は throughput と user + system CPU に戻す
   - 効果は足し算にならない（E1+E2 でも差 3.45 のうち 2.03 / READ）。境界を 1 つずつ削る方向は外れと見る
   - 実験の throughput は回によって揺れている可能性がある（E3 は context switch が変わらないのに −20%）。次の実験は master / M0 を同じ回で測り直して揺れを除く
-- 次: 構造の仮説 E6 — session ごとの直列 executor に session actor と sender / reader / driver の Task を載せる（SE-0417 の task executor preference）。
-  外れたら forge へ上げる
+- E6（2026-10-10）: session ごとの直列 executor（`SerialExecutor` + `TaskExecutor`、直列の DispatchQueue）を session actor の executor にし、
+  sender / reader / cleanup の Task と READ / WRITE の driver を同じ executor に載せた（`Task(executorPreference:)` / `withTaskExecutorPreference`）。
+  - 手元（arm64、同じ container の r2。裏で別セッションの obaket の負荷テストが走っていて r1 は揺れが大きく除外）: read は master 2,301 / M0 2,132 / E6 2,849 / master+E6 2,801 MiB/s
+  - **CI x86（run 37958351629、20 組、比較の相手は master 735ac48）: read throughput +20.3%・user CPU −27.4%・system CPU −54.7%、
+    write throughput +7.1%・user CPU −16.7%**。gate を大きな余裕で通る
+  - 計測専用の commit（branch `perf/106-commit3-e6`、0d6f84c）。`TaskExecutor` は macOS 15、`ExecutorJob` は macOS 14 からの API で、
+    package の最低対応版 macOS 13 では build できない。利用側の obaket は macOS 15 以上が前提
+  - 未検討のリスク: READ の `onChunk` / WRITE の supplier など利用者の callback が session の直列 executor の上で走ると、長い処理が同じ session の
+    cancel・close・期限の処理を待たせる
+- 次: E6 を設計として採るかをユーザーに諮る（最低対応版の引き上げ、callback を executor の外で走らせるか）
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

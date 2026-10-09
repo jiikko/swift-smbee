@@ -197,7 +197,23 @@ commit の分け方（各 commit が単独で契約を満たす）:
     第一候補の直し方は、競合が無いとき（queue が空で送り手がいない）に呼び出し元が送り手を兼ねる形（flat combining）。
     承認済み設計が sender loop を分けた理由（cancel の隔離・送信の所有）に触れるので、実装の前に設計レビューに通す
   - 🚨 フィルタは `SMBeeResourcePerformanceTests/<test>`（ファイル名の `SMBeePerformanceRegressionTests` ではない）。最初の 2 回は 0 件実行の空振りだった
-- 次: context switch の数を指標に M1 を進める。
+- 帰属の実験（2026-10-10、arm64 container、各 3 回、`Executed 1 test` 12 件を確認。codex の報告の要点）:
+
+  | 実験（M0 に当てる。捨てる前提） | context switch / READ | read の throughput |
+  |---|---|---|
+  | master | 0.011 | 2,672 MiB/s |
+  | M0 | 3.46 | 2,288 |
+  | E1: reader の起動を full-send の後へ（early final の契約が壊れる） | 1.28 | 1,001 |
+  | E2: transport の send / receive を `nonisolated(nonsending)` に | 1.95 | 852 |
+  | E3: READ の credit 予約の同期の近道 | 3.46 | 1,832 |
+  | E4: 列が空なら呼び出し元の actor turn で直接送る | 3.21 | 1,597 |
+  | E5: master に E2 | 2.27（master より増える） | 2,216 |
+
+  - context switch を減らした変更は、どれも throughput を大きく落とした。**context switch の数は性能の向きの指標にならない**。主な指標は throughput と user + system CPU に戻す
+  - 効果は足し算にならない（E1+E2 でも差 3.45 のうち 2.03 / READ）。境界を 1 つずつ削る方向は外れと見る
+  - 実験の throughput は回によって揺れている可能性がある（E3 は context switch が変わらないのに −20%）。次の実験は master / M0 を同じ回で測り直して揺れを除く
+- 次: 構造の仮説 E6 — session ごとの直列 executor に session actor と sender / reader / driver の Task を載せる（SE-0417 の task executor preference）。
+  外れたら forge へ上げる
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

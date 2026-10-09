@@ -180,7 +180,19 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - CI の x86 の計測ログ（`/usr/bin/time -v`、テストの実行 19 回ずつ）の voluntary context switch の中央値は master 131,814 / M0 255,314（+94%、
     ばらつき ±0.4% 以内）。CPU の増分は命令の量ではなく、スレッドの待ちと起床の回数から来ていると見る
     （callgrind はスレッドを直列に走らせるので、起床・futex・context switch のコストを数えない）
-- 次: 手元の Linux container で context switch の比が再現するかを確かめ、再現するなら M1 の指標にする。
+- 手元の Linux container（arm64、swift:6.2、4G）で再現した（`/usr/bin/time -v swift test -c release --skip-build --filter SMBeeResourcePerformanceTests/<test>`、
+  各 3 回、ぶれ ±1% 程度。手順は worktree の `tmp/cs-measure.sh`）:
+
+  | 1 回の実行 | voluntary context switch | system CPU | throughput |
+  |---|---|---|---|
+  | read_stream master | 約 560 | 0.02 秒 | 約 2,690 MiB/s |
+  | read_stream M0 | 約 177,000 | 1.66 秒 | 約 2,300 MiB/s（−14%） |
+  | write_stream master | 約 540〜640 | 0.03 秒 | 約 800 MiB/s |
+  | write_stream M0 | 約 31,500 | 0.15 秒 | 約 850 MiB/s |
+
+  READ の経路で request ごとにスレッドを眠らせて起こしている。この数を M1 の指標にする（目標は master の桁）
+  - 🚨 フィルタは `SMBeeResourcePerformanceTests/<test>`（ファイル名の `SMBeePerformanceRegressionTests` ではない）。最初の 2 回は 0 件実行の空振りだった
+- 次: context switch の数を指標に M1 を進める。
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

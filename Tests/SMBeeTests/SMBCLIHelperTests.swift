@@ -13,6 +13,27 @@ final class SMBCLIHelperTests: XCTestCase {
         try SMBURLParser.parseReadURL(url)
     }
 
+    func testRemoteParentDirectoryPathsUseScalarSeparatorBoundaries() throws {
+        XCTAssertEqual(
+            try remoteParentDirectoryPaths(for: "a\\\u{0301}b\\file"),
+            ["a", "a\\\u{0301}b"]
+        )
+    }
+
+    func testRemoteRelativePathPreservesCombiningMarkAtRootBoundary() throws {
+        XCTAssertEqual(try remoteRelativePath(path: "a\\\u{0301}b", root: "a"), "\u{0301}b")
+        XCTAssertThrowsError(try remoteRelativePath(path: "ab\\file", root: "a"))
+    }
+
+    func testLocalRelativePathPreservesCombiningMarkAtRootBoundary() throws {
+        let root = URL(fileURLWithPath: "/tmp/root", isDirectory: true)
+        let file = URL(fileURLWithPath: "/tmp/root/\u{0301}file")
+        XCTAssertEqual(try localRelativePath(file: file, directory: root), "\u{0301}file")
+
+        let outsideFile = URL(fileURLWithPath: "/tmp/root-sibling/file")
+        XCTAssertThrowsError(try localRelativePath(file: outsideFile, directory: root))
+    }
+
     func testValidateSameShareAllowsIdenticalUserHostPortShare() throws {
         let from = try readURL("smb://user@host:445/share/a.txt")
         let to = try readURL("smb://user@host:445/share/b.txt")

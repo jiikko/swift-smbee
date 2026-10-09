@@ -24,8 +24,7 @@ public struct SMBDfsReferralTarget: Sendable, Equatable {
 
     init?(networkAddress: String?) {
         guard let networkAddress else { return nil }
-        guard !SMBPathSeparator.contains(networkAddress, kind: .slash) else { return nil }
-        let components = SMBPathSeparator.split(networkAddress, kind: .backslash, omittingEmptySubsequences: true)
+        let components = SMBPathSeparator.split(networkAddress, kind: .smb, omittingEmptySubsequences: true)
         guard components.count >= 2, !components[0].isEmpty,
               let share = try? SMBShareName(components[1]).rawValue else {
             return nil

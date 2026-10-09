@@ -51,19 +51,32 @@ final class SMBCLIBatchTests: XCTestCase {
     }
 
     func testLocalRecursiveBatchGlobEntriesPreservesRelativePaths() throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let testRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("tmp/cd103", isDirectory: true)
+        try FileManager.default.createDirectory(at: testRoot, withIntermediateDirectories: true)
+        let directory = testRoot.appendingPathComponent("cli-glob-\(UUID().uuidString)", isDirectory: true)
         let nested = directory.appendingPathComponent("nested", isDirectory: true)
         try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
 
         try Data("a".utf8).write(to: directory.appendingPathComponent("a.log"))
+        try Data("mark".utf8).write(to: directory.appendingPathComponent("\u{0301}file.log"))
         try Data("b".utf8).write(to: nested.appendingPathComponent("b.log"))
         try Data("c".utf8).write(to: nested.appendingPathComponent("c.txt"))
 
         let files = try localRecursiveBatchGlobEntries(directory: directory.path, include: "*.log", exclude: ["nested\\skip*"])
 
-        XCTAssertEqual(files.map(\.name), ["a.log", "nested\\b.log"])
+        XCTAssertEqual(Set(files.map(\.name)), Set(["a.log", "nested\\b.log", "\u{0301}file.log"]))
+    }
+
+    func testValidateRemoteEntryNameRejectsSeparatorFollowedByCombiningMark() {
+        for name in ["entry/\u{0301}name", "entry\\\u{0301}name"] {
+            XCTAssertThrowsError(try validateRemoteEntryName(name)) { error in
+                guard case SMBError.protocolError = error else {
+                    return XCTFail("expected protocolError, got \(error)")
+                }
+            }
+        }
     }
 
     func testLocalRecursiveBatchGlobEntriesSkipsSymlinks() throws {

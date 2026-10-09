@@ -2159,10 +2159,7 @@ public enum SMBClient {
     private static let dfsReferralCache = SMBDfsReferralCache()
 
     static func dfsShare(from path: String) throws -> String {
-        guard !SMBPathSeparator.contains(path, kind: .slash) else {
-            throw SMBCodecError.invalidValue("DFS referral path must be in \\\\server\\share[\\path] form")
-        }
-        let components = SMBPathSeparator.split(path, kind: .backslash, omittingEmptySubsequences: true)
+        let components = SMBPathSeparator.split(path, kind: .smb, omittingEmptySubsequences: true)
         guard components.count >= 2 else {
             throw SMBCodecError.invalidValue("DFS referral path must be in \\\\server\\share[\\path] form")
         }
@@ -2177,10 +2174,7 @@ public enum SMBClient {
     }
 
     static func dfsRelativePath(from path: String) throws -> String {
-        guard !SMBPathSeparator.contains(path, kind: .slash) else {
-            throw SMBCodecError.invalidValue("DFS path must be in \\\\server\\share[\\path] form")
-        }
-        let components = SMBPathSeparator.split(path, kind: .backslash, omittingEmptySubsequences: true)
+        let components = SMBPathSeparator.split(path, kind: .smb, omittingEmptySubsequences: true)
         guard components.count >= 2 else {
             throw SMBCodecError.invalidValue("DFS path must be in \\\\server\\share[\\path] form")
         }

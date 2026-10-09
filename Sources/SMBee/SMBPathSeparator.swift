@@ -9,7 +9,8 @@
 /// delimiters stored in variables, raw strings, Unicode escapes, comparisons hidden in
 /// named predicates, reversed comparisons, nested expressions/closures, or equivalent
 /// `CharacterSet` and hand-written loop implementations. It can also match code examples
-/// in comments or strings. Those forms require review because the rule is regex-based.
+/// in comments or strings. Direct closure comparisons with string or `Character` literals
+/// are detected; more complex forms require review because the rule is regex-based.
 enum SMBPathSeparator {
     enum Kind {
         case smb

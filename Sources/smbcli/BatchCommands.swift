@@ -268,13 +268,9 @@ struct MPut: AsyncParsableCommand {
     }
 
     private func makeRemoteParentDirectories(session: SMBClientSession, remotePath: String) async throws {
-        let components = SMBPath.splitSMBPathComponents(remotePath)
-        guard components.count > 1 else { return }
-        var current = ""
-        for component in components.dropLast() {
-            current = try SMBPath.join(current, component)
+        for path in try remoteParentDirectoryPaths(for: remotePath) {
             do {
-                try await session.makeDirectory(path: current)
+                try await session.makeDirectory(path: path)
             } catch SMBError.nameCollision {
             }
         }
@@ -288,6 +284,20 @@ struct MPut: AsyncParsableCommand {
             return false
         }
     }
+}
+
+func remoteParentDirectoryPaths(for remotePath: String) throws -> [String] {
+    let components = SMBPath.splitSMBPathComponents(remotePath)
+    guard components.count > 1 else { return [] }
+
+    var current = ""
+    var parentPaths: [String] = []
+    parentPaths.reserveCapacity(components.count - 1)
+    for component in components.dropLast() {
+        current = try SMBPath.join(current, component)
+        parentPaths.append(current)
+    }
+    return parentPaths
 }
 
 func globMatches(_ pattern: String, _ name: String) -> Bool {
@@ -410,7 +420,7 @@ private func appendRemoteRecursiveBatchGlobEntries(
     }
 }
 
-private func validateRemoteEntryName(_ name: String) throws {
+func validateRemoteEntryName(_ name: String) throws {
     do {
         try SMBPath.validateDirectoryEntryName(name)
     } catch {

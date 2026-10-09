@@ -2,6 +2,25 @@ import XCTest
 @testable import SMBee
 
 final class SMBPathSeparatorTests: XCTestCase {
+    func testEverySeparatorOperationUsesUnicodeScalarBoundaries() {
+        XCTAssertEqual(
+            SMBPathSeparator.split("a\\\u{0301}b/c\u{0600}/d", kind: .smb),
+            ["a", "\u{0301}b", "c\u{0600}", "d"]
+        )
+        XCTAssertTrue(SMBPathSeparator.contains("x\\\u{0301}y", kind: .smb))
+        XCTAssertTrue(SMBPathSeparator.contains("x\u{0600}/y", kind: .smb))
+        XCTAssertEqual(
+            SMBPathSeparator.trimmingBoundarySeparators("/\u{0301}x\u{0600}/", kind: .slash),
+            "\u{0301}x\u{0600}"
+        )
+        XCTAssertTrue(SMBPathSeparator.hasLeadingSeparators("\\\\\u{0301}server", kind: .backslash, count: 2))
+        XCTAssertTrue(SMBPathSeparator.hasTrailingSeparator("x\u{0600}/", kind: .slash))
+        XCTAssertEqual(
+            SMBPathSeparator.replacingSeparators("a\\\u{0301}b/c\u{0600}/d", kind: .smb, with: "-"),
+            "a-\u{0301}b-c\u{0600}-d"
+        )
+    }
+
     func testA1SMBPathUsesScalarSeparatorBoundariesForDotSegments() throws {
         let rejectedPaths = [
             "../\u{0301}y",
@@ -39,7 +58,24 @@ final class SMBPathSeparatorTests: XCTestCase {
         XCTAssertEqual(try SMBClient.dfsRelativePath(from: dfsPath), "\u{0301}leaf")
         let target = try SMBClient.dfsTarget(from: "\\\\server\\\u{0301}share")
         XCTAssertEqual(target.share, "\u{0301}share")
-        XCTAssertThrowsError(try SMBClient.dfsShare(from: "\\\\server/share\\leaf"))
+        XCTAssertEqual(try SMBClient.dfsShare(from: "\\\\server/share\\leaf"), "share")
+        XCTAssertEqual(try SMBClient.dfsRelativePath(from: "\\\\server\\share\\dir/file"), "dir\\file")
+        XCTAssertEqual(
+            try SMBClient.dfsRelativePath(from: "\\\\server\\share\\dir/\u{0301}file"),
+            "dir\\\u{0301}file"
+        )
+
+        let parsedTarget = try SMBClient.dfsTarget(from: "\\\\server/share\\leaf")
+        XCTAssertEqual(parsedTarget.host, "server")
+        XCTAssertEqual(parsedTarget.share, "share")
+
+        let markedHostTarget = try SMBClient.dfsTarget(from: "\\\\\u{0301}server/share")
+        XCTAssertEqual(markedHostTarget.host, "\u{0301}server")
+        XCTAssertEqual(markedHostTarget.share, "share")
+
+        let referralTarget = SMBDfsReferralTarget(networkAddress: "\\\\server/share\\leaf")
+        XCTAssertEqual(referralTarget?.host, "server")
+        XCTAssertEqual(referralTarget?.share, "share")
     }
 
     func testTreeConnectUNCParsingPreservesCombiningMarkAtShareBoundary() throws {
@@ -51,5 +87,15 @@ final class SMBPathSeparatorTests: XCTestCase {
 
         let decodedPath = decodeUTF16LE(encodedPath)
         XCTAssertEqual(decodedPath, path)
+    }
+
+    func testTreeConnectDetectsUNCWhenCombiningMarkFollowsLeadingSeparator() {
+        let malformedUNC = "\\\\\u{0301}server\\share\\extra"
+        XCTAssertThrowsError(try SMB2TreeConnect.encodeRequest(messageId: 1, sessionId: 2, path: malformedUNC))
+    }
+
+    func testDfsPathSuffixRestoresUncSeparatorBeforeCombiningHost() throws {
+        let path = "\\\\\u{0301}server\\share\\leaf"
+        XCTAssertEqual(try SMBClient.dfsPathSuffix(path, consumedUTF16Bytes: 28), "\\leaf")
     }
 }

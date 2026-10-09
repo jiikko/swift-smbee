@@ -1745,7 +1745,7 @@ private func statForVerify(
     }
 }
 
-private func localRelativePath(file: URL, directory: URL) throws -> String {
+func localRelativePath(file: URL, directory: URL) throws -> String {
     let filePath = file.standardizedFileURL.path
     let directoryPath = directory.standardizedFileURL.path
     let fileComponents = SMBPath.splitPOSIXPathComponents(filePath)
@@ -1758,7 +1758,7 @@ private func localRelativePath(file: URL, directory: URL) throws -> String {
     return SMBPath.replacingPOSIXPathSeparators(relativePath, with: "\\")
 }
 
-private func remoteRelativePath(path: String, root: String) throws -> String {
+func remoteRelativePath(path: String, root: String) throws -> String {
     let normalizedPath = SMBPath.trimmingSMBPathSeparators(path)
     let normalizedRoot = SMBPath.trimmingSMBPathSeparators(root)
     guard !normalizedRoot.isEmpty else { return normalizedPath }
@@ -1785,18 +1785,14 @@ private func makeRemoteParentDirectories(
     remotePath: String,
     timeout: Duration?
 ) async throws {
-    let components = SMBPath.splitSMBPathComponents(remotePath)
-    guard components.count > 1 else { return }
-    var current = ""
-    for component in components.dropLast() {
-        current = try SMBPath.join(current, component)
+    for path in try remoteParentDirectoryPaths(for: remotePath) {
         do {
             try await SMBee.makeDirectory(
                 host: endpoint.host,
                 port: endpoint.port,
                 credential: credential,
                 share: endpoint.share,
-                path: current,
+                path: path,
                 timeout: timeout
             )
         } catch SMBError.nameCollision {

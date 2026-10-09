@@ -109,6 +109,9 @@ candidates = sys.argv[5:]
 with open(input_path, encoding="utf-8") as stream:
     runs = json.load(stream)
 code_workflows = ("Test", "E2E", "Performance")
+# Only push runs are the CI of a pushed commit. A workflow_dispatch run on the same commit (for
+# example Performance with a chosen reference_sha) measures something else and is often newer.
+runs = [run for run in runs if run.get("event", "push") == "push"]
 
 # The newest candidate that has any code workflow run is the one GitHub ran them for (a push
 # tip); every candidate's tree differs from the commit only under issues/.
@@ -166,7 +169,7 @@ while true; do
     candidate_runs="$("${GH_RETRY}" gh run list \
       --commit "${candidate}" \
       --limit 20 \
-      --json databaseId,name,status,conclusion,url,headSha)"
+      --json databaseId,name,status,conclusion,url,headSha,event)"
     runs_json="$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1]) + json.loads(sys.argv[2])))' "${runs_json}" "${candidate_runs}")"
   done
   printf '%s\n' "${runs_json}" >"${runs_file}"

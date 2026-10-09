@@ -198,6 +198,22 @@ expect_out code-progress 'Test=in_progress E2E=in_progress Performance=in_progre
 expect_out code-progress 'Timed out waiting for all required workflows' err
 test ! -e "${temporary}/code-progress.performance"
 
+# A newer workflow_dispatch Performance run on the same commit (Performance with reference_sha) is
+# not the push CI: the verifier must keep using the push run.
+reset_runs
+write_runs "${code_sha}" success Test E2E Performance Issues
+python3 - "${runs_dir}/${code_sha}.json" "${code_sha}" <<'DISPATCH'
+import json, sys
+path, sha = sys.argv[1:3]
+runs = json.load(open(path))
+runs.insert(0, {"databaseId": 99, "name": "Performance", "status": "completed", "conclusion": "failure",
+                "url": "https://example.test/dispatch", "headSha": sha, "event": "workflow_dispatch"})
+json.dump(runs, open(path, "w"))
+DISPATCH
+verify code-ignores-dispatch "${code_sha}"
+expect_rc code-ignores-dispatch 0
+expect_out code-ignores-dispatch 'Performance completed    success' out
+
 # Issues runs on every push, so it is required on a code commit too.
 reset_runs
 write_runs "${code_sha}" success Test E2E Performance

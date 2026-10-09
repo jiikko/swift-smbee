@@ -42,6 +42,32 @@ unused_import:
     - Crypto
 
 custom_rules:
+  # Threat model: Unicode grapheme clustering can hide an ASCII path separator when a
+  # combining scalar follows it, bypassing component checks such as `.` / `..` rejection.
+  # This rule catches direct literal String APIs and common inline separator predicates.
+  # It does not detect variables/constants, raw strings, Unicode escapes, named
+  # predicates, reversed comparisons, nested expressions/closures, CharacterSet use, or
+  # hand-written scalar/Character loops; regex matches in comments or strings are possible.
+  no_character_based_smb_path_separator:
+    name: "No Character-based SMB path separator checks"
+    regex: |-
+      (?x)
+      \.split\s*\([^)]*?\bseparator\s*:\s*(?:Character\s*\(\s*)?"(?:/|\\\\)"\s*\)?
+      |\.contains\s*\(\s*"(?:/|\\\\)"
+      |\.(?:firstIndex|lastIndex)\s*\(\s*of\s*:\s*(?:Character\s*\(\s*)?"(?:/|\\\\)"\s*\)?
+      |\.components\s*\(\s*separatedBy\s*:\s*"(?:/|\\\\)"
+      |\.split\s*\([^)]*?\bwhereSeparator\s*:\s*\{[^}]*?(?:==|!=)\s*"(?:/|\\\\)"
+      |\.split\s*\([^)]*?\)\s*\{[^}]*?(?:==|!=)\s*"(?:/|\\\\)"
+      |\.(?:split|contains|firstIndex|lastIndex)\s*(?:\(\s*where\s*:\s*)?\{[^}]*?(?:==|!=)\s*"(?:/|\\\\)"
+      |"/\\\\"\.contains\s*\(
+      |\[\s*"(?:/|\\\\)"\s*,\s*"(?:/|\\\\)"\s*\]\.contains
+      |\.has(?:Prefix|Suffix)\s*\(\s*(?:[^()\n]*?\+\s*)?"(?:/|\\\\){1,2}"
+      |\.replacingOccurrences\s*\(\s*of\s*:\s*"(?:/|\\\\)"
+    included: '(^|/)Sources/.*\.swift$'
+    excluded: '(^|/)Sources/SMBee/SMBPathSeparator\.swift$'
+    message: "Route SMB path separator checks through SMBPathSeparator (issue 103)"
+    severity: error
+
   no_trapping_uint16_length_cast:
     name: "No trapping UInt16 length cast"
     # UInt16(<expr>.count) / UInt16(<expr>Size) は overflow で fatalError する。

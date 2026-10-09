@@ -8389,6 +8389,35 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(entry?.fileSize, 3)
     }
 
+    func testDirectoryEntryMatchingSplitsBackslashBeforeCombiningMark() async throws {
+        let directoryFileId = Array(UInt8(32)..<UInt8(48))
+        let treeId: UInt32 = 0x3344
+        let markedLeaf = "\u{0301}report.txt"
+        let transport = SMBValidateNegotiateScriptTransport(inbound: try framed(
+            authenticatedTreeResponses(treeId: treeId) + [
+                try smb2CreateResponse(fileId: directoryFileId, messageId: 4, treeId: treeId),
+                try smb2QueryDirectoryResponse(
+                    entries: [makeDirectoryEntry(name: markedLeaf, isDirectory: false, fileSize: 3, nextOffset: 0)],
+                    messageId: 5,
+                    treeId: treeId
+                ),
+                try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 6, treeId: treeId),
+                try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 7, treeId: treeId)
+            ]
+        ))
+        let session = try await SMBClient.connect(
+            host: "server",
+            share: "share",
+            credential: SMBCredential(username: "user", password: "pass"),
+            makeTransport: { transport }
+        )
+
+        let entry = try await session.directoryEntry(matching: "docs\\\(markedLeaf)")
+
+        XCTAssertEqual(entry?.name, markedLeaf)
+        XCTAssertEqual(entry?.fileSize, 3)
+    }
+
     func testDirectoryEntryMatchingReturnsNilWhenAbsentFromEnumeration() async throws {
         // 列挙に無い leaf は nil (照合が false positive を作らないこと)。
         let directoryFileId = Array(UInt8(32)..<UInt8(48))

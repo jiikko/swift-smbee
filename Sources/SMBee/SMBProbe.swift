@@ -121,9 +121,11 @@ public enum SMBURLParser {
         guard (1...65535).contains(port) else {
             throw SMBCodecError.invalidValue("invalid port")
         }
-        let parts = try components.percentEncodedPath
-            .split(separator: "/", omittingEmptySubsequences: true)
-            .map { try decodeSMBURLPathComponent(String($0)) }
+        let parts = try SMBPathSeparator.split(
+            components.percentEncodedPath,
+            kind: .slash,
+            omittingEmptySubsequences: true
+        ).map { try decodeSMBURLPathComponent($0) }
         guard let share = parts.first else {
             throw SMBCodecError.invalidValue("SMB URL must include a share")
         }
@@ -142,7 +144,7 @@ public enum SMBURLParser {
         guard decoded != ".", decoded != ".." else {
             throw SMBCodecError.invalidValue("SMB URL path must not contain . or .. components")
         }
-        guard !decoded.contains("/"), !decoded.contains("\\") else {
+        guard !SMBPathSeparator.contains(decoded, kind: .smb) else {
             throw SMBCodecError.invalidValue("SMB URL path component must not contain path separators")
         }
         return decoded

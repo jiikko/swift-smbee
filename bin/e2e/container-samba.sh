@@ -105,6 +105,12 @@ else
   printf '\n== Unicode path E2E tests ==\n'
   SMBEE_DEBUG=1 swift test --filter SMBUnicodePathE2ETests
 
+  if [ "${SMBEE_E2E_PROFILE}" = "smb311-signing-required" ]; then
+    # Raw signed CREATE with a separator before a combining mark (issue 103); needs the unencrypted profile.
+    printf '\n== Path separator server-behavior E2E tests ==\n'
+    SMBEE_DEBUG=1 swift test --filter SMBPathSeparatorE2ETests
+  fi
+
   if [ "${SMBEE_E2E_PROFILE}" = "smb302-encrypted-required" ]; then
     printf '\n== Shared-session ranged-read cancellation E2E tests ==\n'
     SMBEE_DEBUG=1 swift test --filter SMBeeSharedSessionRangedReadE2ETests

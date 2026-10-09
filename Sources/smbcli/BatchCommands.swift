@@ -268,7 +268,7 @@ struct MPut: AsyncParsableCommand {
     }
 
     private func makeRemoteParentDirectories(session: SMBClientSession, remotePath: String) async throws {
-        let components = remotePath.split(separator: "\\").map(String.init)
+        let components = SMBPath.splitSMBPathComponents(remotePath)
         guard components.count > 1 else { return }
         var current = ""
         for component in components.dropLast() {
@@ -343,6 +343,7 @@ func localRecursiveBatchGlobEntries(directory: String, include pattern: String, 
         return []
     }
 
+    let rootComponents = SMBPath.splitPOSIXPathComponents(rootURL.path)
     var files: [LocalBatchFile] = []
     for case let url as URL in enumerator {
         let standardizedURL = url.standardizedFileURL
@@ -351,8 +352,13 @@ func localRecursiveBatchGlobEntries(directory: String, include pattern: String, 
             continue
         }
         guard values.isRegularFile == true else { continue }
-        let relativePath = String(standardizedURL.path.dropFirst(rootURL.path.count + 1))
-        let normalizedRelativePath = relativePath.replacingOccurrences(of: "/", with: "\\")
+        let fileComponents = SMBPath.splitPOSIXPathComponents(standardizedURL.path)
+        guard fileComponents.count > rootComponents.count,
+              Array(fileComponents.prefix(rootComponents.count)) == rootComponents else {
+            continue
+        }
+        let relativePath = fileComponents.dropFirst(rootComponents.count).joined(separator: "/")
+        let normalizedRelativePath = SMBPath.replacingPOSIXPathSeparators(relativePath, with: "\\")
         guard globMatches(pattern, url.lastPathComponent),
               !isExcludedByGlob(url.lastPathComponent, exclude: exclude),
               !isExcludedByGlob(normalizedRelativePath, exclude: exclude)
@@ -405,9 +411,9 @@ private func appendRemoteRecursiveBatchGlobEntries(
 }
 
 private func validateRemoteEntryName(_ name: String) throws {
-    guard !name.isEmpty, name != ".", name != "..",
-          !name.contains("/"), !name.contains("\\"),
-          !name.unicodeScalars.contains(where: { $0.value == 0 }) else {
+    do {
+        try SMBPath.validateDirectoryEntryName(name)
+    } catch {
         throw SMBError.protocolError("invalid remote directory entry name")
     }
 }

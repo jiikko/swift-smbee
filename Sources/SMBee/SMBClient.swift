@@ -152,8 +152,8 @@ private func recursiveEntryIsExcluded(name: String, relativePath: String, exclud
 }
 
 private func recursiveGlobMatches(_ pattern: String, name: String, relativePath: String) -> Bool {
-    let normalizedPattern = pattern.replacingOccurrences(of: "\\", with: "/")
-    let normalizedRelativePath = relativePath.replacingOccurrences(of: "\\", with: "/")
+    let normalizedPattern = SMBPathSeparator.replacingSeparators(pattern, kind: .backslash, with: "/")
+    let normalizedRelativePath = SMBPathSeparator.replacingSeparators(relativePath, kind: .backslash, with: "/")
     return smbGlobMatches(pattern, name)
         || smbGlobMatches(pattern, relativePath)
         || smbGlobMatches(normalizedPattern, name)
@@ -1255,9 +1255,7 @@ public actor SMBClientSession {
     /// matches. Names are compared exactly first, then case-insensitively.
     public func directoryEntry(matching path: String) async throws -> SMBDirectoryEntry? {
         try ensureOpen()
-        let components = path.replacingOccurrences(of: "\\", with: "/")
-            .split(separator: "/")
-            .map(String.init)
+        let components = SMBPathSeparator.split(path, kind: .smb)
         guard let leaf = components.last else { return nil }
         guard !components.contains("."), !components.contains("..") else {
             throw SMBCodecError.invalidValue("SMB path must not contain . or .. components")
@@ -2160,12 +2158,15 @@ struct SMBReadTransferShortRead: Error {
 public enum SMBClient {
     private static let dfsReferralCache = SMBDfsReferralCache()
 
-    private static func dfsShare(from path: String) throws -> String {
-        let components = path.split(separator: "\\", omittingEmptySubsequences: true)
+    static func dfsShare(from path: String) throws -> String {
+        guard !SMBPathSeparator.contains(path, kind: .slash) else {
+            throw SMBCodecError.invalidValue("DFS referral path must be in \\\\server\\share[\\path] form")
+        }
+        let components = SMBPathSeparator.split(path, kind: .backslash, omittingEmptySubsequences: true)
         guard components.count >= 2 else {
             throw SMBCodecError.invalidValue("DFS referral path must be in \\\\server\\share[\\path] form")
         }
-        return try SMBShareName(String(components[1])).rawValue
+        return try SMBShareName(components[1]).rawValue
     }
 
     static func dfsTarget(from networkAddress: String) throws -> SMBDfsReferralTarget {
@@ -2175,8 +2176,11 @@ public enum SMBClient {
         return target
     }
 
-    private static func dfsRelativePath(from path: String) throws -> String {
-        let components = path.split(separator: "\\", omittingEmptySubsequences: true)
+    static func dfsRelativePath(from path: String) throws -> String {
+        guard !SMBPathSeparator.contains(path, kind: .slash) else {
+            throw SMBCodecError.invalidValue("DFS path must be in \\\\server\\share[\\path] form")
+        }
+        let components = SMBPathSeparator.split(path, kind: .backslash, omittingEmptySubsequences: true)
         guard components.count >= 2 else {
             throw SMBCodecError.invalidValue("DFS path must be in \\\\server\\share[\\path] form")
         }
@@ -2191,7 +2195,7 @@ public enum SMBClient {
         // Samba reports PathConsumed from the first server-name character and
         // excludes one of the two UNC leading separators. Restore that UTF-16
         // code unit before slicing the caller's canonical UNC string.
-        let uncAdjustment = path.hasPrefix("\\\\") ? 1 : 0
+        let uncAdjustment = SMBPathSeparator.hasLeadingSeparators(path, kind: .backslash, count: 2) ? 1 : 0
         let consumedUnits = consumedUTF16Bytes / 2 + uncAdjustment
         guard consumedUnits <= units.count else {
             throw SMBCodecError.invalidValue("DFS PathConsumed exceeds referral path length")
@@ -4113,7 +4117,7 @@ public enum SMBClient {
         depth: Int
     ) async throws {
         try SMBPath.validateRecursionDepth(depth)
-        if !path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/")).isEmpty {
+        if !SMBPathSeparator.trimmingBoundarySeparators(path, kind: .smb).isEmpty {
             if dryRun {
                 onAction?(SMBRecursiveAction(kind: .mkdir, path: path))
             } else {
@@ -4622,7 +4626,7 @@ public enum SMBClient {
     }
 
     private static func joinSMBPath(_ parent: String, _ child: String) -> String {
-        let trimmedParent = parent.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+        let trimmedParent = SMBPathSeparator.trimmingBoundarySeparators(parent, kind: .smb)
         if trimmedParent.isEmpty { return child }
         return "\(trimmedParent)\\\(child)"
     }
@@ -9963,7 +9967,7 @@ actor SMBSession {
     }
 
     private nonisolated func joinSMBPath(_ parent: String, _ child: String) -> String {
-        let trimmedParent = parent.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+        let trimmedParent = SMBPathSeparator.trimmingBoundarySeparators(parent, kind: .smb)
         if trimmedParent.isEmpty { return child }
         return "\(trimmedParent)\\\(child)"
     }

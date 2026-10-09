@@ -10,7 +10,7 @@ public struct SMBShareName: Equatable, Sendable {
         guard value != ".", value != ".." else {
             throw SMBCodecError.invalidValue("SMB share name must not be . or ..")
         }
-        guard !value.contains("/"), !value.contains("\\") else {
+        guard !SMBPathSeparator.contains(value, kind: .smb) else {
             throw SMBCodecError.invalidValue("SMB share name must not contain path separators")
         }
         rawValue = value
@@ -22,18 +22,37 @@ public struct SMBPath: Equatable, Sendable {
 
     public var rawValue: String
 
+    package static func splitSMBPathComponents(_ value: String) -> [String] {
+        SMBPathSeparator.split(value, kind: .smb)
+    }
+
+    package static func splitPOSIXPathComponents(_ value: String) -> [String] {
+        SMBPathSeparator.split(value, kind: .slash)
+    }
+
+    package static func replacingSMBPathSeparators(_ value: String, with replacement: String) -> String {
+        SMBPathSeparator.replacingSeparators(value, kind: .smb, with: replacement)
+    }
+
+    package static func replacingPOSIXPathSeparators(_ value: String, with replacement: String) -> String {
+        SMBPathSeparator.replacingSeparators(value, kind: .slash, with: replacement)
+    }
+
+    package static func trimmingSMBPathSeparators(_ value: String) -> String {
+        SMBPathSeparator.trimmingBoundarySeparators(value, kind: .smb)
+    }
+
     public init(_ value: String) throws {
         rawValue = try Self.normalize(value)
     }
 
     public static func normalize(_ value: String) throws -> String {
-        let trimmed = value.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+        let trimmed = SMBPathSeparator.trimmingBoundarySeparators(value, kind: .smb)
         guard !trimmed.isEmpty else { return "" }
-        let parts = trimmed.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "/" || $0 == "\\" })
+        let parts = SMBPathSeparator.split(trimmed, kind: .smb, omittingEmptySubsequences: false)
         var normalized: [String] = []
         normalized.reserveCapacity(parts.count)
-        for part in parts {
-            let component = String(part)
+        for component in parts {
             guard !component.isEmpty else {
                 throw SMBCodecError.invalidValue("SMB path must not contain empty components")
             }
@@ -53,9 +72,9 @@ public struct SMBPath: Equatable, Sendable {
         return "\(normalizedParent)\\\(normalizedChild)"
     }
 
-    static func validateDirectoryEntryName(_ name: String) throws {
+    package static func validateDirectoryEntryName(_ name: String) throws {
         guard !name.isEmpty, name != ".", name != "..",
-              !name.contains("/"), !name.contains("\\"),
+              !SMBPathSeparator.contains(name, kind: .smb),
               !name.unicodeScalars.contains(where: { $0.value == 0 }) else {
             throw SMBCodecError.invalidValue("invalid directory entry name")
         }
@@ -76,8 +95,8 @@ public struct SMBPath: Equatable, Sendable {
     }
 
     private static func canonicalComparisonComponents(_ path: String) -> [String] {
-        path.split(separator: "\\").map {
-            String($0)
+        SMBPathSeparator.split(path, kind: .backslash).map {
+            $0
                 .precomposedStringWithCanonicalMapping
                 .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
                 .precomposedStringWithCanonicalMapping

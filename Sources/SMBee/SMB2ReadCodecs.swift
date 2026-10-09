@@ -225,12 +225,12 @@ enum SMB2TreeConnect {
     }
 
     private static func treeConnectPath(_ path: String) throws -> String {
-        guard path.hasPrefix("\\\\") else { return path }
-        let parts = path.dropFirst(2).split(separator: "\\", omittingEmptySubsequences: false).map(String.init)
-        guard parts.count == 2 else {
+        guard SMBPathSeparator.hasLeadingSeparators(path, kind: .backslash, count: 2) else { return path }
+        let parts = SMBPathSeparator.split(path, kind: .backslash, omittingEmptySubsequences: false)
+        guard parts.count == 4, parts[0].isEmpty, parts[1].isEmpty else {
             throw SMBCodecError.invalidValue("TREE_CONNECT path must be \\\\host\\share")
         }
-        return "\\\\\(parts[0])\\\(try SMBShareName(parts[1]).rawValue)"
+        return "\\\\\(parts[2])\\\(try SMBShareName(parts[3]).rawValue)"
     }
 
     static func decodeResponse(_ bytes: [UInt8]) throws -> SMBTreeConnectResult {

@@ -1651,7 +1651,9 @@ private func verifyRecursiveUploads(
 ) async throws {
     for action in actions where action.kind == .upload {
         let relativePath = try remoteRelativePath(path: action.path, root: endpoint.path)
-        let localFile = localDirectory.appendingPathComponent(relativePath.replacingOccurrences(of: "\\", with: "/"))
+        let localFile = localDirectory.appendingPathComponent(
+            SMBPath.replacingSMBPathSeparators(relativePath, with: "/")
+        )
         try await verifyTransfer(
             mode: mode,
             download: false,
@@ -1746,22 +1748,27 @@ private func statForVerify(
 private func localRelativePath(file: URL, directory: URL) throws -> String {
     let filePath = file.standardizedFileURL.path
     let directoryPath = directory.standardizedFileURL.path
-    let prefix = directoryPath.hasSuffix("/") ? directoryPath : directoryPath + "/"
-    guard filePath.hasPrefix(prefix) else {
+    let fileComponents = SMBPath.splitPOSIXPathComponents(filePath)
+    let directoryComponents = SMBPath.splitPOSIXPathComponents(directoryPath)
+    guard fileComponents.count > directoryComponents.count,
+          Array(fileComponents.prefix(directoryComponents.count)) == directoryComponents else {
         throw ValidationError("downloaded file is outside destination directory: \(filePath)")
     }
-    return String(filePath.dropFirst(prefix.count)).replacingOccurrences(of: "/", with: "\\")
+    let relativePath = fileComponents.dropFirst(directoryComponents.count).joined(separator: "/")
+    return SMBPath.replacingPOSIXPathSeparators(relativePath, with: "\\")
 }
 
 private func remoteRelativePath(path: String, root: String) throws -> String {
-    let normalizedPath = path.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
-    let normalizedRoot = root.trimmingCharacters(in: CharacterSet(charactersIn: "\\/"))
+    let normalizedPath = SMBPath.trimmingSMBPathSeparators(path)
+    let normalizedRoot = SMBPath.trimmingSMBPathSeparators(root)
     guard !normalizedRoot.isEmpty else { return normalizedPath }
-    guard normalizedPath == normalizedRoot || normalizedPath.hasPrefix(normalizedRoot + "\\") else {
+    let pathComponents = SMBPath.splitSMBPathComponents(normalizedPath)
+    let rootComponents = SMBPath.splitSMBPathComponents(normalizedRoot)
+    guard pathComponents.count >= rootComponents.count,
+          Array(pathComponents.prefix(rootComponents.count)) == rootComponents else {
         throw ValidationError("recursive action path is outside destination root: \(path)")
     }
-    if normalizedPath == normalizedRoot { return "" }
-    return String(normalizedPath.dropFirst(normalizedRoot.count + 1))
+    return pathComponents.dropFirst(rootComponents.count).joined(separator: "\\")
 }
 
 private extension SMBURLParser.ReadURL {
@@ -1778,7 +1785,7 @@ private func makeRemoteParentDirectories(
     remotePath: String,
     timeout: Duration?
 ) async throws {
-    let components = remotePath.split(separator: "\\").map(String.init)
+    let components = SMBPath.splitSMBPathComponents(remotePath)
     guard components.count > 1 else { return }
     var current = ""
     for component in components.dropLast() {

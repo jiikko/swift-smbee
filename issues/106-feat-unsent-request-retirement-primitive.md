@@ -221,7 +221,20 @@ commit の分け方（各 commit が単独で契約を満たす）:
     package の最低対応版 macOS 13 では build できない。利用側の obaket は macOS 15 以上が前提
   - 未検討のリスク: READ の `onChunk` / WRITE の supplier など利用者の callback が session の直列 executor の上で走ると、長い処理が同じ session の
     cancel・close・期限の処理を待たせる
-- 次: E6 を設計として採るかをユーザーに諮る（最低対応版の引き上げ、callback を executor の外で走らせるか）
+- 2026-10-10: ユーザーが E6 の採用と、最低対応版の macOS 13 → 15 への引き上げを承認した（利用側の obaket は macOS 15 以上）
+- E6 の設計（codex sol-high が書き、敵対レビュー 2 観点を通した。全文は worktree の `tmp/design-e6.md`、要点をここに残す）:
+  - session ごとに直列 DispatchQueue の `SerialExecutor` + `TaskExecutor` を 1 つ持つ。session actor と、sender / reader / cancel / timer / cleanup の Task、
+    READ / WRITE の driver を載せる。enqueue は `runSynchronously(isolatedTo:taskExecutor:)` で両方の executor を runtime に渡す（E6 の計測版は serial だけで不完全）
+  - 利用者の callback（onChunk・supplier・onEntry・onChange・onAction・直接の progress）は session から独立した共有の concurrent executor C で走らせる。
+    長い callback が同じ session の cancel・close・期限を塞がないため。chunk ごとの往復の費用は計測で確かめる
+  - transport の新しい契約: async の本体でブロックする syscall を呼ばない、close は短時間。POSIX（受信は detached、送信は専用 queue）・NW・in-memory は構造上満たす。
+    外部の実装向けに doc へ書く
+  - close の自己待ち: fault を起こした reader / sender / timer は同期の close と terminal 化だけを行い、join は別の terminalizer に渡して自分は終わる
+  - session close は callback を join しない。callback が戻らないと operation の return とその参照は残りうる（既存の協調的 cancel の契約）
+  - 敵対レビューで採用した 4 件: callback 中の close が配送中の slot を空にする（lease の回収を分ける）、transfer の drain 期限が join を driver に頼る（terminalizer へ）、
+    通常 request の timeout の勝敗が job の順で決まる（絶対の応答期限を保存して同じ clock で比べる）、cancel の drain 期限に外側の操作の期限が入らない（登録時に捕まえる）。
+    後の 2 件は executor と無関係な M0 の契約の穴
+  - 実装の分割: M1a executor の製品化 → M1b callback の境界と lease → M1c 期限と後始末 → M2 flaky なテストと P3
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

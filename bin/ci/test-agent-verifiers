@@ -270,6 +270,9 @@ verify move-out-of-sources "${moved_sha}"
 expect_rc move-out-of-sources 1
 expect_out move-out-of-sources 'Test=missing' out
 
+# verify-agent-performance takes the newest run: it must not pick a workflow_dispatch Performance run.
+grep -Fq -- '--event push' "${SCRIPT_DIR}/verify-agent-performance" || fail "verify-agent-performance does not restrict to push runs"
+
 # The skipped path must stay the same in the workflows and in verify-agent-push.
 grep -Fqx "skip_prefix='issues/'" "${SCRIPT_DIR}/verify-agent-push" || fail "verify-agent-push skip_prefix is not issues/"
 for workflow in test e2e performance; do

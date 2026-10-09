@@ -42,11 +42,14 @@ commit_sha="$(git rev-parse "${commit}^{commit}")"
 deadline=$((SECONDS + timeout_seconds))
 run_json=""
 
+# Only the push run gates a pushed commit: a workflow_dispatch run (reference_sha) on the same commit is newer
+# and measures a different pair count.
 echo "Waiting for Performance workflow for ${commit_sha}..."
 while [ "${SECONDS}" -lt "${deadline}" ]; do
   run_json="$("${GH_RETRY}" gh run list \
     --workflow Performance \
     --commit "${commit_sha}" \
+    --event push \
     --limit 1 \
     --json databaseId,status,conclusion,url,headSha \
     --jq '.[0] // empty')"

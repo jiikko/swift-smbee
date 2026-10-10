@@ -14,8 +14,8 @@
 - `Tests/SMBeeTests/SMBeeTests.swift`: `testConcurrentReadChunksDemuxOutOfOrderResponses` / `awaitWithTimeout` /
   `waitForOutboundFrameCount`
 - 起因コミット: `9cf1daf` "Add SMB2 credit window allocator" / `08dbcd6` "Add SMB2 multi-flight response demux"
-- 先行 issue: [`issues/done/002-design-smbsession-concurrent-multiflight.md`](done/002-design-smbsession-concurrent-multiflight.md)
-  (multi-flight 設計) / [`issues/done/007-ci-swift60-linux-test-stall.md`](done/007-ci-swift60-linux-test-stall.md)
+- 先行 issue: [`issues/done/002-design-smbsession-concurrent-multiflight.md`](002-design-smbsession-concurrent-multiflight.md)
+  (multi-flight 設計) / [`issues/done/007-ci-swift60-linux-test-stall.md`](007-ci-swift60-linux-test-stall.md)
   (前回の Linux stall。**下記「007 の結論訂正」で 6.2 について覆る**)
 - 観測した CI run: https://github.com/jiikko/swift-smbee/actions/runs/28601793534/job/84811644475
 
@@ -60,7 +60,7 @@ Linux の global executor では **`second` が先に到着して messageId 0 �
    **`Task.value` の await はキャンセルで抜けない** (`group.cancelAll()` しても drain 不能)。
    → group が終われず **永久 hang → 10 分 CI kill**。
 
-これは [`issues/done/007`](done/007-ci-swift60-linux-test-stall.md) のコメントが警戒していた
+これは [`issues/done/007`](007-ci-swift60-linux-test-stall.md) のコメントが警戒していた
 `awaitWithTimeout` の穴そのもの。`XCTAssertEqual(readUInt64LE(requests[0], at: 72), 0)`
 (outbound 順は send 順であって messageId 順ではない) もこの反転時に fail するはずで、
 CI ログ (in_progress 中は取得不可) には非 fatal assert の失敗が出ているはず。
@@ -240,7 +240,7 @@ codex 3 観点 (read-only) + Claude の裏取りによる監査。**本 issue �
 ### 訂正 1: 主仮説 A は、観測された hang を説明していない
 
 本文は `testConcurrentReadChunksDemuxOutOfOrderResponses` を「有力な主因」としていたが、
-CI アーカイブログの全数勘定（[`013`](waiting/013-linux-ci-intermittent-hang.md) の「全数勘定」節）では:
+CI アーカイブログの全数勘定（[`013`](../waiting/013-linux-ci-intermittent-hang.md) の「全数勘定」節）では:
 
 - hang した 8 job のうち、そのテストに**到達した job は 0 件**（実行はアルファベット順で
   `ChangeNotify…` < `ConcurrentRead…`）。
@@ -297,14 +297,14 @@ A は「論理は妥当だが Linux 実機で未確認」と本文自身が但�
 
 `ControlledReceiveTransport.receive(maxLength:)`（`SMBeeTests.swift:1068`）に cancellation
 handler が無い。最終応答を注入しないテストを書くと receive continuation が永久 pending になる。
-現行テストは応答を注入しているので発火しない。詳細は [`013`](waiting/013-linux-ci-intermittent-hang.md)。
+現行テストは応答を注入しているので発火しない。詳細は [`013`](../waiting/013-linux-ci-intermittent-hang.md)。
 
 ### 着手手順の更新
 
 本文の「着手手順 1（まず A を Linux 実機で確定）」は**不要になった**。A は観測で否定された。
 代わりに:
 
-1. **hang の再現を待つか、待たずに構造を直すかを決める**（[`013`](waiting/013-linux-ci-intermittent-hang.md) は
+1. **hang の再現を待つか、待たずに構造を直すかを決める**（[`013`](../waiting/013-linux-ci-intermittent-hang.md) は
    `waiting/` へ移した。真因は未確定）。
 2. 構造を直すなら **§1 か 代替 A のどちらかを選ぶ**（上の再評価を根拠に）。
 3. どちらでも `sentResponseMessageIds` の 4 つの役割を先に分離すること（これを飛ばすと
@@ -521,7 +521,7 @@ macOS / Linux unit / `bin/e2e/container-samba.sh` / `bin/ci/verify-agent-push` r
 - idle な long-lived reader の CPU / メモリ影響（**未測定**）
 - CANCEL 後に server が final を返さない場合、tombstone が無期限に残る（回収方針が未定）
 - **hang の真因は依然未確定**。本タスクは構造改修であって hang の修正ではない
-  （[`013`](waiting/013-linux-ci-intermittent-hang.md) は `waiting/` で再現待ち）
+  （[`013`](../waiting/013-linux-ci-intermittent-hang.md) は `waiting/` で再現待ち）
 
 ### 却下済み（再提案を防ぐため記録）
 

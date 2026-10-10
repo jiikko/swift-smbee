@@ -262,7 +262,14 @@ commit の分け方（各 commit が単独で契約を満たす）:
 - 2 周目の敵対レビュー（M3 の修正が攻め口）: 3 件を再現して直した（M3b、2c26827）: drain の完了の判定で時刻を取り直していた（経路ごとの成立時刻で比べる）、
   期限で退役した CLOSE の記録を enqueue / catch が消していた、M3 の D3 の修正が progress の既知のサイズと速度を落としていた（stream の emitter の一経路に戻した）。
   D2・D4・DL1 の修正は壊せなかった
-- macOS 763 件 / Linux 770 件が green。smoke は M2 の時点（f3e70d4）で 3 profile 通過
+- 3 周目（M3c、c2850e0）: 期限による退役の helper が送信済みの `.draining` を上書きしていた → cleanup の FileId の台帳の書き込みを `transitionCleanupLedger` に寄せ、
+  遷移表で固定し、関数の外での書き込みを source の検査（`testSourceShapeCleanupLedgerIsMutatedOnlyThroughTransitionFunction`）で止めた（外で書き込む変異で red）。
+  download はエラー・cancel・short read のときも progress の通知の完了を待つ（master の静的な download にあった、戻った後に通知が届く穴も塞がる）
+- 4 周目（M3d、ec3ca64）: 台帳に試行の識別子が無く、遅れた CLOSE A が同じ FileId の CLOSE B を退役させる → 台帳は 3 周続けて破られたので、条件の継ぎ足しをやめ、
+  各記録に所有者（`SMBRequestIdentity`）を持たせて所有者が一致する遷移だけを適用する構造にした。M3c で progress の待ちを CLOSE・ファイルの後始末より前に置いた
+  順序の誤り（指示の誤り）も直し、後始末を先に済ませる
+- macOS 767 件 / Linux 774 件が green。smoke は M2 の時点（f3e70d4）で 3 profile 通過（M3 以降は未実施）
+- 次: 5 周目の敵対レビュー（M3d の差分）→ 採用する指摘が出なくなったら smoke・x86 gate・master へ
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

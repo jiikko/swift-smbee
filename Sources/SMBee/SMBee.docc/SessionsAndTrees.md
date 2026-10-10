@@ -25,7 +25,9 @@ await session.close()
 ```
 
 Actors serialize session and tree state. Closures and progress callbacks are
-`@Sendable`; do not assume they run on the caller's executor.
+`@Sendable`; do not assume they run on the caller's executor. Callback placement,
+blocking behavior, and the progress-queue exception are described in
+``Callbacks``.
 
 Handle, tree, and session cleanup uses a bounded internal deadline. If a server does
 not answer `CLOSE`, `TREE_DISCONNECT`, or `LOGOFF`, SMBee closes the transport and

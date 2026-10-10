@@ -1,6 +1,87 @@
 import Foundation
 @testable import SMBee
 
+final class SMBCallbackExecutionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observationStorage: SMBSessionExecutorObservation?
+
+    func record(on executor: SMBSessionExecutor) {
+        let observation = executor.executionContextForTesting(.userCallback)
+        lock.lock()
+        observationStorage = observation
+        lock.unlock()
+    }
+
+    var observation: SMBSessionExecutorObservation? {
+        lock.lock()
+        defer { lock.unlock() }
+        return observationStorage
+    }
+}
+
+final class SMBSessionExecutorObservationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observationsStorage: [SMBSessionExecutorProbePoint: SMBSessionExecutorObservation] = [:]
+
+    func append(_ observation: SMBSessionExecutorObservation) {
+        lock.lock()
+        observationsStorage[observation.point] = observation
+        lock.unlock()
+    }
+
+    func contains(_ point: SMBSessionExecutorProbePoint) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return observationsStorage[point] != nil
+    }
+
+    func observation(for point: SMBSessionExecutorProbePoint) -> SMBSessionExecutorObservation? {
+        lock.lock()
+        defer { lock.unlock() }
+        return observationsStorage[point]
+    }
+}
+
+final class SMBBlockingCallbackGate: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+
+    func block() {
+        semaphore.wait()
+    }
+
+    func release() {
+        semaphore.signal()
+    }
+}
+
+final class SMBAsyncCallbackSuspensionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func suspend() async {
+        await withCheckedContinuation { continuation in
+            let shouldWait = lock.withLock { () -> Bool in
+                guard !released else { return false }
+                waiters.append(continuation)
+                return true
+            }
+            if !shouldWait { continuation.resume() }
+        }
+    }
+
+    func release() {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !released else { return [] }
+            released = true
+            let ready = waiters
+            waiters.removeAll()
+            return ready
+        }
+        ready.forEach { $0.resume() }
+    }
+}
+
 enum SMBIssue102WireFixtures {
     static func anonymousSessionResponses() throws -> [[UInt8]] {
         [
@@ -244,6 +325,67 @@ final class SMBContinuationCountBarrier: @unchecked Sendable {
 
 struct SMBContinuationWaitTimedOut: Error {}
 
+/// A manual sleeper keyed by requested duration, so tests can release a particular deadline
+/// without depending on which concurrent timer registered first.
+final class SMBKeyedManualSleeper: @unchecked Sendable {
+    private struct Sleep {
+        let id: UUID
+        let duration: Duration
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private let lock = NSLock()
+    private var sleeps: [Sleep] = []
+    private var registrationWaiters: [Duration: [CheckedContinuation<Void, Never>]] = [:]
+
+    func sleep(for duration: Duration) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { continuation in
+                let result = lock.withLock { () -> (Bool, [CheckedContinuation<Void, Never>]) in
+                    guard !Task.isCancelled else { return (true, []) }
+                    sleeps.append(Sleep(id: id, duration: duration, continuation: continuation))
+                    let waiters = registrationWaiters.removeValue(forKey: duration) ?? []
+                    return (false, waiters)
+                }
+                result.1.forEach { $0.resume() }
+                if result.0 { continuation.resume(throwing: CancellationError()) }
+            }
+        } onCancel: {
+            self.cancel(id)
+        }
+    }
+
+    func waitUntilSleeping(for duration: Duration) async {
+        await withCheckedContinuation { continuation in
+            let alreadySleeping = lock.withLock { () -> Bool in
+                guard !sleeps.contains(where: { $0.duration == duration }) else { return true }
+                registrationWaiters[duration, default: []].append(continuation)
+                return false
+            }
+            if alreadySleeping { continuation.resume() }
+        }
+    }
+
+    func fire(for duration: Duration) {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+            let ready = sleeps.filter { $0.duration == duration }.map(\.continuation)
+            sleeps.removeAll { $0.duration == duration }
+            return ready
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    private func cancel(_ id: UUID) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard let index = sleeps.firstIndex(where: { $0.id == id }) else { return nil }
+            return sleeps.remove(at: index).continuation
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
 /// Holds reader tasks after their receive loop exits so lifecycle overlap and shutdown joins
 /// can be tested at an exact event boundary. Cancellation intentionally does not release a
 /// held task; the test must release it explicitly after proving the join behavior.
@@ -426,6 +568,140 @@ final class SMBContinuationTransportFactory: @unchecked Sendable {
             makeCountStorage += 1
             return transports.removeFirst()
         }
+    }
+}
+
+final class SMBStaticReadRetryScriptTransport: SMBContinuationScriptTransport, @unchecked Sendable {
+    struct ReadRequest: Sendable {
+        let header: SMB2Header
+        let offset: UInt64
+        let length: UInt32
+    }
+
+    private let fileSize: UInt64
+    private let completesReadsAutomatically: Bool
+    private let readLock = NSLock()
+    private var readsByOffset: [UInt64: ReadRequest] = [:]
+    private var readWaiters: [UInt64: [CheckedContinuation<ReadRequest, Never>]] = [:]
+
+    init(fileSize: UInt64, completesReadsAutomatically: Bool) throws {
+        self.fileSize = fileSize
+        self.completesReadsAutomatically = completesReadsAutomatically
+        try super.init(inbound: SMBIssue102WireFixtures.framed(SMBIssue102WireFixtures.anonymousSessionResponses()))
+    }
+
+    override func send(_ bytes: [UInt8]) async throws {
+        guard let packet = try smbPacketInDirectTCPStream(bytes) else {
+            try await super.send(bytes)
+            return
+        }
+        let header = try SMB2Header.decode(packet)
+        var readRequest: ReadRequest?
+        if header.command == SMB2Commands.read {
+            var lengthReader = SMBByteReader(bytes: Array(packet[68..<72]))
+            var offsetReader = SMBByteReader(bytes: Array(packet[72..<80]))
+            readRequest = ReadRequest(
+                header: header,
+                offset: try offsetReader.readUInt64LE(),
+                length: try lengthReader.readUInt32LE()
+            )
+        }
+
+        try await super.send(bytes)
+
+        switch header.command {
+        case SMB2Commands.create:
+            try enqueue(Self.createResponse(for: header))
+        case SMB2Commands.queryInfo:
+            try enqueue(Self.queryInfoResponse(for: header, fileSize: fileSize))
+        case SMB2Commands.read:
+            guard let readRequest else { return }
+            publish(readRequest)
+            if completesReadsAutomatically {
+                let available = fileSize > readRequest.offset ? fileSize - readRequest.offset : 0
+                let count = min(UInt64(readRequest.length), available)
+                try respond(to: readRequest, payload: Array(repeating: 0x5a, count: Int(count)))
+            }
+        case SMB2Commands.close, SMB2Commands.treeDisconnect, SMB2Commands.logoff:
+            try enqueue(Self.statusResponse(for: header))
+        default:
+            break
+        }
+    }
+
+    func waitForRead(offset: UInt64) async -> ReadRequest {
+        await withCheckedContinuation { continuation in
+            let readRequest = readLock.withLock { () -> ReadRequest? in
+                if let readRequest = readsByOffset[offset] { return readRequest }
+                readWaiters[offset, default: []].append(continuation)
+                return nil
+            }
+            if let readRequest { continuation.resume(returning: readRequest) }
+        }
+    }
+
+    func respond(to request: ReadRequest, payload: [UInt8]) throws {
+        var response = try SMB2Header(
+            command: SMB2Commands.read,
+            credits: 16,
+            messageId: request.header.messageId,
+            treeId: request.header.treeId,
+            sessionId: request.header.sessionId
+        ).encode()
+        response.append(contentsOf: Array(repeating: 0, count: 16))
+        writeUInt16LE(17, to: &response, at: 64)
+        response[66] = 80
+        writeUInt32LE(UInt32(payload.count), to: &response, at: 68)
+        response.append(contentsOf: payload)
+        try enqueue(response)
+    }
+
+    private func publish(_ request: ReadRequest) {
+        let waiters = readLock.withLock { () -> [CheckedContinuation<ReadRequest, Never>] in
+            readsByOffset[request.offset] = request
+            let waiters = readWaiters.removeValue(forKey: request.offset) ?? []
+            return waiters
+        }
+        waiters.forEach { $0.resume(returning: request) }
+    }
+
+    private static func createResponse(for request: SMB2Header) throws -> [UInt8] {
+        var response = try SMB2Header(
+            command: SMB2Commands.create,
+            credits: 16,
+            messageId: request.messageId,
+            treeId: request.treeId,
+            sessionId: request.sessionId
+        ).encode()
+        response.append(contentsOf: Array(repeating: 0, count: 88))
+        writeUInt16LE(89, to: &response, at: 64)
+        response.replaceSubrange(128..<144, with: Array(repeating: 0x55, count: 16))
+        return response
+    }
+
+    private static func queryInfoResponse(for request: SMB2Header, fileSize: UInt64) throws -> [UInt8] {
+        var response = try SMB2Header(
+            command: SMB2Commands.queryInfo,
+            credits: 16,
+            messageId: request.messageId,
+            treeId: request.treeId,
+            sessionId: request.sessionId
+        ).encode()
+        response.append(contentsOf: [9, 0, 72, 0, 56, 0, 0, 0])
+        var info = Array(repeating: UInt8(0), count: 56)
+        writeUInt64LE(fileSize, to: &info, at: 40)
+        response.append(contentsOf: info)
+        return response
+    }
+
+    private static func statusResponse(for request: SMB2Header) throws -> [UInt8] {
+        try SMB2Header(
+            command: request.command,
+            credits: 16,
+            messageId: request.messageId,
+            treeId: request.treeId,
+            sessionId: request.sessionId
+        ).encode()
     }
 }
 
@@ -849,6 +1125,12 @@ class SMBWritePipelineScriptTransport: SMBReadPipelineScriptTransport, @unchecke
     private let writeLock = NSLock()
     private var writeRequestsStorage: [WriteRequest] = []
     private let writeRequestBarrier = SMBContinuationCountBarrier()
+    private let queryInfoFileSize: UInt64
+
+    init(queryInfoFileSize: UInt64 = 1_234) {
+        self.queryInfoFileSize = queryInfoFileSize
+        super.init()
+    }
 
     override func send(_ bytes: [UInt8]) async throws {
         let command = try smbPacketInDirectTCPStream(bytes).flatMap { try? SMB2Header.decode($0).command }
@@ -941,7 +1223,7 @@ class SMBWritePipelineScriptTransport: SMBReadPipelineScriptTransport, @unchecke
         ).encode()
         response.append(contentsOf: [9, 0, 72, 0, 56, 0, 0, 0])
         var info = Array(repeating: UInt8(0), count: 56)
-        writeUInt64LE(1_234, to: &info, at: 40)
+        writeUInt64LE(queryInfoFileSize, to: &info, at: 40)
         writeUInt64LE(4_096, to: &info, at: 32)
         response.append(contentsOf: info)
         try enqueue(response)

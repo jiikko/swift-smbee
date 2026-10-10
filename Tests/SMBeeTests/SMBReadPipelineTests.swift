@@ -4,12 +4,125 @@ import XCTest
 final class SMBReadPipelineTests: XCTestCase {
     private let chunkSize = 1_048_576
 
+    func testSessionDownloadClosesAndCleansLocalTempBeforePendingProgressFinishesAfterReadError() async throws {
+        let testChunkSize = chunkSize
+        let fileSize = UInt64(testChunkSize * 3)
+        let transport = SMBWritePipelineScriptTransport(queryInfoFileSize: fileSize)
+        let session = makeSession(transport: transport, credits: 81)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let progressCallbackGate = SMBBlockingCallbackGate()
+        let firstProgressEntered = SMBReadPipelineEventSignal()
+        let secondProgressDelivered = SMBReadPipelineEventSignal()
+        let secondProgressEmitted = SMBReadPipelineEventSignal()
+        let failurePhase = SMBReadPipelineFailurePhaseRace()
+        let events = SMBReadPipelineProgressErrorEvents()
+        let downloadDirectory = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("tmp/c3", isDirectory: true)
+            .appendingPathComponent("download-progress-error-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: downloadDirectory, withIntermediateDirectories: true)
+        let destination = downloadDirectory.appendingPathComponent("download.bin")
+        defer {
+            progressCallbackGate.release()
+            try? FileManager.default.removeItem(at: downloadDirectory)
+        }
+
+        let operation = Task {
+            await SMBDownloadTestSeams.$afterStreamProgressEmittedForTesting.withValue(
+                { bytes in
+                    if bytes == UInt64(testChunkSize * 2) {
+                        secondProgressEmitted.signal()
+                    }
+                },
+                operation: {
+                    await SMBDownloadTestSeams.$beforeStreamReadErrorProgressFinishForTesting.withValue(
+                        { failurePhase.signal(.progressFinish) },
+                        operation: {
+                            await SMBDownloadTestSeams.$beforeStreamReadErrorPropagationForTesting.withValue(
+                                { failurePhase.signal(.propagation) },
+                                operation: {
+                                    do {
+                                        try await client.download(path: "progress-error.bin", localFile: destination) { progress in
+                                            events.record(.progress(progress.bytesTransferred))
+                                            if progress.bytesTransferred == UInt64(testChunkSize) {
+                                                firstProgressEntered.signal()
+                                                progressCallbackGate.block()
+                                            } else if progress.bytesTransferred == UInt64(testChunkSize * 2) {
+                                                secondProgressDelivered.signal()
+                                            }
+                                        }
+                                        events.record(.unexpectedSuccess)
+                                    } catch {
+                                        events.record(.failure)
+                                    }
+                                }
+                            )
+                        }
+                    )
+                }
+            )
+        }
+
+        try await transport.waitForCommand(SMB2Commands.create)
+        try transport.completeCreate()
+        try await transport.waitForCommand(SMB2Commands.queryInfo)
+        try await transport.waitForCommand(SMB2Commands.read, occurrence: 3)
+        let requests = transport.readRequests
+        XCTAssertEqual(requests.count, 3)
+
+        try transport.respond(
+            to: requests[0],
+            payload: Array(repeating: 0x31, count: testChunkSize)
+        )
+        await firstProgressEntered.wait()
+        try transport.respond(
+            to: requests[1],
+            payload: Array(repeating: 0x32, count: testChunkSize)
+        )
+        await secondProgressEmitted.wait()
+        try transport.respond(to: requests[2], status: SMB2Status.accessDenied)
+        let failureHandlingPhase = await failurePhase.wait()
+        XCTAssertEqual(failureHandlingPhase, .progressFinish)
+        XCTAssertGreaterThan(
+            transport.sentCommands.filter { $0 == SMB2Commands.close }.count,
+            0,
+            "CLOSE must be sent while the progress callback is still blocked"
+        )
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(atPath: downloadDirectory.path).isEmpty,
+            "the temporary download file must be removed before waiting for progress delivery"
+        )
+        let eventsBeforeRelease = events.events
+        XCTAssertFalse(eventsBeforeRelease.contains(.failure))
+        XCTAssertFalse(eventsBeforeRelease.contains(.progress(fileSize - UInt64(testChunkSize))))
+
+        progressCallbackGate.release()
+        await secondProgressDelivered.wait()
+        await operation.value
+        let finalEvents = events.events
+        guard let secondProgressIndex = finalEvents.firstIndex(of: .progress(fileSize - UInt64(testChunkSize))) else {
+            return XCTFail("second coalesced progress notification was not delivered")
+        }
+        guard let failureIndex = finalEvents.firstIndex(of: .failure) else {
+            return XCTFail("download did not report the scripted READ failure")
+        }
+        XCTAssertLessThan(secondProgressIndex, failureIndex)
+        XCTAssertFalse(finalEvents.contains(.unexpectedSuccess))
+        await session.closeTransportAndWait(cause: "download_progress_error_test_complete")
+    }
+
     func testFourReadSlotsStayOccupiedDuringCallbackAndDeliverInOffsetOrder() async throws {
         let testChunkSize = chunkSize
         let transport = SMBReadPipelineScriptTransport()
         let session = makeSession(transport: transport, credits: 81)
+#if DEBUG
+        let (executorEvents, executorEventContinuation) = AsyncStream.makeStream(of: SMBSessionExecutorObservation.self)
+        session.sessionExecutor.setExecutionObserverForTesting { observation in
+            executorEventContinuation.yield(observation)
+        }
+#endif
         let client = SMBClientSession(session: session, treeId: 1)
         let callbackEntered = SMBContinuationCountBarrier()
+        let callbackExecution = SMBCallbackExecutionRecorder()
         let callbackGate = SMBContinuationAsyncGate()
         let callbackGateClock = ManualSMBSleeper()
         let collector = SMBReadPipelineChunkCollector()
@@ -22,6 +135,10 @@ final class SMBReadPipelineTests: XCTestCase {
             try await client.withReadStream(path: "file.bin", knownSize: UInt64(testChunkSize * 5)) { data in
                 let chunkNumber = collector.append(data)
                 if chunkNumber == 1 {
+                    callbackExecution.record(on: session.sessionExecutor)
+#if DEBUG
+                    session.sessionExecutor.recordExecutionContextForTesting(.readCallback)
+#endif
                     callbackEntered.signal()
                     try await callbackGate.suspend(
                         timeout: .seconds(30),
@@ -66,13 +183,295 @@ final class SMBReadPipelineTests: XCTestCase {
         let pendingAfterSuccess = await session.pendingCountForTesting()
         XCTAssertEqual(pendingAfterSuccess, 0)
         await session.closeTransportAndWait(cause: "read_pipeline_test_complete")
+#if DEBUG
+        executorEventContinuation.finish()
+        var callbackObservation: SMBSessionExecutorObservation?
+        for await observation in executorEvents where observation.point == .readCallback {
+            callbackObservation = observation
+        }
+        let callbackContext = try XCTUnwrap(callbackObservation)
+        XCTAssertTrue(callbackContext.isOnExecutorQueue)
+        XCTAssertTrue(callbackContext.taskExecutorMatches)
+        let callbackExecutorContext = try XCTUnwrap(callbackExecution.observation)
+        XCTAssertTrue(callbackExecutorContext.isOnExecutorQueue)
+        XCTAssertTrue(callbackExecutorContext.taskExecutorMatches)
+#endif
     }
+
+#if DEBUG
+    func testStoppedReadRetiresQueuedUnsentRequestsBeforeMIDCommit() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let sendGate = SMBContinuationAsyncGate()
+        let sendGateClock = ManualSMBSleeper()
+        transport.installAfterReadSendHook { request in
+            guard request.offset == 0 else { return }
+            do {
+                try await sendGate.suspend(
+                    timeout: .seconds(60),
+                    sleeper: { try await sendGateClock.sleep(for: $0) }
+                )
+            } catch {
+                // The test releases the first READ after stopping the transfer.
+            }
+        }
+        defer {
+            sendGate.release()
+            transport.failConnection()
+        }
+
+        let operation = Task {
+            try await client.withReadStream(
+                path: "cancel-with-queued-reads.bin",
+                knownSize: UInt64(testChunkSize * 4)
+            ) { _ in }
+        }
+
+        try await waitForCommand(transport, SMB2Commands.create, label: "queued READ cancellation CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 1)
+        try await smbIssue102AwaitWithTimeout("first READ send is held after transport capture") {
+            try await sendGate.waitUntilSuspended(
+                timeout: .seconds(60),
+                sleeper: { try await Task.sleep(for: $0) }
+            )
+        }
+        try await smbIssue102AwaitWithTimeout("three later READs are queued behind the held first send") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 3)
+        }
+
+        operation.cancel()
+        try await smbIssue102AwaitWithTimeout("READ transfer records caller cancellation") {
+            await session.waitForReadTransfersStoppedForTesting()
+        }
+        sendGate.release()
+        try await smbIssue102AwaitWithTimeout("sender retires every stopped queued READ") {
+            while await session.senderLoopStatisticsForTesting().queuedRequests != 0 {
+                await Task.yield()
+            }
+        }
+
+        XCTAssertEqual(transport.readRequests.count, 1, "stopped unsent tickets must not reach the transport")
+        XCTAssertEqual(transport.readRequests.map(\.header.messageId), [1])
+        let cursorAfterQueuedRetirement = await session.nextMessageIdForTesting()
+        XCTAssertEqual(cursorAfterQueuedRetirement, 17, "queued READs must not allocate MessageIds")
+        let activeRecordsBeforeFirstFinal = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertEqual(activeRecordsBeforeFirstFinal, 1, "only the first sent READ remains active")
+
+        try transport.respond(to: transport.readRequests[0], payload: Array(repeating: 0x31, count: testChunkSize))
+        do {
+            try await smbIssue102AwaitWithTimeout("cancelled READ transfer completes after its sent request drains") {
+                try await operation.value
+            }
+            XCTFail("cancelled READ transfer unexpectedly succeeded")
+        } catch is CancellationError {
+            // Expected after the first sent READ drains and queued unsent tickets are retired.
+        }
+        let activeRecordsAfterDrain = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertEqual(activeRecordsAfterDrain, 0)
+    }
+
+    func testSuspendedAsyncReadCallbackDoesNotHoldSessionOrTerminalWireLease() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let virtualTime = SMBReadPipelineVirtualClock()
+        let cleanupSleeper = SMBKeyedManualSleeper()
+        let sessionTime = SMBSessionMonotonicTime(
+            now: { virtualTime.now() },
+            sleep: { try await cleanupSleeper.sleep(for: $0) }
+        )
+        let session = makeSession(
+            transport: transport,
+            credits: 81,
+            cleanupTimeout: .seconds(30),
+            sessionTime: sessionTime,
+            cleanupTimeoutSleeper: { try await cleanupSleeper.sleep(for: $0) }
+        )
+        let executorEvents = SMBSessionExecutorObservationRecorder()
+        session.sessionExecutor.setExecutionObserverForTesting { executorEvents.append($0) }
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let callbackEntered = SMBContinuationCountBarrier()
+        let callbackReturned = SMBContinuationCountBarrier()
+        let callbackExecution = SMBCallbackExecutionRecorder()
+        let callbackGate = SMBAsyncCallbackSuspensionGate()
+        let operationReturned = SMBContinuationCountBarrier()
+        let readerJoinStarted = SMBContinuationCountBarrier()
+        await session.setReaderTaskJoinSnapshotHookForTesting { _ in
+            readerJoinStarted.signal()
+        }
+        defer {
+            callbackGate.release()
+            transport.failConnection()
+        }
+
+        let operation = Task {
+            defer { operationReturned.signal() }
+            try await client.withReadStream(path: "blocked-callback.bin", knownSize: UInt64(testChunkSize * 4)) { _ in
+                callbackExecution.record(on: session.sessionExecutor)
+                callbackEntered.signal()
+                await callbackGate.suspend()
+                callbackReturned.signal()
+            }
+        }
+
+        try await waitForCommand(transport, SMB2Commands.create, label: "blocked callback READ CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 4)
+        let recordsBeforeCancellation = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertGreaterThan(recordsBeforeCancellation, 0, "the drain oracle must start with live post-auth request records")
+        let request = transport.readRequests[0]
+        try transport.respond(to: request, payload: Array(repeating: 0x5a, count: testChunkSize))
+        try await smbIssue102AwaitWithTimeout("async READ callback entered") {
+            try await callbackEntered.waitForCount(1)
+        }
+
+        operation.cancel()
+        try await smbIssue102AwaitWithTimeout("same-session cancellation reaches the transfer while callback is suspended") {
+            await session.waitForReadTransfersStoppedForTesting()
+        }
+        try await smbIssue102AwaitWithTimeout("suspended-callback READ drain deadline") {
+            await cleanupSleeper.waitUntilSleeping(for: .seconds(30))
+        }
+        let stoppedLeaseCounts = await session.readTransferCallbackLeaseCountsForTesting()
+        XCTAssertEqual(stoppedLeaseCounts.delivery, 1)
+        let readersBeforeDeadline = await session.readerTaskCountForTesting()
+        XCTAssertGreaterThan(readersBeforeDeadline, 0)
+
+        virtualTime.advance(by: .seconds(31))
+        cleanupSleeper.fire(for: .seconds(30))
+        try await smbIssue102AwaitWithTimeout("wire drain deadline closes while async callback is suspended") {
+            try await transport.waitForCloseCount(1)
+        }
+        try await smbIssue102AwaitWithTimeout("transfer deadline starts reader join while callback is suspended") {
+            try await readerJoinStarted.waitForCount(1)
+        }
+        try await smbIssue102AwaitWithTimeout("transfer deadline reclaims active request records while callback is suspended") {
+            while await session.activePostAuthRequestRecordCountForTesting() != 0 {
+                await Task.yield()
+            }
+        }
+        let joinedLeaseCounts = await session.readTransferCallbackLeaseCountsForTesting()
+        XCTAssertEqual(joinedLeaseCounts.delivery, 1)
+        let activeRecordsAfterJoin = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertEqual(activeRecordsAfterJoin, 0)
+        XCTAssertEqual(transport.closeCount, 1)
+        let drainWake = try XCTUnwrap(executorEvents.observation(for: .readTransferDrainTimerWake))
+        XCTAssertTrue(drainWake.isOnExecutorQueue)
+        XCTAssertTrue(drainWake.taskExecutorMatches)
+        let callbackSessionContext = try XCTUnwrap(callbackExecution.observation)
+        XCTAssertTrue(callbackSessionContext.isOnExecutorQueue)
+        XCTAssertTrue(callbackSessionContext.taskExecutorMatches)
+
+        callbackGate.release()
+        try await smbIssue102AwaitWithTimeout("suspended READ callback returned") {
+            try await callbackReturned.waitForCount(1)
+        }
+        let operationFailed = try await smbIssue102AwaitWithTimeout("cancelled READ operation completes after callback") {
+            do {
+                try await operation.value
+                return false
+            } catch {
+                return true
+            }
+        }
+        XCTAssertTrue(operationFailed, "cancelled operation unexpectedly succeeded")
+        try await smbIssue102AwaitWithTimeout("operation return is recorded once") {
+            try await operationReturned.waitForCount(1)
+        }
+        let releasedCounts = await session.readTransferCallbackLeaseCountsForTesting()
+        XCTAssertEqual(releasedCounts.delivery, 0)
+        XCTAssertEqual(releasedCounts.retirement, 0)
+    }
+
+    func testSynchronousReadCallbackOccupiesSessionExecutorUntilItReturns() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let callbackEntered = SMBContinuationCountBarrier()
+        let callbackReturned = SMBContinuationCountBarrier()
+        let callbackExecution = SMBCallbackExecutionRecorder()
+        let callbackGate = SMBBlockingCallbackGate()
+        let executorEvents = SMBSessionExecutorObservationRecorder()
+        session.sessionExecutor.setExecutionObserverForTesting { executorEvents.append($0) }
+        defer {
+            callbackGate.release()
+            transport.failConnection()
+        }
+
+        let operation = Task {
+            try await client.withReadStream(path: "sync-blocked-callback.bin", knownSize: UInt64(testChunkSize * 4)) { _ in
+                callbackExecution.record(on: session.sessionExecutor)
+                callbackEntered.signal()
+                callbackGate.block()
+                callbackReturned.signal()
+            }
+        }
+
+        try await waitForCommand(transport, SMB2Commands.create, label: "sync-blocked callback READ CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 4)
+        try transport.respond(
+            to: transport.readRequests[0],
+            payload: Array(repeating: 0x4b, count: testChunkSize)
+        )
+        try await smbIssue102AwaitWithTimeout("synchronous READ callback entered") {
+            try await callbackEntered.waitForCount(1)
+        }
+
+        operation.cancel()
+        XCTAssertTrue(executorEvents.contains(.readCancellationRequested))
+        XCTAssertFalse(
+            executorEvents.contains(.readCancellationApplied),
+            "session cancellation state must wait while the synchronous callback occupies S"
+        )
+
+        callbackGate.release()
+        try await smbIssue102AwaitWithTimeout("synchronous READ callback returned") {
+            try await callbackReturned.waitForCount(1)
+        }
+        try await smbIssue102AwaitWithTimeout("cancel state advances after synchronous callback returns") {
+            await session.waitForReadTransfersStoppedForTesting()
+        }
+        // The transfer can stop through the driver before the cancellation Task records that it
+        // applied, so wait for the applied event itself rather than for the stop.
+        try await smbIssue102AwaitWithTimeout("cancellation Task applies after the callback returns") {
+            while !executorEvents.contains(.readCancellationApplied) {
+                await Task.yield()
+            }
+        }
+        let callbackSessionContext = try XCTUnwrap(callbackExecution.observation)
+        XCTAssertTrue(callbackSessionContext.isOnExecutorQueue)
+        XCTAssertTrue(callbackSessionContext.taskExecutorMatches)
+
+        transport.failConnection()
+        do {
+            try await smbIssue102AwaitWithTimeout("synchronous callback cancellation cleanup") {
+                try await operation.value
+            }
+            XCTFail("cancelled read stream unexpectedly succeeded")
+        } catch {
+            // Cancellation or the deliberately failed transport terminates the transfer.
+        }
+    }
+#endif
 
     func testClientSessionReadUsesFourPipelinedReadsAndReturnsOffsetOrderedBytes() async throws {
         let testChunkSize = chunkSize
         let totalSize = testChunkSize * 5
         let transport = SMBReadPipelineScriptTransport()
         let session = makeSession(transport: transport, credits: 81)
+#if DEBUG
+        let (executorEvents, executorEventContinuation) = AsyncStream.makeStream(of: SMBSessionExecutorObservation.self)
+        session.sessionExecutor.setExecutionObserverForTesting { observation in
+            executorEventContinuation.yield(observation)
+        }
+        let sessionExecutorContext = await session.executionContextForTesting()
+#endif
         let client = SMBClientSession(session: session, treeId: 1)
         let progress = SMBReadPipelineProgressCollector()
         defer { transport.failConnection() }
@@ -81,11 +480,15 @@ final class SMBReadPipelineTests: XCTestCase {
             try await client.read(
                 path: "file.bin",
                 knownSize: UInt64(totalSize),
-                onProgress: progress.append
+                onProgress: { value in
+                    session.sessionExecutor.recordExecutionContextForTesting(.progressCallback)
+                    progress.append(value)
+                }
             )
         }
         try await waitForCommand(transport, SMB2Commands.create, label: "readAll CREATE")
         try transport.completeCreate()
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 1)
         try await waitForReadCount(transport, 4)
 
         let firstEpoch = transport.readRequests
@@ -128,6 +531,24 @@ final class SMBReadPipelineTests: XCTestCase {
         XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
         let pendingAfterSuccess = await session.pendingCountForTesting()
         XCTAssertEqual(pendingAfterSuccess, 0)
+        await session.closeTransportAndWait(cause: "read_driver_executor_placement_test")
+#if DEBUG
+        executorEventContinuation.finish()
+
+        var observations: [SMBSessionExecutorProbePoint: SMBSessionExecutorObservation] = [:]
+        for await observation in executorEvents {
+            observations[observation.point] = observation
+        }
+        for point in [SMBSessionExecutorProbePoint.readDriver, .readDriverAfterStep] {
+            let observation = try XCTUnwrap(observations[point], "missing execution probe for \(point)")
+            XCTAssertTrue(observation.isOnExecutorQueue)
+            XCTAssertTrue(observation.taskExecutorMatches)
+            XCTAssertEqual(observation.executorIdentity, sessionExecutorContext.executorIdentity)
+        }
+        let progressContext = try XCTUnwrap(observations[.progressCallback])
+        XCTAssertFalse(progressContext.isOnExecutorQueue)
+        XCTAssertFalse(progressContext.taskExecutorMatches)
+#endif
     }
 
     func testClientSessionReadShortChunkThenEOFKeepsShortReadErrorAndProgress() async throws {
@@ -1700,6 +2121,84 @@ final class SMBReadPipelineTests: XCTestCase {
 
 private enum SMBReadPipelineCallbackFailure: Error {
     case injected
+}
+
+private enum SMBReadPipelineFailurePhase: Equatable {
+    case progressFinish
+    case propagation
+}
+
+private final class SMBReadPipelineFailurePhaseRace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var phase: SMBReadPipelineFailurePhase?
+    private var waiter: CheckedContinuation<SMBReadPipelineFailurePhase, Never>?
+
+    func signal(_ phase: SMBReadPipelineFailurePhase) {
+        let ready = lock.withLock { () -> CheckedContinuation<SMBReadPipelineFailurePhase, Never>? in
+            guard self.phase == nil else { return nil }
+            self.phase = phase
+            defer { waiter = nil }
+            return waiter
+        }
+        ready?.resume(returning: phase)
+    }
+
+    func wait() async -> SMBReadPipelineFailurePhase {
+        await withCheckedContinuation { continuation in
+            let ready = lock.withLock { () -> SMBReadPipelineFailurePhase? in
+                if let phase { return phase }
+                waiter = continuation
+                return nil
+            }
+            if let ready { continuation.resume(returning: ready) }
+        }
+    }
+}
+
+private enum SMBReadPipelineProgressErrorEvent: Equatable {
+    case progress(UInt64)
+    case failure
+    case unexpectedSuccess
+}
+
+private final class SMBReadPipelineProgressErrorEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBReadPipelineProgressErrorEvent] = []
+
+    func record(_ event: SMBReadPipelineProgressErrorEvent) {
+        lock.withLock { storage.append(event) }
+    }
+
+    var events: [SMBReadPipelineProgressErrorEvent] {
+        lock.withLock { storage }
+    }
+}
+
+private final class SMBReadPipelineEventSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !signaled else { return [] }
+            signaled = true
+            defer { waiters.removeAll() }
+            return waiters
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let ready = lock.withLock { () -> Bool in
+                guard !signaled else { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if ready { continuation.resume() }
+        }
+    }
 }
 
 private final class SMBReadPipelineVirtualClock: @unchecked Sendable {

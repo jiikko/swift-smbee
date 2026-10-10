@@ -3,6 +3,10 @@
 A Swift SMB 3.x client library for file operations, persistent sessions, and
 command-line workflows on macOS and Linux.
 
+The macOS deployment target is macOS 15. Linux builds use Swift 6.2 or later.
+Custom ``SMBTransport`` implementations must meet the requirements in
+<doc:TransportRequirements>.
+
 ## Overview
 
 Use the high-level ``SMBee`` facade for one-shot operations. Use
@@ -29,4 +33,5 @@ are not currently supported.
 - ``SMBClientTreeSession``
 - ``SMBError``
 - ``SMBTransportError``
+- <doc:TransportRequirements>
 - ``SMBCodecError``

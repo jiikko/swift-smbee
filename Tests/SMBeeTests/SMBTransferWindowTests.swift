@@ -825,6 +825,38 @@ final class SMBTransferWindowTests: XCTestCase {
         XCTAssertNil(window.beginPreparing(candidateLength: 4))
     }
 
+#if DEBUG
+    func testTerminalJoinKeepsCallbackLeaseUntilItsOwnerReleasesExactlyOnce() throws {
+        for direction in [SMBTransferDirection.read, .write] {
+            let window = SMBTransferWindow(
+                transferIdentifier: direction == .read ? 101 : 102,
+                direction: direction
+            )
+            let ticket = try makeTicket(window, sequence: 1, length: 4)
+            complete(window, ticket: ticket, result: .success(payload: [1, 2, 3, 4]))
+            _ = try XCTUnwrap(window.beginNextRetirement())
+
+            window.markTerminalClose()
+            window.markTerminalSendOwnersJoined(at: ContinuousClock.now)
+            window.reclaimSlotsAfterTerminalJoin()
+
+            let leaseCounts = window.callbackLeaseCountsForTesting
+            XCTAssertEqual(leaseCounts.delivery, direction == .read ? 1 : 0)
+            XCTAssertEqual(leaseCounts.retirement, direction == .write ? 1 : 0)
+            XCTAssertEqual(window.committedSlotCount, 1, "callback-owned slot storage remains charged")
+
+            XCTAssertTrue(window.finishRetirement(ticket, advanceFrontier: direction == .write))
+            XCTAssertTrue(window.releaseRetiredSlot(ticket))
+            XCTAssertFalse(window.finishRetirement(ticket, advanceFrontier: true))
+            XCTAssertFalse(window.releaseRetiredSlot(ticket), "callback lease can be collected only once")
+            let releasedLeaseCounts = window.callbackLeaseCountsForTesting
+            XCTAssertEqual(releasedLeaseCounts.delivery, 0)
+            XCTAssertEqual(releasedLeaseCounts.retirement, 0)
+            XCTAssertEqual(window.committedSlotCount, 0)
+        }
+    }
+#endif
+
     func testEachStaleTicketFieldIsRejectedAndCorrectFinalIsRetained() throws {
         let alter: [(SMBTransferTicket) -> SMBTransferTicket] = [
             { replacingTicket($0, transferIdentifier: $0.transferIdentifier + 1) },

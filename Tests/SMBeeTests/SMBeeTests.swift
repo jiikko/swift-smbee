@@ -2456,6 +2456,10 @@ final class SMBeeTests: XCTestCase {
             if count == 2 { completeJoinSnapshotCount.increment() }
             joinSnapshot.signal()
         }
+        let joinWillAwait = SMBContinuationCountBarrier()
+        await session.setReaderTaskJoinWillAwaitHookForTesting { _ in
+            joinWillAwait.signal()
+        }
         let closeCompleted = SMBContinuationCountBarrier()
         let closing = Task {
             await session.closeTransportAndWait(cause: "test_join_both_reader_tasks")
@@ -2469,7 +2473,15 @@ final class SMBeeTests: XCTestCase {
                 sleeper: { try await snapshotClock.sleep(for: $0) }
             )
         }
+        try await awaitWithTimeout("shutdown begins awaiting a snapshotted reader") {
+            try await joinWillAwait.waitForCount(
+                1,
+                timeout: .seconds(1),
+                sleeper: { try await snapshotClock.sleep(for: $0) }
+            )
+        }
         XCTAssertEqual(completeJoinSnapshotCount.value, 1, "shutdown must snapshot both reader tasks")
+        XCTAssertEqual(closeCompleted.currentCount, 0, "close remains suspended on the snapshotted readers")
 
         let closeWaitClock = ManualSMBSleeper()
         let closeWait = Task {
@@ -2505,6 +2517,7 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(transport.closeCount, 1)
         await session.setReaderTaskExitHookForTesting(nil)
         await session.setReaderTaskJoinSnapshotHookForTesting(nil)
+        await session.setReaderTaskJoinWillAwaitHookForTesting(nil)
     }
 
     func testCloseJoinsReplacementAfterOldReaderExits() async throws {
@@ -5988,10 +6001,10 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(entries, [SMBDirectoryEntry(name: "a.txt", fileSize: 1, isDirectory: false, attributes: 0x80)])
     }
 
-    func testWatchAutoReconnectResubscribesAfterConnectionDropAndEmitsOverflow() async throws {
+    func testWatchAutoReconnectResubscribesAfterReconnectableFailureAndEmitsOverflow() async throws {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
-        // Transport #1: auth + tree + CREATE for the watch, then drains — the CHANGE_NOTIFY
-        // long-poll receive hits connectionClosed, triggering reconnect.
+        // Transport #1: auth + tree + CREATE for the watch, then the CHANGE_NOTIFY receives
+        // STATUS_NETWORK_NAME_DELETED, triggering reconnect through a deterministic server error.
         // Transport #2: fresh auth + tree + CREATE + a real ADDED notification.
         // Transport #2 parks after delivering the notification (rather than draining) so the
         // resubscribed watch stays blocked on its next long-poll until the test cancels,
@@ -6008,7 +6021,19 @@ final class SMBeeTests: XCTestCase {
         let factory = TransportFactorySequence([
             SMBValidateNegotiateScriptTransport(
                 inbound: try framed(authenticatedTreeResponses(credential: .anonymous) + [
-                    smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344)
+                    smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+                    smb2StatusResponse(
+                        status: SMB2Status.networkNameDeleted,
+                        command: SMB2Commands.changeNotify,
+                        messageId: 5,
+                        treeId: 0x3344
+                    ),
+                    smb2StatusResponse(
+                        status: SMB2Status.success,
+                        command: SMB2Commands.close,
+                        messageId: 6,
+                        treeId: 0x3344
+                    )
                 ]),
                 blockWhenDrained: false
             ),
@@ -6066,6 +6091,100 @@ final class SMBeeTests: XCTestCase {
         XCTAssertEqual(factory.makeCount, 2)
         let sawOverflow = await events.sawOverflow
         XCTAssertTrue(sawOverflow, "expected an overflow (full rescan) signal after reconnect")
+    }
+
+    func testWatchAutoReconnectResubscribesAfterTransportDisconnect() async throws {
+        let fileId = hexBytes("00112233445566778899aabbccddeeff")
+        let firstTransport = ControlledReceiveTransport()
+        firstTransport.enqueueInbound(try framed(authenticatedTreeResponses(credential: .anonymous) + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344)
+        ]))
+        let secondTransport = ControlledReceiveTransport()
+        secondTransport.enqueueInbound(try framed(authenticatedTreeResponses(credential: .anonymous) + [
+            smb2CreateResponse(fileId: fileId, messageId: 4, treeId: 0x3344),
+            smb2ChangeNotifyResponse(
+                entries: [makeFileNotifyEntry(action: 1, name: "after-disconnect.txt", nextOffset: 0)],
+                messageId: 5,
+                treeId: 0x3344
+            )
+        ]))
+        let factory = TransportFactorySequence([firstTransport, secondTransport])
+        SMBTransportTestOverride.factory = factory.make
+        defer { SMBTransportTestOverride.factory = nil }
+
+        let session = try await SMBee.connect(host: "server", credential: .anonymous, share: "share")
+        let events = ChangeNotifyEventAccumulator()
+        let changeReceived = SMBContinuationCountBarrier()
+        let changeReceivedClock = ManualSMBSleeper()
+        let overflowReceived = SMBContinuationCountBarrier()
+        let overflowReceivedClock = ManualSMBSleeper()
+        let watcher = Task {
+            try await session.withChangeNotifications(path: "dir", autoReconnect: true) { event in
+                await events.record(event)
+                switch event {
+                case .overflow:
+                    overflowReceived.signal()
+                case .changes(let changes) where changes.contains(where: { $0.name == "after-disconnect.txt" }):
+                    changeReceived.signal()
+                default:
+                    break
+                }
+            }
+        }
+
+        try await smbIssue102AwaitWithTimeout("first watch sends CHANGE_NOTIFY") {
+            try await firstTransport.waitForOutboundFrameCount(
+                atLeast: 6,
+                timeout: .seconds(60),
+                sleeper: { try await Task.sleep(for: $0) }
+            )
+        }
+        try await smbIssue102AwaitWithTimeout("first CHANGE_NOTIFY receive is blocked") {
+            try await firstTransport.waitUntilReceiveIsBlocked(
+                timeout: .seconds(60),
+                sleeper: { try await Task.sleep(for: $0) }
+            )
+        }
+        firstTransport.finishInput()
+
+        try await smbIssue102AwaitWithTimeout("transport failure emits watch overflow before reconnect") {
+            try await overflowReceived.waitForCount(
+                1,
+                timeout: .seconds(60),
+                sleeper: { try await overflowReceivedClock.sleep(for: $0) }
+            )
+        }
+        try await smbIssue102AwaitWithTimeout("watch receives a real change after transport reconnect") {
+            try await changeReceived.waitForCount(
+                1,
+                timeout: .seconds(60),
+                sleeper: { try await changeReceivedClock.sleep(for: $0) }
+            )
+        }
+
+        watcher.cancel()
+        let wireSession = await session.wireSessionForTesting()
+        await wireSession.closeTransportAndWait(cause: "test_watch_transport_disconnect_reconnect_cancel")
+        do {
+            try await smbIssue102AwaitWithTimeout("transport-disconnected watcher cancellation completes") {
+                try await watcher.value
+            }
+        } catch is CancellationError {
+            // Cancelling the watch releases its blocked receive on the replacement transport.
+        }
+
+        XCTAssertEqual(factory.makeCount, 2, "transport EOF must construct one replacement transport")
+        try await smbIssue102AwaitWithTimeout("replacement transport sends its CHANGE_NOTIFY request") {
+            try await secondTransport.waitForOutboundFrameCount(
+                atLeast: 6,
+                timeout: .seconds(60),
+                sleeper: { try await Task.sleep(for: $0) }
+            )
+        }
+        let sawAdded = await events.containsChange(named: "after-disconnect.txt")
+        XCTAssertTrue(sawAdded, "expected the ADDED notification after the transport reconnect")
+        let sawOverflow = await events.sawOverflow
+        XCTAssertTrue(sawOverflow, "expected a full-rescan overflow event after transport EOF")
     }
 
     func testSMBeeFacadeMutatingOperationsUseTransportOverride() async throws {
@@ -8649,8 +8768,10 @@ final class SMBeeTests: XCTestCase {
         )
 
         let collector = ChangeNotifyCollector()
+        let changeCallbackExecution = SMBCallbackExecutionRecorder()
         let task = Task {
             try await session.changeNotify(treeId: 0x3344, fileId: fileId, filter: .default, watchTree: false) { event in
+                changeCallbackExecution.record(on: session.sessionExecutor)
                 collector.append(event)
                 throw CancellationError()
             }
@@ -8663,6 +8784,9 @@ final class SMBeeTests: XCTestCase {
         }
 
         XCTAssertEqual(collector.events, [.overflow])
+        let changeCallbackContext = try XCTUnwrap(changeCallbackExecution.observation)
+        XCTAssertTrue(changeCallbackContext.isOnExecutorQueue)
+        XCTAssertTrue(changeCallbackContext.taskExecutorMatches)
     }
 
     func testChangeNotifyCancellationSendsSMB2Cancel() async throws {
@@ -9351,7 +9475,9 @@ final class SMBeeTests: XCTestCase {
         )
 
         let streamed = TestDirectoryEntryCollector()
+        let directoryCallbackExecution = SMBCallbackExecutionRecorder()
         try await session.queryDirectory(treeId: 0x3344, fileId: fileId) { entry in
+            directoryCallbackExecution.record(on: session.sessionExecutor)
             streamed.append(entry)
         }
 
@@ -9359,6 +9485,9 @@ final class SMBeeTests: XCTestCase {
             SMBDirectoryEntry(name: "a.txt", fileSize: 1, isDirectory: false, attributes: 0x80),
             SMBDirectoryEntry(name: "b", fileSize: 0, isDirectory: true, attributes: 0x10)
         ])
+        let directoryCallbackContext = try XCTUnwrap(directoryCallbackExecution.observation)
+        XCTAssertTrue(directoryCallbackContext.isOnExecutorQueue)
+        XCTAssertTrue(directoryCallbackContext.taskExecutorMatches)
         let requests = try unframed(transport.outbound)
         XCTAssertEqual(requests.map { try? SMB2Header.decode($0).command }, [
             SMB2Commands.queryDirectory,
@@ -10564,6 +10693,7 @@ final class SMBeeTests: XCTestCase {
             credential: SMBCredential(username: "user", password: "pass"),
             transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
         )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
 
         try await clientSession.startKeepAlive(interval: .milliseconds(50))
@@ -10575,11 +10705,8 @@ final class SMBeeTests: XCTestCase {
         let echoHeader = try SMB2Header.decode(echoRequest)
         let closeTask = Task { await clientSession.close() }
 
-        try await awaitWithTimeout("close registers the in-flight ECHO drain") {
-            await session.waitForPendingCommandResponseDrainWaiterCountForTesting(
-                command: SMB2Commands.echo,
-                atLeast: 1
-            )
+        try await awaitWithTimeout("close registers the cancelled request drain") {
+            await session.waitForCancelledResponseDrainWaiterCountForTesting(atLeast: 1)
         }
         try await waitForOutboundFrameCount(2, transport: transport)
         let outboundBeforeEchoFinal = try unframed(transport.outbound)
@@ -10619,14 +10746,16 @@ final class SMBeeTests: XCTestCase {
 
     func testClientSessionCloseSkipsGracefulTeardownWhenKeepAliveEchoNeverDrains() async throws {
         let transport = ControlledReceiveTransport()
-        let clock = ManualSMBSleeper()
+        let clock = SMBActivationTestClock()
         let session = SMBSession(
             host: "server", port: 445,
             credential: SMBCredential(username: "user", password: "pass"),
             transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16),
             cleanupTimeout: .seconds(5),
-            cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
+            wireDrainGrace: .seconds(5),
+            sessionTime: clock.source
         )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
         let clientSession = SMBClientSession(session: session, treeId: 0x3344)
 
         try await clientSession.startKeepAlive(interval: .milliseconds(50))
@@ -10635,22 +10764,15 @@ final class SMBeeTests: XCTestCase {
             await session.waitForRequestSentCountForTesting(atLeast: 1)
         }
         let closeTask = Task { await clientSession.close() }
-        try await awaitWithTimeout("close registers the in-flight ECHO drain") {
-            await session.waitForPendingCommandResponseDrainWaiterCountForTesting(
-                command: SMB2Commands.echo,
-                atLeast: 1
-            )
+        try await awaitWithTimeout("close registers the cancelled request drain") {
+            await session.waitForCancelledResponseDrainWaiterCountForTesting(atLeast: 1)
         }
         try await awaitWithTimeout("ECHO drain deadline armed") {
-            try await clock.waitUntilCallCount(
-                atLeast: 1,
-                timeout: .seconds(1),
-                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
-            )
+            await clock.waitForSleepCount(atLeast: 1)
         }
         // The ECHO final never arrives: the deadline closes the wire instead of sending
         // TREE_DISCONNECT / LOGOFF across the unresolved request.
-        clock.fireNext()
+        clock.advance(by: .seconds(5), resumeDueSleeps: true)
         try await awaitWithTimeout("close after ECHO drain timeout") { await closeTask.value }
 
         let transportClosed = await session.isTransportClosedForTesting()
@@ -10658,6 +10780,79 @@ final class SMBeeTests: XCTestCase {
         let commands = try unframed(transport.outbound).map { try SMB2Header.decode($0).command }
         XCTAssertFalse(commands.contains(SMB2Commands.treeDisconnect), "\(commands)")
         XCTAssertFalse(commands.contains(SMB2Commands.logoff), "\(commands)")
+    }
+
+    func testClientCloseJoinsReaderWhenCancelledDrainTurnsTerminal() async throws {
+        let transport = ControlledReceiveTransport()
+        let clock = SMBActivationTestClock()
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport,
+            signingKey: Array(repeating: UInt8(0x11), count: 16),
+            cleanupTimeout: .seconds(5),
+            wireDrainGrace: .seconds(5),
+            sessionTime: clock.source
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
+        let exitGate = SMBReaderTaskExitGate()
+        defer { exitGate.releaseAll() }
+        await session.setReaderTaskExitHookForTesting { handle in await exitGate.hold(handle) }
+        let closeJoinSnapshots = SMBContinuationCountBarrier()
+        await session.setReaderTaskJoinSnapshotHookForTesting { _ in closeJoinSnapshots.signal() }
+        let clientSession = SMBClientSession(session: session, treeId: 0x3344)
+
+        try await clientSession.startKeepAlive(interval: .milliseconds(10))
+        try await waitForOutboundFrameCount(1, transport: transport)
+        let closeCompletions = SMBContinuationCountBarrier()
+        let firstClose = Task {
+            await clientSession.close()
+            closeCompletions.signal()
+        }
+        try await awaitWithTimeout("client close waits for its cancelled ECHO drain") {
+            await session.waitForCancelledResponseDrainWaiterCountForTesting(atLeast: 1)
+        }
+        try await awaitWithTimeout("client close arms the ECHO drain deadline") {
+            await clock.waitForSleepCount(atLeast: 1)
+        }
+
+        let secondCloseJoined = SMBContinuationCountBarrier()
+        let secondClose = Task {
+            await clientSession.closeForTesting { event in
+                if event == .joinedExistingCleanup { secondCloseJoined.signal() }
+            }
+            closeCompletions.signal()
+        }
+        try await awaitWithTimeout("second client close joins the in-flight cleanup") {
+            try await secondCloseJoined.waitForCount(1)
+        }
+
+        clock.advance(by: .seconds(5), resumeDueSleeps: true)
+        try await awaitWithTimeout("terminal reader reaches the controlled exit hook") {
+            try await exitGate.waitForCount(
+                1,
+                timeout: .seconds(1),
+                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
+            )
+        }
+        try await awaitWithTimeout("terminalizer and client close both snapshot the reader join") {
+            try await closeJoinSnapshots.waitForCount(
+                2,
+                timeout: .seconds(1),
+                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
+            )
+        }
+        XCTAssertEqual(closeCompletions.currentCount, 0, "both client closes must remain pending while reader exit is held")
+
+        exitGate.releaseAll()
+        try await awaitWithTimeout("both client close calls finish after reader exit") {
+            try await closeCompletions.waitForCount(2)
+        }
+        await firstClose.value
+        await secondClose.value
+        XCTAssertEqual(transport.closeCount, 1)
+        await session.setReaderTaskExitHookForTesting(nil)
+        await session.setReaderTaskJoinSnapshotHookForTesting(nil)
     }
 
     func testCancelledParkedEchoDoesNotSendStaleFrameAfterCreditGrant() async throws {
@@ -11744,6 +11939,7 @@ final class SMBeeTests: XCTestCase {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let transport = ControlledReceiveTransport()
         let sleeper = RequestTimeoutSleeperGate()
+        let clock = SMBActivationTestClock()
         let session = SMBSession(
             host: "server",
             port: 445,
@@ -11751,6 +11947,7 @@ final class SMBeeTests: XCTestCase {
             transport: transport,
             signingKey: Array(repeating: UInt8(0x11), count: 16),
             requestTimeout: .milliseconds(100),
+            sessionTime: clock.source,
             requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
         )
         let lock = Task {
@@ -11774,6 +11971,7 @@ final class SMBeeTests: XCTestCase {
         let timersAfterSend = await session.requestTimeoutTaskCountForTesting()
         XCTAssertEqual(timersAfterSend, 1)
 
+        clock.advance(by: .milliseconds(100), resumeDueSleeps: false)
         sleeper.fireNext()
         do {
             try await awaitWithTimeout("fail-immediately LOCK request timeout") {
@@ -11862,6 +12060,7 @@ final class SMBeeTests: XCTestCase {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let transport = ControlledReceiveTransport()
         let sleeper = RequestTimeoutSleeperGate()
+        let clock = SMBActivationTestClock()
         let session = SMBSession(
             host: "server",
             port: 445,
@@ -11870,6 +12069,7 @@ final class SMBeeTests: XCTestCase {
             signingKey: Array(repeating: UInt8(0x11), count: 16),
             initialCredits: 2,
             requestTimeout: .milliseconds(300),
+            sessionTime: clock.source,
             requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
         )
         defer { sleeper.reset() }
@@ -11905,6 +12105,7 @@ final class SMBeeTests: XCTestCase {
         let timersBeforeTimeout = await session.requestTimeoutTaskCountForTesting()
         XCTAssertEqual(pendingBeforeTimeout, 2, "a credit waiter has no response record until its charge is reserved")
         XCTAssertEqual(timersBeforeTimeout, 2)
+        clock.advance(by: .milliseconds(300), resumeDueSleeps: false)
         sleeper.fireNext()
         try await awaitWithTimeout("request timeout processing") {
             while await session.requestTimeoutCompletionCountForTesting() < 1 {
@@ -12202,6 +12403,7 @@ final class SMBeeTests: XCTestCase {
         let fileId = hexBytes("00112233445566778899aabbccddeeff")
         let transport = ControlledReceiveTransport()
         let sleeper = RequestTimeoutSleeperGate()
+        let clock = SMBActivationTestClock()
         let session = SMBSession(
             host: "server",
             port: 445,
@@ -12209,6 +12411,7 @@ final class SMBeeTests: XCTestCase {
             transport: transport,
             signingKey: Array(repeating: UInt8(0x11), count: 16),
             requestTimeout: .milliseconds(100),
+            sessionTime: clock.source,
             requestTimeoutSleeper: { try await sleeper.sleep(for: $0) }
         )
         let read = Task {
@@ -12225,6 +12428,7 @@ final class SMBeeTests: XCTestCase {
         }
         let request = try XCTUnwrap(try unframed(transport.outbound).first)
         let header = try SMB2Header.decode(request)
+        clock.advance(by: .milliseconds(100), resumeDueSleeps: false)
         sleeper.fireNext()
         do {
             _ = try await awaitWithTimeout("READ request timeout") { try await read.value }

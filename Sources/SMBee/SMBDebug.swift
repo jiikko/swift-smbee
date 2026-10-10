@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 enum SMBWireDataProvenance: Equatable, Sendable {
@@ -21,6 +22,10 @@ struct SMBSessionDebugConfiguration: Sendable {
 }
 
 struct SMBSessionDebugLogger: Sendable {
+#if DEBUG
+    private static let outputQueue = DispatchQueue(label: "SMBee.debug-output")
+#endif
+
     private let configurationProvider: @Sendable () -> SMBSessionDebugConfiguration
     private let sink: @Sendable (String) -> Void
 
@@ -76,6 +81,75 @@ struct SMBSessionDebugLogger: Sendable {
         guard configurationProvider().enabled else { return }
         sink(message)
     }
+
+#if DEBUG
+    /// Queues diagnostics from latency-sensitive session work so a blocked stderr sink
+    /// cannot occupy the session executor.
+    func enqueueLine(_ message: String) {
+        Self.outputQueue.async { self.line(message) }
+    }
+#endif
+}
+
+/// Measures a callback in place, without changing the task's executor. Only debug builds
+/// read the clock; diagnostic output is queued away from the session executor.
+struct SMBCallbackDurationMeasurement: Sendable {
+#if DEBUG
+    private let logger: SMBSessionDebugLogger
+    private let sessionID: String
+    private let label: String
+    private let startedAt: ContinuousClock.Instant?
+
+    init(logger: SMBSessionDebugLogger, sessionID: String, label: String) {
+        self.logger = logger
+        self.sessionID = sessionID
+        self.label = label
+        self.startedAt = logger.isEnabled ? ContinuousClock.now : nil
+    }
+
+    func finish() {
+        guard let startedAt else { return }
+        let duration = ContinuousClock.now - startedAt
+        guard duration >= .milliseconds(100) else { return }
+        logger.enqueueLine(
+            "[callback] slow session=\(sessionID) name=\(label) " +
+                "duration_ms=\(SMBPerfLog.milliseconds(duration)) threshold_ms=100"
+        )
+    }
+#else
+    init(logger: SMBSessionDebugLogger, sessionID: String, label: String) {
+        _ = logger
+        _ = sessionID
+        _ = label
+    }
+
+    @inline(__always)
+    func finish() {}
+#endif
+}
+
+@concurrent
+func runSMBUserSyncCallbackOnPreferredExecutor(
+    _ operation: @escaping @Sendable () -> Void,
+    label: String,
+    logger: SMBSessionDebugLogger,
+    sessionID: String
+) async {
+    let measurement = SMBCallbackDurationMeasurement(logger: logger, sessionID: sessionID, label: label)
+    operation()
+    measurement.finish()
+}
+
+@concurrent
+func runSMBUserAsyncCallbackOnPreferredExecutor<Result: Sendable>(
+    _ operation: @escaping @Sendable () async throws -> Result,
+    label: String,
+    logger: SMBSessionDebugLogger,
+    sessionID: String
+) async throws -> Result {
+    let measurement = SMBCallbackDurationMeasurement(logger: logger, sessionID: sessionID, label: label)
+    defer { measurement.finish() }
+    return try await operation()
 }
 
 enum SMBDebug {

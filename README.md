@@ -5,6 +5,11 @@
 
 A pure-Swift SMB2/3 client.
 
+## 対応環境
+
+- macOS 15 以降。macOS 13/14 はこの package version の deployment target 外です。
+- Linux with Swift 6.2 or later.
+
 SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing は本ライブラリで
 **自作**し、AES-CMAC / AES-GCM / HMAC / SHA などの暗号プリミティブの計算は
 CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift-crypto)（Linuxを含む）、
@@ -32,6 +37,7 @@ CommonCrypto（Apple platform）、[swift-crypto](https://github.com/apple/swift
 
 - [docs/smb-protocol.md](docs/smb-protocol.md) — 実装する SMB wire 仕様と一次ソース（MS-SMB2 / MS-NLMP / NIST 等）
 - [docs/architecture.md](docs/architecture.md) — 内部構成と transport 抽象（既定は全プラットフォームで POSIX socket。NWConnection は明示 injection の opt-in）
+- [SMBTransport requirements](Sources/SMBee/SMBee.docc/TransportRequirements.md) — custom transport の executor / non-blocking I/O / close contract
 - [docs/testing.md](docs/testing.md) — テスト戦略（unit vector / コンテナ Samba で E2E: ローカル=Apple container・CI=Docker / 実サーバ smoke）
 - [docs/coverage.md](docs/coverage.md) — SMBee が実装済み・未検証・未対応の SMB surface とテスト状況
 - [docs/api-stability.md](docs/api-stability.md) — 0.1 public API freeze、error / concurrency / credential migration 方針

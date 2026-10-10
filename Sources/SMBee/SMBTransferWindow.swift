@@ -126,6 +126,15 @@ final class SMBTransferWindow {
         }
     }
 
+#if DEBUG
+    var callbackLeaseCountsForTesting: (delivery: Int, retirement: Int) {
+        (
+            delivery: slots.filter { $0.phase == .delivering }.count,
+            retirement: slots.filter { $0.phase == .retiring }.count
+        )
+    }
+#endif
+
     var hasReadyRetirement: Bool {
         readyRetirementSlotIndex != nil
     }
@@ -253,6 +262,23 @@ final class SMBTransferWindow {
             return false
         }
         slots[index].sendPhase = .sending
+        return true
+    }
+
+    /// A transfer may stop after a ticket is committed locally but before the sender assigns
+    /// a MessageId. Retire that ticket without creating wire ownership or a sequence hole.
+    @discardableResult
+    func retireUnsent(_ ticket: SMBTransferTicket, at time: ContinuousClock.Instant) -> Bool {
+        guard isStopped,
+              let index = matchingCommittedSlot(for: ticket),
+              slots[index].sendPhase == .registered,
+              !slots[index].sendOwnerFinished,
+              case nil = slots[index].result else {
+            return false
+        }
+        clearSlotPayload(at: index)
+        setPhase(.vacant, for: index)
+        recordWireDrainedIfReady(at: time)
         return true
     }
 
@@ -443,6 +469,14 @@ final class SMBTransferWindow {
     func reclaimSlotsAfterTerminalJoin() {
         guard terminallyClosed, terminalSendOwnersJoined else { return }
         for index in slots.indices {
+            switch slots[index].phase {
+            case .delivering, .retiring:
+                // The wire owner is joined, but the driver still owns the callback lease.
+                // Its return path finishes and releases this slot exactly once.
+                continue
+            case .vacant, .preparing, .committed, .completed, .retired:
+                break
+            }
             clearSlotPayload(at: index)
             setPhase(.vacant, for: index)
         }

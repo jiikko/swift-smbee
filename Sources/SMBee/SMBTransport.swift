@@ -8,14 +8,24 @@ public enum SMBTransportError: Error, Equatable, Sendable {
     case timedOut
 }
 
+/// A single-connection SMB byte transport.
+///
+/// Implementations may be called from a custom executor owned by an `SMBSession`.
+/// The protocol does not promise a particular executor or thread. Async methods must
+/// suspend while network I/O is pending and must move blocking syscalls, name resolution,
+/// polling, and blocking reads or writes to an independent I/O worker. Making a method
+/// `async`, `nonisolated`, or `nonisolated(nonsending)` does not move blocking work off
+/// the caller's executor. See <doc:TransportRequirements> for the full conformer contract.
 public protocol SMBTransport: Sendable {
     /// Opens this transport's one connection lifetime. Implementations must cooperate with
     /// `close()` so a concurrent connect does not publish a connection after terminal close.
+    /// Resolve names and perform blocking connect or poll work on an independent I/O worker.
     func connect(host: String, port: UInt16) async throws
 
     /// Sends one logical byte stream. Concurrent invocations are allowed, but the bytes
     /// from each invocation must not be interleaved with another invocation. The order in
-    /// which concurrent invocations become visible is unspecified.
+    /// which concurrent invocations become visible is unspecified. A blocking write must
+    /// run on an independent I/O worker, not on the calling task's executor.
     func send(_ bytes: [UInt8]) async throws
 
     /// Sends the concatenation of all segments as one logical byte stream. It has the same
@@ -26,11 +36,13 @@ public protocol SMBTransport: Sendable {
     /// array means peer EOF. `SMBSession` keeps a receive pending while responses are
     /// outstanding and relies on `close()` to wake it, so a receive that is waiting when
     /// `close()` is called must return (empty or throwing) without waiting for the peer.
+    /// Blocking receive and poll syscalls must run on an independent I/O worker.
     func receive(maxLength: Int) async throws -> [UInt8]
 
-    /// Terminal and idempotent. Closing must make already-issued connect, send, and receive
-    /// operations return without depending on a peer response, and future I/O must fail.
-    /// A closed transport is never reopened; reconnecting uses a new transport instance.
+    /// Terminal, idempotent, and short-running. Start interruption and make already-issued
+    /// connect, send, and receive operations return without depending on a peer response.
+    /// Do not synchronously wait for a peer, queue drain, I/O worker, or task join. Future I/O
+    /// must fail. A closed transport is never reopened; reconnecting uses a new instance.
     func close()
 }
 

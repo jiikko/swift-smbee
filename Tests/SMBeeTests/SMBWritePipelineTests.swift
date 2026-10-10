@@ -310,6 +310,7 @@ final class SMBWritePipelineTests: XCTestCase {
             sessionTime: sessionTime,
             cleanupTimeoutSleeper: { try await drainSleeper.sleep(for: $0) }
         )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
         let client = SMBClientSession(session: session, treeId: 1)
         let data = patternedBytes(count: chunkSize * 2)
         let totalBytes = UInt64(chunkSize * 3)
@@ -463,6 +464,7 @@ final class SMBWritePipelineTests: XCTestCase {
         let operation = Task { try await client.upload(path: "file.bin", data: data) }
         try await waitForCommand(transport, SMB2Commands.create, occurrence: 1)
         try transport.completeCreate()
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 1)
         try await waitForWrites(transport, offsets: (0..<4).map { UInt64($0 * chunkSize) })
         try await waitForActiveSendTasks(session, label: "four pipelined WRITE send owners")
 
@@ -500,6 +502,8 @@ final class SMBWritePipelineTests: XCTestCase {
         let calls = SMBWritePipelineCounter()
         let progress = SMBWritePipelineProgressCollector()
         let supplierEntered = SMBContinuationCountBarrier()
+        let supplierCallbackExecution = SMBCallbackExecutionRecorder()
+        let progressCallbackExecution = SMBCallbackExecutionRecorder()
         defer { transport.failConnection() }
 
         let operation = Task {
@@ -507,6 +511,7 @@ final class SMBWritePipelineTests: XCTestCase {
                 path: "supplier.bin",
                 totalBytes: UInt64(data.count),
                 nextChunk: { _ in
+                    supplierCallbackExecution.record(on: session.sessionExecutor)
                     let call = calls.increment()
                     if call == 1 {
                         supplierEntered.signal()
@@ -518,7 +523,10 @@ final class SMBWritePipelineTests: XCTestCase {
                     }
                     return []
                 },
-                onProgress: { progress.append($0.bytesTransferred) }
+                onProgress: {
+                    progressCallbackExecution.record(on: session.sessionExecutor)
+                    progress.append($0.bytesTransferred)
+                }
             )
         }
 
@@ -542,6 +550,12 @@ final class SMBWritePipelineTests: XCTestCase {
         try await smbIssue102AwaitWithTimeout("oversized async supplier WRITE completion") {
             try await operation.value
         }
+        let supplierCallbackContext = try XCTUnwrap(supplierCallbackExecution.observation)
+        XCTAssertTrue(supplierCallbackContext.isOnExecutorQueue)
+        XCTAssertTrue(supplierCallbackContext.taskExecutorMatches)
+        let progressCallbackContext = try XCTUnwrap(progressCallbackExecution.observation)
+        XCTAssertFalse(progressCallbackContext.isOnExecutorQueue)
+        XCTAssertFalse(progressCallbackContext.taskExecutorMatches)
         XCTAssertEqual(calls.value, 2, "the supplier is called again once for EOF after its array drains")
         let requests = transport.writeRequests.sorted { $0.offset < $1.offset }
         XCTAssertEqual(requests.map(\.offset), (0..<requestCount).map { UInt64($0 * 65_536) })
@@ -912,6 +926,105 @@ final class SMBWritePipelineTests: XCTestCase {
         await session.closeTransportAndWait(cause: "write_deadline_test_complete")
     }
 
+    func testWriteDrainDeadlineJoinsWireOwnersWhileAsyncSupplierIsSuspended() async throws {
+        let transport = SMBWritePipelineScriptTransport()
+        let virtualTime = SMBWritePipelineVirtualClock()
+        let drainSleeper = SMBKeyedManualSleeper()
+        let sessionTime = SMBSessionMonotonicTime(
+            now: { virtualTime.now() },
+            sleep: { try await drainSleeper.sleep(for: $0) }
+        )
+        let session = makeSession(
+            transport: transport,
+            credits: 81,
+            sessionTime: sessionTime,
+            cleanupTimeoutSleeper: { try await drainSleeper.sleep(for: $0) }
+        )
+        let executorEvents = SMBSessionExecutorObservationRecorder()
+        session.sessionExecutor.setExecutionObserverForTesting { executorEvents.append($0) }
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let testChunkSize = chunkSize
+        let data = patternedBytes(count: testChunkSize * 2)
+        let supplierCalls = SMBWritePipelineCounter()
+        let supplierEntered = SMBContinuationCountBarrier()
+        let supplierGate = SMBAsyncCallbackSuspensionGate()
+        let readerJoinStarted = SMBContinuationCountBarrier()
+        await session.setReaderTaskJoinSnapshotHookForTesting { _ in
+            readerJoinStarted.signal()
+        }
+        defer {
+            supplierGate.release()
+            transport.failConnection()
+        }
+
+        let operation = Task {
+            try await client.upload(
+                path: "suspended-supplier-drain.bin",
+                totalBytes: UInt64(data.count),
+                nextChunk: { maximumLength in
+                    let call = supplierCalls.increment()
+                    if call == 1 {
+                        return Array(data.prefix(maximumLength))
+                    }
+                    if call == 2 {
+                        supplierEntered.signal()
+                        await supplierGate.suspend()
+                        let start = min(testChunkSize, data.count)
+                        let end = min(data.count, start + maximumLength)
+                        return Array(data[start..<end])
+                    }
+                    return []
+                }
+            )
+        }
+
+        try await waitForCommand(transport, SMB2Commands.create, occurrence: 1)
+        try transport.completeCreate(credits: 81)
+        _ = try await waitForWrite(transport, offset: 0)
+        let recordsBeforeCancellation = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertGreaterThan(recordsBeforeCancellation, 0, "the drain oracle must start with live post-auth request records")
+        try await smbIssue102AwaitWithTimeout("second WRITE source callback suspends") {
+            try await supplierEntered.waitForCount(1)
+        }
+        operation.cancel()
+        try await smbIssue102AwaitWithTimeout("suspended-supplier WRITE drain timer is installed") {
+            await drainSleeper.waitUntilSleeping(for: .seconds(30))
+        }
+        let readersBeforeDeadline = await session.readerTaskCountForTesting()
+        XCTAssertGreaterThan(readersBeforeDeadline, 0)
+
+        virtualTime.advance(by: .seconds(30))
+        drainSleeper.fire(for: .seconds(30))
+        try await smbIssue102AwaitWithTimeout("WRITE drain deadline closes transport while supplier is suspended") {
+            try await transport.waitForCloseCount(1)
+        }
+        try await smbIssue102AwaitWithTimeout("WRITE drain deadline starts reader join") {
+            try await readerJoinStarted.waitForCount(1)
+        }
+        try await smbIssue102AwaitWithTimeout("WRITE drain deadline reclaims active request records") {
+            while await session.activePostAuthRequestRecordCountForTesting() != 0 {
+                await Task.yield()
+            }
+        }
+        let activeRecordsAfterJoin = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertEqual(activeRecordsAfterJoin, 0)
+        let drainWake = try XCTUnwrap(executorEvents.observation(for: .writeTransferDrainTimerWake))
+        XCTAssertTrue(drainWake.isOnExecutorQueue)
+        XCTAssertTrue(drainWake.taskExecutorMatches)
+
+        supplierGate.release()
+        do {
+            try await smbIssue102AwaitWithTimeout("cancelled WRITE driver exits after supplier resumes") {
+                try await operation.value
+            }
+            XCTFail("cancelled WRITE unexpectedly succeeded")
+        } catch is CancellationError {
+        } catch SMBTransportError.timedOut {
+        } catch SMBTransportError.connectionClosed {
+        }
+    }
+
     func testTransportDisconnectTerminalizesAndJoinsWrites() async throws {
         let transport = SMBWritePipelineScriptTransport()
         let session = makeSession(transport: transport, credits: 81)
@@ -947,6 +1060,13 @@ final class SMBWritePipelineTests: XCTestCase {
     func testSingleCreditWritesKeepSerialLengthsAndMessageIds() async throws {
         let transport = SMBWritePipelineScriptTransport()
         let session = makeSession(transport: transport, credits: 1)
+#if DEBUG
+        let (executorEvents, executorEventContinuation) = AsyncStream.makeStream(of: SMBSessionExecutorObservation.self)
+        session.sessionExecutor.setExecutionObserverForTesting { observation in
+            executorEventContinuation.yield(observation)
+        }
+        let sessionExecutorContext = await session.executionContextForTesting()
+#endif
         let client = SMBClientSession(session: session, treeId: 1)
         let data = patternedBytes(count: 130_000)
         defer { transport.failConnection() }
@@ -971,6 +1091,20 @@ final class SMBWritePipelineTests: XCTestCase {
         XCTAssertTrue(transport.sentCommands.contains(SMB2Commands.flush))
         XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
         await session.closeTransportAndWait(cause: "write_single_credit_test_complete")
+#if DEBUG
+        executorEventContinuation.finish()
+
+        var observations: [SMBSessionExecutorProbePoint: SMBSessionExecutorObservation] = [:]
+        for await observation in executorEvents {
+            observations[observation.point] = observation
+        }
+        for point in [SMBSessionExecutorProbePoint.writeDriver, .writeDriverAfterStep] {
+            let observation = try XCTUnwrap(observations[point], "missing execution probe for \(point)")
+            XCTAssertTrue(observation.isOnExecutorQueue)
+            XCTAssertTrue(observation.taskExecutorMatches)
+            XCTAssertEqual(observation.executorIdentity, sessionExecutorContext.executorIdentity)
+        }
+#endif
     }
 
     private func makeSession(

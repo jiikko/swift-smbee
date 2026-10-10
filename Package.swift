@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "SMBee",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v15)],
     products: [
         .library(name: "SMBee", targets: ["SMBee"]),
         .executable(name: "smbcli", targets: ["smbcli"]),

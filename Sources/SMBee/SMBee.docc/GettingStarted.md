@@ -2,6 +2,11 @@
 
 Connect to an SMB 3.x share and perform basic file operations.
 
+## Requirements
+
+SMBee supports macOS 15 and later. This package version cannot be deployed to
+macOS 13 or 14. Linux builds require Swift 6.2 or later.
+
 ## Connect once and reuse the session
 
 Create credentials at the point of use. Avoid logging or retaining them after

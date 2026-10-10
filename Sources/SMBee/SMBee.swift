@@ -209,6 +209,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter onEntry: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func withDirectoryStream(
         host: String,
         port: UInt16 = 445,
@@ -229,6 +230,7 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter onEntry: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func withDirectoryStream(
         host: String,
         port: UInt16 = 445,
@@ -248,6 +250,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall watch deadline.
+    /// - Parameter onChange: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func withChangeNotifications(
         host: String,
         port: UInt16 = 445,
@@ -272,6 +275,7 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter onChange: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func withChangeNotifications(
         host: String,
         port: UInt16 = 445,
@@ -490,6 +494,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func read(
         host: String,
         port: UInt16 = 445,
@@ -524,6 +529,7 @@ public enum SMBee {
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     /// - Parameter operationTimeout: Deadline for credential resolution, connection, and the complete read.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func read(
         host: String,
         port: UInt16 = 445,
@@ -550,6 +556,8 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter onChunk: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func withReadStream(
         host: String,
         port: UInt16 = 445,
@@ -576,6 +584,7 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter onChunk: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func withReadStream(
         host: String,
         port: UInt16 = 445,
@@ -597,6 +606,7 @@ public enum SMBee {
     }
 
     /// - Parameter operationTimeout: Deadline for credential resolution, connection, the complete stream, CLOSE, and teardown.
+    /// - Parameter onChunk: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func withReadStream(
         host: String,
         port: UInt16 = 445,
@@ -620,6 +630,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func download(
         host: String,
         port: UInt16 = 445,
@@ -706,6 +717,8 @@ public enum SMBee {
     ///   the source size. Missing or size-mismatched files are transferred with overwrite enabled. If both
     ///   `resume` and `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not
     ///   byte-level partial-file resume.
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -759,6 +772,8 @@ public enum SMBee {
     ///   the source size. Missing or size-mismatched files are transferred with overwrite enabled. If both
     ///   `resume` and `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not
     ///   byte-level partial-file resume.
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -799,6 +814,8 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func downloadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -865,6 +882,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -929,6 +947,7 @@ public enum SMBee {
     }
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -950,6 +969,7 @@ public enum SMBee {
         }
     }
 
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -976,6 +996,7 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func upload(
         host: String,
         port: UInt16 = 445,
@@ -1010,6 +1031,8 @@ public enum SMBee {
     ///   `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not byte-level
     ///   partial-file resume.
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1057,6 +1080,8 @@ public enum SMBee {
     ///   size. Missing or size-mismatched files are uploaded with overwrite enabled. If both `resume` and
     ///   `skipExisting` are true, `resume` takes precedence. This is size-based skip only, not byte-level
     ///   partial-file resume.
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1095,6 +1120,8 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
+    /// - Parameter onProgress: Coalesced updates use the progress queue; direct per-chunk updates use S. See ``Callbacks``.
     public static func uploadDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1256,6 +1283,7 @@ public enum SMBee {
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     /// - Parameter operationTimeout: Deadline for the complete recursive server-side copy.
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1295,6 +1323,7 @@ public enum SMBee {
         }
     }
 
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1329,6 +1358,7 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func copyDirectory(
         host: String,
         port: UInt16 = 445,
@@ -1411,6 +1441,7 @@ public enum SMBee {
 
     /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
     /// - Parameter operationTimeout: Deadline for the complete delete, including recursive traversal when requested.
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func delete(
         host: String,
         port: UInt16 = 445,
@@ -1442,6 +1473,7 @@ public enum SMBee {
         }
     }
 
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func delete(
         host: String,
         port: UInt16 = 445,
@@ -1468,6 +1500,7 @@ public enum SMBee {
         )
     }
 
+    /// - Parameter onAction: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func delete(
         host: String,
         port: UInt16 = 445,

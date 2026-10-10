@@ -182,6 +182,38 @@ final class SMBOperationDeadlineTests: XCTestCase {
         installGate.reset()
     }
 
+    func testSessionDownloadProgressCallbackIsDeliveredOnce() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("smbee-download-progress-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let transport = try makeDeadlineTransport([
+            deadlineCreateResponse(fileId: deadlineFileId, messageId: 0),
+            deadlineQueryInfoResponse(size: 4, messageId: 1),
+            deadlineReadResponse(Array("data".utf8), messageId: 2),
+            deadlineStatusResponse(command: SMB2Commands.close, messageId: 3)
+        ])
+        let session = SMBSession(host: "server", port: 445, credential: .anonymous, transport: transport)
+        let client = SMBClientSession(session: session, treeId: deadlineTreeId)
+        let progress = SMBDeadlineProgressCollector()
+
+        try await client.download(
+            path: "file.bin",
+            localFile: directory.appendingPathComponent("download.bin"),
+            onProgress: progress.append
+        )
+
+        let snapshots = progress.snapshots
+        XCTAssertEqual(snapshots.count, 1, "one downloaded chunk produces one progress callback")
+        guard let snapshot = snapshots.first else {
+            XCTFail("download progress callback was not delivered")
+            return
+        }
+        XCTAssertEqual(snapshot.bytesTransferred, 4)
+        XCTAssertEqual(snapshot.totalBytes, 4, "download progress retains QUERY_INFO's known size")
+        XCTAssertGreaterThan(snapshot.bytesPerSecond, 0, "download progress retains the stream's measured rate")
+    }
+
     func testSessionDeadlinesStartBeforeActorAdmission() async throws {
         // Keep the actor blocked until the manual sleeper reports deadline registration.
         let streamTransport = SMBDeadlineTransport(inbound: [])
@@ -931,6 +963,17 @@ private final class SMBDeadlineCounter: @unchecked Sendable {
 
     func increment() {
         lock.withLock { storage += 1 }
+    }
+}
+
+private final class SMBDeadlineProgressCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBTransferProgress] = []
+
+    var snapshots: [SMBTransferProgress] { lock.withLock { storage } }
+
+    func append(_ progress: SMBTransferProgress) {
+        lock.withLock { storage.append(progress) }
     }
 }
 

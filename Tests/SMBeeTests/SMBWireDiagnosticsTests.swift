@@ -2,6 +2,45 @@ import XCTest
 @testable import SMBee
 
 final class SMBWireDiagnosticsTests: XCTestCase {
+    func testNormalDebugSinkRunsSynchronouslyBeforeTheRequestSend() async throws {
+        let sinkEntered = SMBContinuationCountBarrier()
+        let sinkGate = SMBBlockingCallbackGate()
+        let debugLogger = SMBSessionDebugLogger(
+            configuration: SMBSessionDebugConfiguration(enabled: true, traceWire: false, traceWireFull: false),
+            sink: { message in
+                guard message.hasPrefix("ECHO request") else { return }
+                sinkEntered.signal()
+                sinkGate.block()
+            }
+        )
+        var response = try SMB2Header(command: SMB2Commands.echo, credits: 1, messageId: 0).encode()
+        response.append(contentsOf: [4, 0, 0, 0])
+        let transport = InMemoryTransport(inbound: try DirectTCPFraming.frame(response))
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 1,
+            debugLogger: debugLogger
+        )
+        defer {
+            sinkGate.release()
+            Task { await session.closeTransportAndWait(cause: "debug_sink_gate_test_cleanup") }
+        }
+
+        let operation = Task { try await session.echo() }
+        try await smbIssue102AwaitWithTimeout("normal debug sink receives the ECHO line") {
+            try await sinkEntered.waitForCount(1)
+        }
+        XCTAssertTrue(transport.outbound.isEmpty, "the synchronous sink blocks the request before transport send")
+        sinkGate.release()
+        try await smbIssue102AwaitWithTimeout("ECHO proceeds after the diagnostic sink returns") {
+            try await operation.value
+        }
+        await session.closeTransportAndWait(cause: "debug_sink_gate_test_complete")
+    }
+
     func testTestingWaitersReleaseOnCancellationAndTerminalTransitions() async throws {
         let session = SMBSession(
             host: "test",
@@ -910,8 +949,250 @@ final class SMBWireDiagnosticsTests: XCTestCase {
         XCTAssertEqual(transport.closeCallCount, 0)
         let state = await session.cleanupAttemptStateForTesting(fileId: fileId)
         XCTAssertEqual(state, "retiredUnknown")
+        try await awaitWithTimeout("pre-send CLOSE sender cancellation completes") {
+            await session.waitForActiveSendTasksForTesting()
+        }
         let creditWaiterCountAfterPreSendTimeout = await session.creditWaiterCountForTesting()
         XCTAssertEqual(creditWaiterCountAfterPreSendTimeout, 0)
+    }
+
+    func testPostAuthBestEffortCloseDeadlineCoversCreditWait() async throws {
+        let clock = ManualSMBSleeper()
+        let transport = CommandAwareCloseTimeoutTransport()
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 0,
+            cleanupTimeout: .seconds(5),
+            cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 0x1111_2222_3333_4444, firstMessageId: 0)
+        let fileId = [UInt8](repeating: 0x4a, count: 16)
+        let closeTask = Task { await session.bestEffortClose(treeId: 1, fileId: fileId) }
+        await session.waitForCreditWaiterCountForTesting(atLeast: 1)
+
+        let deadlineCountWhileWaitingForCredit = await session.activePostAuthRequestDeadlineCountForTesting()
+        XCTAssertEqual(deadlineCountWhileWaitingForCredit, 1, "the cleanup deadline must be fixed before credit reservation")
+        var timerRegistered = false
+        for _ in 0..<10_000 where !timerRegistered {
+            await Task.yield()
+            timerRegistered = clock.callCount > 0
+        }
+        XCTAssertTrue(timerRegistered, "the manual cleanup timer must be sleeping while CLOSE waits for credit")
+        guard timerRegistered else {
+            await session.closeTransportAndWait(cause: "post_auth_close_deadline_red_cleanup")
+            await closeTask.value
+            return
+        }
+
+        XCTAssertTrue(clock.fireNext(), "the CLOSE deadline sleeper must be fireable")
+        await closeTask.value
+        let creditWaiters = await session.creditWaiterCountForTesting()
+        let recordsAfterTimeout = await session.activePostAuthRequestRecordCountForTesting()
+        let sentCommands = transport.commandCount(SMB2Commands.close)
+        let cleanupState = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertEqual(creditWaiters, 0)
+        XCTAssertEqual(recordsAfterTimeout, 0)
+        XCTAssertEqual(sentCommands, 0, "an uncommitted CLOSE cannot be sent after its cleanup deadline")
+        XCTAssertEqual(cleanupState, "retiredUnknown")
+        await session.closeTransportAndWait(cause: "post_auth_close_deadline_test_complete")
+    }
+
+    func testPostAuthBestEffortCloseDeadlineRetiresQueuedClose() async throws {
+        let clock = ManualSMBSleeper()
+        let transport = CommandAwareCloseTimeoutTransport()
+        transport.blockSends(for: [SMB2Commands.echo])
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 2,
+            cleanupTimeout: .seconds(5),
+            cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 0x1111_2222_3333_4444, firstMessageId: 0)
+        let first = Task { try await session.echoThroughSenderLoopForTesting() }
+        await transport.waitUntilBlockedSendCount(1)
+        let fileId = [UInt8](repeating: 0x4b, count: 16)
+        let closeTask = Task { await session.bestEffortClose(treeId: 1, fileId: fileId) }
+        await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 1)
+        let deadlineCountWhileQueued = await session.activePostAuthRequestDeadlineCountForTesting()
+        XCTAssertEqual(deadlineCountWhileQueued, 1)
+
+        var timerRegistered = false
+        for _ in 0..<10_000 where !timerRegistered {
+            await Task.yield()
+            timerRegistered = clock.callCount > 0
+        }
+        XCTAssertTrue(timerRegistered, "the manual cleanup timer must be sleeping while CLOSE waits in the sender queue")
+        guard timerRegistered else {
+            await session.closeTransportAndWait(cause: "queued_post_auth_close_deadline_red_cleanup")
+            transport.releaseBlockedSends(for: SMB2Commands.echo)
+            _ = await first.result
+            await closeTask.value
+            return
+        }
+
+        XCTAssertTrue(clock.fireNext())
+        await closeTask.value
+        let queuedAfterTimeout = await session.senderLoopStatisticsForTesting()
+        let nextMessageId = await session.nextMessageIdForTesting()
+        let creditBalance = await session.creditBalanceForTesting()
+        let cleanupState = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertEqual(transport.commandCount(SMB2Commands.close), 0)
+        XCTAssertEqual(queuedAfterTimeout.queuedRequests, 0)
+        XCTAssertEqual(nextMessageId, 1, "queued CLOSE retirement must not allocate a MID")
+        XCTAssertEqual(creditBalance, 1, "queued CLOSE retirement refunds its reserved credit")
+        XCTAssertEqual(cleanupState, "retiredUnknown")
+
+        transport.releaseBlockedSends(for: SMB2Commands.echo)
+        try await first.value
+        await session.closeTransportAndWait(cause: "queued_post_auth_close_deadline_complete")
+    }
+
+    func testPostAuthCleanupDeadlineCatchPreservesDrainingFileId() async throws {
+        let outerCleanupDeadline = SMBKeyedManualSleeper()
+        let pendingCleanupTimeout = SMBKeyedManualSleeper()
+        let drainDeadline = SMBKeyedManualSleeper()
+        let cleanupSleeper: @Sendable (Duration) async throws -> Void = { duration in
+            if case .some = SMBOperationDeadline.operationContext {
+                try await outerCleanupDeadline.sleep(for: duration)
+            } else {
+                try await pendingCleanupTimeout.sleep(for: duration)
+            }
+        }
+        let transport = CommandAwareCloseTimeoutTransport(heldCommands: [SMB2Commands.close])
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 2,
+            cleanupTimeout: .seconds(5),
+            requestTimeout: .seconds(7),
+            requestTimeoutSleeper: { try await drainDeadline.sleep(for: $0) },
+            cleanupTimeoutSleeper: cleanupSleeper
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 0x1111_2222_3333_4444, firstMessageId: 0)
+        let catchReached = SMBWireTestEventSignal()
+        await session.setCleanupCloseCreditWaitCatchHookForTesting {
+            catchReached.signal()
+        }
+        let fileId = [UInt8](repeating: 0x4c, count: 16)
+        let closeTask = Task { await session.bestEffortClose(treeId: 1, fileId: fileId) }
+
+        try await transport.waitUntilSent(command: SMB2Commands.close, count: 1)
+        await session.waitForRequestSentCountForTesting(atLeast: 1)
+        await outerCleanupDeadline.waitUntilSleeping(for: .seconds(5))
+        await pendingCleanupTimeout.waitUntilSleeping(for: .seconds(5))
+
+        outerCleanupDeadline.fire(for: .seconds(5))
+        await catchReached.wait()
+        await closeTask.value
+        let stateAfterCatch = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertTrue(
+            stateAfterCatch?.hasPrefix("draining:") == true,
+            "a deadline catch after full-send must retain the committed CLOSE drain state"
+        )
+
+        await drainDeadline.waitUntilSleeping(for: .seconds(7))
+        drainDeadline.fire(for: .seconds(7))
+        await session.waitForCleanupDrainTimeoutCallbackCountForTesting(atLeast: 1)
+        let transportClosedAfterDrainDeadline = await session.isTransportClosedForTesting()
+        XCTAssertTrue(
+            transportClosedAfterDrainDeadline,
+            "the drain timer must still recognize the committed CLOSE and terminalize the session"
+        )
+        await session.closeTransportAndWait(cause: "cleanup_deadline_drain_state_test_complete")
+    }
+
+    func testLateCleanupDeadlineCatchForCloseADoesNotRetireCloseBForSameFileId() async throws {
+        let outerCleanupDeadline = SMBKeyedManualSleeper()
+        let pendingCleanupTimeout = SMBKeyedManualSleeper()
+        let drainDeadline = SMBKeyedManualSleeper()
+        let cleanupSleeper: @Sendable (Duration) async throws -> Void = { duration in
+            if case .some = SMBOperationDeadline.operationContext {
+                try await outerCleanupDeadline.sleep(for: duration)
+            } else {
+                try await pendingCleanupTimeout.sleep(for: duration)
+            }
+        }
+        let transport = CommandAwareCloseTimeoutTransport(closeCredits: 0)
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 1,
+            cleanupTimeout: .seconds(5),
+            requestTimeout: .seconds(7),
+            requestTimeoutSleeper: { try await drainDeadline.sleep(for: $0) },
+            cleanupTimeoutSleeper: cleanupSleeper
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 0x1111_2222_3333_4444, firstMessageId: 0)
+
+        let oldCatchReached = SMBWireTestEventSignal()
+        let releaseOldCatch = SMBWireUncancelledGate()
+        await session.setCleanupCloseDeadlineRetirementWillApplyHookForTesting {
+            oldCatchReached.signal()
+            await releaseOldCatch.suspend()
+        }
+
+        let fileId = [UInt8](repeating: 0x6a, count: 16)
+        let closeA = Task { await session.bestEffortClose(treeId: 1, fileId: fileId) }
+        try await transport.waitUntilSent(command: SMB2Commands.close, count: 1)
+        await session.waitForRequestSentCountForTesting(atLeast: 1)
+        await outerCleanupDeadline.waitUntilSleeping(for: .seconds(5))
+        await pendingCleanupTimeout.waitUntilSleeping(for: .seconds(5))
+
+        outerCleanupDeadline.fire(for: .seconds(5))
+        await oldCatchReached.wait()
+
+        transport.releaseNextResponse(command: SMB2Commands.close)
+        await session.waitForCleanupLedgerCountForTesting(0)
+        let balanceAfterAFinal = await session.creditBalanceForTesting()
+        XCTAssertEqual(balanceAfterAFinal, 0, "CLOSE A's response grants no credit to CLOSE B")
+        let ledgerAfterAFinal = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertNil(ledgerAfterAFinal, "CLOSE A's successful final removes only A's ledger state")
+
+        let closeB = Task { await session.bestEffortClose(treeId: 1, fileId: fileId) }
+        await session.waitForCreditWaiterCountForTesting(atLeast: 1)
+        let ledgerWhileBWaitsForCredit = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertEqual(ledgerWhileBWaitsForCredit, "sending")
+
+        releaseOldCatch.release()
+        await closeA.value
+        let ledgerAfterLateACatch = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertEqual(
+            ledgerAfterLateACatch,
+            "sending",
+            "a delayed transition owned by CLOSE A must not replace CLOSE B's state"
+        )
+
+        await session.grantCreditsForTesting(1)
+        try await transport.waitUntilSent(command: SMB2Commands.close, count: 2)
+        await session.waitForRequestSentCountForTesting(atLeast: 2)
+        let closeMessageIds = transport.messageIds(for: SMB2Commands.close)
+        XCTAssertEqual(closeMessageIds.count, 2)
+        XCTAssertNotEqual(closeMessageIds.first, closeMessageIds.last)
+
+        await outerCleanupDeadline.waitUntilSleeping(for: .seconds(5))
+        outerCleanupDeadline.fire(for: .seconds(5))
+        await closeB.value
+        await drainDeadline.waitUntilSleeping(for: .seconds(7))
+        drainDeadline.fire(for: .seconds(7))
+        await session.waitForCleanupDrainTimeoutCallbackCountForTesting(atLeast: 1)
+        let terminalizedByBDrainDeadline = await session.isTransportClosedForTesting()
+        XCTAssertTrue(
+            terminalizedByBDrainDeadline,
+            "CLOSE B's drain timeout must still match its own ledger entry and close the session"
+        )
+
+        await session.setCleanupCloseDeadlineRetirementWillApplyHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "same_file_id_cleanup_owner_test_complete")
     }
 
     func testCleanupLedgerLimitCountsSendingAttemptsAndClosesAt65() async throws {
@@ -3903,6 +4184,8 @@ final class ManualSMBSleeper: @unchecked Sendable {
     private var waiters: [Waiter] = []
     private let callCountBarrier = SMBContinuationCountBarrier()
 
+    var callCount: Int { lock.withLock { callCountStorage } }
+
     func sleep(for duration: Duration) async throws {
         let id = UUID()
         try await withTaskCancellationHandler {
@@ -3947,9 +4230,11 @@ final class ManualSMBSleeper: @unchecked Sendable {
         waiters.forEach { $0.continuation.resume(throwing: CancellationError()) }
     }
 
-    func fireNext() {
+    @discardableResult
+    func fireNext() -> Bool {
         let waiter = lock.withLock { waiters.isEmpty ? nil : waiters.removeFirst() }
         waiter?.continuation.resume()
+        return waiter != nil
     }
 
     private func cancel(id: UUID) {
@@ -4001,6 +4286,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
     private let heldCommands: Set<UInt16>
     private let sendFailures: [UInt16: SMBTransportError]
     private let closeStatus: UInt32
+    private let closeCredits: UInt16
     private let closeTreeIdOverride: UInt32?
     private let closeSessionIdOverride: UInt64?
     private let corruptCloseSignature: Bool
@@ -4013,6 +4299,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         heldCommands: Set<UInt16> = [SMB2Commands.read, SMB2Commands.close],
         sendFailures: [UInt16: SMBTransportError] = [:],
         closeStatus: UInt32 = SMB2Status.success,
+        closeCredits: UInt16 = 1,
         closeTreeIdOverride: UInt32? = nil,
         closeSessionIdOverride: UInt64? = nil,
         corruptCloseSignature: Bool = false,
@@ -4024,6 +4311,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         self.heldCommands = heldCommands
         self.sendFailures = sendFailures
         self.closeStatus = closeStatus
+        self.closeCredits = closeCredits
         self.closeTreeIdOverride = closeTreeIdOverride
         self.closeSessionIdOverride = closeSessionIdOverride
         self.corruptCloseSignature = corruptCloseSignature
@@ -4376,6 +4664,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
                 sessionId: responseSessionId,
                 treeId: closeTreeIdOverride ?? request.treeId,
                 status: closeStatus,
+                credits: closeCredits,
                 body: body,
                 asyncId: closeFinalAsyncIdOverride ?? closeInterimAsyncId
             ))
@@ -4391,6 +4680,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
         sessionId: UInt64,
         treeId: UInt32,
         status: UInt32,
+        credits: UInt16 = 1,
         body: [UInt8],
         asyncId: UInt64? = nil
     ) throws -> [UInt8] {
@@ -4401,7 +4691,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
             packet = try SMB2Header.asyncHeader(
                 status: status,
                 command: command,
-                credits: 1,
+                credits: credits,
                 flags: flags,
                 messageId: messageId,
                 asyncId: asyncId,
@@ -4411,7 +4701,7 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
             packet = try SMB2Header(
                 status: status,
                 command: command,
-                credits: 1,
+                credits: credits,
                 flags: flags,
                 messageId: messageId,
                 treeId: treeId,
@@ -4493,6 +4783,61 @@ private final class CommandAwareCloseTimeoutTransport: SMBTransport, @unchecked 
 
 private struct SMBWireDiagnosticsTimeout: Error {
     let label: String
+}
+
+private final class SMBWireTestEventSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var signaled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !signaled else { return [] }
+            signaled = true
+            defer { waiters.removeAll() }
+            return waiters
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let ready = lock.withLock { () -> Bool in
+                guard !signaled else { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if ready { continuation.resume() }
+        }
+    }
+}
+
+private final class SMBWireUncancelledGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isReleased = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private let entered = SMBWireTestEventSignal()
+
+    func suspend() async {
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                entered.signal()
+                guard !isReleased else { return true }
+                continuations.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    func release() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            isReleased = true
+            defer { continuations.removeAll() }
+            return continuations
+        }
+        pending.forEach { $0.resume() }
+    }
 }
 
 private final class SMBWireDiagnosticsResumeOnceBox<T: Sendable>: @unchecked Sendable {

@@ -251,7 +251,18 @@ commit の分け方（各 commit が単独で契約を満たす）:
   close のテストは reader の join が待ちに入った event を見てから検査。compound の final の credit ack での回収、credit の fast path のテストを追加。
   source の形のテストは sender の hot path の複数箇所に広げた（per-frame の nested Task の検出は executor の後も意味がある）。5 種類の変異で red を確認
   - macOS 749 件 / Linux 756 件が green
-- 次: 実装後のレビュー（設計適合・並行・期限・テストの素通りの 4 観点）→ 指摘の対応 → 変異検証 → smoke → x86 gate → master へ
+- 実装後のレビュー（2026-10-10、codex sol-high の 4 観点 + merger、14 件 → 12 件）。指摘ごとに HEAD で再現する失敗テストを書き、master と比べてから採否（M3、3625184）:
+  - 直した（再現 + master からの退行 / 承認済み設計の違反）: D1 認証後の CLOSE の期限が credit 待ち・送信の列の待ちを覆わない、
+    D2 止めた transfer の未送信 request が送られる（判定は MID の採番と同じ actor turn の同期の関数にし、返金だけを退役の経路で await）、
+    D3 download の progress の二重通知、D4 通常 request の timeout / 送信失敗が独立した join を始めない、DL1 cancel の tombstone に旧経路の 64 件上限が無い、
+    DL2 compound の final の期限に slice ごとの検証時刻を使う
+  - テストの素通り 5 件を直した（新しい経路を通らない oracle、FIFO と LIFO を区別できない、timer の配置の未検査、Task の書き方で source の検査を抜ける、reconnect の oracle）
+  - 記録のみ: D5 debug の sink を actor の上で同期に呼ぶ（master と同じ既存の挙動。debug の設定でだけ起きる）
+  - 変異 16 本で red。FIFO のテストは 2 本の Task を同時に起こして列に入る順を前提にしていて、Linux で逆順になった（e4aae42 で、2 本目が列に入ってから 3 本目を起こす形に直した）
+- 2 周目の敵対レビュー（M3 の修正が攻め口）: 3 件を再現して直した（M3b、2c26827）: drain の完了の判定で時刻を取り直していた（経路ごとの成立時刻で比べる）、
+  期限で退役した CLOSE の記録を enqueue / catch が消していた、M3 の D3 の修正が progress の既知のサイズと速度を落としていた（stream の emitter の一経路に戻した）。
+  D2・D4・DL1 の修正は壊せなかった
+- macOS 763 件 / Linux 770 件が green。smoke は M2 の時点（f3e70d4）で 3 profile 通過
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

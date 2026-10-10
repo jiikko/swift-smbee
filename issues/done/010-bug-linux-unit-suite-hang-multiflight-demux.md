@@ -752,3 +752,7 @@ actor の中で reader を回す試作は改善せず戻した。
   そのため、M3 の P2-2（cancel の後に final が来ないと、reader が session を保持し続ける）は**未対応のまま**。
   - いま master にあるのは、keepalive の ECHO だけを close で待つ修正（上の fix）まで。
   - 状態: M3 は master に入っている。残りは M4（上の「M4 の残り」）と P2-2（issue 106 の Commit 3 の入れ直しで閉じる）。
+- 2026-10-10: **P2-2 は issue 106 Commit 3 の入れ直し（d085790）で閉じた**。cancel の後は初回 cancel で固定した期限 D で wire を drain し、final が来なければ
+  期限で session を terminal にして reader / sender を join する。固定するテスト: `SMBUnsentRequestActivationTests.testOriginalSendStallWithoutFinalTerminalizesAndJoinsReaderAndSender`、
+  `testSelectedCancelSendOwnerKeepsDrainAliveUntilDeadlineAndJoin`（terminal の後に session が deinit される）。
+  d085790 の `verify-agent-push` は rc=0（Test / E2E / Performance、run 38040191798）。M1〜M5 と P2-2 がそろったので done へ移す

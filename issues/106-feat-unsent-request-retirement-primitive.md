@@ -277,6 +277,9 @@ commit の分け方（各 commit が単独で契約を満たす）:
 - **master へ（d085790、1 マイルストーン = 1 commit に squash）**。macOS 768 件（3 回連続）/ Linux 775 件（2 回連続）が green、smoke 3 profile、
   CI x86 の 20 組（run 38038353368、比較の相手は master de6e32e）: read throughput +20.1%・user CPU −28.3%・system CPU −54.7%、
   write +8.5%・user CPU −17.5%
+- master の push の `verify-agent-push`（d085790）は rc=0。Performance（run 38040191798、前回の成功した master との 20 組）: read throughput +19.4%・user CPU −27.6%、
+  write +7.8%・user CPU −16.2%。issue 010 の P2-2 はこれで閉じた（010 を done へ）
+- 計測用の branch `perf/106-commit3` / `perf/106-commit3-e6` は削除した
 - Commit 4（069 M2）と Commit 5（READ / WRITE の ticket と delivery の統合）はこの上に積む
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ

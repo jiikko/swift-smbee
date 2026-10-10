@@ -31,8 +31,8 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 | 2 | P2 | `docs/api-stability.md` が「actor が呼び出し全体を直列化する」と読める（actor は await をまたいで排他しない） | — |
 | 3 | P2 | handle の cleanup 失敗が共有 session の全操作を終わらせる | [069](069-bug-cleanup-failure-kills-shared-session.md)（対応中） |
 | 4 | P2 | 公開の入口（`SMBee` と `SMBClient`）と安定性契約が揃っていない（custom transport は `SMBClient.connect` からしか渡せない） | — |
-| 5 | P2 | credit waiter が永久に待つ順序がある（CreditCharge 未満の grant を返すサーバの存在は未確認） | [010](010-bug-linux-unit-suite-hang-multiflight-demux.md) |
-| 6 | P2 | 送信後に cancel した request の tombstone に終端の期限が無い | [010](010-bug-linux-unit-suite-hang-multiflight-demux.md) |
+| 5 | P2 | credit waiter が永久に待つ順序がある（CreditCharge 未満の grant を返すサーバの存在は未確認） | [010](done/010-bug-linux-unit-suite-hang-multiflight-demux.md) |
+| 6 | P2 | 送信後に cancel した request の tombstone に終端の期限が無い | [010](done/010-bug-linux-unit-suite-hang-multiflight-demux.md) |
 | 9 | P2 | `withTree` が TREE_DISCONNECT の失敗（transport を閉じる）を結果に反映しない | 069 で後回しにした TREE_DISCONNECT の経路と関係（069 本文の「M2」） |
 | 14 | P2 | READ streaming が 1 request ずつ応答を待つ（RTT のある経路で帯域を使い切れない。未実測） | — |
 | 15 | P2 | WRITE も 1 chunk ずつ応答を待つ（未実測） | [done/015](done/015-perf-upload-write-chunk-and-pipeline.md)（本文の 64 KiB の上限の記述が今の実装と食い違う、とレビュワー） |

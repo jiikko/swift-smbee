@@ -242,6 +242,9 @@ commit の分け方（各 commit が単独で契約を満たす）:
 - 2026-10-10 ユーザー判断: **利用者の callback は session の executor の上で走らせ、契約を明記する**（「短く。重い処理は利用者が自分の Task / actor へ」を doc に書き、
   debug build で長い callback を診断する）。同期の callback が走る間は同じ session の cancel・close・期限が待たされる（master より悪い点として受け入れる）。
   M1b の lease の分離（callback の実行中に close されても配送中の slot を callback の後に一回だけ精算）は残す
+- M1b'（callback を executor の上に戻し、契約を DocC `Callbacks.md` と各 API の doc に書いた。debug build でだけ 100 ms を超える callback を診断）:
+  macOS 744 件 / Linux 751 件が green。x86（run 38009245555、20 組、比較の相手は master 6929bf5）で read +29.2%・user CPU −34.0%、write +12.0%・user CPU −21.1%
+- 次: M1c（§12 の A2〜A4: transfer の drain 期限の terminalizer、通常 request の timeout の勝敗、外側の操作の期限）。codex の枠のリセット（11:39）を待って起動する
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

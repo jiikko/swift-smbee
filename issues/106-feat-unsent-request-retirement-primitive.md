@@ -26,7 +26,7 @@ commit の分け方（各 commit が単独で契約を満たす）:
 
 1. request の識別と credit の所有の準備（送信経路は旧経路のまま）— **完了**
 2. 受信の土台と compound の相関（認証前に grant を適用しないようにする。issue 104 を含む）— **完了**
-3. 新しい送信経路の有効化、取消、wire の drain の期限、reader の後始末（issue 010 の P2-2）
+3. 新しい送信経路の有効化、取消、wire の drain の期限、reader の後始末（issue 010 の P2-2）— **完了**（2026-10-10、d085790）
 4. issue 069 M2 の統合
 5. READ / WRITE の ticket と delivery の統合（pipelining）
 
@@ -160,7 +160,7 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - 同じ commit に手動起動の run が並ぶと verifier が掴んでいたので、`verify-agent-push` / `verify-agent-performance` を push の run だけ見るように直した
   - 🚨 master の ref で手動起動すると、concurrency で push の Performance の run が取り消される。手動起動は branch で行う
 - M0: 3d6eace を今の master に載せ替えた（衝突 10 か所。pipelining の READ / WRITE の transfer ticket も post-auth の sequencer に載せた）。
-  macOS 737 件 / Linux container 744 件が green、smoke 3 profile が通過。worktree の commit は branch `perf/106-commit3`（2ef2a6c）
+  macOS 737 件 / Linux container 744 件が green、smoke 3 profile が通過。計測用の branch `perf/106-commit3`（2ef2a6c。master に入れた後に削除）
 - M0 の x86 の計測（run 37916870148、20 組、比較の相手は master dfe6815）:
 
   | | throughput | user CPU | system CPU |
@@ -181,7 +181,7 @@ commit の分け方（各 commit が単独で契約を満たす）:
     ばらつき ±0.4% 以内）。CPU の増分は命令の量ではなく、スレッドの待ちと起床の回数から来ていると見る
     （callgrind はスレッドを直列に走らせるので、起床・futex・context switch のコストを数えない）
 - 手元の Linux container（arm64、swift:6.2、4G）で再現した（`/usr/bin/time -v swift test -c release --skip-build --filter SMBeeResourcePerformanceTests/<test>`、
-  各 3 回、ぶれ ±1% 程度。手順は worktree の `tmp/cs-measure.sh`）:
+  各 3 回、ぶれ ±1% 程度。手順: container の中で `swift test -c release --scratch-path /tmp/b --filter NoSuchTest` で build し、`/usr/bin/time -v swift test -c release --skip-build --filter SMBeeResourcePerformanceTests/<test>` を 3 回。worktree は削除済み）:
 
   | 1 回の実行 | voluntary context switch | system CPU | throughput |
   |---|---|---|---|
@@ -222,7 +222,7 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - 未検討のリスク: READ の `onChunk` / WRITE の supplier など利用者の callback が session の直列 executor の上で走ると、長い処理が同じ session の
     cancel・close・期限の処理を待たせる
 - 2026-10-10: ユーザーが E6 の採用と、最低対応版の macOS 13 → 15 への引き上げを承認した（利用側の obaket は macOS 15 以上）
-- E6 の設計（codex sol-high が書き、敵対レビュー 2 観点を通した。全文は worktree の `tmp/design-e6.md`、要点をここに残す）:
+- E6 の設計（codex sol-high が書き、敵対レビュー 2 観点を通した。全文は削除した worktree の `tmp/design-e6.md` にあった。要点をここに残す）:
   - session ごとに直列 DispatchQueue の `SerialExecutor` + `TaskExecutor` を 1 つ持つ。session actor と、sender / reader / cancel / timer / cleanup の Task、
     READ / WRITE の driver を載せる。enqueue は `runSynchronously(isolatedTo:taskExecutor:)` で両方の executor を runtime に渡す（E6 の計測版は serial だけで不完全）
   - 利用者の callback（onChunk・supplier・onEntry・onChange・onAction・直接の progress）は session から独立した共有の concurrent executor C で走らせる。
@@ -269,7 +269,15 @@ commit の分け方（各 commit が単独で契約を満たす）:
   各記録に所有者（`SMBRequestIdentity`）を持たせて所有者が一致する遷移だけを適用する構造にした。M3c で progress の待ちを CLOSE・ファイルの後始末より前に置いた
   順序の誤り（指示の誤り）も直し、後始末を先に済ませる
 - macOS 767 件 / Linux 774 件が green。smoke は M2 の時点（f3e70d4）で 3 profile 通過（M3 以降は未実施）
-- 次: 5 周目の敵対レビュー（M3d の差分）→ 採用する指摘が出なくなったら smoke・x86 gate・master へ
+- 5 周目（M3e、2026-10-10）: 台帳の所有者・遷移表・download のエラー経路は壊せなかった（収束）。新しく 1 件: 静的な `SMBClient.read` が progress を
+  `withSession` の再試行の外で作っていて、再接続の後に前の試行の受信量が残った（master は試行ごとに作っていた。退行）→ 試行ごとに作る。
+  修正前の複製で red・修正後 green・外へ戻す変異で red。この周の修正は判定のロジックを新設せず直接の実測で確かめたので、規定の例外として周回を打ち切った
+- 仕上げで見つけたテストの不安定さ 2 件（どちらもテスト側。観測で確定）: cleanup の配置のテストの helper が pending の登録を件数の waiter に通知していなかった
+  （単独で 25 回中 18 回失敗 → 登録後の合図を待つ。macOS 50/50・Linux 20/20）、同期の READ callback のテストが transfer の停止を「cancel の適用」の代わりに待っていた
+- **master へ（d085790、1 マイルストーン = 1 commit に squash）**。macOS 768 件（3 回連続）/ Linux 775 件（2 回連続）が green、smoke 3 profile、
+  CI x86 の 20 組（run 38038353368、比較の相手は master de6e32e）: read throughput +20.1%・user CPU −28.3%・system CPU −54.7%、
+  write +8.5%・user CPU −17.5%
+- Commit 4（069 M2）と Commit 5（READ / WRITE の ticket と delivery の統合）はこの上に積む
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

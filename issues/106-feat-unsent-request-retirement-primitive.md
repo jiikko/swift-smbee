@@ -244,7 +244,14 @@ commit の分け方（各 commit が単独で契約を満たす）:
   M1b の lease の分離（callback の実行中に close されても配送中の slot を callback の後に一回だけ精算）は残す
 - M1b'（callback を executor の上に戻し、契約を DocC `Callbacks.md` と各 API の doc に書いた。debug build でだけ 100 ms を超える callback を診断）:
   macOS 744 件 / Linux 751 件が green。x86（run 38009245555、20 組、比較の相手は master 6929bf5）で read +29.2%・user CPU −34.0%、write +12.0%・user CPU −21.1%
-- 次: M1c（§12 の A2〜A4: transfer の drain 期限の terminalizer、通常 request の timeout の勝敗、外側の操作の期限）。codex の枠のリセット（11:39）を待って起動する
+- M1c（6543df8）: A2 transfer の drain 期限の処理を独立した terminalizer の `closeTransportAndWait` へ、A3 通常 request の timeout を full-send 時に保存した
+  絶対の応答期限と同じ clock で判定（exact な期限以降は timeout）、A4 request 登録時に外側の `SMBOperationDeadline` を捕まえ、初回 cancel で
+  `min(cancelAt + grace, 外側の期限)` に固定。各修正を個別に戻すと対応するテストが red。hot path に増えたのは登録時の TaskLocal の読み取りだけ
+- M2（f3e70d4）: `testFinalDrainReleasesTimerBeforeCreditGrantAckAndReapsRecordAfterAck` は ack の後の回収の event を待つ形に（macOS 30/30、Linux 10/10）。
+  close のテストは reader の join が待ちに入った event を見てから検査。compound の final の credit ack での回収、credit の fast path のテストを追加。
+  source の形のテストは sender の hot path の複数箇所に広げた（per-frame の nested Task の検出は executor の後も意味がある）。5 種類の変異で red を確認
+  - macOS 749 件 / Linux 756 件が green
+- 次: 実装後のレビュー（設計適合・並行・期限・テストの素通りの 4 観点）→ 指摘の対応 → 変異検証 → smoke → x86 gate → master へ
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

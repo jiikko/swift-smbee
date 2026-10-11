@@ -338,8 +338,15 @@ commit の分け方（各 commit が単独で契約を満たす）:
     - sender が列から取り出した転送の request を隔離で拒否する経路は、refund の後に record の回収も receipt の完了もしないので、Tree の close が soft の期限まで待つ
     - P2: final を受けた時点で wire の receipt を完了するので、credit の grant の精算より前に TREE_DISCONNECT が出うる
     - P2: acquire の後に親を登録し直すと、祖先ごとの件数が食い違う（production での到達性は未確認）
-  - 次: 3 観点の指摘を codex（luna-max）に再現テスト → 修正 → 変異の順で直させる。期限の判定は soft の callback・final の受理・owner の回収のどの順で届いても
-    同じ結果になるよう、1 つの関数で固定の softAt / hardAt と比べる形に寄せる（1 周目の修正で 3 経路に分かれて食い違ったため）
+- 2 周目の指摘の修正（worktree の c374f62、codex luna-max。12 件すべて再現した。テストの 3 件は production の不具合ではなくテストの素通り）:
+  - cleanup の期限の判定を `SMBCleanupDeadlines.disposition` の 1 関数に寄せ、soft の callback・final の受理・send owner の回収のどの順で届いても、
+    固定の softAt / hardAt と同じ規則で比べるようにした（1 周目の修正で 3 経路に分かれて食い違ったため）
+  - full-send の時刻は平文・暗号化の両経路で共通に記録し、cleanup の request に限る。公開の親 close は lease を待つ前に子の Tree の隔離を準備する。
+    隔離で拒否した転送の request は refund の後に receipt を完了する。wire の receipt は credit の grant の精算まで保持する。facade の親の付け替えで件数を移す
+  - 変異: 12 件それぞれに修正を戻す変異を当てて red（codex が実行）
+  - 検証（自分で実行）: macOS 823 件・Linux 830 件 green、strict lint 0、期限の 3 テストを 20 回連続 green
+  - codex が開発の途中で起こした xctest が 1 つ、T4 のテストの待ちで止まったまま孤児で残っていた。最終の版の 20 回の繰り返しでは止まらなかったので、途中の版の残骸と判断した（stack は採ってから止めた）
+- 3 周目の敵対レビュー（c374f62 に対して 3 観点）を実行中
 
 ## 関連
 

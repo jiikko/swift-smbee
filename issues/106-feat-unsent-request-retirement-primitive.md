@@ -309,9 +309,20 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - F6: full-send の成立時刻と owner の回収時刻を区別できない
   - P2: lease / facade の記録が履歴に比例して増える（F7）、64 件の上限を File と Tree の合計で数えない（F8）、消した A/B の所有者の production の試験（F9）、
     遅れて届く soft の callback（F10 / F11）、テストの素通り 4 件（F12〜F15）
-  - 次: 指摘ごとに再現テスト → master と比較 → 本物を直す（codex）
-  削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
-- 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
+- 指摘 F1〜F15 の修正（worktree の 5145816、codex luna-max）:
+  - Tree の barrier を production に配線した。Tree の隔離の時点で、committed の request に wire の receipt、未送信の request と credit 待ちに retirement の receipt を張る。
+    完了は最終応答の除去・refund・送信前の catch・session terminal の各経路で行う
+  - transfer の credit: 即時に取れなければ必ず取消の token を作って Tree 単位の台帳に入れる（正の残高を見た後に枯れた場合も）。即時に取れる通常の経路は token も lock も作らない
+  - 公開の親 close は子の Tree の lease を待つ（期限は cleanup の期限で有限）。成功した TREE_DISCONNECT の後は、その incarnation の retiredUnknown の File 台帳を消す
+  - full-send の成立時刻を記録し、soft の期限の判定に使う（送信中に soft が来ても full-send が soft より前なら draining）。final は soft の timer の identity を無効にする
+  - File の登録は File + Tree の合計で 64 件の上限を数える。soft の期限を過ぎた File の owner を final / catch で回収する。lease は解放で消し、facade は close の join 後に退役させる
+    （lease と barrier の数は祖先ごとの件数で持ち、判定を O(1) にした）
+  - 消した A/B 所有者の production のテストを復元した。F12〜F15 のテストは production の経路を通るように直した
+  - 変異: F1〜F15 の各指摘に、修正を戻す変異を当てて対象のテストが red（codex が実行）。初回に green だった F4・F8・F9・F12・F13・F14/15 は、
+    production の修正そのものを戻す形に当て直して red。codex の判定式が出した `compile_error=True` は XCTest の assert 失敗の行（`file:line: error:`）を拾った誤検知で、
+    実際にはテストが実行されて落ちている（log で確認）
+  - 検証: macOS 812 件 green・strict lint 0（自分で再実行）。Linux 819 件 green・analyzer 0 は codex の報告
+  - codex の最後の段（手元の container で master と 20 組を比べる計測）は Bash の時間上限で止まった。手元の負荷で数字が汚れるので container を止め、性能は CI の x86 gate で見る
 
 ## 関連
 

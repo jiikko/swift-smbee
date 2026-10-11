@@ -374,7 +374,16 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - 検証（自分で実行）: macOS 832 件を 5 回連続 green（各 10 分の上限つき。hang なし）、Linux 839 件 green、strict lint 0
   - codex の作業の途中で、最終の版より前の binary の xctest が既存のテスト（`testEarlyFinalThenCancellation...`）で止まったまま孤児で残っていた（2 回目）。
     stack は async の待ちしか映らず原因は読めなかった。最終の版の 5 回の全件の実行では止まらなかった
-- 5 周目の敵対レビュー（d3822e7 に対して 2 観点: 回収されない record と二度と呼ばれない回収 / テストの素通り）を実行中
+- 5 周目の敵対レビュー（d3822e7 に対して 2 観点）:
+  - production は収束した。request の終わり方ごと（成功・エラーの final、cancel、credit 待ちの拒否、Tree の隔離、cleanup の soft / hard、terminal、
+    READ / WRITE・compound・暗号化・STATUS_PENDING の後の final）に record の最後の状態と最後の回収の遷移を表にして、残る record・呼ばれない回収・
+    `creditRefundPending` の下ろし忘れを反証できなかった
+  - テストの穴（P2 が 2 件）: `creditRefundPending` を立てる行を消しても落ちない（accept 前の grant を soft で取り消す順序が無い）、
+    Tree に拒否された request の record が残っても落ちない（session の close の removeAll が隠す）→ テストだけを足す（codex、実行中）
+  - 記録のみ（P3 が 2 件、直さない）: source の形の検査は、別名の変数を通した `balanceSnapshot` の参照と、呼ばれないクロージャの中の receipt の判定を見分けない。
+    この検査が止めるのは書き戻しの退行で、意図的な迂回は対象にしない（振る舞いは実行型のテストが別に押さえる）
+  - 周回の打ち切り: 5 周目の修正はテストの追加だけで、判定のロジックを新設せず、各テストは変異で直接確かめるので、
+    規定の例外として周回をここで打ち切る
 
 ## 関連
 

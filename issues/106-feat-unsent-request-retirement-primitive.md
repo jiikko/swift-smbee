@@ -333,6 +333,13 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - テストの観点（P2 が 3 件）: positive snapshot の試験は旧条件へ戻しても通る（競合の順序を固定していない）、Tree 台帳の回収の試験は別 Tree の誤回収を検出しない、
     lifecycle の回収の試験は `facadeParents` などの件数を数えていない
   - 壊せなかった: fast path の隔離後の予約、token の refund の二重と漏れ、final 後の nil の identity を timeout と誤読する経路
+  - barrier・台帳の観点（リセット後に再実行。P1 が 2 件、P2 が 2 件）:
+    - 親の close の barrier が body の lease を待つが、子の Tree の隔離と credit 待ちの取消は barrier の後の `performClose` にあるので、grant が来なければ期限まで循環待ちする
+    - sender が列から取り出した転送の request を隔離で拒否する経路は、refund の後に record の回収も receipt の完了もしないので、Tree の close が soft の期限まで待つ
+    - P2: final を受けた時点で wire の receipt を完了するので、credit の grant の精算より前に TREE_DISCONNECT が出うる
+    - P2: acquire の後に親を登録し直すと、祖先ごとの件数が食い違う（production での到達性は未確認）
+  - 次: 3 観点の指摘を codex（luna-max）に再現テスト → 修正 → 変異の順で直させる。期限の判定は soft の callback・final の受理・owner の回収のどの順で届いても
+    同じ結果になるよう、1 つの関数で固定の softAt / hardAt と比べる形に寄せる（1 周目の修正で 3 経路に分かれて食い違ったため）
 
 ## 関連
 

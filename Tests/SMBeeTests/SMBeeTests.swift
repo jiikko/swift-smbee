@@ -4863,6 +4863,7 @@ final class SMBeeTests: XCTestCase {
             credential: .anonymous,
             transport: transport,
             cleanupTimeout: .seconds(5),
+            sessionTime: clock.sessionTime,
             cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
         )
         let closeTask = Task { await session.bestEffortClose(treeId: 1, fileId: [UInt8](repeating: 1, count: 16)) }
@@ -4909,6 +4910,7 @@ final class SMBeeTests: XCTestCase {
             credential: .anonymous,
             transport: transport,
             cleanupTimeout: .seconds(5),
+            sessionTime: clock.sessionTime,
             cleanupTimeoutSleeper: { try await clock.sleep(for: $0) }
         )
         let closeTask = Task {

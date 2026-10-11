@@ -29,11 +29,22 @@ Actors serialize session and tree state. Closures and progress callbacks are
 blocking behavior, and the progress-queue exception are described in
 ``Callbacks``.
 
-Handle, tree, and session cleanup uses a bounded internal deadline. If a server does
-not answer `CLOSE`, `TREE_DISCONNECT`, or `LOGOFF`, SMBee closes the transport and
-invalidates the session rather than retaining an indeterminate server-side resource.
-After such a cleanup failure, create a new ``SMBClientSession`` instead of reusing the
-old one.
+File and scoped Tree cleanup has a soft deadline and a finite hard deadline. The default
+soft budget is five seconds; the hard grace is at most sixty seconds and is shortened by
+`requestTimeout` when configured. If a cleanup request is still waiting for credit or a
+send slot at the soft deadline, SMBee retires it without allocating a MessageId. If the
+request was fully sent, the caller receives a timeout while SMBee drains its response
+until the fixed hard deadline. A missing response before that hard deadline does not by
+itself close the shared transport. Reaching the hard deadline with an unfinished wire
+drain does close the session. Explicit session close still performs terminal teardown.
+
+`withTree` reports a scoped cleanup failure when its body succeeded. When both the body
+and cleanup fail, it preserves the body error. A ``SMBError/treeUnavailable(treeId:operation:)``
+means that the selected Tree is closing or retired; it does not invalidate other Trees on
+the shared session and does not trigger automatic reconnect. If `close()` is called from
+inside a callback that holds an active operation lease, it starts cleanup and returns
+without waiting for that cleanup; calls outside such callbacks wait for the shared cleanup
+to finish.
 
 ## Resolving canonical names on case-insensitive shares
 

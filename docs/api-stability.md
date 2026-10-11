@@ -64,10 +64,12 @@ duration. Work already appended to a resume destination is not rolled back.
   competing operations such as writes to the same path. Callbacks accepted by the actors are
   `@Sendable` and may run away from the caller's executor.
 - Repeated or concurrent `close()` calls on an SMB client session or scoped tree share one
-  cleanup operation; each caller returns after that cleanup finishes. Session close releases
-  reconnect waiters and closes an in-progress candidate without waiting for credential-provider
-  code to return. A scoped-tree setup already in progress gets a bounded grace period; if it does
-  not finish, the affected transport is closed to release it.
+  cleanup operation. Calls outside an active operation lease return after cleanup finishes; a
+  scoped-tree `close()` from a callback holding that lease starts cleanup and returns, while the
+  enclosing `withTree` joins the result. Session close releases reconnect waiters and closes an
+  in-progress candidate without waiting for credential-provider code to return. A scoped-tree
+  setup already in progress gets a bounded grace period; if it does not finish, the affected
+  transport is closed to release it.
 - Cancelling a task requests cooperative cancellation. An in-flight SMB request may send
   SMB2 CANCEL or drain its response to preserve session correlation before returning.
 - `operationTimeout` is also cooperative. It reports `SMBTransportError.timedOut` only
@@ -78,13 +80,24 @@ duration. Work already appended to a resume destination is not rolled back.
   contiguous prefix confirmed by successful WRITE responses. Supplier-based uploads report
   bytes supplied to the transfer, so that progress can include bytes whose WRITE has not yet
   been acknowledged when the operation fails.
-- File/tree/session cleanup has a bounded internal deadline. A missing cleanup response
-  invalidates and closes the transport because the server-side resource state is unknown;
-  callers must establish a new session before continuing.
+- File and scoped Tree cleanup captures one soft deadline when cleanup intent is registered
+  and a finite hard deadline at most 60 seconds later (shortened by `requestTimeout`). An
+  uncommitted request is retired locally at the soft deadline without a MessageId. A fully
+  sent request reports a soft timeout while its response drains until the fixed hard
+  deadline; only an unfinished drain at the hard deadline makes the session terminal.
+  Explicit session close remains terminal teardown. A scoped cleanup failure does not
+  invalidate other Trees on the same session.
+- `withTree` throws a scoped cleanup error after a successful body, and preserves a body
+  error when both body and cleanup fail. `treeUnavailable` is a local Tree admission error,
+  not a reconnect signal. A `close()` issued from a callback that currently holds an active
+  operation lease starts cleanup and returns; calls outside those callbacks join cleanup.
 
 ## Error contract
 
 - `SMBError` represents mapped SMB status, recursive-operation, and session-level errors.
+- `SMBError.treeUnavailable(treeId:operation:)` identifies a closing or retired scoped Tree.
+  `SMBError.cleanupFailed(resource:underlying:)` identifies a cleanup failure and its
+  resource; neither case is an automatic reconnect/retry signal.
 - `SMBTransportError` represents connection failures and operation deadline expiry.
 - `SMBCodecError` represents invalid arguments, malformed/truncated wire data, and local
   consistency checks. It is public so consumers can catch every documented error family.

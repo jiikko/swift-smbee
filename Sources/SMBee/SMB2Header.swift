@@ -361,6 +361,9 @@ actor SMB2CreditWindow {
         let id: UInt64
         let messageId: UInt64?
         let command: UInt16?
+        let treeIdentity: SMBTreeIdentity?
+        let requestIdentity: SMBRequestIdentity?
+        let cancellationToken: SMBTreeCreditCancellationToken?
         let enqueuedAt: ContinuousClock.Instant?
         let continuation: CheckedContinuation<SMB2CreditWindowFastState.Reservation, Error>
     }
@@ -375,6 +378,7 @@ actor SMB2CreditWindow {
     private var grantActorHookForTesting: (@Sendable () async -> Void)?
     private let diagnosticSessionId: String
     private var waiters: [Waiter] = []
+    private var scopedReservationTokens: [SMBRequestIdentity: SMBTreeCreditCancellationToken] = [:]
     private var waiterCountWaiters: [PendingWaiterCountObserver] = []
     private var nextWaiterId: UInt64 = 0
     private var nextWaiterCountObserverId: UInt64 = 0
@@ -398,8 +402,73 @@ actor SMB2CreditWindow {
         fastState.tryReserve(upTo: charge, minimumCharge: charge, onlyWithoutHooks: true)?.remainingBalance
     }
 
-    nonisolated func reserveUpToIfAvailable(maximumCharge: UInt16) -> UInt16? {
-        fastState.tryReserve(upTo: maximumCharge, minimumCharge: 1, onlyWithoutHooks: true)?.charge
+    /// Synchronous Tree-scoped reservation for the uncontended path. The caller remains
+    /// in its actor turn, so no cancellation token or additional actor hop is needed.
+    nonisolated func reserveIfAvailable(
+        charge: UInt16,
+        treeIdentity: SMBTreeIdentity,
+        requestIdentity: SMBRequestIdentity
+    ) -> UInt32? {
+        guard treeIdentity.sessionInstance == requestIdentity.sessionInstance,
+              treeIdentity.generation == requestIdentity.generation else { return nil }
+        return fastState.tryReserve(upTo: charge, minimumCharge: charge, onlyWithoutHooks: true)?.remainingBalance
+    }
+
+    /// Tree-scoped uncontended reservation. It preserves the synchronous fast path while
+    /// atomically claiming the request's one-shot cancellation token.
+    nonisolated func reserveIfAvailable(
+        charge: UInt16,
+        treeIdentity: SMBTreeIdentity,
+        requestIdentity: SMBRequestIdentity,
+        cancellationToken: SMBTreeCreditCancellationToken
+    ) -> UInt32? {
+        guard cancellationToken.tree == treeIdentity,
+              cancellationToken.request == requestIdentity,
+              !cancellationToken.isCancelled,
+              let reservation = fastState.tryReserve(
+                  upTo: charge,
+                  minimumCharge: charge,
+                  onlyWithoutHooks: true
+              ) else {
+            return nil
+        }
+        switch cancellationToken.claimGrant(charge: reservation.charge) {
+        case .owned:
+            guard cancellationToken.acceptGrant() else { return nil }
+            return reservation.remainingBalance
+        case .refundOnce, .rejected:
+            _ = fastState.refund(reservation.charge)
+            return nil
+        }
+    }
+
+    nonisolated func reserveUpToIfAvailable(
+        maximumCharge: UInt16,
+        treeIdentity: SMBTreeIdentity,
+        requestIdentity: SMBRequestIdentity
+    ) -> UInt16? {
+        guard treeIdentity.sessionInstance == requestIdentity.sessionInstance,
+              treeIdentity.generation == requestIdentity.generation else {
+            return nil
+        }
+        return fastState.tryReserve(upTo: maximumCharge, minimumCharge: 1, onlyWithoutHooks: true)?.charge
+    }
+
+    nonisolated func reserveUpToIfAvailableWithBalance(
+        maximumCharge: UInt16,
+        treeIdentity: SMBTreeIdentity,
+        requestIdentity: SMBRequestIdentity
+    ) -> (charge: UInt16, balance: UInt32)? {
+        guard treeIdentity.sessionInstance == requestIdentity.sessionInstance,
+              treeIdentity.generation == requestIdentity.generation,
+              let reservation = fastState.tryReserve(
+                  upTo: maximumCharge,
+                  minimumCharge: 1,
+                  onlyWithoutHooks: true
+              ) else {
+            return nil
+        }
+        return (reservation.charge, reservation.remainingBalance)
     }
 
     nonisolated func grantIfUncontended(totalCredits: UInt64, receiptCount: Int) -> UInt32? {
@@ -454,6 +523,40 @@ actor SMB2CreditWindow {
         return reservation.remainingBalance
     }
 
+    func reserve(
+        charge requestedCharge: UInt16,
+        treeIdentity: SMBTreeIdentity,
+        requestIdentity: SMBRequestIdentity,
+        cancellationToken: SMBTreeCreditCancellationToken
+    ) async throws -> UInt32 {
+        guard cancellationToken.tree == treeIdentity,
+              cancellationToken.request == requestIdentity,
+              scopedReservationTokens[requestIdentity] == nil else {
+            throw CancellationError()
+        }
+        scopedReservationTokens[requestIdentity] = cancellationToken
+        defer { scopedReservationTokens.removeValue(forKey: requestIdentity) }
+        guard !cancellationToken.isCancelled else { throw CancellationError() }
+        let reservation = try await reserveCredits(
+            upTo: requestedCharge,
+            minimumCharge: requestedCharge,
+            messageId: nil,
+            command: nil,
+            treeIdentity: treeIdentity,
+            requestIdentity: requestIdentity,
+            cancellationToken: cancellationToken
+        )
+        // Optional-chained so an unset hook adds no suspension between claim and accept.
+        await cancellationToken.refundInterleavingHookForTesting?(
+            .grantClaimedBeforeAccept(charge: reservation.charge)
+        )
+        guard cancellationToken.acceptGrant() else {
+            throw CancellationError()
+        }
+        await reservationAcquiredHookForTesting?(reservation.charge)
+        return reservation.remainingBalance
+    }
+
     /// Atomically reserves up to `maximumCharge`, but wakes as soon as one credit is
     /// available. Variable length READ/WRITE callers then size the packet to the exact
     /// reservation. This avoids parking behind a stale multi-credit size estimate when a
@@ -469,6 +572,38 @@ actor SMB2CreditWindow {
             messageId: messageId,
             command: command
         )
+    }
+
+    /// Reserves credits for one Tree-scoped request. The caller creates the token before
+    /// entering this actor; Tree quarantine can therefore cancel before waiter registration.
+    /// Production requests use this overload after Tree identity and request owner capture.
+    func reserveUpTo(
+        maximumCharge: UInt16,
+        treeIdentity: SMBTreeIdentity,
+        requestIdentity: SMBRequestIdentity,
+        cancellationToken: SMBTreeCreditCancellationToken
+    ) async throws -> UInt16 {
+        guard cancellationToken.tree == treeIdentity, cancellationToken.request == requestIdentity else {
+            throw CancellationError()
+        }
+        guard scopedReservationTokens[requestIdentity] == nil else {
+            throw CancellationError()
+        }
+        scopedReservationTokens[requestIdentity] = cancellationToken
+        defer { scopedReservationTokens.removeValue(forKey: requestIdentity) }
+        guard !cancellationToken.isCancelled else { throw CancellationError() }
+
+        let reservation = try await reserveUpToResult(
+            maximumCharge: maximumCharge,
+            waitIfUnavailable: true,
+            messageId: nil,
+            command: nil,
+            treeIdentity: treeIdentity,
+            requestIdentity: requestIdentity,
+            cancellationToken: cancellationToken
+        )
+        guard cancellationToken.acceptGrant() else { throw CancellationError() }
+        return reservation.charge
     }
 
     /// Performs the same immediate reservation as `reserveUpTo`, but optionally returns
@@ -506,11 +641,47 @@ actor SMB2CreditWindow {
         return (reservation.charge, reservation.remainingBalance)
     }
 
+    /// Tree-scoped transfer preparation. The token is registered before this actor can park
+    /// the waiter, so quarantine can cancel either an already parked or a late-arriving wait.
+    func reserveUpToWithBalance(
+        maximumCharge: UInt16,
+        waitIfUnavailable: Bool,
+        treeIdentity: SMBTreeIdentity,
+        requestIdentity: SMBRequestIdentity,
+        cancellationToken: SMBTreeCreditCancellationToken
+    ) async throws -> (charge: UInt16, balance: UInt32) {
+        guard cancellationToken.tree == treeIdentity,
+              cancellationToken.request == requestIdentity,
+              scopedReservationTokens[requestIdentity] == nil else {
+            throw CancellationError()
+        }
+        scopedReservationTokens[requestIdentity] = cancellationToken
+        defer { scopedReservationTokens.removeValue(forKey: requestIdentity) }
+        guard !cancellationToken.isCancelled else { throw CancellationError() }
+
+        let reservation = try await reserveUpToResult(
+            maximumCharge: maximumCharge,
+            waitIfUnavailable: waitIfUnavailable,
+            messageId: nil,
+            command: nil,
+            treeIdentity: treeIdentity,
+            requestIdentity: requestIdentity,
+            cancellationToken: cancellationToken
+        )
+        if reservation.charge > 0, !cancellationToken.acceptGrant() {
+            throw CancellationError()
+        }
+        return (reservation.charge, reservation.remainingBalance)
+    }
+
     private func reserveUpToResult(
         maximumCharge: UInt16,
         waitIfUnavailable: Bool,
         messageId: UInt64?,
-        command: UInt16?
+        command: UInt16?,
+        treeIdentity: SMBTreeIdentity? = nil,
+        requestIdentity: SMBRequestIdentity? = nil,
+        cancellationToken: SMBTreeCreditCancellationToken? = nil
     ) async throws -> SMB2CreditWindowFastState.Reservation {
         let reservation = try await reserveCredits(
             upTo: maximumCharge,
@@ -518,7 +689,10 @@ actor SMB2CreditWindow {
             messageId: messageId,
             command: command,
             waitIfUnavailable: waitIfUnavailable,
-            preserveWaiterFIFO: !waitIfUnavailable
+            preserveWaiterFIFO: !waitIfUnavailable,
+            treeIdentity: treeIdentity,
+            requestIdentity: requestIdentity,
+            cancellationToken: cancellationToken
         )
         if waitIfUnavailable || reservation.charge > 0 {
             await reservationAcquiredHookForTesting?(reservation.charge)
@@ -532,10 +706,16 @@ actor SMB2CreditWindow {
         messageId: UInt64?,
         command: UInt16?,
         waitIfUnavailable: Bool = true,
-        preserveWaiterFIFO: Bool = false
+        preserveWaiterFIFO: Bool = false,
+        treeIdentity: SMBTreeIdentity? = nil,
+        requestIdentity: SMBRequestIdentity? = nil,
+        cancellationToken: SMBTreeCreditCancellationToken? = nil
     ) async throws -> SMB2CreditWindowFastState.Reservation {
         if case .failed(let error) = state {
             throw error
+        }
+        if let cancellationToken, cancellationToken.isCancelled {
+            throw CancellationError()
         }
         guard requestedCharge > 0, minimumCharge > 0 else {
             return SMB2CreditWindowFastState.Reservation(charge: 0, remainingBalance: balance)
@@ -546,6 +726,16 @@ actor SMB2CreditWindow {
                minimumCharge: minimumCharge,
                onlyWithoutHooks: false
            ) {
+            if let cancellationToken {
+                let claim = cancellationToken.claimGrant(charge: reservation.charge)
+                switch claim {
+                case .owned:
+                    break
+                case .refundOnce, .rejected:
+                    _ = fastState.refund(reservation.charge)
+                    throw CancellationError()
+                }
+            }
             return reservation
         }
         guard waitIfUnavailable else {
@@ -566,6 +756,10 @@ actor SMB2CreditWindow {
                     continuation.resume(throwing: error)
                     return
                 }
+                if let cancellationToken, cancellationToken.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
                 let enqueuedAt = SMBPerfLog.effectiveIsEnabled ? ContinuousClock.now : nil
                 fastState.setWaitersPending(true)
                 waiters.append(Waiter(
@@ -574,6 +768,9 @@ actor SMB2CreditWindow {
                     id: id,
                     messageId: messageId,
                     command: command,
+                    treeIdentity: treeIdentity,
+                    requestIdentity: requestIdentity,
+                    cancellationToken: cancellationToken,
                     enqueuedAt: enqueuedAt,
                     continuation: continuation
                 ))
@@ -605,6 +802,46 @@ actor SMB2CreditWindow {
         for waiter in parked {
             waiter.continuation.resume(throwing: error)
         }
+    }
+
+    /// Cancels only the selected requests in one Tree incarnation. The shared credit window
+    /// remains active, so unrelated Tree waiters and the transport retain their FIFO state.
+    @discardableResult
+    func cancelWaiters(
+        treeIdentity: SMBTreeIdentity,
+        requestIdentities: Set<SMBRequestIdentity>,
+        error: Error
+    ) -> Int {
+        guard !requestIdentities.isEmpty else { return 0 }
+
+        for requestIdentity in requestIdentities {
+            guard let token = scopedReservationTokens[requestIdentity], token.tree == treeIdentity else { continue }
+            if let charge = token.cancel() { _ = fastState.refund(charge) }
+        }
+
+        fastState.beginWaiterDrain()
+        var cancelledCount = 0
+        var retained: [Waiter] = []
+        retained.reserveCapacity(waiters.count)
+        for waiter in waiters {
+            let matchesTree = waiter.treeIdentity == treeIdentity
+            var matchesRequest = false
+            if let requestIdentity = waiter.requestIdentity {
+                matchesRequest = requestIdentities.contains(requestIdentity)
+            }
+            if matchesTree && matchesRequest {
+                if let token = waiter.cancellationToken, let charge = token.cancel() {
+                    _ = fastState.refund(charge)
+                }
+                cancelledCount += 1
+                waiter.continuation.resume(throwing: error)
+            } else {
+                retained.append(waiter)
+            }
+        }
+        waiters = retained
+        resumeReadyWaiters()
+        return cancelledCount
     }
 
     func reset(initialCredits: UInt32) {
@@ -668,6 +905,17 @@ actor SMB2CreditWindow {
         while let waiter = waiters.first, balance >= UInt32(waiter.minimumCharge) {
             waiters.removeFirst()
             guard let reservation = fastState.reserveForWaiter(upTo: waiter.charge) else { break }
+            if let cancellationToken = waiter.cancellationToken {
+                let claim = cancellationToken.claimGrant(charge: reservation.charge)
+                switch claim {
+                case .owned:
+                    break
+                case .refundOnce, .rejected:
+                    _ = fastState.refund(reservation.charge)
+                    waiter.continuation.resume(throwing: CancellationError())
+                    continue
+                }
+            }
             if let enqueuedAt = waiter.enqueuedAt {
                 SMBPerfLog.line(
                     "[wire] credit_granted session=\(diagnosticSessionId) " +

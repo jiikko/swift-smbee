@@ -156,6 +156,7 @@ final class SMBSessionExecutorTests: XCTestCase {
             transport: InMemoryTransport(mode: .waitUntilClosed),
             cleanupTimeout: .seconds(5),
             requestTimeout: .seconds(7),
+            sessionTime: cleanupSleeper.sessionTime,
             requestTimeoutSleeper: { try await drainSleeper.sleep(for: $0) },
             cleanupTimeoutSleeper: { try await cleanupSleeper.sleep(for: $0) }
         )
@@ -217,14 +218,16 @@ final class SMBSessionExecutorTests: XCTestCase {
             XCTFail("sent cleanup unexpectedly completed")
         } catch SMBTransportError.timedOut {
         }
-        try await smbIssue102AwaitWithTimeout("cleanup drain timer sleeps") {
-            try await drainSleeper.waitUntilCallCount(
-                atLeast: 1,
+        try await smbIssue102AwaitWithTimeout("fixed cleanup hard deadline sleeps") {
+            try await cleanupSleeper.waitUntilCallCount(
+                atLeast: 3,
                 timeout: .seconds(60),
                 sleeper: { try await Task.sleep(for: $0) }
             )
         }
-        XCTAssertTrue(drainSleeper.fireNext())
+        XCTAssertEqual(cleanupSleeper.requestedDurations, [.seconds(5), .seconds(5), .seconds(7)])
+        XCTAssertEqual(drainSleeper.callCount, 0, "scoped cleanup no longer uses a second request-timeout adapter")
+        XCTAssertTrue(cleanupSleeper.fireNext())
         try await smbIssue102AwaitWithTimeout("cleanup drain timeout closes the session") {
             while !executorEvents.contains(.cleanupDrainTimeoutWake) {
                 await Task.yield()

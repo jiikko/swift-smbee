@@ -868,17 +868,21 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
 class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked Sendable {
     private let watchLock = NSLock()
     private let autoRespondChangeNotify: Bool
+    private let holdCloseResponses: Bool
     private var createRequests: [SMB2Header] = []
     private var completedCreateCount = 0
     private var treeConnectRequest: SMB2Header?
     private var treeDisconnectRequest: SMB2Header?
+    private var queryInfoRequest: SMB2Header?
+    private var closeRequest: SMB2Header?
     private var changeNotifyRequest: SMB2Header?
     private var watchedCommands: [UInt16] = []
     private var treeDisconnectTreeIDs: [UInt32] = []
     private var afterCommandSignalHook: (@Sendable (UInt16) async -> Void)?
 
-    init(autoRespondChangeNotify: Bool = false) {
+    init(autoRespondChangeNotify: Bool = false, holdCloseResponses: Bool = false) {
         self.autoRespondChangeNotify = autoRespondChangeNotify
+        self.holdCloseResponses = holdCloseResponses
         super.init(inbound: [])
     }
 
@@ -892,10 +896,12 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
             watchedCommands.append(header.command)
             switch header.command {
             case SMB2Commands.create: createRequests.append(header)
+            case SMB2Commands.close: closeRequest = header
             case SMB2Commands.treeConnect: treeConnectRequest = header
             case SMB2Commands.treeDisconnect:
                 treeDisconnectRequest = header
                 treeDisconnectTreeIDs.append(header.treeId)
+            case SMB2Commands.queryInfo: queryInfoRequest = header
             case SMB2Commands.changeNotify: changeNotifyRequest = header
             default: break
             }
@@ -904,7 +910,9 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
         let hook = watchLock.withLock { afterCommandSignalHook }
         await hook?(header.command)
         switch header.command {
-        case SMB2Commands.close, SMB2Commands.logoff:
+        case SMB2Commands.close where !holdCloseResponses:
+            try respond(status: SMB2Status.success, to: header)
+        case SMB2Commands.logoff:
             try respond(status: SMB2Status.success, to: header)
         case SMB2Commands.changeNotify where autoRespondChangeNotify:
             try respond(status: SMB2Status.accessDenied, to: header)
@@ -949,13 +957,18 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
         try enqueue(response)
     }
 
-    func completeTreeConnect(status: UInt32 = SMB2Status.success, treeId: UInt32 = 0x5566) throws {
+    func completeTreeConnect(
+        status: UInt32 = SMB2Status.success,
+        treeId: UInt32 = 0x5566,
+        credits: UInt16 = 1
+    ) throws {
         guard let request = watchLock.withLock({ treeConnectRequest }) else {
             throw SMBCodecError.invalidValue("test transport has no TREE_CONNECT request")
         }
         var response = try SMB2Header(
             status: status,
             command: SMB2Commands.treeConnect,
+            credits: credits,
             messageId: request.messageId,
             treeId: treeId,
             sessionId: request.sessionId
@@ -968,11 +981,36 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
         try enqueue(response)
     }
 
-    func completeTreeDisconnect() throws {
+    func completeTreeDisconnect(status: UInt32 = SMB2Status.success) throws {
         guard let request = watchLock.withLock({ treeDisconnectRequest }) else {
             throw SMBCodecError.invalidValue("test transport has no TREE_DISCONNECT request")
         }
-        try respond(status: SMB2Status.success, to: request)
+        try respond(status: status, to: request)
+    }
+
+    func completeClose(status: UInt32 = SMB2Status.success) throws {
+        guard let request = watchLock.withLock({ closeRequest }) else {
+            throw SMBCodecError.invalidValue("test transport has no CLOSE request")
+        }
+        try respond(status: status, to: request)
+    }
+
+    func completeQueryInfo(fileSize: UInt64 = 0) throws {
+        guard let request = watchLock.withLock({ queryInfoRequest }) else {
+            throw SMBCodecError.invalidValue("test transport has no QUERY_INFO request")
+        }
+        var response = try SMB2Header(
+            command: SMB2Commands.queryInfo,
+            credits: 4,
+            messageId: request.messageId,
+            treeId: request.treeId,
+            sessionId: request.sessionId
+        ).encode()
+        response.append(contentsOf: [9, 0, 72, 0, 56, 0, 0, 0])
+        var information = Array(repeating: UInt8(0), count: 56)
+        writeUInt64LE(fileSize, to: &information, at: 40)
+        response.append(contentsOf: information)
+        try enqueue(response)
     }
 
     func completeChangeNotify(status: UInt32 = SMB2Status.notifyEnumDir) throws {
@@ -1415,6 +1453,33 @@ final class SMBContinuationAsyncGate: @unchecked Sendable {
         let waiter = lock.withLock { waiters.removeValue(forKey: id) }
         waiter?.timeoutTask?.cancel()
         waiter?.continuation.resume(throwing: CancellationError())
+    }
+}
+
+final class SMBContinuationBooleanLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Bool?
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    func signal(_ value: Bool) {
+        let waiter = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+            guard result == nil else { return nil }
+            result = value
+            defer { continuation = nil }
+            return continuation
+        }
+        waiter?.resume(returning: value)
+    }
+
+    func wait() async -> Bool {
+        await withCheckedContinuation { waiter in
+            let ready = lock.withLock { () -> Bool? in
+                if let result { return result }
+                continuation = waiter
+                return nil
+            }
+            if let ready { waiter.resume(returning: ready) }
+        }
     }
 }
 

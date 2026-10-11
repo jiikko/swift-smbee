@@ -1311,9 +1311,12 @@ final class SMBReadPipelineTests: XCTestCase {
 
     func testCreditWaitReturnsAfterIndependentClientClose() async throws {
         let transport = SMBReadPipelineScriptTransport()
-        let virtualTime = SMBReadPipelineVirtualClock()
-        let sessionTime = SMBSessionMonotonicTime(now: { virtualTime.now() }, sleep: { _ in })
         let cleanupSleeper = ManualSMBSleeper()
+        let virtualTime = SMBReadPipelineVirtualClock(backingSleeper: cleanupSleeper)
+        let sessionTime = SMBSessionMonotonicTime(
+            now: { virtualTime.now() },
+            sleep: { try await cleanupSleeper.sleep(for: $0) }
+        )
         let session = makeSession(
             transport: transport,
             credits: 1,
@@ -1347,7 +1350,7 @@ final class SMBReadPipelineTests: XCTestCase {
         }
 
         let close = Task { await client.close() }
-        try await waitForSleeperCall(cleanupSleeper, count: 1, label: "TREE_DISCONNECT cleanup timeout")
+        try await waitForSleeperCall(cleanupSleeper, count: 1, label: "session close lease-barrier timeout")
         cleanupSleeper.fireNext()
         try await smbIssue102AwaitWithTimeout("client close tears down the session") { await close.value }
 
@@ -2206,17 +2209,26 @@ private final class SMBReadPipelineVirtualClock: @unchecked Sendable {
     private var instant = ContinuousClock.now
     private var observingNow = false
     private let observedNowBarrier = SMBContinuationCountBarrier()
+    private let backingSleeper: ManualSMBSleeper?
+
+    init(backingSleeper: ManualSMBSleeper? = nil) {
+        self.backingSleeper = backingSleeper
+    }
 
     func now() -> ContinuousClock.Instant {
         let result = lock.withLock { () -> (ContinuousClock.Instant, Bool) in
-            (instant, observingNow)
+            (backingSleeper?.sessionTime.now() ?? instant, observingNow)
         }
         if result.1 { observedNowBarrier.signal() }
         return result.0
     }
 
     func advance(by duration: Duration) {
-        lock.withLock { instant += duration }
+        if let backingSleeper {
+            backingSleeper.advance(by: duration)
+        } else {
+            lock.withLock { instant += duration }
+        }
     }
 
     func startObservingNow() {

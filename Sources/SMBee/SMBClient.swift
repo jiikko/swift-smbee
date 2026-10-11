@@ -871,6 +871,7 @@ public actor SMBClientSession {
 
     private var session: SMBSession
     private var treeId: UInt32
+    private let facadeOwner = SMBFacadeOwnerAllocator.make()
     private var childTrees: [UUID: ScopedTree] = [:]
     private var treeSetupSessions: [UUID: SMBSession] = [:]
     private let reconnectInfo: ReconnectInfo?
@@ -908,6 +909,10 @@ public actor SMBClientSession {
 
     func wireSessionForTesting() -> SMBSession {
         session
+    }
+
+    func facadeOwnerForTesting() -> SMBFacadeOwner {
+        facadeOwner
     }
 
     func installSymbolicLinkReparsePointForTesting(path: String, target: String) async throws {
@@ -1071,6 +1076,10 @@ public actor SMBClientSession {
 
     private func close(onEvent: (@Sendable (SMBClientCloseEvent) -> Void)?) async {
         if let closeTask {
+            guard !SMBOperationTaskContext.hasActiveLease() else {
+                onEvent?(.returnedWithoutJoining)
+                return
+            }
             onEvent?(.joinedExistingCleanup)
             await closeTask.value
             return
@@ -1083,6 +1092,7 @@ public actor SMBClientSession {
         isClosed = true
         let closingSession = session
         let closingTreeId = treeId
+        let closingChildren = Array(childTrees.values)
         let waiters = Array(reconnectWaiters.values)
         reconnectWaiters.removeAll()
         waiters.forEach { $0.resume(throwing: SMBError.connectionLost(operation: "RECONNECT")) }
@@ -1095,15 +1105,39 @@ public actor SMBClientSession {
         self.keepAliveTask = nil
         keepAliveTask?.cancel()
 
-        let task = Task {
-            await self.performClose(
-                session: closingSession,
-                treeId: closingTreeId,
-                candidateSession: candidateSession,
-                keepAliveTask: keepAliveTask
+        await closingSession.registerFacade(owner: facadeOwner)
+        for child in closingChildren {
+            await child.child.prepareCloseIntentIfMatching(
+                session: child.session,
+                treeId: child.treeId
             )
         }
+        let task = Task {
+            let disposition = await closingSession.closeFacade(
+                owner: facadeOwner,
+                joinEvenInsideLease: true,
+                sessionCloseBarrierDeadline: true
+            ) {
+                await self.performClose(
+                    session: closingSession,
+                    treeId: closingTreeId,
+                    candidateSession: candidateSession,
+                    keepAliveTask: keepAliveTask
+                )
+                return .success
+            }
+            if case .joined(.failed) = disposition {
+                await closingSession.closeTransportAndWait(
+                    cause: "client_close_operation_barrier_timeout",
+                    diagnosticError: SMBTransportError.timedOut
+                )
+            }
+        }
         closeTask = task
+        guard !SMBOperationTaskContext.hasActiveLease() else {
+            onEvent?(.returnedWithoutJoining)
+            return
+        }
         await task.value
     }
 
@@ -1277,7 +1311,19 @@ public actor SMBClientSession {
             finishTreeSetup(setupID)
             throw SMBError.connectionLost(operation: "SESSION")
         }
-        let child = SMBClientTreeSession(session: setupSession, treeId: childTreeId)
+        guard let childIdentity = await setupSession.treeIdentity(treeId: childTreeId) else {
+            finishTreeSetup(setupID)
+            throw SMBError.protocolError("TREE_CONNECT did not publish its Tree identity")
+        }
+        let childOwner = SMBFacadeOwnerAllocator.make()
+        await setupSession.registerFacade(owner: facadeOwner)
+        await setupSession.registerFacade(owner: childOwner, parent: facadeOwner)
+        let child = SMBClientTreeSession(
+            session: setupSession,
+            treeId: childTreeId,
+            treeIdentity: childIdentity,
+            facadeOwner: childOwner
+        )
         let childID = UUID()
         // The child retains the exact wire session and TreeId that TREE_CONNECT returned, so
         // close cannot accidentally apply a stale TreeId to a replacement reconnect session.
@@ -1286,15 +1332,50 @@ public actor SMBClientSession {
         guard !isClosed else {
             throw SMBError.connectionLost(operation: "SESSION")
         }
-        do {
-            let result = try await operation(child)
-            await child.close()
+        guard let parentLease = await setupSession.acquireOperationLease(owner: facadeOwner, tree: nil) else {
+            let cleanup = await child.closeReporting(joinEvenInsideLease: true)
             childTrees[childID] = nil
-            return result
-        } catch {
-            await child.close()
+            await setupSession.retireFacade(owner: childOwner)
+            if case .failed(let reason) = cleanup {
+                throw SMBError.cleanupFailed(resource: .tree(treeId: childTreeId), underlying: reason)
+            }
+            throw SMBError.treeUnavailable(treeId: childTreeId, operation: "withTree")
+        }
+        guard let childLease = await setupSession.acquireOperationLease(owner: childOwner, tree: childIdentity) else {
+            await setupSession.releaseOperationLease(parentLease)
+            let cleanup = await child.closeReporting(joinEvenInsideLease: true)
             childTrees[childID] = nil
-            throw error
+            await setupSession.retireFacade(owner: childOwner)
+            if case .failed(let reason) = cleanup {
+                throw SMBError.cleanupFailed(resource: .tree(treeId: childTreeId), underlying: reason)
+            }
+            throw SMBError.treeUnavailable(treeId: childTreeId, operation: "withTree")
+        }
+
+        let bodyResult: Result<T, Error> = await SMBOperationTaskContext.withLease(parentLease) {
+            await SMBOperationTaskContext.withLease(childLease) {
+                do { return .success(try await operation(child)) } catch { return .failure(error) }
+            }
+        }
+        await setupSession.releaseOperationLease(childLease)
+        await setupSession.releaseOperationLease(parentLease)
+        let cleanup = await child.closeReporting(joinEvenInsideLease: true)
+        childTrees[childID] = nil
+        await setupSession.retireFacade(owner: childOwner)
+        if let operationContext = SMBOperationDeadline.operationContext,
+           Task.isCancelled,
+           operationContext.now() >= operationContext.deadline {
+            throw SMBTransportError.timedOut
+        }
+        switch bodyResult {
+        case .failure(let bodyError):
+            throw bodyError
+        case .success(let value):
+            if Task.isCancelled { throw CancellationError() }
+            if case .failed(let reason) = cleanup {
+                throw SMBError.cleanupFailed(resource: .tree(treeId: childTreeId), underlying: reason)
+            }
+            return value
         }
     }
 
@@ -2205,51 +2286,120 @@ enum SMBDirectoryEntrySelection {
 public actor SMBClientTreeSession {
     private let session: SMBSession
     private let treeId: UInt32
+    private let treeIdentity: SMBTreeIdentity?
+    private let facadeOwner: SMBFacadeOwner
     private var isClosed = false
-    private var closeTask: Task<Void, Never>?
+    private var cleanupIntent: SMBTreeCleanupIntent?
+    private var closeOutcome: SMBOperationCloseOutcome?
 
-    init(session: SMBSession, treeId: UInt32) {
+    init(
+        session: SMBSession,
+        treeId: UInt32,
+        treeIdentity: SMBTreeIdentity? = nil,
+        facadeOwner: SMBFacadeOwner = SMBFacadeOwnerAllocator.make()
+    ) {
         self.session = session
         self.treeId = treeId
+        self.treeIdentity = treeIdentity
+        self.facadeOwner = facadeOwner
     }
 
     public func close() async {
-        await close(onEvent: nil)
+        _ = await closeReporting()
     }
 
     func closeForTesting(onEvent: @escaping @Sendable (SMBClientCloseEvent) -> Void) async {
-        await close(onEvent: onEvent)
+        _ = await closeReporting(onEvent: onEvent)
     }
 
     func closeIfMatching(session expectedSession: SMBSession, treeId expectedTreeId: UInt32) async {
         guard session === expectedSession, treeId == expectedTreeId else { return }
-        await close(onEvent: nil)
+        _ = await closeReporting()
     }
 
-    private func close(onEvent: (@Sendable (SMBClientCloseEvent) -> Void)?) async {
-        if let closeTask {
-            onEvent?(.joinedExistingCleanup)
-            await closeTask.value
-            return
-        }
-        guard !isClosed else {
-            onEvent?(.returnedWithoutJoining)
-            return
-        }
+    func prepareCloseIntentIfMatching(session expectedSession: SMBSession, treeId expectedTreeId: UInt32) async {
+        guard session === expectedSession, treeId == expectedTreeId else { return }
         isClosed = true
-        let task = Task {
-            await session.bestEffortTreeDisconnect(treeId: treeId)
+        if cleanupIntent != nil { return }
+        let resolvedIdentity: SMBTreeIdentity?
+        if let treeIdentity { resolvedIdentity = treeIdentity } else { resolvedIdentity = await session.ensureTreeIdentity(treeId: treeId) }
+        guard let resolvedIdentity else { return }
+        await session.registerFacade(owner: facadeOwner)
+        cleanupIntent = await session.prepareTreeCleanupIntent(
+            resolvedIdentity,
+            facadeOwner: facadeOwner
+        )
+    }
+
+    func closeReporting() async -> SMBOperationCloseOutcome {
+        await closeReporting(onEvent: nil, joinEvenInsideLease: false)
+    }
+
+    func closeReporting(joinEvenInsideLease: Bool) async -> SMBOperationCloseOutcome {
+        await closeReporting(onEvent: nil, joinEvenInsideLease: joinEvenInsideLease)
+    }
+
+    private func closeReporting(
+        onEvent: (@Sendable (SMBClientCloseEvent) -> Void)?,
+        joinEvenInsideLease: Bool = false
+    ) async -> SMBOperationCloseOutcome {
+        if let closeOutcome {
+            onEvent?(.joinedExistingCleanup)
+            return closeOutcome
         }
-        closeTask = task
-        await task.value
+        let wasClosed = isClosed
+        isClosed = true
+        let resolvedIdentity: SMBTreeIdentity?
+        if let treeIdentity { resolvedIdentity = treeIdentity } else { resolvedIdentity = await session.ensureTreeIdentity(treeId: treeId) }
+        guard let resolvedIdentity else {
+            onEvent?(wasClosed ? .returnedWithoutJoining : .returnedWithoutJoining)
+            return .failed("TREE_DISCONNECT could not register cleanup intent")
+        }
+        await session.registerFacade(owner: facadeOwner)
+        let intent: SMBTreeCleanupIntent
+        if let cleanupIntent {
+            intent = cleanupIntent
+        } else if let prepared = await session.prepareTreeCleanupIntent(
+            resolvedIdentity,
+            facadeOwner: facadeOwner
+        ) {
+            intent = prepared
+        } else {
+            onEvent?(.returnedWithoutJoining)
+            await session.retireFacade(owner: facadeOwner)
+            return .failed("TREE_DISCONNECT could not register cleanup intent")
+        }
+        cleanupIntent = intent
+        let wireSession = session
+        let willJoinExistingCleanup = joinEvenInsideLease || !SMBOperationTaskContext.hasActiveLease()
+        if wasClosed && willJoinExistingCleanup {
+            onEvent?(.joinedExistingCleanup)
+        }
+        let disposition = await session.closeFacade(
+            owner: facadeOwner,
+            joinEvenInsideLease: joinEvenInsideLease
+        ) {
+            await wireSession.performTreeCleanup(intent, identity: resolvedIdentity)
+        }
+        switch disposition {
+        case .startedOnly:
+            if !(wasClosed && willJoinExistingCleanup) { onEvent?(.returnedWithoutJoining) }
+            return .failed("TREE_DISCONNECT cleanup started")
+        case .joined(let outcome):
+            closeOutcome = outcome
+            await session.retireFacade(owner: facadeOwner)
+            return outcome
+        }
     }
 
     public func list(path: String = "") async throws -> [SMBDirectoryEntry] {
-        let collector = SMBDirectoryEntryCollector()
-        try await withDirectoryStream(path: path) { entry in
-            collector.append(entry)
+        try await withOperationLease(operation: "LIST") {
+            let collector = SMBDirectoryEntryCollector()
+            try await withDirectoryStream(path: path) { entry in
+                collector.append(entry)
+            }
+            return collector.entries
         }
-        return collector.entries
     }
 
     /// - Parameter onEntry: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
@@ -2257,58 +2407,78 @@ public actor SMBClientTreeSession {
         path: String = "",
         onEntry: @escaping @Sendable (SMBDirectoryEntry) async throws -> Void
     ) async throws {
-        try ensureOpen()
-        let fileId = try await session.create(treeId: treeId, path: path, directory: true)
-        do {
-            try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
-            await session.bestEffortClose(treeId: treeId, fileId: fileId)
-        } catch {
-            await session.bestEffortClose(treeId: treeId, fileId: fileId)
-            throw error
+        try await withOperationLease(operation: "QUERY_DIRECTORY") {
+            let fileId = try await session.create(treeId: treeId, path: path, directory: true)
+            do {
+                try await session.queryDirectory(treeId: treeId, fileId: fileId, onEntry: onEntry)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
+            } catch {
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
+                throw error
+            }
         }
     }
 
     public func stat(path: String) async throws -> SMBFileStat {
-        try ensureOpen()
-        let fileId = try await session.createForMetadata(treeId: treeId, path: path)
-        do {
-            let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
-            await session.bestEffortClose(treeId: treeId, fileId: fileId)
-            return stat
-        } catch {
-            await session.bestEffortClose(treeId: treeId, fileId: fileId)
-            throw error
+        try await withOperationLease(operation: "QUERY_INFO") {
+            let fileId = try await session.createForMetadata(treeId: treeId, path: path)
+            do {
+                let stat = try await session.queryInfo(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
+                return stat
+            } catch {
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
+                throw error
+            }
         }
     }
 
     public func readlink(path: String) async throws -> SMBReparsePoint {
-        try ensureOpen()
-        let fileId = try await session.create(treeId: treeId, request: .reparsePoint(path: path))
-        do {
-            let reparsePoint = try await session.reparsePoint(treeId: treeId, fileId: fileId)
-            await session.bestEffortClose(treeId: treeId, fileId: fileId)
-            return reparsePoint
-        } catch {
-            await session.bestEffortClose(treeId: treeId, fileId: fileId)
-            throw error
+        try await withOperationLease(operation: "READLINK") {
+            let fileId = try await session.create(treeId: treeId, request: .reparsePoint(path: path))
+            do {
+                let reparsePoint = try await session.reparsePoint(treeId: treeId, fileId: fileId)
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
+                return reparsePoint
+            } catch {
+                await session.bestEffortClose(treeId: treeId, fileId: fileId)
+                throw error
+            }
         }
     }
 
     /// Enumerate server shares through the SRVSVC named pipe on this tree.
     /// This is intended for an IPC$ tree returned by `SMBClientSession.withTree`.
     public func listShares() async throws -> [SMBShareInfo] {
-        try ensureOpen()
-        return try await session.listShares(treeId: treeId)
+        try await withOperationLease(operation: "LIST_SHARES") {
+            try await session.listShares(treeId: treeId)
+        }
     }
 
     public func dfsReferral(path: String) async throws -> SMBDfsReferralResult {
-        try ensureOpen()
-        return try await session.dfsReferral(treeId: treeId, path: path)
+        try await withOperationLease(operation: "DFS_REFERRAL") {
+            try await session.dfsReferral(treeId: treeId, path: path)
+        }
     }
 
-    private func ensureOpen() throws {
-        if isClosed {
-            throw SMBError.connectionLost(operation: "TREE")
+    private func withOperationLease<T: Sendable>(
+        operation: String,
+        body: @Sendable () async throws -> T
+    ) async throws -> T {
+        if isClosed { throw SMBError.treeUnavailable(treeId: treeId, operation: operation) }
+        let identity: SMBTreeIdentity?
+        if let treeIdentity { identity = treeIdentity } else { identity = await session.ensureTreeIdentity(treeId: treeId) }
+        await session.registerFacade(owner: facadeOwner)
+        guard let lease = await session.acquireOperationLease(owner: facadeOwner, tree: identity) else {
+            throw SMBError.treeUnavailable(treeId: treeId, operation: operation)
+        }
+        do {
+            let value = try await SMBOperationTaskContext.withLease(lease, operation: body)
+            await session.releaseOperationLease(lease)
+            return value
+        } catch {
+            await session.releaseOperationLease(lease)
+            throw error
         }
     }
 }
@@ -5029,6 +5199,12 @@ enum SMBRequestCreditState: Equatable, Sendable {
     case discardedOnTerminal
 }
 
+private enum SMBOperationBarrierProgress {
+    case stateChanged
+    case precommitRetirementSettled
+    case terminalJoinCompleted
+}
+
 struct SMBRequestRecordSnapshot: Sendable {
     let identity: SMBRequestIdentity
     let caller: SMBRequestCallerState
@@ -5528,11 +5704,22 @@ actor SMBUnsentRequestRecord {
 private final class SMBPreReservedCredit: @unchecked Sendable {
     private let lock = NSLock()
     let charge: UInt16
+    let treeIdentity: SMBTreeIdentity?
+    let requestIdentity: SMBRequestIdentity?
+    let cancellationToken: SMBTreeCreditCancellationToken?
     private var claimed = false
     private var released = false
 
-    init(charge: UInt16) {
+    init(
+        charge: UInt16,
+        treeIdentity: SMBTreeIdentity? = nil,
+        requestIdentity: SMBRequestIdentity? = nil,
+        cancellationToken: SMBTreeCreditCancellationToken? = nil
+    ) {
         self.charge = charge
+        self.treeIdentity = treeIdentity
+        self.requestIdentity = requestIdentity
+        self.cancellationToken = cancellationToken
     }
 
     var payloadLimit: UInt64 {
@@ -5631,6 +5818,7 @@ private struct SMBResponseCorrelationState {
     let expectedTreeId: UInt32
     let longPoll: Bool
     let cleanupFileId: SMBFileIdLedgerKey?
+    let cleanupTreeIdentity: SMBTreeIdentity?
     let responseProtectionPolicy: SMBResponseProtectionPolicy
     var asyncId: UInt64?
     var pendingCount: Int
@@ -5640,11 +5828,13 @@ private struct SMBResponseCorrelationState {
 private struct SMBFileIdLedgerKey: Hashable {
     // FileIds are fixed at 16 bytes. Keeping their two words inline avoids allocating a
     // short Array every time a request is admitted or rechecked before MID commit.
+    let treeIdentity: SMBTreeIdentity
     let firstWord: UInt64
     let secondWord: UInt64
 
-    init(bytes: [UInt8]) {
+    init(bytes: [UInt8], treeIdentity: SMBTreeIdentity) {
         precondition(bytes.count == 16, "SMB FileId ledger keys must contain exactly 16 bytes")
+        self.treeIdentity = treeIdentity
         (firstWord, secondWord) = bytes.withUnsafeBytes { rawBytes in
             (
                 rawBytes.loadUnaligned(fromByteOffset: 0, as: UInt64.self),
@@ -5653,7 +5843,8 @@ private struct SMBFileIdLedgerKey: Hashable {
         }
     }
 
-    init(packet: [UInt8], offset: Int) {
+    init(packet: [UInt8], offset: Int, treeIdentity: SMBTreeIdentity) {
+        self.treeIdentity = treeIdentity
         (firstWord, secondWord) = packet.withUnsafeBytes { rawBytes in
             (
                 rawBytes.loadUnaligned(fromByteOffset: offset, as: UInt64.self),
@@ -5661,6 +5852,19 @@ private struct SMBFileIdLedgerKey: Hashable {
             )
         }
     }
+}
+
+private struct SMBTreeCreditPreparation: Sendable {
+    let treeIdentity: SMBTreeIdentity
+    let cancellationToken: SMBTreeCreditCancellationToken
+}
+
+private struct SMBTransferCreditPreparation: Sendable {
+    let charge: UInt16
+    let balance: UInt32
+    let requestIdentity: SMBRequestIdentity
+    let treeIdentity: SMBTreeIdentity
+    let cancellationToken: SMBTreeCreditCancellationToken?
 }
 
 private enum SMBCleanupAttemptState: Equatable {
@@ -5674,12 +5878,21 @@ private struct SMBCleanupLedgerEntry: Equatable {
     let state: SMBCleanupAttemptState
 }
 
+struct SMBTreeCleanupIntent: Sendable {
+    let owner: SMBRequestIdentity
+    let facadeOwner: SMBFacadeOwner
+    let deadlines: SMBCleanupDeadlines
+    var timeoutIdentity: UUID?
+    var timeoutTask: Task<Void, Never>?
+}
+
 private enum SMBCleanupLedgerTransition {
     case beginAttempt
     case retireUnsentForDeadline
     case abandonUnsent
     case beginDrain(messageId: UInt64)
     case finalResponse(messageId: UInt64, succeeded: Bool)
+    case treeDisconnected(SMBTreeIdentity)
     case terminal
 }
 
@@ -5717,6 +5930,8 @@ private struct SMBPendingResponse {
     var cancellationRequested = false
     var continuationResumed = false
     var cleanupFileId: SMBFileIdLedgerKey?
+    var cleanupTreeIdentity: SMBTreeIdentity?
+    var cleanupDeadlines: SMBCleanupDeadlines?
     var cleanupTombstone = false
     var cleanupTimeoutTask: Task<Void, Never>?
     var cleanupDrainTask: Task<Void, Never>?
@@ -5751,6 +5966,10 @@ private struct SMBQueuedPostAuthRequest {
     let requestTimeoutPolicy: SMBRequestTimeoutPolicy
     let responseProtectionPolicy: SMBResponseProtectionPolicy
     let cleanupKey: SMBFileIdLedgerKey?
+    let treeIdentity: SMBTreeIdentity?
+    let cleanupTreeIdentity: SMBTreeIdentity?
+    let cleanupDeadlines: SMBCleanupDeadlines?
+    let creditCancellationToken: SMBTreeCreditCancellationToken?
     let reservedCharge: UInt16
     let completionTarget: SMBPendingResponseCompletionTarget
     let sendKind: SMBPostAuthSendKind
@@ -5771,6 +5990,12 @@ private final class SMBSessionActiveRequestRecord {
     let treeId: UInt32
     let fileId: SMBFileIdLedgerKey?
     let cleanupKey: SMBFileIdLedgerKey?
+    let treeIdentity: SMBTreeIdentity?
+    let cleanupTreeIdentity: SMBTreeIdentity?
+    let cleanupDeadlines: SMBCleanupDeadlines?
+    var creditCancellationToken: SMBTreeCreditCancellationToken?
+    var cleanupTimeoutTask: Task<Void, Never>?
+    var cleanupTimeoutIdentity: UUID?
     var messageId: UInt64?
     let maximumCreditCharge: UInt16
     let longPoll: Bool
@@ -5781,10 +6006,13 @@ private final class SMBSessionActiveRequestRecord {
     var send: SMBRequestSendState = .notStarted
     var wire: SMBRequestWireState = .notApplicable
     var credit: SMBRequestCreditState = .waiting
+    var creditRefundPending = false
     var queuedRequestOwned = false
     var unselectedControlOwned = false
     var originalSendOwned = false
     var selectedCancelOwned = false
+    var fullSendCompletedAt: ContinuousClock.Instant?
+    var originalSendOwnerRecoveredAt: ContinuousClock.Instant?
     var wireDrainDeadline: ContinuousClock.Instant?
     var wireDrainTask: Task<Void, Never>?
     var wireDrainTimerIdentity: UUID?
@@ -5798,6 +6026,12 @@ private final class SMBSessionActiveRequestRecord {
         treeId: UInt32,
         fileId: SMBFileIdLedgerKey?,
         cleanupKey: SMBFileIdLedgerKey?,
+        treeIdentity: SMBTreeIdentity?,
+        cleanupTreeIdentity: SMBTreeIdentity?,
+        cleanupDeadlines: SMBCleanupDeadlines?,
+        creditCancellationToken: SMBTreeCreditCancellationToken?,
+        cleanupTimeoutTask: Task<Void, Never>? = nil,
+        cleanupTimeoutIdentity: UUID? = nil,
         maximumCreditCharge: UInt16,
         longPoll: Bool,
         requestTimeoutPolicy: SMBRequestTimeoutPolicy,
@@ -5810,6 +6044,12 @@ private final class SMBSessionActiveRequestRecord {
         self.treeId = treeId
         self.fileId = fileId
         self.cleanupKey = cleanupKey
+        self.treeIdentity = treeIdentity
+        self.cleanupTreeIdentity = cleanupTreeIdentity
+        self.cleanupDeadlines = cleanupDeadlines
+        self.creditCancellationToken = creditCancellationToken
+        self.cleanupTimeoutTask = cleanupTimeoutTask
+        self.cleanupTimeoutIdentity = cleanupTimeoutIdentity
         self.maximumCreditCharge = maximumCreditCharge
         self.longPoll = longPoll
         self.requestTimeoutPolicy = requestTimeoutPolicy
@@ -6014,7 +6254,6 @@ private enum SMBTestingCountWaitKind: Equatable {
     case requestSent
     case requestSentWaiterRegistrations
     case cleanupLedger
-    case cleanupDrainTimeoutCallbacks
     case receivedPacketDispatches
     case senderFrameCount
     case senderLoopExitCount
@@ -6034,10 +6273,6 @@ private struct SMBTestingCountWaiter {
     let target: Int
     let isAtLeast: Bool
     let continuation: CheckedContinuation<Void, Never>
-}
-
-private enum SMBPostAuthCleanupDeadlineScope {
-    @TaskLocal static var isActive = false
 }
 
 /// この actor は mutable wire state (messageId / sessionId / transformNonce / 鍵 / 交渉値) を隔離する。
@@ -6123,6 +6358,16 @@ actor SMBSession {
     private var postAuthActive = false
     private var nextRequestSequence: UInt64 = 0
     private var cleanupLedger: [SMBFileIdLedgerKey: SMBCleanupLedgerEntry] = [:]
+    private var treeCleanupLedger: [SMBTreeIdentity: SMBCleanupLedgerEntry] = [:]
+    private var treeIdentityByTreeId: [UInt32: SMBTreeIdentity] = [:]
+    private var treeLifecycle: [SMBTreeIdentity: (owner: SMBRequestIdentity, state: SMBTreeLifecycleState)] = [:]
+    private var nextTreeIncarnationSequence: UInt64 = 0
+    private var treeCleanupIntents: [SMBTreeIdentity: SMBTreeCleanupIntent] = [:]
+    private var treeCreditPreparations: [SMBRequestIdentity: SMBTreeCreditPreparation] = [:]
+    private var softExpiredCleanupOwners: Set<SMBRequestIdentity> = []
+    private let operationLeaseHarness = SMBOperationLeaseHarness()
+    private var operationBarrierByRequest: [SMBRequestIdentity: SMBOperationBarrierReceipt] = [:]
+    private var completedOperationBarriers: [SMBOperationBarrierReceipt] = []
     private var cancelledRequestDrainWaiters: [SMBCancelledRequestDrainWaiter] = []
     private var testingCountWaiters: [SMBTestingCountWaiter] = []
     private var nextTestingCountWaiterId: UInt64 = 0
@@ -6137,11 +6382,20 @@ actor SMBSession {
     private var readerTaskJoinSnapshotHookForTesting: (@Sendable (Int) -> Void)?
     private var readerTaskJoinWillAwaitHookForTesting: (@Sendable (UUID) -> Void)?
     private var activePostAuthRequestRecordReapedHookForTesting: (@Sendable (UInt64) -> Void)?
+    private var finalCreditGrantAcknowledgedHookForTesting: (@Sendable () -> Void)?
     private var responseSliceValidatedHookForTesting: (@Sendable (Int) -> Void)?
-    private var cleanupCloseCancellationWillApplyHookForTesting: (@Sendable () async -> Void)?
-    private var cleanupCloseCancellationAppliedHookForTesting: (@Sendable () -> Void)?
+    private var cleanupSoftDeadlineAppliedHookForTesting: (@Sendable () -> Void)?
+    private var cleanupCreditRefundInterleavingHookForTesting:
+        (@Sendable (SMBCleanupCreditRefundInterleavingPoint) async -> Void)?
     private var cleanupCloseCreditWaitCatchHookForTesting: (@Sendable () -> Void)?
-    private var cleanupCloseDeadlineRetirementWillApplyHookForTesting: (@Sendable () async -> Void)?
+    private var cleanupFileCloseCatchHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
+    private var cleanupTimeoutWakeHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
+    private var cleanupTimeoutIdentityCheckHookForTesting: (@Sendable (Bool) -> Void)?
+    private var treeCleanupIntentPreparedHookForTesting: (@Sendable (SMBTreeIdentity) async -> Void)?
+    private var transferCreditSnapshotHookForTesting: (@Sendable (SMBTreeIdentity, UInt32) async -> Void)?
+    private var transferCreditRetirementHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
+    private var cleanupFullSendBoundaryHookForTesting: (@Sendable (UInt64) async -> Void)?
+    private var senderPrecommitAdmissionHookForTesting: (@Sendable (UInt16) async -> Void)?
     private var creditFailureTask: Task<Void, Never>?
     private var activeSendTasks: [UUID: Task<Void, Never>] = [:]
     private var activeCancelTasks: [UUID: Task<Void, Never>] = [:]
@@ -6159,7 +6413,6 @@ actor SMBSession {
     private var requestTimeoutCompletionCountForTestingStorage = 0
     private var receivedPacketDispatchCountForTestingStorage = 0
     private var lastFinalAcceptanceForTestingStorage: ContinuousClock.Instant?
-    private var cleanupDrainTimeoutCallbackCountForTestingStorage = 0
     private var wireFailure: Error?
     private var creditGrantAfterAwaitHookForTesting: (@Sendable () async -> Void)?
     private let cleanupTimeout: Duration
@@ -6485,6 +6738,7 @@ actor SMBSession {
         if result.encryptionRequired, encryptionKey == nil {
             throw SMBError.protocolError("TREE_CONNECT requires encryption but no SMB encryption key was negotiated")
         }
+        _ = registerTreeIdentity(treeId: result.treeId)
         return result.treeId
     }
 
@@ -6826,12 +7080,16 @@ actor SMBSession {
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        try validateFileIdAdmission(command: SMB2Commands.read, fileId: fileId, cleanupFileId: nil)
+        try validateFileIdAdmission(command: SMB2Commands.read, treeId: treeId, fileId: fileId, cleanupFileId: nil)
+        let requestIdentity = makeRequestIdentity(generation: generation)
+        let treeIdentity = treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId)
         let maximumLength = UInt32(min(UInt64(negotiatedReadChunkSize()), length))
         let reservation = try await reserveVariableCredit(
             maximumPayloadLength: maximumLength,
             command: SMB2Commands.read,
-            generation: generation
+            generation: generation,
+            treeIdentity: treeIdentity,
+            requestIdentity: requestIdentity
         )
         let requestLength = UInt32(min(UInt64(maximumLength), reservation.payloadLimit))
         do {
@@ -6850,7 +7108,8 @@ actor SMBSession {
                 packet: packet,
                 responseLabel: "READ response",
                 requestTimeoutPolicy: requestTimeoutPolicy,
-                creditReservation: reservation
+                creditReservation: reservation,
+                requestIdentity: requestIdentity
             )
             let header = try SMB2Header.decode(response)
             if header.status == SMB2Status.endOfFile {
@@ -7270,15 +7529,19 @@ actor SMBSession {
             guard let generation = readerLifecycle.activeGeneration else {
                 throw wireFailure ?? SMBTransportError.connectionClosed
             }
-            try validateFileIdAdmission(command: SMB2Commands.write, fileId: fileId, cleanupFileId: nil)
+            try validateFileIdAdmission(command: SMB2Commands.write, treeId: treeId, fileId: fileId, cleanupFileId: nil)
             let maximumLength = min(data.count - cursor, negotiatedWriteChunkSize())
             guard maximumLength > 0 else {
                 throw SMBCodecError.invalidValue("SMB negotiated write size is zero")
             }
+            let requestIdentity = makeRequestIdentity(generation: generation)
+            let treeIdentity = treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId)
             let reservation = try await reserveVariableCredit(
                 maximumPayloadLength: UInt32(maximumLength),
                 command: SMB2Commands.write,
-                generation: generation
+                generation: generation,
+                treeIdentity: treeIdentity,
+                requestIdentity: requestIdentity
             )
             let payloadLength = min(maximumLength, Int(clamping: reservation.payloadLimit))
             let requestData = Array(data[cursor..<(cursor + payloadLength)])
@@ -7302,7 +7565,8 @@ actor SMBSession {
                 let response = try await signedWireTransaction(
                     packet: packet,
                     responseLabel: "WRITE response",
-                    creditReservation: reservation
+                    creditReservation: reservation,
+                    requestIdentity: requestIdentity
                 )
                 let count = try SMB2Write.decodeResponseCount(response)
                 SMBPerfLog.line(
@@ -7660,21 +7924,11 @@ actor SMBSession {
 
     /// Cleanup path: do not inherit caller cancellation while trying to release a handle.
     func bestEffortClose(treeId: UInt32, fileId: [UInt8]) async {
-        let timeout = cleanupTimeout
-        let sleeper = cleanupTimeoutSleeper
         let task = Task.detached(executorPreference: sessionExecutor) { [self] in
             sessionExecutor.recordExecutionContextForTesting(.cleanupCloseTask)
             let started = SMBPerfLog.effectiveIsEnabled ? ContinuousClock.now : nil
             do {
-                try await SMBOperationDeadline.run(
-                    timeout: timeout,
-                    time: sessionTime,
-                    sleeper: sleeper
-                ) {
-                    try await SMBPostAuthCleanupDeadlineScope.$isActive.withValue(true) {
-                        try await self.close(treeId: treeId, fileId: fileId)
-                    }
-                }
+                try await self.close(treeId: treeId, fileId: fileId)
             } catch {
                 if let started {
                     let elapsed = SMBPerfLog.milliseconds(ContinuousClock.now - started)
@@ -7694,21 +7948,270 @@ actor SMBSession {
         try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_DISCONNECT")
     }
 
-    /// Cleanup path for scoped trees. A missing response invalidates the shared transport,
-    /// because the server-side tree lifetime can no longer be determined safely.
-    func bestEffortTreeDisconnect(treeId: UInt32) async {
-        let timeout = cleanupTimeout
-        let task = Task.detached(executorPreference: sessionExecutor) { [self] in
-            sessionExecutor.recordExecutionContextForTesting(.cleanupTreeDisconnectTask)
-            do {
-                try await SMBOperationDeadline.run(timeout: timeout, sleeper: cleanupTimeoutSleeper) {
-                    try await self.treeDisconnect(treeId: treeId)
-                }
-            } catch {
-                await self.closeTransportAndWait(cause: "best_effort_tree_disconnect", diagnosticError: error)
+    func bestEffortTreeDisconnect(treeId: UInt32) async -> SMBOperationCloseOutcome {
+        guard let identity = treeIdentityByTreeId[treeId] else {
+            return .failed("TREE_DISCONNECT has no published Tree incarnation")
+        }
+        let facadeOwner = SMBFacadeOwnerAllocator.make()
+        await registerFacade(owner: facadeOwner)
+        let intent = await prepareTreeCleanupIntent(identity, facadeOwner: facadeOwner)
+        guard let intent else {
+            await retireFacade(owner: facadeOwner)
+            return .failed("TREE_DISCONNECT Tree is unavailable")
+        }
+        let disposition = await closeFacade(owner: facadeOwner) {
+            await self.performTreeCleanup(intent, identity: identity)
+        }
+        switch disposition {
+        case .startedOnly: return .failed("TREE_DISCONNECT cleanup started")
+        case .joined(let outcome):
+            await retireFacade(owner: facadeOwner)
+            return outcome
+        }
+    }
+
+    func prepareTreeCleanupIntent(
+        _ identity: SMBTreeIdentity,
+        facadeOwner: SMBFacadeOwner
+    ) async -> SMBTreeCleanupIntent? {
+        guard treeIdentityByTreeId[identity.treeId] == identity,
+              isGenerationActive(identity.generation) else {
+            return nil
+        }
+        if let existing = treeCleanupIntents[identity] { return existing }
+        guard treeLifecycle[identity] == nil else { return nil }
+
+        let owner = makeRequestIdentity(generation: identity.generation)
+        let deadlines = SMBCleanupDeadlines(
+            intentAt: sessionTime.now(),
+            softBudget: cleanupTimeout,
+            hardGrace: Self.defaultWireDrainGrace,
+            requestTimeout: requestTimeout
+        )
+        guard cleanupLedger.count + treeCleanupLedger.count < Self.maxCleanupAttempts else {
+            let error = SMBCodecError.invalidValue("SMB cleanup ledger limit exceeded")
+            closeTransport(cause: "cleanup_ledger_limit", diagnosticError: error)
+            return nil
+        }
+        _ = transitionTreeLifecycle(identity, owner: owner, event: .beginQuarantine)
+        _ = transitionTreeCleanupLedger(identity, owner: owner, event: .beginAttempt)
+
+        let committedRequestIdentities = pendingResponses.values.compactMap { pending -> SMBRequestIdentity? in
+            guard let record = activePostAuthRequestRecords[pending.requestIdentity],
+                  record.treeIdentity == identity,
+                  pending.expectedTreeId == identity.treeId,
+                  pending.cleanupTreeIdentity == nil else { return nil }
+            return pending.requestIdentity
+        }
+        for requestIdentity in committedRequestIdentities {
+            await beginTreeRequestBarrier(
+                requestIdentity,
+                tree: identity,
+                owner: facadeOwner,
+                kind: .wire,
+                requiresPendingResponse: true
+            )
+        }
+        let uncommittedRequestIdentities = activePostAuthRequestRecords.values.compactMap { record -> SMBRequestIdentity? in
+            guard record.treeIdentity == identity,
+                  record.cleanupTreeIdentity == nil else { return nil }
+            switch record.send {
+            case .notStarted:
+                return record.identity
+            case .neverSubmitted:
+                let creditSettled = record.credit == .refunded || record.credit == .discardedOnTerminal
+                let hasOwnedWork = record.queuedRequestOwned
+                    || record.unselectedControlOwned
+                    || record.originalSendOwned
+                    || record.selectedCancelOwned
+                return creditSettled && !hasOwnedWork ? nil : record.identity
+            case .committed, .fullySent:
+                return record.outstandingCreditGrantAcknowledgements > 0 ? record.identity : nil
+            case .failed:
+                return nil
             }
         }
-        await task.value
+        for requestIdentity in uncommittedRequestIdentities {
+            await beginTreeRequestBarrier(
+                requestIdentity,
+                tree: identity,
+                owner: facadeOwner,
+                kind: .retirement,
+                requiresPendingResponse: false
+            )
+        }
+        let creditPreparationIdentities = treeCreditPreparations.compactMap { requestIdentity, preparation in
+            preparation.treeIdentity == identity ? requestIdentity : nil
+        }
+        for requestIdentity in creditPreparationIdentities {
+            await beginTreeRequestBarrier(
+                requestIdentity,
+                tree: identity,
+                owner: facadeOwner,
+                kind: .retirement,
+                requiresPendingResponse: false
+            )
+        }
+
+        let timeoutIdentity = UUID()
+        let delay = max(.zero, sessionTime.now().duration(to: deadlines.softAt))
+        let sleeper = cleanupTimeoutSleeper
+        let executor = sessionExecutor
+        let timeoutTask = Task.detached(executorPreference: executor) { [weak self] in
+            do { try await sleeper(delay) } catch { return }
+            await self?.cleanupIntentSoftDeadlineDidFire(
+                identity: owner,
+                timerIdentity: timeoutIdentity,
+                deadlines: deadlines
+            )
+        }
+        var intent = SMBTreeCleanupIntent(
+            owner: owner,
+            facadeOwner: facadeOwner,
+            deadlines: deadlines,
+            timeoutIdentity: timeoutIdentity,
+            timeoutTask: timeoutTask
+        )
+        treeCleanupIntents[identity] = intent
+
+        let refusal = SMBError.treeUnavailable(treeId: identity.treeId, operation: "TREE_DISCONNECT")
+        var selected = Set<SMBRequestIdentity>()
+        var retiredByTreePreparation = Set<SMBRequestIdentity>()
+        var refunds: [UInt16] = []
+        var lateGrantRefunds: [UInt16] = []
+        for (requestIdentity, preparation) in treeCreditPreparations where preparation.treeIdentity == identity {
+            selected.insert(requestIdentity)
+            if let charge = preparation.cancellationToken.cancel() {
+                lateGrantRefunds.append(charge)
+            }
+        }
+        var retained: [SMBQueuedPostAuthRequest] = []
+        retained.reserveCapacity(queuedPostAuthRequests.count)
+        for item in queuedPostAuthRequests {
+            guard item.treeIdentity == identity,
+                  item.cleanupTreeIdentity == nil,
+                  let record = activePostAuthRequestRecords[item.identity],
+                  case .notStarted = record.send else {
+                retained.append(item)
+                continue
+            }
+            selected.insert(item.identity)
+            retiredByTreePreparation.insert(item.identity)
+            if let token = item.creditCancellationToken, let charge = token.cancel() { lateGrantRefunds.append(charge) }
+            refunds.append(item.reservedCharge)
+            if let cleanupKey = item.cleanupKey {
+                transitionCleanupLedger(cleanupKey, owner: item.identity, .retireUnsentForDeadline)
+            }
+            updateActivePostAuthRecord(item.identity) {
+                $0.caller = .localRefusal
+                $0.send = .neverSubmitted
+                $0.queuedRequestOwned = false
+                $0.cleanupTimeoutTask?.cancel()
+                $0.cleanupTimeoutTask = nil
+                $0.cleanupTimeoutIdentity = nil
+            }
+            failQueuedPostAuthRequest(item, error: refusal)
+        }
+        queuedPostAuthRequests = retained
+        for record in activePostAuthRequestRecords.values where record.treeIdentity == identity
+            && record.cleanupTreeIdentity == nil {
+            if case .notStarted = record.send {
+                selected.insert(record.identity)
+                if let token = record.creditCancellationToken, let charge = token.cancel() {
+                    lateGrantRefunds.append(charge)
+                }
+                record.caller = .localRefusal
+                record.send = .neverSubmitted
+                record.cleanupTimeoutTask?.cancel()
+                record.cleanupTimeoutTask = nil
+                record.cleanupTimeoutIdentity = nil
+                if let cleanupKey = record.cleanupKey {
+                    transitionCleanupLedger(cleanupKey, owner: record.identity, .retireUnsentForDeadline)
+                }
+            }
+        }
+        if !selected.isEmpty {
+            _ = await creditWindow.cancelWaiters(
+                treeIdentity: identity,
+                requestIdentities: selected,
+                error: refusal
+            )
+        }
+        for charge in lateGrantRefunds { await refundCredit(charge: charge) }
+        for charge in refunds { await refundCredit(charge: charge) }
+        for requestIdentity in retiredByTreePreparation {
+            updateActivePostAuthRecord(requestIdentity) { $0.credit = .refunded }
+            reclaimActivePostAuthRequestRecordIfEligible(requestIdentity)
+        }
+        await completeReadyOperationBarriers()
+        intent = treeCleanupIntents[identity] ?? intent
+        if let hook = treeCleanupIntentPreparedHookForTesting { await hook(identity) }
+        return intent
+    }
+
+    func performTreeCleanup(_ intent: SMBTreeCleanupIntent, identity: SMBTreeIdentity) async -> SMBOperationCloseOutcome {
+        guard treeCleanupIntents[identity]?.owner == intent.owner else {
+            return .failed("TREE_DISCONNECT cleanup owner is no longer current")
+        }
+        if softExpiredCleanupOwners.contains(intent.owner) || sessionTime.now() >= intent.deadlines.softAt {
+            guard let timerIdentity = intent.timeoutIdentity else {
+                return .failed(String(describing: SMBTransportError.timedOut))
+            }
+            await cleanupIntentSoftDeadlineDidFire(
+                identity: intent.owner,
+                timerIdentity: timerIdentity,
+                deadlines: intent.deadlines
+            )
+            return .failed(String(describing: SMBTransportError.timedOut))
+        }
+        do {
+            let packet = try SMB2TreeDisconnect.encodeRequest(
+                messageId: nextMessageId(),
+                sessionId: sessionId,
+                treeId: identity.treeId
+            )
+            debugDump("TREE_DISCONNECT request", packet)
+            let response = try await signedWireTransaction(
+                packet: packet,
+                responseLabel: "TREE_DISCONNECT response",
+                cleanupTreeIdentity: identity,
+                cleanupDeadlines: intent.deadlines,
+                requestIdentity: intent.owner
+            )
+            let header = try SMB2Header.decode(response)
+            try SMBErrorMapper.throwIfFailure(status: header.status, operation: "TREE_DISCONNECT")
+            _ = transitionTreeCleanupLedger(
+                identity,
+                owner: intent.owner,
+                event: .finalResponse(messageId: header.messageId, succeeded: true)
+            )
+            _ = transitionTreeLifecycle(identity, owner: intent.owner, event: .retire)
+            _ = transitionCleanupLedger(nil, owner: intent.owner, .treeDisconnected(identity))
+            finishTreeCleanupIntent(identity, owner: intent.owner, forgetRetired: true)
+            return .success
+        } catch {
+            let failedAfterSoft = softExpiredCleanupOwners.contains(intent.owner)
+            if !failedAfterSoft {
+                _ = transitionTreeCleanupLedger(identity, owner: intent.owner, event: .retireUnsentForDeadline)
+                _ = transitionTreeLifecycle(identity, owner: intent.owner, event: .retireUnknown)
+            }
+            finishTreeCleanupIntent(identity, owner: intent.owner, forgetRetired: false)
+            return .failed(Self.diagnosticError(error))
+        }
+    }
+
+    private func finishTreeCleanupIntent(
+        _ identity: SMBTreeIdentity,
+        owner: SMBRequestIdentity,
+        forgetRetired: Bool
+    ) {
+        guard let intent = treeCleanupIntents[identity], intent.owner == owner else { return }
+        intent.timeoutTask?.cancel()
+        treeCleanupIntents.removeValue(forKey: identity)
+        if forgetRetired {
+            _ = transitionTreeLifecycle(identity, owner: owner, event: .forgetRetired)
+        }
+        softExpiredCleanupOwners.remove(owner)
     }
 
     func logoff() async throws {
@@ -7843,7 +8346,14 @@ actor SMBSession {
         await creditFailureTask?.value
         markReadTransfersTerminalJoinComplete()
         markWriteTransfersTerminalJoinComplete()
+        for identity in Array(operationBarrierByRequest.keys) {
+            completeOperationBarrierIfWireWorkIsComplete(
+                for: identity,
+                progress: .terminalJoinCompleted
+            )
+        }
         activePostAuthRequestRecords.removeAll()
+        await completeReadyOperationBarriers()
     }
 
     private func finishConnectAttempt() {
@@ -7950,20 +8460,56 @@ actor SMBSession {
         responseSliceValidatedHookForTesting = hook
     }
 
-    func setCleanupCloseCancellationAppliedHookForTesting(_ hook: (@Sendable () -> Void)?) {
-        cleanupCloseCancellationAppliedHookForTesting = hook
+    func setCleanupSoftDeadlineAppliedHookForTesting(_ hook: (@Sendable () -> Void)?) {
+        cleanupSoftDeadlineAppliedHookForTesting = hook
     }
 
-    func setCleanupCloseCancellationWillApplyHookForTesting(_ hook: (@Sendable () async -> Void)?) {
-        cleanupCloseCancellationWillApplyHookForTesting = hook
+    func setCleanupCreditRefundInterleavingHookForTesting(
+        _ hook: (@Sendable (SMBCleanupCreditRefundInterleavingPoint) async -> Void)?
+    ) {
+        cleanupCreditRefundInterleavingHookForTesting = hook
     }
 
     func setCleanupCloseCreditWaitCatchHookForTesting(_ hook: (@Sendable () -> Void)?) {
         cleanupCloseCreditWaitCatchHookForTesting = hook
     }
 
-    func setCleanupCloseDeadlineRetirementWillApplyHookForTesting(_ hook: (@Sendable () async -> Void)?) {
-        cleanupCloseDeadlineRetirementWillApplyHookForTesting = hook
+    func setCleanupFileCloseCatchHookForTesting(
+        _ hook: (@Sendable (SMBRequestIdentity) async -> Void)?
+    ) {
+        cleanupFileCloseCatchHookForTesting = hook
+    }
+
+    func setCleanupTimeoutDeliveryHooksForTesting(
+        onWake: (@Sendable (SMBRequestIdentity) async -> Void)?,
+        onIdentityCheck: (@Sendable (Bool) -> Void)?
+    ) {
+        cleanupTimeoutWakeHookForTesting = onWake
+        cleanupTimeoutIdentityCheckHookForTesting = onIdentityCheck
+    }
+
+    func setTreeCleanupIntentPreparedHookForTesting(_ hook: (@Sendable (SMBTreeIdentity) async -> Void)?) {
+        treeCleanupIntentPreparedHookForTesting = hook
+    }
+
+    func setTransferCreditSnapshotHookForTesting(
+        _ hook: (@Sendable (SMBTreeIdentity, UInt32) async -> Void)?
+    ) {
+        transferCreditSnapshotHookForTesting = hook
+    }
+
+    func setTransferCreditRetirementHookForTesting(
+        _ hook: (@Sendable (SMBRequestIdentity) async -> Void)?
+    ) {
+        transferCreditRetirementHookForTesting = hook
+    }
+
+    func setCleanupFullSendBoundaryHookForTesting(_ hook: (@Sendable (UInt64) async -> Void)?) {
+        cleanupFullSendBoundaryHookForTesting = hook
+    }
+
+    func setSenderPrecommitAdmissionHookForTesting(_ hook: (@Sendable (UInt16) async -> Void)?) {
+        senderPrecommitAdmissionHookForTesting = hook
     }
 
     func setCreditReservationAcquiredHookForTesting(_ hook: (@Sendable (UInt16) async -> Void)?) async {
@@ -7976,6 +8522,10 @@ actor SMBSession {
 
     func setCreditGrantAfterAwaitHookForTesting(_ hook: (@Sendable () async -> Void)?) {
         creditGrantAfterAwaitHookForTesting = hook
+    }
+
+    func setFinalCreditGrantAcknowledgedHookForTesting(_ hook: (@Sendable () -> Void)?) {
+        finalCreditGrantAcknowledgedHookForTesting = hook
     }
 
     func setCreditGrantActorHookForTesting(_ hook: (@Sendable () async -> Void)?) async {
@@ -8148,8 +8698,16 @@ actor SMBSession {
         fileId: [UInt8],
         onRegistered: @Sendable () -> Void = {}
     ) async throws {
-        let fileKey = SMBFileIdLedgerKey(bytes: fileId)
+        let treeIdentity = ensureTreeIdentity(treeId: treeId) ?? registerTreeIdentity(treeId: treeId)
+        let fileKey = SMBFileIdLedgerKey(bytes: fileId, treeIdentity: treeIdentity)
         let requestIdentity = makeRequestIdentity(generation: Self.initialWireGeneration)
+        let deadlines = SMBCleanupDeadlines(
+            intentAt: sessionTime.now(),
+            softBudget: cleanupTimeout,
+            hardGrace: Self.defaultWireDrainGrace,
+            requestTimeout: requestTimeout
+        )
+        let timerIdentity = UUID()
         transitionCleanupLedger(fileKey, owner: requestIdentity, .beginAttempt)
         _ = try await withCheckedThrowingContinuation { continuation in
             storePendingResponse(messageId: messageId, pending: SMBPendingResponse(
@@ -8169,15 +8727,15 @@ actor SMBSession {
                 sendPhase: .registered,
                 cancellationRequested: false,
                 continuationResumed: false,
-                cleanupFileId: fileKey
+                cleanupFileId: fileKey,
+                cleanupDeadlines: deadlines,
+                cleanupTimeoutTask: startCleanupIntentTimeout(
+                    identity: requestIdentity,
+                    timerIdentity: timerIdentity,
+                    deadlines: deadlines
+                ),
+                cleanupTimeoutIdentity: timerIdentity
             ))
-            let identity = UUID()
-            pendingResponses[messageId]?.cleanupTimeoutIdentity = identity
-            pendingResponses[messageId]?.cleanupTimeoutTask = startCleanupTimeout(
-                messageId: messageId,
-                generation: Self.initialWireGeneration,
-                identity: identity
-            )
             onRegistered()
         }
     }
@@ -8206,20 +8764,23 @@ actor SMBSession {
         cleanupLedger.count
     }
 
+    func softExpiredCleanupOwnerCountForTesting() -> Int {
+        softExpiredCleanupOwners.count
+    }
+
     func waitForCleanupLedgerCountForTesting(_ target: Int) async {
         await waitForTestingCount(.cleanupLedger, equalTo: target)
     }
 
-    func waitForCleanupDrainTimeoutCallbackCountForTesting(atLeast count: Int) async {
-        await waitForTestingCount(.cleanupDrainTimeoutCallbacks, atLeast: count)
-    }
-
-    func cleanupDrainTimeoutIdentityForTesting(messageId: UInt64) -> UUID? {
-        pendingResponses[messageId]?.cleanupDrainIdentity
-    }
-
     func fireCleanupDrainTimeoutForTesting(messageId: UInt64, generation: UInt64, identity: UUID) {
-        cleanupDrainTimeoutDidFire(messageId: messageId, generation: generation, identity: identity)
+        guard let pending = pendingResponses[messageId],
+              let deadlines = pending.cleanupDeadlines else { return }
+        cleanupHardDeadlineDidFire(
+            messageId: messageId,
+            owner: pending.requestIdentity,
+            timerIdentity: identity,
+            deadlines: deadlines
+        )
     }
 
     func waitForCreditWaiterCountForTesting(atLeast count: Int) async {
@@ -8231,7 +8792,16 @@ actor SMBSession {
     }
 
     func cleanupAttemptStateForTesting(fileId: [UInt8]) -> String? {
-        guard let state = cleanupLedger[SMBFileIdLedgerKey(bytes: fileId)] else { return nil }
+        guard fileId.count == 16 else { return nil }
+        let key = SMBFileIdLedgerKey(bytes: fileId, treeIdentity: treeIdentityByTreeId.values.first ?? SMBTreeIdentity(
+            sessionInstance: sessionInstanceIdentity,
+            generation: Self.initialWireGeneration,
+            treeId: 0,
+            incarnationSequence: 0
+        ))
+        guard let state = cleanupLedger[key] ?? cleanupLedger.first(where: {
+            $0.key.firstWord == key.firstWord && $0.key.secondWord == key.secondWord
+        })?.value else { return nil }
         return switch state.state {
         case .sending:
             "sending"
@@ -8364,8 +8934,13 @@ actor SMBSession {
         try await flush(treeId: treeId, fileId: fileId)
     }
 
-    func retireFileIdForTesting(_ fileId: [UInt8]) {
-        let key = SMBFileIdLedgerKey(bytes: fileId)
+    func retireFileIdForTesting(_ fileId: [UInt8], treeId: UInt32 = 0) {
+        guard fileId.count == 16 else { return }
+        let treeIdentity = ensureTreeIdentity(treeId: treeId) ?? registerTreeIdentity(treeId: treeId)
+        let words = SMBFileIdLedgerKey(bytes: fileId, treeIdentity: treeIdentity)
+        let key = cleanupLedger.keys.first(where: {
+            $0.firstWord == words.firstWord && $0.secondWord == words.secondWord
+        }) ?? words
         let owner = makeRequestIdentity(generation: Self.initialWireGeneration)
         if cleanupLedger[key] == nil {
             transitionCleanupLedger(key, owner: owner, .beginAttempt)
@@ -8424,12 +8999,12 @@ actor SMBSession {
         await waitForTestingCount(.receivedPacketDispatches, atLeast: target)
     }
 
-    func dispatchReceivedPacketForTesting(_ packet: [UInt8]) throws {
-        try dispatchReceivedPacketForTesting(packet, generation: Self.initialWireGeneration)
+    func dispatchReceivedPacketForTesting(_ packet: [UInt8]) async throws {
+        try await dispatchReceivedPacketForTesting(packet, generation: Self.initialWireGeneration)
     }
 
-    func dispatchReceivedPacketForTesting(_ packet: [UInt8], generation: UInt64) throws {
-        try dispatchReceivedPacket(SMBReceivedFrame(
+    func dispatchReceivedPacketForTesting(_ packet: [UInt8], generation: UInt64) async throws {
+        try await dispatchReceivedPacket(SMBReceivedFrame(
             bytes: packet,
             transformSessionId: 0,
             generation: generation
@@ -8443,8 +9018,8 @@ actor SMBSession {
     func dispatchReceivedPacketThenCancelForTesting(
         _ packet: [UInt8],
         cancel: @Sendable () -> Void
-    ) throws {
-        try dispatchReceivedPacket(SMBReceivedFrame(
+    ) async throws {
+        try await dispatchReceivedPacket(SMBReceivedFrame(
             bytes: packet,
             transformSessionId: 0,
             generation: Self.initialWireGeneration
@@ -8513,8 +9088,6 @@ actor SMBSession {
             value = requestSentWaiterRegistrationCountForTestingStorage
         case .cleanupLedger:
             value = cleanupLedger.count
-        case .cleanupDrainTimeoutCallbacks:
-            value = cleanupDrainTimeoutCallbackCountForTestingStorage
         case .receivedPacketDispatches:
             value = receivedPacketDispatchCountForTestingStorage
         case .senderFrameCount:
@@ -8633,14 +9206,30 @@ actor SMBSession {
         responseLabel: String,
         requestTimeoutPolicy: SMBRequestTimeoutPolicy = .eligible,
         cleanupFileId: [UInt8]? = nil,
-        creditReservation: SMBPreReservedCredit? = nil
+        creditReservation: SMBPreReservedCredit? = nil,
+        cleanupTreeIdentity: SMBTreeIdentity? = nil,
+        cleanupDeadlines suppliedCleanupDeadlines: SMBCleanupDeadlines? = nil,
+        requestIdentity suppliedIdentity: SMBRequestIdentity? = nil
     ) async throws -> [UInt8] {
         let requestHeader = try SMB2Header.decode(packet)
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        let requestIdentity = makeRequestIdentity(generation: generation)
-        let cleanupDeadlineCancellationIsActive = SMBPostAuthCleanupDeadlineScope.isActive
+        let requestIdentity: SMBRequestIdentity
+        if let suppliedIdentity { requestIdentity = suppliedIdentity } else { requestIdentity = makeRequestIdentity(generation: generation) }
+        let cleanupDeadlines: SMBCleanupDeadlines?
+        if let suppliedCleanupDeadlines {
+            cleanupDeadlines = suppliedCleanupDeadlines
+        } else if cleanupFileId != nil || cleanupTreeIdentity != nil {
+            cleanupDeadlines = SMBCleanupDeadlines(
+                intentAt: sessionTime.now(),
+                softBudget: cleanupTimeout,
+                hardGrace: Self.defaultWireDrainGrace,
+                requestTimeout: requestTimeout
+            )
+        } else {
+            cleanupDeadlines = nil
+        }
         let transaction: @Sendable () async throws -> SMBReceivedFrame = { [self] in
             try await withTaskCancellationHandler {
                 try await demuxedWireTransaction(
@@ -8651,6 +9240,8 @@ actor SMBSession {
                     requestTimeoutPolicy: requestTimeoutPolicy,
                     responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
                     cleanupFileId: cleanupFileId,
+                    cleanupTreeIdentity: cleanupTreeIdentity,
+                    cleanupDeadlines: cleanupDeadlines,
                     requestIdentity: requestIdentity,
                     creditReservation: creditReservation,
                     postAuthSendKind: .signed,
@@ -8667,16 +9258,9 @@ actor SMBSession {
                     }
                 )
             } onCancel: {
-                if cleanupFileId != nil {
-                    guard cleanupDeadlineCancellationIsActive else { return }
-                    Task(executorPreference: sessionExecutor) { [weak self] in
-                        self?.sessionExecutor.recordExecutionContextForTesting(.cancellationTask)
-                        await self?.runCleanupCloseCancellationWillApplyHookForTesting()
-                        await self?.cleanupCloseCancellationDidFire(
-                            identity: requestIdentity,
-                            generation: generation
-                        )
-                    }
+                if cleanupFileId != nil || cleanupTreeIdentity != nil {
+                    // The cleanup request's single absolute deadline owns retirement.
+                    // Explicit caller cancellation is handled by the credit waiter itself.
                     return
                 }
                 if requestHeader.messageId == Self.postAuthMessageIdPlaceholder {
@@ -8795,6 +9379,8 @@ actor SMBSession {
         requestTimeoutPolicy: SMBRequestTimeoutPolicy,
         responseProtectionPolicy: SMBResponseProtectionPolicy = .sessionDefault,
         cleanupFileId: [UInt8]? = nil,
+        cleanupTreeIdentity: SMBTreeIdentity? = nil,
+        cleanupDeadlines: SMBCleanupDeadlines? = nil,
         requestIdentity suppliedIdentity: SMBRequestIdentity? = nil,
         creditReservation: SMBPreReservedCredit? = nil,
         postAuthSendKind: SMBPostAuthSendKind? = nil,
@@ -8818,9 +9404,34 @@ actor SMBSession {
             closeTransport(cause: "request_after_wire_failure", diagnosticError: wireFailure)
             throw wireFailure
         }
-        try validateFileIdAdmission(packet: packet, command: requestHeader.command, cleanupFileId: cleanupFileId)
-        let cleanupKey = cleanupFileId.map(SMBFileIdLedgerKey.init(bytes:))
-        let requestIdentity = suppliedIdentity ?? makeRequestIdentity(generation: generation)
+        let requestIdentity: SMBRequestIdentity
+        if let suppliedIdentity { requestIdentity = suppliedIdentity } else { requestIdentity = makeRequestIdentity(generation: generation) }
+        let treeOperation = responseLabel.hasSuffix(" response")
+            ? String(responseLabel.dropLast(" response".count))
+            : responseLabel
+        let requestTreeIdentity = treeIdentityForRequest(
+            treeId: requestHeader.treeId,
+            command: requestHeader.command
+        )
+        try validateTreeAdmission(
+            treeId: requestHeader.treeId,
+            command: requestHeader.command,
+            operation: treeOperation,
+            owner: requestIdentity,
+            cleanupTreeIdentity: cleanupTreeIdentity
+        )
+        try validateFileIdAdmission(
+            packet: packet,
+            command: requestHeader.command,
+            cleanupFileId: cleanupFileId,
+            treeIdentity: requestTreeIdentity
+        )
+        let cleanupKey: SMBFileIdLedgerKey?
+        if let cleanupFileId, let requestTreeIdentity {
+            cleanupKey = SMBFileIdLedgerKey(bytes: cleanupFileId, treeIdentity: requestTreeIdentity)
+        } else {
+            cleanupKey = nil
+        }
         if postAuthActive, requestHeader.messageId == Self.postAuthMessageIdPlaceholder {
             guard let postAuthSendKind else {
                 throw SMBCodecError.invalidValue("post-auth request is missing its sender kind")
@@ -8835,6 +9446,9 @@ actor SMBSession {
                 requestTimeoutPolicy: requestTimeoutPolicy,
                 responseProtectionPolicy: responseProtectionPolicy,
                 cleanupKey: cleanupKey,
+                treeIdentity: requestTreeIdentity,
+                cleanupTreeIdentity: cleanupTreeIdentity,
+                cleanupDeadlines: cleanupDeadlines,
                 creditReservation: creditReservation,
                 sendKind: postAuthSendKind
             ) else {
@@ -8846,7 +9460,7 @@ actor SMBSession {
             guard cleanupLedger[cleanupKey] == nil else {
                 throw SMBCodecError.invalidValue("SMB FileId already has an unresolved CLOSE attempt")
             }
-            guard cleanupLedger.count < Self.maxCleanupAttempts else {
+            guard cleanupLedger.count + treeCleanupLedger.count < Self.maxCleanupAttempts else {
                 let error = SMBCodecError.invalidValue("SMB cleanup ledger limit exceeded")
                 closeTransport(cause: "cleanup_ledger_limit", diagnosticError: error)
                 throw SMBTransportError.connectionClosed
@@ -8864,6 +9478,8 @@ actor SMBSession {
                 requestTimeoutPolicy: requestTimeoutPolicy,
                 responseProtectionPolicy: responseProtectionPolicy,
                 cleanupFileId: cleanupKey,
+                cleanupTreeIdentity: cleanupTreeIdentity,
+                cleanupDeadlines: cleanupDeadlines,
                 completionTarget: .transaction(continuation),
                 send: send
             )
@@ -8885,11 +9501,27 @@ actor SMBSession {
         requestTimeoutPolicy: SMBRequestTimeoutPolicy,
         responseProtectionPolicy: SMBResponseProtectionPolicy,
         cleanupFileId: SMBFileIdLedgerKey? = nil,
+        cleanupTreeIdentity: SMBTreeIdentity? = nil,
+        cleanupDeadlines: SMBCleanupDeadlines? = nil,
         completionTarget: SMBPendingResponseCompletionTarget,
         send: @escaping SMBWireSendClosure
     ) {
         let generation = generation ?? readerLifecycle.activeGeneration ?? Self.initialWireGeneration
         let identity = requestIdentity ?? makeRequestIdentity(generation: generation)
+        let cleanupTimer: (identity: UUID, task: Task<Void, Never>)?
+        if let cleanupTreeIdentity, let intent = treeCleanupIntents[cleanupTreeIdentity], intent.owner == identity,
+           let timerIdentity = intent.timeoutIdentity,
+           let task = intent.timeoutTask {
+            cleanupTimer = (timerIdentity, task)
+        } else if let cleanupDeadlines {
+            let timerIdentity = UUID()
+            cleanupTimer = (
+                timerIdentity,
+                startCleanupIntentTimeout(identity: identity, timerIdentity: timerIdentity, deadlines: cleanupDeadlines)
+            )
+        } else {
+            cleanupTimer = nil
+        }
         storePendingResponse(messageId: requestHeader.messageId, pending: SMBPendingResponse(
             requestIdentity: identity,
             generation: generation,
@@ -8907,17 +9539,12 @@ actor SMBSession {
             sendPhase: .registered,
             cancellationRequested: false,
             continuationResumed: false,
-            cleanupFileId: cleanupFileId
+            cleanupFileId: cleanupFileId,
+            cleanupTreeIdentity: cleanupTreeIdentity,
+            cleanupDeadlines: cleanupDeadlines,
+            cleanupTimeoutTask: cleanupTimer?.task,
+            cleanupTimeoutIdentity: cleanupTimer?.identity
         ))
-        if cleanupFileId != nil {
-            let timerIdentity = UUID()
-            pendingResponses[requestHeader.messageId]?.cleanupTimeoutIdentity = timerIdentity
-            pendingResponses[requestHeader.messageId]?.cleanupTimeoutTask = startCleanupTimeout(
-                messageId: requestHeader.messageId,
-                generation: generation,
-                identity: timerIdentity
-            )
-        }
         SMBPerfLog.line(
             "[wire] pending session=\(diagnosticSessionId) message_id=\(requestHeader.messageId) " +
                 "command=\(requestHeader.command) label=\(label) ts_ns=\(SMBPerfLog.timestampNanoseconds())"
@@ -8958,6 +9585,9 @@ actor SMBSession {
         requestTimeoutPolicy: SMBRequestTimeoutPolicy,
         responseProtectionPolicy: SMBResponseProtectionPolicy,
         cleanupKey: SMBFileIdLedgerKey?,
+        treeIdentity: SMBTreeIdentity?,
+        cleanupTreeIdentity: SMBTreeIdentity?,
+        cleanupDeadlines: SMBCleanupDeadlines?,
         creditReservation: SMBPreReservedCredit?,
         sendKind: SMBPostAuthSendKind,
         transferTicket: SMBTransferTicket? = nil
@@ -8966,7 +9596,7 @@ actor SMBSession {
             guard cleanupLedger[cleanupKey] == nil else {
                 throw SMBCodecError.invalidValue("SMB FileId already has an unresolved CLOSE attempt")
             }
-            guard cleanupLedger.count < Self.maxCleanupAttempts else {
+            guard cleanupLedger.count + treeCleanupLedger.count < Self.maxCleanupAttempts else {
                 let error = SMBCodecError.invalidValue("SMB cleanup ledger limit exceeded")
                 closeTransport(cause: "cleanup_ledger_limit", diagnosticError: error)
                 throw SMBTransportError.connectionClosed
@@ -8974,9 +9604,31 @@ actor SMBSession {
             transitionCleanupLedger(cleanupKey, owner: identity, .beginAttempt)
         }
         let maximumCreditCharge = creditReservation?.charge ?? max(1, header.creditCharge)
+        let creditCancellationToken = creditReservation?.cancellationToken
+        let cleanupTimeoutIdentity: UUID?
+        let cleanupTimeoutTask: Task<Void, Never>?
+        if let cleanupTreeIdentity, let intent = treeCleanupIntents[cleanupTreeIdentity], intent.owner == identity {
+            cleanupTimeoutIdentity = intent.timeoutIdentity
+            cleanupTimeoutTask = intent.timeoutTask
+        } else if let cleanupDeadlines {
+            let timerIdentity = UUID()
+            cleanupTimeoutIdentity = timerIdentity
+            cleanupTimeoutTask = startCleanupIntentTimeout(
+                identity: identity,
+                timerIdentity: timerIdentity,
+                deadlines: cleanupDeadlines
+            )
+        } else {
+            cleanupTimeoutIdentity = nil
+            cleanupTimeoutTask = nil
+        }
         let requestFileId: SMBFileIdLedgerKey?
         if let offset = Self.fileIdOffsetInRequest(command: header.command), offset + 16 <= packet.count {
-            requestFileId = SMBFileIdLedgerKey(packet: packet, offset: offset)
+            if let treeIdentity {
+                requestFileId = SMBFileIdLedgerKey(packet: packet, offset: offset, treeIdentity: treeIdentity)
+            } else {
+                requestFileId = nil
+            }
         } else {
             requestFileId = nil
         }
@@ -8987,6 +9639,12 @@ actor SMBSession {
             treeId: header.treeId,
             fileId: requestFileId,
             cleanupKey: cleanupKey,
+            treeIdentity: treeIdentity,
+            cleanupTreeIdentity: cleanupTreeIdentity,
+            cleanupDeadlines: cleanupDeadlines,
+            creditCancellationToken: creditCancellationToken,
+            cleanupTimeoutTask: cleanupTimeoutTask,
+            cleanupTimeoutIdentity: cleanupTimeoutIdentity,
             maximumCreditCharge: maximumCreditCharge,
             longPoll: longPoll,
             requestTimeoutPolicy: requestTimeoutPolicy,
@@ -9000,8 +9658,12 @@ actor SMBSession {
                 packet,
                 header: header,
                 generation: generation,
-                creditReservation: creditReservation
+                creditReservation: creditReservation,
+                treeIdentity: treeIdentity,
+                requestIdentity: identity,
+                cancellationToken: creditCancellationToken
             )
+            let settledCancellationToken = activePostAuthRequestRecords[identity]?.creditCancellationToken
             updateActivePostAuthRecord(identity) {
                 $0.credit = .reserved(maximumCharge: maximumCreditCharge)
             }
@@ -9016,6 +9678,19 @@ actor SMBSession {
                 }
                 throw wireFailure ?? SMBTransportError.connectionClosed
             }
+            do {
+                try validateTreeAdmission(
+                    treeId: header.treeId,
+                    command: header.command,
+                    operation: responseLabel,
+                    owner: identity,
+                    cleanupTreeIdentity: cleanupTreeIdentity
+                )
+            } catch {
+                await refundCredit(charge: reservedCharge)
+                updateActivePostAuthRecord(identity) { $0.credit = .refunded }
+                throw error
+            }
             let cancelledBeforeRoute = cancelledBeforeEnqueue.remove(identity) != nil
             if cancelledBeforeRoute || (transferTicket == nil && Task.isCancelled) {
                 await refundCredit(charge: reservedCharge)
@@ -9024,8 +9699,12 @@ actor SMBSession {
                     $0.caller = cleanupRetiredForDeadline ? .timedOut : .cancelled
                     $0.send = .neverSubmitted
                     $0.credit = .refunded
+                    $0.cleanupTimeoutTask?.cancel()
+                    $0.cleanupTimeoutTask = nil
+                    $0.cleanupTimeoutIdentity = nil
                 }
-                activePostAuthRequestRecords.removeValue(forKey: identity)
+                reclaimActivePostAuthRequestRecordIfEligible(identity)
+                await completeReadyOperationBarriers()
                 if let cleanupKey, !cleanupRetiredForDeadline {
                     transitionCleanupLedger(cleanupKey, owner: identity, .abandonUnsent)
                 }
@@ -9048,6 +9727,10 @@ actor SMBSession {
                     requestTimeoutPolicy: requestTimeoutPolicy,
                     responseProtectionPolicy: responseProtectionPolicy,
                     cleanupKey: cleanupKey,
+                    treeIdentity: treeIdentity,
+                    cleanupTreeIdentity: cleanupTreeIdentity,
+                    cleanupDeadlines: cleanupDeadlines,
+                    creditCancellationToken: settledCancellationToken,
                     reservedCharge: reservedCharge,
                     completionTarget: .transfer(transferTicket),
                     sendKind: sendKind
@@ -9073,6 +9756,10 @@ actor SMBSession {
                     requestTimeoutPolicy: requestTimeoutPolicy,
                     responseProtectionPolicy: responseProtectionPolicy,
                     cleanupKey: cleanupKey,
+                    treeIdentity: treeIdentity,
+                    cleanupTreeIdentity: cleanupTreeIdentity,
+                    cleanupDeadlines: cleanupDeadlines,
+                    creditCancellationToken: settledCancellationToken,
                     reservedCharge: reservedCharge,
                     completionTarget: .transaction(continuation),
                     sendKind: sendKind
@@ -9085,47 +9772,71 @@ actor SMBSession {
                 startSenderLoopIfNeeded(generation: generation)
             }
         } catch {
-            if cleanupKey != nil, Task.isCancelled, SMBPostAuthCleanupDeadlineScope.isActive {
-                await cleanupCloseDeadlineRetirementWillApplyHookForTesting?()
+            if cleanupKey != nil, let hook = cleanupFileCloseCatchHookForTesting {
+                await hook(identity)
             }
             let cleanupRetiredForDeadline = retireCleanupFileIdForDeadlineIfNeeded(cleanupKey, owner: identity)
+            let activeRecordForError = activePostAuthRequestRecords[identity]
+            let propagatedError: Error
+            if softExpiredCleanupOwners.contains(identity) || cleanupRetiredForDeadline {
+                propagatedError = SMBTransportError.timedOut
+            } else if let tree = activeRecordForError?.treeIdentity,
+                      activeRecordForError?.cleanupTreeIdentity == nil,
+                      case .some = treeLifecycle[tree] {
+                let operation = responseLabel.hasSuffix(" response")
+                    ? String(responseLabel.dropLast(" response".count))
+                    : responseLabel
+                propagatedError = SMBError.treeUnavailable(treeId: tree.treeId, operation: operation)
+            } else {
+                propagatedError = error
+            }
             if activePostAuthRequestRecords[identity]?.messageId == nil,
                pendingMessageIdByIdentity[identity] == nil {
                 let activeRecord = activePostAuthRequestRecords[identity]
                 let isAwaitingLocalRetirementAck = activeRecord?.caller == .cancelled
                     && reservedCharge > 0
                     && activeRecord?.credit != .refunded
-                let hasOwnedWork = activeRecord.map {
-                    $0.queuedRequestOwned
-                        || $0.unselectedControlOwned
-                        || $0.originalSendOwned
-                        || $0.selectedCancelOwned
-                } ?? false
-                if !isAwaitingLocalRetirementAck, !hasOwnedWork {
-                    activePostAuthRequestRecords.removeValue(forKey: identity)
-                }
                 updateActivePostAuthRecord(identity) {
                     if $0.caller == .pending {
-                        if error is CancellationError {
+                        if propagatedError is CancellationError {
                             $0.caller = cleanupRetiredForDeadline ? .timedOut : .cancelled
-                        } else if error is SMBCodecError {
+                        } else if propagatedError is SMBCodecError || propagatedError is SMBError {
                             $0.caller = .localRefusal
                         } else {
                             $0.caller = .transportError
                         }
                     }
                     if case .notStarted = $0.send { $0.send = .neverSubmitted }
+                    $0.cleanupTimeoutTask?.cancel()
+                    $0.cleanupTimeoutTask = nil
+                    $0.cleanupTimeoutIdentity = nil
                     if reservedCharge == 0 {
-                        $0.credit = wireFailure == nil ? .refunded : .discardedOnTerminal
+                        if wireFailure != nil {
+                            $0.credit = .discardedOnTerminal
+                        } else if !$0.creditRefundPending,
+                                  $0.creditCancellationToken?.hasClaimedOrAcceptedGrant != true {
+                            $0.credit = .refunded
+                        }
                     }
+                }
+                let hasOwnedWork = activePostAuthRequestRecords[identity].map {
+                    $0.queuedRequestOwned
+                        || $0.unselectedControlOwned
+                        || $0.originalSendOwned
+                        || $0.selectedCancelOwned
+                } ?? false
+                if !isAwaitingLocalRetirementAck, !hasOwnedWork {
+                    reclaimActivePostAuthRequestRecordIfEligible(identity)
                 }
             }
             cancelledBeforeEnqueue.remove(identity)
             if let cleanupKey, cleanupLedger[cleanupKey]?.state == .sending, !cleanupRetiredForDeadline {
                 transitionCleanupLedger(cleanupKey, owner: identity, .abandonUnsent)
             }
+            if cleanupKey != nil { softExpiredCleanupOwners.remove(identity) }
             cleanupCloseCreditWaitCatchHookForTesting?()
-            throw error
+            await completeReadyOperationBarriers()
+            throw propagatedError
         }
     }
 
@@ -9156,7 +9867,38 @@ actor SMBSession {
         case .transaction(let continuation):
             continuation.resume(throwing: error)
         case .transfer(let ticket):
-            failTransferRequest(ticket, error: error)
+            if isTreeUnavailable(error) {
+                refuseTransferRequestForTree(ticket, error: error)
+            } else {
+                failTransferRequest(ticket, error: error)
+            }
+        }
+    }
+
+    private func isTreeUnavailable(_ error: Error) -> Bool {
+        guard let error = error as? SMBError else { return false }
+        if case .treeUnavailable = error { return true }
+        return false
+    }
+
+    private func refuseTransferRequestForTree(_ ticket: SMBTransferTicket, error: Error) {
+        let now = sessionTime.now()
+        if let state = readTransfers[ticket.transferIdentifier], ticket.epoch == state.window.epoch {
+            stopReadTransfer(
+                state,
+                for: .offsetFailure(offset: ticket.offset, error: error),
+                at: now
+            )
+            if state.window.retireUnsent(ticket, at: now) { signalReadTransfer(state) }
+            return
+        }
+        if let state = writeTransfers[ticket.transferIdentifier], ticket.epoch == state.window.epoch {
+            stopWriteTransfer(
+                state,
+                for: .offsetFailure(offset: ticket.offset, error: error),
+                at: now
+            )
+            if state.window.retireUnsent(ticket, at: now) { signalWriteTransfer(state) }
         }
     }
 
@@ -9187,6 +9929,7 @@ actor SMBSession {
                     handleCancelSendFailure(error, generation: generation)
                     break
                 }
+                await completeReadyOperationBarriers()
                 continue
             }
             guard !queuedPostAuthRequests.isEmpty else { break }
@@ -9206,6 +9949,10 @@ actor SMBSession {
                 continue
             }
 
+            if let hook = senderPrecommitAdmissionHookForTesting {
+                await hook(item.command)
+            }
+
             var committedMessageId: UInt64?
             do {
                 // Scope and generation admission are repeated at the final actor turn before
@@ -9218,11 +9965,28 @@ actor SMBSession {
                 if let registeredFileId = activeRecord.fileId {
                     guard let offset = Self.fileIdOffsetInRequest(command: activeRecord.command),
                           offset + 16 <= item.packet.count,
-                          SMBFileIdLedgerKey(packet: item.packet, offset: offset) == registeredFileId else {
+                          let treeIdentity = activeRecord.treeIdentity,
+                          SMBFileIdLedgerKey(packet: item.packet, offset: offset, treeIdentity: treeIdentity) == registeredFileId else {
                         throw SMBCodecError.invalidValue("post-auth request FileId changed before commit")
                     }
                 }
-                try validateFileIdAdmission(packet: item.packet, command: activeRecord.command, cleanupKey: activeRecord.cleanupKey)
+                if let deadlines = item.cleanupDeadlines, sessionTime.now() >= deadlines.softAt {
+                    retireCleanupBeforeCommit(identity: item.identity, record: activeRecord)
+                    throw SMBTransportError.timedOut
+                }
+                try validateTreeAdmission(
+                    treeId: item.treeId,
+                    command: item.command,
+                    operation: item.responseLabel,
+                    owner: item.identity,
+                    cleanupTreeIdentity: item.cleanupTreeIdentity
+                )
+                try validateFileIdAdmission(
+                    packet: item.packet,
+                    command: activeRecord.command,
+                    cleanupKey: activeRecord.cleanupKey,
+                    treeIdentity: activeRecord.treeIdentity
+                )
                 guard isGenerationActive(generation) else {
                     throw wireFailure ?? SMBTransportError.connectionClosed
                 }
@@ -9255,18 +10019,13 @@ actor SMBSession {
                     cancellationRequested: false,
                     continuationResumed: false,
                     cleanupFileId: activeRecord.cleanupKey,
+                    cleanupTreeIdentity: activeRecord.cleanupTreeIdentity,
+                    cleanupDeadlines: activeRecord.cleanupDeadlines,
+                    cleanupTimeoutTask: activeRecord.cleanupTimeoutTask,
+                    cleanupTimeoutIdentity: activeRecord.cleanupTimeoutIdentity,
                     usesSenderLoop: true
                 )
                 pendingResponses[selectedMessageId] = pending
-                if activeRecord.cleanupKey != nil {
-                    let timerIdentity = UUID()
-                    pendingResponses[selectedMessageId]?.cleanupTimeoutIdentity = timerIdentity
-                    pendingResponses[selectedMessageId]?.cleanupTimeoutTask = startCleanupTimeout(
-                        messageId: selectedMessageId,
-                        generation: generation,
-                        identity: timerIdentity
-                    )
-                }
                 SMBPerfLog.line(
                     "[wire] commit session=\(diagnosticSessionId) request=\(item.identity.requestSequence) " +
                         "message_id=\(selectedMessageId) charge=\(item.reservedCharge) " +
@@ -9303,6 +10062,7 @@ actor SMBSession {
                         "frames=\(senderFrameCountForTestingStorage) message_id=\(selectedMessageId)"
                 )
                 await sendDidSucceed(messageId: selectedMessageId, generation: generation)
+                await completeReadyOperationBarriers()
                 if case .transfer(let ticket) = item.completionTarget {
                     transferSendOwnerFinished(ticket)
                 }
@@ -9327,6 +10087,9 @@ actor SMBSession {
                     }
                     $0.send = .neverSubmitted
                     $0.queuedRequestOwned = false
+                    $0.cleanupTimeoutTask?.cancel()
+                    $0.cleanupTimeoutTask = nil
+                    $0.cleanupTimeoutIdentity = nil
                 }
                 if let cleanupKey = item.cleanupKey {
                     transitionCleanupLedger(cleanupKey, owner: item.identity, .abandonUnsent)
@@ -9338,15 +10101,21 @@ actor SMBSession {
                     transferTicket = nil
                 }
                 if let transferTicket {
-                    terminateTransferAdmissionFailure(transferTicket, error: error)
-                    await creditFailureTask?.value
+                    if isTreeUnavailable(error) {
+                        refuseTransferRequestForTree(transferTicket, error: error)
+                    } else {
+                        terminateTransferAdmissionFailure(transferTicket, error: error)
+                        await creditFailureTask?.value
+                    }
                 }
                 await refundCredit(charge: item.reservedCharge)
+                updateActivePostAuthRecord(item.identity) { $0.credit = .refunded }
                 if transferTicket == nil {
-                    updateActivePostAuthRecord(item.identity) { $0.credit = .refunded }
-                    activePostAuthRequestRecords.removeValue(forKey: item.identity)
                     failQueuedPostAuthRequest(item, error: error)
                 }
+                reclaimActivePostAuthRequestRecordIfEligible(item.identity)
+                await completeReadyOperationBarriers()
+                resumeSatisfiedTestingCountWaiters()
             }
         }
         if senderLoopTaskID == taskID {
@@ -9419,6 +10188,9 @@ actor SMBSession {
             $0.caller = callerState
             $0.send = .neverSubmitted
             $0.queuedRequestOwned = false
+            $0.cleanupTimeoutTask?.cancel()
+            $0.cleanupTimeoutTask = nil
+            $0.cleanupTimeoutIdentity = nil
         }
         return true
     }
@@ -9426,7 +10198,8 @@ actor SMBSession {
     private func finishRetiredStoppedTransferRequest(_ item: SMBQueuedPostAuthRequest) async {
         await refundCredit(charge: item.reservedCharge)
         updateActivePostAuthRecord(item.identity) { $0.credit = .refunded }
-        activePostAuthRequestRecords.removeValue(forKey: item.identity)
+        reclaimActivePostAuthRequestRecordIfEligible(item.identity)
+        await completeReadyOperationBarriers()
         resumeSatisfiedTestingCountWaiters()
     }
 
@@ -9443,6 +10216,7 @@ actor SMBSession {
             pending.cancelQueued = false
             activeRecord.unselectedControlOwned = false
             pendingResponses[messageId] = pending
+            completeOperationBarrierIfWireWorkIsComplete(for: control.requestIdentity)
             completeOrdinaryDrainIfReady(messageId: messageId, conditionCompletedAt: controlOwnerReleasedAt)
             return
         }
@@ -9488,6 +10262,7 @@ actor SMBSession {
         current.cancelSendOwned = false
         currentRecord.selectedCancelOwned = false
         pendingResponses[messageId] = current
+        completeOperationBarrierIfWireWorkIsComplete(for: control.requestIdentity)
         completeOrdinaryDrainIfReady(messageId: messageId, conditionCompletedAt: cancelOwnerRecoveredAt)
     }
 
@@ -9523,8 +10298,11 @@ actor SMBSession {
             await refundCredit(charge: item.reservedCharge)
             if transferTicket == nil {
                 updateActivePostAuthRecord(identity) { $0.credit = .refunded }
-                activePostAuthRequestRecords.removeValue(forKey: identity)
+                reclaimActivePostAuthRequestRecordIfEligible(identity)
+            } else {
+                completeOperationBarrierIfWireWorkIsComplete(for: identity)
             }
+            await completeReadyOperationBarriers()
             return
         }
         guard let messageId = messageId(for: identity),
@@ -9587,6 +10365,7 @@ actor SMBSession {
         pendingResponses[messageId] = pending
         startSenderLoopIfNeeded(generation: identity.generation)
         completeOrdinaryDrainIfReady(messageId: messageId, conditionCompletedAt: cancelAt)
+        await completeReadyOperationBarriers()
     }
 
     private func startWireDrainTimer(
@@ -9764,6 +10543,313 @@ actor SMBSession {
         )
     }
 
+    private func registerTreeIdentity(treeId: UInt32) -> SMBTreeIdentity {
+        nextTreeIncarnationSequence &+= 1
+        let identity = SMBTreeIdentity(
+            sessionInstance: sessionInstanceIdentity,
+            generation: Self.initialWireGeneration,
+            treeId: treeId,
+            incarnationSequence: nextTreeIncarnationSequence
+        )
+        treeIdentityByTreeId[treeId] = identity
+        return identity
+    }
+
+    func treeIdentity(treeId: UInt32) -> SMBTreeIdentity? {
+        treeIdentityByTreeId[treeId]
+    }
+
+    func ensureTreeIdentity(treeId: UInt32) -> SMBTreeIdentity? {
+        if let identity = treeIdentityByTreeId[treeId] { return identity }
+        guard isGenerationActive(Self.initialWireGeneration) else { return nil }
+        return registerTreeIdentity(treeId: treeId)
+    }
+
+    func registerFacade(
+        owner: SMBFacadeOwner,
+        parent: SMBFacadeOwner? = nil
+    ) async {
+        await operationLeaseHarness.registerFacade(owner, parent: parent, sessionExecutor: sessionExecutor)
+    }
+
+    func retireFacade(owner: SMBFacadeOwner) async {
+        await operationLeaseHarness.retireFacade(owner)
+    }
+
+    func operationLifecycleRecordCountsForTesting() async -> (
+        facades: Int,
+        leases: Int,
+        barriers: Int,
+        closeWorkers: Int,
+        activeTrees: Int,
+        parentRecords: Int,
+        executorRecords: Int,
+        retiredFacades: Int
+    ) {
+        let harness = await operationLeaseHarness.recordCountsForTesting()
+        return (
+            harness.facades,
+            harness.leases,
+            harness.barriers,
+            harness.closeWorkers,
+            treeIdentityByTreeId.count,
+            harness.parentRecords,
+            harness.executorRecords,
+            harness.retiredFacades
+        )
+    }
+
+    func setOperationBarrierEvaluationHookForTesting(
+        _ hook: @escaping @Sendable (SMBFacadeOwner, Bool) async -> Void
+    ) async {
+        await operationLeaseHarness.setBarrierEvaluationHookForTesting(hook)
+    }
+
+    private func beginTreeRequestBarrier(
+        _ requestIdentity: SMBRequestIdentity,
+        tree: SMBTreeIdentity,
+        owner: SMBFacadeOwner,
+        kind: SMBOperationBarrierKind,
+        requiresPendingResponse: Bool
+    ) async {
+        guard operationBarrierByRequest[requestIdentity] == nil else { return }
+        let receipt = await operationLeaseHarness.beginBarrier(owner: owner, kind: kind)
+        let stillOwned: Bool
+        if requiresPendingResponse {
+            let messageId = activePostAuthRequestRecords[requestIdentity]?.messageId
+                ?? pendingMessageIdByIdentity[requestIdentity]
+            if let messageId, let pending = pendingResponses[messageId] {
+                if let record = activePostAuthRequestRecords[requestIdentity] {
+                    stillOwned = record.treeIdentity == tree
+                        && pending.requestIdentity == requestIdentity
+                        && pending.expectedTreeId == tree.treeId
+                        && pending.cleanupTreeIdentity == nil
+                } else {
+                    stillOwned = false
+                }
+            } else {
+                stillOwned = false
+            }
+        } else if let preparation = treeCreditPreparations[requestIdentity],
+                  preparation.treeIdentity == tree {
+            stillOwned = true
+        } else if let record = activePostAuthRequestRecords[requestIdentity],
+                  record.treeIdentity == tree,
+                  record.cleanupTreeIdentity == nil {
+            switch record.send {
+            case .notStarted:
+                stillOwned = true
+            case .neverSubmitted:
+                let creditSettled = record.credit == .refunded || record.credit == .discardedOnTerminal
+                let hasOwnedWork = record.queuedRequestOwned
+                    || record.unselectedControlOwned
+                    || record.originalSendOwned
+                    || record.selectedCancelOwned
+                stillOwned = !creditSettled || hasOwnedWork
+            case .committed, .fullySent:
+                stillOwned = record.outstandingCreditGrantAcknowledgements > 0
+            case .failed:
+                stillOwned = false
+            }
+        } else {
+            stillOwned = false
+        }
+        guard stillOwned, operationBarrierByRequest[requestIdentity] == nil else {
+            await operationLeaseHarness.completeBarrier(receipt)
+            return
+        }
+        operationBarrierByRequest[requestIdentity] = receipt
+    }
+
+    private func completeOperationBarrierIfWireWorkIsComplete(
+        for requestIdentity: SMBRequestIdentity,
+        progress: SMBOperationBarrierProgress = .stateChanged
+    ) {
+        guard operationBarrierByRequest[requestIdentity] != nil else { return }
+        let workIsComplete: Bool
+        if case .terminalJoinCompleted = progress {
+            workIsComplete = true
+        } else if let record = activePostAuthRequestRecords[requestIdentity] {
+            guard record.outstandingCreditGrantAcknowledgements == 0,
+                  !record.queuedRequestOwned,
+                  !record.unselectedControlOwned,
+                  !record.originalSendOwned,
+                  !record.selectedCancelOwned,
+                  treeCreditPreparations[requestIdentity] == nil,
+                  pendingMessageIdByIdentity[requestIdentity] == nil else {
+                return
+            }
+            switch record.send {
+            case .neverSubmitted:
+                workIsComplete = record.caller != .pending
+                    && record.messageId == nil
+                    && record.credit == .refunded
+            case .fullySent:
+                workIsComplete = record.wire == .finalAccepted
+                    && record.originalSendOwnerRecoveredAt != nil
+                    && (record.cleanupDeadlines == nil || record.fullSendCompletedAt != nil)
+                    && record.wireDrainDeadline == nil
+                    && record.wireDrainTimerIdentity == nil
+            case .notStarted, .committed, .failed:
+                workIsComplete = false
+            }
+        } else if case .precommitRetirementSettled = progress {
+            workIsComplete = treeCreditPreparations[requestIdentity] == nil
+                && pendingMessageIdByIdentity[requestIdentity] == nil
+        } else {
+            workIsComplete = false
+        }
+        guard workIsComplete,
+              let receipt = operationBarrierByRequest.removeValue(forKey: requestIdentity) else {
+            return
+        }
+        completedOperationBarriers.append(receipt)
+    }
+
+    private func completeReadyOperationBarriers() async {
+        guard !completedOperationBarriers.isEmpty else { return }
+        let receipts = completedOperationBarriers
+        completedOperationBarriers.removeAll(keepingCapacity: true)
+        for receipt in receipts {
+            await operationLeaseHarness.completeBarrier(receipt)
+        }
+    }
+
+    func acquireOperationLease(
+        owner: SMBFacadeOwner,
+        tree: SMBTreeIdentity?
+    ) async -> SMBOperationLease? {
+        if let tree, case .some = treeLifecycle[tree] { return nil }
+        let sessionIdentity = SMBSessionIncarnationIdentity(
+            sessionInstance: sessionInstanceIdentity,
+            generation: Self.initialWireGeneration
+        )
+        return await operationLeaseHarness.acquire(owner: owner, session: sessionIdentity, tree: tree)
+    }
+
+    func releaseOperationLease(_ lease: SMBOperationLease) async {
+        await operationLeaseHarness.release(lease)
+    }
+
+    func closeFacade(
+        owner: SMBFacadeOwner,
+        joinEvenInsideLease: Bool = false,
+        sessionCloseBarrierDeadline: Bool = false,
+        cleanup: @escaping @Sendable () async -> SMBOperationCloseOutcome
+    ) async -> SMBOperationCloseDisposition {
+        let timeoutTask: Task<Void, Never>?
+        var isWaitingForBarrier = false
+        if sessionCloseBarrierDeadline {
+            await operationLeaseHarness.stopAdmission(owner)
+            isWaitingForBarrier = await operationLeaseHarness.hasBlockedWork(owner: owner)
+        }
+        if isWaitingForBarrier {
+            let deadline = sessionTime.now().advanced(by: cleanupTimeout)
+            let sleeper = cleanupTimeoutSleeper
+            let time = sessionTime
+            let harness = operationLeaseHarness
+            let executor = sessionExecutor
+            timeoutTask = Task.detached(executorPreference: executor) {
+                while !Task.isCancelled {
+                    let now = time.now()
+                    if now >= deadline {
+                        await harness.expireClose(owner)
+                        return
+                    }
+                    do {
+                        try await sleeper(now.duration(to: deadline))
+                    } catch {
+                        if !Task.isCancelled {
+                            await harness.expireClose(owner)
+                        }
+                        return
+                    }
+                }
+            }
+        } else {
+            timeoutTask = nil
+        }
+        let disposition = await operationLeaseHarness.close(
+            owner: owner,
+            joinEvenInsideLease: joinEvenInsideLease,
+            cleanup: cleanup
+        )
+        timeoutTask?.cancel()
+        await timeoutTask?.value
+        return disposition
+    }
+
+    private func transitionTreeLifecycle(
+        _ tree: SMBTreeIdentity,
+        owner: SMBRequestIdentity,
+        event: SMBTreeLifecycleEvent
+    ) -> SMBTreeLifecycleState? {
+        let current = treeLifecycle[tree]
+        if let current, current.owner != owner { return current.state }
+        let next: SMBTreeLifecycleState
+        switch event {
+        case .beginQuarantine:
+            guard current == nil else { return current?.state }
+            next = .quarantined
+        case .retire:
+            guard current != nil else { return nil }
+            next = .retired
+        case .retireUnknown:
+            guard current != nil else { return nil }
+            next = .retiredUnknown
+        case .forgetRetired:
+            guard let current, current.state == .retired else { return current?.state }
+            treeLifecycle.removeValue(forKey: tree)
+            if treeIdentityByTreeId[tree.treeId] == tree {
+                treeIdentityByTreeId.removeValue(forKey: tree.treeId)
+            }
+            return nil
+        }
+        treeLifecycle[tree] = (owner, next)
+        return next
+    }
+
+    private func transitionTreeCleanupLedger(
+        _ tree: SMBTreeIdentity,
+        owner: SMBRequestIdentity,
+        event: SMBCleanupLedgerTransition
+    ) -> SMBCleanupAttemptState? {
+        let currentEntry = treeCleanupLedger[tree]
+        if let currentEntry, currentEntry.owner != owner { return currentEntry.state }
+        let current = currentEntry?.state
+        let next: SMBCleanupAttemptState?
+        switch event {
+        case .beginAttempt:
+            next = current ?? .sending
+        case .retireUnsentForDeadline:
+            if case .some(.sending) = current { next = .retiredUnknown } else { next = current }
+        case .abandonUnsent:
+            if case .some(.sending) = current { next = nil } else { next = current }
+        case .beginDrain(let messageId):
+            if case .some(.sending) = current { next = .draining(messageId) } else { next = current }
+        case .finalResponse(let messageId, let succeeded):
+            switch current {
+            case .some(.sending): next = succeeded ? nil : .retiredUnknown
+            case .some(.draining(let currentMessageId)) where currentMessageId == messageId:
+                next = succeeded ? nil : .retiredUnknown
+            case .some(.retiredUnknown): next = succeeded ? nil : current
+            case .some(.draining), .none: next = current
+            }
+        case .treeDisconnected:
+            next = current
+        case .terminal:
+            next = nil
+        }
+        if next != current {
+            if let next {
+                treeCleanupLedger[tree] = SMBCleanupLedgerEntry(owner: owner, state: next)
+            } else {
+                treeCleanupLedger.removeValue(forKey: tree)
+            }
+        }
+        return treeCleanupLedger[tree]?.state
+    }
+
     private func updateActivePostAuthRecord(
         _ identity: SMBRequestIdentity,
         _ update: (inout SMBSessionActiveRequestRecord) -> Void
@@ -9786,27 +10872,72 @@ actor SMBSession {
         guard let pending = pendingResponses.removeValue(forKey: messageId) else { return nil }
         pendingMessageIdByIdentity.removeValue(forKey: pending.requestIdentity)
         queuedControlSends.removeAll { $0.requestIdentity == pending.requestIdentity }
-        reapActivePostAuthRequestRecordIfEligible(pending.requestIdentity)
+        reclaimActivePostAuthRequestRecordIfEligible(pending.requestIdentity)
         resumeCancelledRequestDrainWaiters()
         return pending
     }
 
-    private func reapActivePostAuthRequestRecordIfEligible(_ identity: SMBRequestIdentity) {
+    private func reclaimActivePostAuthRequestRecordIfEligible(_ identity: SMBRequestIdentity) {
         guard let record = activePostAuthRequestRecords[identity],
-              let messageId = record.messageId,
-              pendingResponses[messageId]?.requestIdentity != identity,
-              record.wire == .finalAccepted,
-              record.send == .fullySent,
-              record.wireDrainDeadline == nil,
+              record.caller != .pending,
               record.outstandingCreditGrantAcknowledgements == 0,
+              !record.creditRefundPending,
               !record.queuedRequestOwned,
               !record.unselectedControlOwned,
               !record.originalSendOwned,
-              !record.selectedCancelOwned else {
+              !record.selectedCancelOwned,
+              record.cleanupTimeoutTask == nil,
+              record.cleanupTimeoutIdentity == nil,
+              record.wireDrainDeadline == nil,
+              record.wireDrainTask == nil,
+              record.wireDrainTimerIdentity == nil,
+              treeCreditPreparations[identity] == nil,
+              pendingMessageIdByIdentity[identity] == nil else {
             return
         }
-        activePostAuthRequestRecords.removeValue(forKey: identity)
-        activePostAuthRequestRecordReapedHookForTesting?(messageId)
+
+        if let messageId = record.messageId,
+           pendingResponses[messageId]?.requestIdentity == identity {
+            return
+        }
+
+        switch record.send {
+        case .neverSubmitted:
+            guard record.messageId == nil else { return }
+            switch record.wire {
+            case .notApplicable, .sessionTerminal: break
+            case .waiting, .statusPending, .finalAccepted: return
+            }
+            switch record.credit {
+            case .refunded, .discardedOnTerminal: break
+            case .waiting, .reserved, .prepared, .committed: return
+            }
+        case .fullySent:
+            guard record.messageId != nil else { return }
+            switch record.wire {
+            case .finalAccepted, .sessionTerminal: break
+            case .notApplicable, .waiting, .statusPending: return
+            }
+            switch record.credit {
+            case .committed, .refunded, .discardedOnTerminal: break
+            case .waiting, .reserved, .prepared: return
+            }
+        case .failed:
+            guard record.wire == .sessionTerminal else { return }
+            switch record.credit {
+            case .refunded, .discardedOnTerminal: break
+            case .waiting, .reserved, .prepared, .committed: return
+            }
+        case .notStarted, .committed:
+            return
+        }
+
+        completeOperationBarrierIfWireWorkIsComplete(for: identity)
+        guard operationBarrierByRequest[identity] == nil else { return }
+        guard activePostAuthRequestRecords.removeValue(forKey: identity) != nil else { return }
+        if let messageId = record.messageId {
+            activePostAuthRequestRecordReapedHookForTesting?(messageId)
+        }
     }
 
     private func acknowledgeFinalCreditGrant(for effect: SMBValidatedResponseEffect) {
@@ -9818,7 +10949,8 @@ actor SMBSession {
             return
         }
         record.outstandingCreditGrantAcknowledgements -= 1
-        reapActivePostAuthRequestRecordIfEligible(identity)
+        reclaimActivePostAuthRequestRecordIfEligible(identity)
+        finalCreditGrantAcknowledgedHookForTesting?()
         sessionExecutor.recordExecutionContextForTesting(.creditGrantAcknowledgement)
     }
 
@@ -9935,7 +11067,22 @@ actor SMBSession {
     /// helper runs. This admission check is a backstop for any later internal path: once a
     /// CLOSE attempt starts, no new handle operation may use that 16-byte identity until a
     /// successful CLOSE response resolves it. A failed or unknown identity stays retired.
-    private func validateFileIdAdmission(packet: [UInt8], command: UInt16, cleanupFileId: [UInt8]?) throws {
+    private func treeIdentityForRequest(treeId: UInt32, command: UInt16) -> SMBTreeIdentity? {
+        switch command {
+        case SMB2Commands.sessionSetup, SMB2Commands.treeConnect,
+             SMB2Commands.echo, SMB2Commands.logoff, SMB2Commands.cancel:
+            return nil
+        default:
+            return treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId)
+        }
+    }
+
+    private func validateFileIdAdmission(
+        packet: [UInt8],
+        command: UInt16,
+        cleanupFileId: [UInt8]?,
+        treeIdentity: SMBTreeIdentity?
+    ) throws {
         guard let offset = Self.fileIdOffsetInRequest(command: command) else {
             if cleanupFileId != nil {
                 throw SMBCodecError.invalidValue("cleanup CLOSE packet does not carry a FileId")
@@ -9943,14 +11090,61 @@ actor SMBSession {
             return
         }
         guard offset + 16 <= packet.count else { throw SMBCodecError.truncated }
-        let fileId = Array(packet[offset..<offset + 16])
-        try validateFileIdAdmission(command: command, fileId: fileId, cleanupFileId: cleanupFileId)
+        guard let treeIdentity else {
+            if cleanupFileId != nil {
+                throw SMBCodecError.invalidValue("cleanup CLOSE has no Tree identity")
+            }
+            return
+        }
+        let packetKey = SMBFileIdLedgerKey(packet: packet, offset: offset, treeIdentity: treeIdentity)
+        if let cleanupFileId {
+            guard command == SMB2Commands.close,
+                  cleanupFileId.count == 16,
+                  packetKey == SMBFileIdLedgerKey(bytes: cleanupFileId, treeIdentity: treeIdentity) else {
+                throw SMBCodecError.invalidValue("cleanup CLOSE FileId does not match its ledger key")
+            }
+            return
+        }
+        guard cleanupLedger[packetKey] == nil else {
+            throw SMBCodecError.invalidValue("SMB FileId is unresolved after CLOSE")
+        }
+    }
+
+    private func validateTreeAdmission(
+        treeId: UInt32,
+        command: UInt16,
+        operation: String,
+        owner: SMBRequestIdentity,
+        cleanupTreeIdentity: SMBTreeIdentity?
+    ) throws {
+        switch command {
+        case SMB2Commands.sessionSetup, SMB2Commands.treeConnect,
+             SMB2Commands.echo, SMB2Commands.logoff, SMB2Commands.cancel:
+            return
+        default:
+            break
+        }
+        let currentIdentity = treeIdentityByTreeId[treeId]
+        if let cleanupTreeIdentity {
+            guard cleanupTreeIdentity.treeId == treeId,
+                  currentIdentity == cleanupTreeIdentity,
+                  let state = treeLifecycle[cleanupTreeIdentity],
+                  state.owner == owner,
+                  state.state == .quarantined else {
+                throw SMBError.treeUnavailable(treeId: treeId, operation: operation)
+            }
+            return
+        }
+        if let currentIdentity, case .some = treeLifecycle[currentIdentity] {
+            throw SMBError.treeUnavailable(treeId: treeId, operation: operation)
+        }
     }
 
     private func validateFileIdAdmission(
         packet: [UInt8],
         command: UInt16,
-        cleanupKey: SMBFileIdLedgerKey?
+        cleanupKey: SMBFileIdLedgerKey?,
+        treeIdentity: SMBTreeIdentity?
     ) throws {
         guard let offset = Self.fileIdOffsetInRequest(command: command) else {
             if cleanupKey != nil {
@@ -9959,7 +11153,13 @@ actor SMBSession {
             return
         }
         guard offset + 16 <= packet.count else { throw SMBCodecError.truncated }
-        let fileKey = SMBFileIdLedgerKey(packet: packet, offset: offset)
+        guard let treeIdentity else {
+            if cleanupKey != nil {
+                throw SMBCodecError.invalidValue("cleanup CLOSE has no Tree identity")
+            }
+            return
+        }
+        let fileKey = SMBFileIdLedgerKey(packet: packet, offset: offset, treeIdentity: treeIdentity)
         if let cleanupKey {
             guard command == SMB2Commands.close, fileKey == cleanupKey else {
                 throw SMBCodecError.invalidValue("cleanup CLOSE FileId does not match its ledger key")
@@ -9971,7 +11171,12 @@ actor SMBSession {
         }
     }
 
-    private func validateFileIdAdmission(command: UInt16, fileId: [UInt8], cleanupFileId: [UInt8]?) throws {
+    private func validateFileIdAdmission(
+        command: UInt16,
+        treeId: UInt32,
+        fileId: [UInt8],
+        cleanupFileId: [UInt8]?
+    ) throws {
         guard Self.fileIdOffsetInRequest(command: command) != nil else {
             if cleanupFileId != nil {
                 throw SMBCodecError.invalidValue("cleanup CLOSE packet does not carry a FileId")
@@ -9981,13 +11186,17 @@ actor SMBSession {
         guard fileId.count == 16 else {
             throw SMBCodecError.invalidValue("SMB FileId must be 16 bytes")
         }
+        let treeIdentity = treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId)
+        guard let treeIdentity else {
+            throw SMBCodecError.invalidValue("SMB FileId has no Tree identity")
+        }
         if let cleanupFileId {
             guard command == SMB2Commands.close, fileId == cleanupFileId else {
                 throw SMBCodecError.invalidValue("cleanup CLOSE FileId does not match its ledger key")
             }
             return
         }
-        guard cleanupLedger[SMBFileIdLedgerKey(bytes: fileId)] == nil else {
+        guard cleanupLedger[SMBFileIdLedgerKey(bytes: fileId, treeIdentity: treeIdentity)] == nil else {
             throw SMBCodecError.invalidValue("SMB FileId is unresolved after CLOSE")
         }
     }
@@ -10006,71 +11215,278 @@ actor SMBSession {
         }
     }
 
-    private func startCleanupTimeout(messageId: UInt64, generation: UInt64, identity: UUID) -> Task<Void, Never> {
-        let duration = cleanupTimeout
-        let sleeper = cleanupTimeoutSleeper
-        let executor = sessionExecutor
-        return Task.detached(executorPreference: executor) { [weak self] in
-            do {
-                try await sleeper(duration)
-            } catch {
-                return
-            }
-            executor.recordExecutionContextForTesting(.cleanupTimeoutWake)
-            await self?.cleanupTimeoutDidFire(messageId: messageId, generation: generation, identity: identity)
-        }
-    }
-
-    private func cleanupCloseCancellationDidFire(
+    private func retireCleanupBeforeCommit(
         identity: SMBRequestIdentity,
-        generation: UInt64
-    ) async {
-        guard isGenerationActive(generation), identity.generation == generation else { return }
-        if let messageId = messageId(for: identity),
-           let pending = pendingResponses[messageId],
-           pending.requestIdentity == identity,
-           let timerIdentity = pending.cleanupTimeoutIdentity {
-            cleanupTimeoutDidFire(messageId: messageId, generation: generation, identity: timerIdentity)
-            return
-        }
-
-        if let index = queuedPostAuthRequests.firstIndex(where: { $0.identity == identity }) {
-            let item = queuedPostAuthRequests.remove(at: index)
-            resumeSatisfiedTestingCountWaiters()
-            updateActivePostAuthRecord(identity) {
-                $0.caller = .timedOut
-                $0.send = .neverSubmitted
-                $0.queuedRequestOwned = false
-            }
-            if let cleanupKey = item.cleanupKey {
-                transitionCleanupLedger(cleanupKey, owner: identity, .retireUnsentForDeadline)
-            }
-            await refundCredit(charge: item.reservedCharge)
-            updateActivePostAuthRecord(identity) { $0.credit = .refunded }
-            activePostAuthRequestRecords.removeValue(forKey: identity)
-            switch item.completionTarget {
-            case .transaction(let continuation):
-                continuation.resume(throwing: SMBTransportError.timedOut)
-            case .transfer:
-                assertionFailure("cleanup CLOSE cannot be a transfer request")
-            }
-            return
-        }
-
-        guard let record = activePostAuthRequestRecords[identity], record.messageId == nil else { return }
+        record: SMBSessionActiveRequestRecord
+    ) {
+        softExpiredCleanupOwners.insert(identity)
         record.caller = .timedOut
         record.send = .neverSubmitted
+        record.queuedRequestOwned = false
+        record.cleanupTimeoutTask?.cancel()
+        record.cleanupTimeoutTask = nil
+        record.cleanupTimeoutIdentity = nil
+        _ = record.creditCancellationToken?.cancel()
         if let cleanupKey = record.cleanupKey {
             transitionCleanupLedger(cleanupKey, owner: identity, .retireUnsentForDeadline)
         }
-        // If credit is granted concurrently with cancellation, enqueuePostAuthRequest sees
-        // this identity and refunds the reservation before it can add a queue item or MID.
-        cancelledBeforeEnqueue.insert(identity)
-        cleanupCloseCancellationAppliedHookForTesting?()
+        if let tree = record.cleanupTreeIdentity {
+            _ = transitionTreeCleanupLedger(tree, owner: identity, event: .retireUnsentForDeadline)
+            _ = transitionTreeLifecycle(tree, owner: identity, event: .retireUnknown)
+        }
     }
 
-    private func runCleanupCloseCancellationWillApplyHookForTesting() async {
-        await cleanupCloseCancellationWillApplyHookForTesting?()
+    private func startCleanupIntentTimeout(
+        identity: SMBRequestIdentity,
+        timerIdentity: UUID,
+        deadlines: SMBCleanupDeadlines
+    ) -> Task<Void, Never> {
+        let now = sessionTime.now()
+        let delay = now < deadlines.softAt ? now.duration(to: deadlines.softAt) : .zero
+        let sleeper = cleanupTimeoutSleeper
+        let executor = sessionExecutor
+        let wakeHook = cleanupTimeoutWakeHookForTesting
+        return Task.detached(executorPreference: executor) { [weak self] in
+            do { try await sleeper(delay) } catch { return }
+            executor.recordExecutionContextForTesting(.cleanupTimeoutWake)
+            if let wakeHook { await wakeHook(identity) }
+            await self?.cleanupIntentSoftDeadlineDidFire(
+                identity: identity,
+                timerIdentity: timerIdentity,
+                deadlines: deadlines
+            )
+        }
+    }
+
+    private func cleanupIntentSoftDeadlineDidFire(
+        identity: SMBRequestIdentity,
+        timerIdentity: UUID,
+        deadlines: SMBCleanupDeadlines
+    ) async {
+        let record = activePostAuthRequestRecords[identity]
+        let treeEntry = treeCleanupIntents.first { $0.value.owner == identity }
+        let treeIntent = treeEntry?.value
+        let pendingEntry = pendingResponses.first { $0.value.requestIdentity == identity }
+        let pendingAtStart = pendingEntry?.value
+        let timerIsCurrent: Bool
+        if let currentIdentity = record?.cleanupTimeoutIdentity, currentIdentity == timerIdentity {
+            timerIsCurrent = true
+        } else if let treeIntent, treeIntent.timeoutIdentity == timerIdentity {
+            timerIsCurrent = true
+        } else if pendingAtStart?.cleanupTimeoutIdentity == timerIdentity {
+            timerIsCurrent = true
+        } else {
+            timerIsCurrent = false
+        }
+        cleanupTimeoutIdentityCheckHookForTesting?(timerIsCurrent)
+        guard timerIsCurrent else { return }
+        let now = sessionTime.now()
+        if now < deadlines.softAt {
+            let replacement = startCleanupIntentTimeout(
+                identity: identity,
+                timerIdentity: timerIdentity,
+                deadlines: deadlines
+            )
+            if let record { record.cleanupTimeoutTask = replacement }
+            if let tree = record?.cleanupTreeIdentity ?? treeEntry?.key,
+               var intent = treeCleanupIntents[tree], intent.owner == identity {
+                intent.timeoutTask = replacement
+                treeCleanupIntents[tree] = intent
+            }
+            if let messageId = record?.messageId,
+               var pending = pendingResponses[messageId], pending.requestIdentity == identity {
+                pending.cleanupTimeoutTask = replacement
+                pendingResponses[messageId] = pending
+            }
+            if let pendingEntry,
+               var pending = pendingResponses[pendingEntry.key],
+               pending.requestIdentity == identity {
+                pending.cleanupTimeoutTask = replacement
+                pendingResponses[pendingEntry.key] = pending
+            }
+            return
+        }
+        softExpiredCleanupOwners.insert(identity)
+
+        guard let record else {
+            if let pendingEntry,
+               var pending = pendingResponses[pendingEntry.key],
+               pending.requestIdentity == identity {
+                let messageId = pendingEntry.key
+                pending.cleanupTimeoutTask = nil
+                pending.cleanupTimeoutIdentity = nil
+                switch pending.sendPhase {
+                case .registered:
+                    removePendingResponse(messageId: messageId)
+                    pending.sendTask?.cancel()
+                    if let fileId = pending.cleanupFileId {
+                        transitionCleanupLedger(fileId, owner: identity, .retireUnsentForDeadline)
+                    }
+                    if let tree = pending.cleanupTreeIdentity {
+                        _ = transitionTreeCleanupLedger(tree, owner: identity, event: .retireUnsentForDeadline)
+                        _ = transitionTreeLifecycle(tree, owner: identity, event: .retireUnknown)
+                    }
+                    pending.continuationResumed = true
+                    resolvePendingCompletion(
+                        pending.completionTarget,
+                        with: .failure(SMBTransportError.timedOut)
+                    )
+                    resumePendingCountWaiters()
+                case .sending, .sent:
+                    _ = applyCleanupDeadlineEvent(
+                        .softTimeout,
+                        at: now,
+                        messageId: messageId,
+                        pending: &pending,
+                        record: nil
+                    )
+                }
+                if let treeIntent, let tree = treeEntry?.key {
+                    _ = transitionTreeLifecycle(tree, owner: treeIntent.owner, event: .retireUnknown)
+                    await operationLeaseHarness.expireClose(treeIntent.facadeOwner)
+                }
+                return
+            }
+            if let treeIntent, let tree = treeEntry?.key {
+                softExpiredCleanupOwners.insert(identity)
+                _ = transitionTreeCleanupLedger(tree, owner: treeIntent.owner, event: .retireUnsentForDeadline)
+                _ = transitionTreeLifecycle(tree, owner: treeIntent.owner, event: .retireUnknown)
+                var updatedIntent = treeIntent
+                updatedIntent.timeoutTask = nil
+                updatedIntent.timeoutIdentity = nil
+                treeCleanupIntents[tree] = updatedIntent
+                await operationLeaseHarness.expireClose(treeIntent.facadeOwner)
+            }
+            cleanupSoftDeadlineAppliedHookForTesting?()
+            return
+        }
+        record.cleanupTimeoutTask = nil
+        record.cleanupTimeoutIdentity = nil
+
+        if let messageId = record.messageId,
+           var pending = pendingResponses[messageId],
+           pending.requestIdentity == identity {
+            _ = applyCleanupDeadlineEvent(
+                .softTimeout,
+                at: now,
+                messageId: messageId,
+                pending: &pending,
+                record: record
+            )
+            return
+        }
+
+        let refusalError: Error
+        if let tree = record.cleanupTreeIdentity {
+            _ = transitionTreeCleanupLedger(tree, owner: identity, event: .retireUnsentForDeadline)
+            _ = transitionTreeLifecycle(tree, owner: identity, event: .retireUnknown)
+            if let intent = treeCleanupIntents[tree] {
+                await operationLeaseHarness.expireClose(intent.facadeOwner)
+            }
+            refusalError = SMBTransportError.timedOut
+        } else {
+            if let cleanupKey = record.cleanupKey {
+                transitionCleanupLedger(cleanupKey, owner: identity, .retireUnsentForDeadline)
+            }
+            refusalError = SMBTransportError.timedOut
+        }
+        record.caller = .timedOut
+        record.send = .neverSubmitted
+        record.queuedRequestOwned = false
+        cancelledBeforeEnqueue.insert(identity)
+        var queuedRefund: UInt16?
+        if let index = queuedPostAuthRequests.firstIndex(where: { $0.identity == identity }) {
+            let item = queuedPostAuthRequests.remove(at: index)
+            queuedRefund = item.reservedCharge
+            failQueuedPostAuthRequest(item, error: refusalError)
+            resumeSatisfiedTestingCountWaiters()
+        }
+        let creditCancellationToken = record.creditCancellationToken
+        let lateGrantRefund = creditCancellationToken?.cancel()
+        if let tree = record.treeIdentity {
+            _ = await creditWindow.cancelWaiters(
+                treeIdentity: tree,
+                requestIdentities: [identity],
+                error: refusalError
+            )
+        }
+        let refundIsPending: Bool
+        if lateGrantRefund != nil {
+            refundIsPending = true
+        } else {
+            refundIsPending = queuedRefund != nil
+        }
+        if refundIsPending { record.creditRefundPending = true }
+        if let lateGrantRefund {
+            await creditCancellationToken?.refundInterleavingHookForTesting?(.refundPending(charge: lateGrantRefund))
+        }
+        if let lateGrantRefund {
+            await refundCredit(charge: lateGrantRefund)
+        }
+        if let queuedRefund { await refundCredit(charge: queuedRefund) }
+        record.creditRefundPending = false
+        if refundIsPending {
+            if wireFailure != nil {
+                record.credit = .discardedOnTerminal
+            } else {
+                record.credit = .refunded
+            }
+        }
+        reclaimActivePostAuthRequestRecordIfEligible(identity)
+        await completeReadyOperationBarriers()
+        cleanupSoftDeadlineAppliedHookForTesting?()
+    }
+
+    private func startCleanupHardDeadline(
+        messageId: UInt64,
+        owner: SMBRequestIdentity,
+        timerIdentity: UUID,
+        deadlines: SMBCleanupDeadlines
+    ) -> Task<Void, Never> {
+        let now = sessionTime.now()
+        let delay = now < deadlines.hardAt ? now.duration(to: deadlines.hardAt) : .zero
+        let sleeper = cleanupTimeoutSleeper
+        let executor = sessionExecutor
+        return Task.detached(executorPreference: executor) { [weak self] in
+            do { try await sleeper(delay) } catch { return }
+            executor.recordExecutionContextForTesting(.cleanupDrainTimeoutWake)
+            await self?.cleanupHardDeadlineDidFire(
+                messageId: messageId,
+                owner: owner,
+                timerIdentity: timerIdentity,
+                deadlines: deadlines
+            )
+        }
+    }
+
+    private func cleanupHardDeadlineDidFire(
+        messageId: UInt64,
+        owner: SMBRequestIdentity,
+        timerIdentity: UUID,
+        deadlines: SMBCleanupDeadlines
+    ) {
+        guard var pending = pendingResponses[messageId],
+              pending.requestIdentity == owner,
+              pending.cleanupDrainIdentity == timerIdentity,
+              pending.cleanupTombstone else { return }
+        let now = sessionTime.now()
+        if now < deadlines.hardAt {
+            pendingResponses[messageId]?.cleanupDrainTask = startCleanupHardDeadline(
+                messageId: messageId,
+                owner: owner,
+                timerIdentity: timerIdentity,
+                deadlines: deadlines
+            )
+            return
+        }
+        let record = activePostAuthRequestRecords[owner]
+        _ = applyCleanupDeadlineEvent(
+            .hardTimeout,
+            at: now,
+            messageId: messageId,
+            pending: &pending,
+            record: record
+        )
     }
 
     /// A best-effort CLOSE deadline can win while its precommit credit wait is unwinding.
@@ -10087,36 +11503,12 @@ actor SMBSession {
         } else {
             wasAlreadyRetired = false
         }
-        var deadlineCancellation = false
-        if Task.isCancelled {
-            if SMBPostAuthCleanupDeadlineScope.isActive {
-                deadlineCancellation = true
-            }
-        }
+        let deadlineCancellation = softExpiredCleanupOwners.contains(owner)
         if deadlineCancellation {
             transitionCleanupLedger(cleanupKey, owner: owner, .retireUnsentForDeadline)
         }
         if wasAlreadyRetired { return true }
         return deadlineCancellation
-    }
-
-    private func startCleanupDrainTimeout(
-        messageId: UInt64,
-        generation: UInt64,
-        identity: UUID,
-        duration: Duration
-    ) -> Task<Void, Never> {
-        let sleeper = requestTimeoutSleeper
-        let executor = sessionExecutor
-        return Task.detached(executorPreference: executor) { [weak self] in
-            do {
-                try await sleeper(duration)
-            } catch {
-                return
-            }
-            executor.recordExecutionContextForTesting(.cleanupDrainTimeoutWake)
-            await self?.cleanupDrainTimeoutDidFire(messageId: messageId, generation: generation, identity: identity)
-        }
     }
 
     private func startRequestTimeout(
@@ -10162,6 +11554,24 @@ actor SMBSession {
         owner: SMBRequestIdentity? = nil,
         _ transition: SMBCleanupLedgerTransition
     ) -> SMBCleanupAttemptState? {
+        if case .treeDisconnected(let tree) = transition {
+            guard let owner,
+                  let lifecycle = treeLifecycle[tree],
+                  lifecycle.owner == owner,
+                  lifecycle.state == .retired else { return nil }
+            let retiredKeys = cleanupLedger.compactMap { key, entry -> SMBFileIdLedgerKey? in
+                guard key.treeIdentity == tree,
+                      case .retiredUnknown = entry.state else { return nil }
+                return key
+            }
+            for retiredKey in retiredKeys {
+                cleanupLedger.removeValue(forKey: retiredKey)
+            }
+            if !retiredKeys.isEmpty {
+                resumeCleanupLedgerCountWaiters()
+            }
+            return nil
+        }
         if case .terminal = transition {
             if !cleanupLedger.isEmpty {
                 cleanupLedger.removeAll()
@@ -10215,6 +11625,8 @@ actor SMBSession {
             }
         case .terminal:
             next = current
+        case .treeDisconnected:
+            next = current
         }
 
         if next != current {
@@ -10226,83 +11638,6 @@ actor SMBSession {
             resumeCleanupLedgerCountWaiters()
         }
         return cleanupLedger[key]?.state
-    }
-
-    private func cleanupTimeoutDidFire(messageId: UInt64, generation: UInt64, identity: UUID) {
-        guard var pending = pendingResponses[messageId],
-              isGenerationActive(generation),
-              pending.generation == generation,
-              pending.cleanupTimeoutIdentity == identity,
-              let fileId = pending.cleanupFileId,
-              !pending.continuationResumed else {
-            return
-        }
-        pending.cleanupTimeoutTask = nil
-        pending.cleanupTimeoutIdentity = nil
-        pending.timeoutTask?.cancel()
-        pending.timeoutTask = nil
-        pending.timeoutIdentity = nil
-
-        switch pending.sendPhase {
-        case .registered:
-            removePendingResponse(messageId: messageId)
-            pending.sendTask?.cancel()
-            transitionCleanupLedger(fileId, owner: pending.requestIdentity, .retireUnsentForDeadline)
-            pending.continuationResumed = true
-            resolvePendingCompletion(
-                pending.completionTarget,
-                with: .failure(SMBTransportError.timedOut)
-            )
-            resumePendingCountWaiters()
-        case .sending:
-            // The transport has no complete-frame send acknowledgement. At this point a CLOSE
-            // may be partial or complete, so this is a wire fault and the session must close.
-            beginSessionFaultTerminalization(
-                cause: "cleanup_close_timeout_sending",
-                error: SMBTransportError.timedOut
-            )
-        case .sent:
-            pending.cleanupTombstone = true
-            pending.continuationResumed = true
-            transitionCleanupLedger(fileId, owner: pending.requestIdentity, .beginDrain(messageId: messageId))
-            if let requestTimeout {
-                let drainIdentity = UUID()
-                pending.cleanupDrainIdentity = drainIdentity
-                pending.cleanupDrainTask = startCleanupDrainTimeout(
-                    messageId: messageId,
-                    generation: generation,
-                    identity: drainIdentity,
-                    duration: requestTimeout
-                )
-            }
-            pendingResponses[messageId] = pending
-            resolvePendingCompletion(
-                pending.completionTarget,
-                with: .failure(SMBTransportError.timedOut)
-            )
-        }
-    }
-
-    private func cleanupDrainTimeoutDidFire(messageId: UInt64, generation: UInt64, identity: UUID) {
-        cleanupDrainTimeoutCallbackCountForTestingStorage += 1
-        resumeSatisfiedTestingCountWaiters()
-        guard let pending = pendingResponses[messageId],
-              isGenerationActive(generation),
-              pending.generation == generation,
-              pending.cleanupTombstone,
-              pending.cleanupDrainIdentity == identity,
-              let fileId = pending.cleanupFileId,
-              cleanupLedger[fileId]?.owner == pending.requestIdentity,
-              cleanupLedger[fileId]?.state == .draining(messageId) else {
-            return
-        }
-        // requestTimeout is the response tolerance for this session; a nil value intentionally
-        // leaves only the 64-entry ledger bound. We cannot restore credit until the server grants it,
-        // so unrelated credit waiters may remain parked until this bound closes the session.
-        beginSessionFaultTerminalization(
-            cause: "cleanup_close_drain_timeout",
-            error: SMBTransportError.timedOut
-        )
     }
 
     nonisolated private static func sendAndLog(
@@ -10469,6 +11804,20 @@ actor SMBSession {
         return packet
     }
 
+    private func recordCleanupFullSendCompletion(messageId: UInt64?, generation: UInt64) -> UInt64? {
+        guard isGenerationActive(generation),
+              let messageId,
+              let pending = pendingResponses[messageId],
+              pending.usesSenderLoop,
+              pending.cleanupDeadlines != nil,
+              let record = activePostAuthRequestRecords[pending.requestIdentity] else {
+            return nil
+        }
+        record.fullSendCompletedAt = sessionTime.now()
+        completeOperationBarrierIfWireWorkIsComplete(for: pending.requestIdentity)
+        return messageId
+    }
+
     private func sendPlaintext(
         _ packet: [UInt8],
         messageId: UInt64?,
@@ -10502,6 +11851,12 @@ actor SMBSession {
         do {
             try await transport.send(DirectTCPFraming.segments([packet]))
             guard isGenerationActive(generation) else { throw SMBTransportError.connectionClosed }
+            if let cleanupMessageId = recordCleanupFullSendCompletion(
+                messageId: messageId,
+                generation: generation
+            ), let hook = cleanupFullSendBoundaryHookForTesting {
+                await hook(cleanupMessageId)
+            }
         } catch {
             terminalizeSendFailureBeforeCreditRefund(messageId: messageId, error: error)
             await creditFailureTask?.value
@@ -10575,6 +11930,12 @@ actor SMBSession {
         do {
             try await transport.send(DirectTCPFraming.segments([try header.encode(), sealed.ciphertext]))
             guard isGenerationActive(generation) else { throw SMBTransportError.connectionClosed }
+            if let cleanupMessageId = recordCleanupFullSendCompletion(
+                messageId: messageId,
+                generation: generation
+            ), let hook = cleanupFullSendBoundaryHookForTesting {
+                await hook(cleanupMessageId)
+            }
         } catch {
             terminalizeSendFailureBeforeCreditRefund(messageId: messageId, error: error)
             await creditFailureTask?.value
@@ -10739,6 +12100,7 @@ actor SMBSession {
         // this one credit-window hop. A delayed credit acknowledgement cannot move the final
         // acceptance time or release an unvalidated slice.
         await recordCreditGrants(effects, generation: generation)
+        await completeReadyOperationBarriers()
         guard isGenerationActive(generation) else { return false }
         guard hasReaderEligibleResponseOutstanding else {
             // Commit the stop and lifecycle transition in this actor turn, with no await
@@ -10981,6 +12343,7 @@ actor SMBSession {
                 expectedTreeId: pending.expectedTreeId,
                 longPoll: pending.longPoll,
                 cleanupFileId: pending.cleanupFileId,
+                cleanupTreeIdentity: pending.cleanupTreeIdentity,
                 responseProtectionPolicy: pending.responseProtectionPolicy,
                 asyncId: pending.asyncId,
                 pendingCount: pending.pendingCount,
@@ -11066,7 +12429,7 @@ actor SMBSession {
                 "SMB response correlation mismatch command=\(header.command)/\(state.expectedCommand)"
             )
         }
-        if state.cleanupFileId != nil {
+        if state.cleanupFileId != nil || state.cleanupTreeIdentity != nil {
             guard header.sessionId == state.expectedSessionId else {
                 throw SMBCodecError.invalidValue(
                     "SMB cleanup response correlation mismatch session=\(header.sessionId)/\(state.expectedSessionId)"
@@ -11093,7 +12456,7 @@ actor SMBSession {
             guard state.asyncId == nil else {
                 throw SMBCodecError.invalidValue("SMB2 sync final response after async interim (message id \(header.messageId))")
             }
-            if state.cleanupFileId != nil {
+            if state.cleanupFileId != nil || state.cleanupTreeIdentity != nil {
                 guard header.treeId == state.expectedTreeId else {
                     throw SMBCodecError.invalidValue(
                         "SMB cleanup response correlation mismatch tree=\(header.treeId)/\(state.expectedTreeId)"
@@ -11219,6 +12582,9 @@ actor SMBSession {
             updateActivePostAuthRecord(identity) { $0.wire = .statusPending(asyncId: asyncId) }
             debugLine("\(pending.label) accepted interim STATUS_PENDING AsyncId=\(asyncId)")
         case .final(let asyncId, let pendingCount, let frame, let status, let sendPhase, let acceptedAt):
+            guard advanceCleanupAtFinalAcceptance(messageId: effect.messageId, acceptedAt: acceptedAt) else {
+                return
+            }
             if let pending = pendingResponses[effect.messageId],
                pending.requestIdentity == identity,
                let timeoutIdentity = pending.timeoutIdentity,
@@ -11282,6 +12648,7 @@ actor SMBSession {
                     updateActivePostAuthRecord(identity) { $0.unselectedControlOwned = false }
                 }
                 pendingResponses[effect.messageId] = pending
+                completeOperationBarrierIfWireWorkIsComplete(for: identity)
                 completeOrdinaryDrainIfReady(
                     messageId: effect.messageId,
                     conditionCompletedAt: acceptedAt
@@ -11320,6 +12687,132 @@ actor SMBSession {
             }
             pendingResponses[effect.messageId] = pending
         }
+    }
+
+    private func advanceCleanupAtFinalAcceptance(
+        messageId: UInt64,
+        acceptedAt: ContinuousClock.Instant
+    ) -> Bool {
+        guard var pending = pendingResponses[messageId], pending.cleanupDeadlines != nil else { return true }
+        let record = activePostAuthRequestRecords[pending.requestIdentity]
+        let disposition = applyCleanupDeadlineEvent(
+            .finalAccepted,
+            at: acceptedAt,
+            messageId: messageId,
+            pending: &pending,
+            record: record
+        )
+        return disposition != .terminal
+    }
+
+    @discardableResult
+    private func applyCleanupDeadlineEvent(
+        _ event: SMBCleanupDeadlineEvent,
+        at eventTime: ContinuousClock.Instant,
+        messageId: UInt64,
+        pending: inout SMBPendingResponse,
+        record: SMBSessionActiveRequestRecord?
+    ) -> SMBCleanupDeadlineDisposition {
+        guard let deadlines = pending.cleanupDeadlines else { return .beforeSoft }
+
+        let fullSendCompletedAt: ContinuousClock.Instant?
+        let sendOwnerRecoveredAt: ContinuousClock.Instant?
+        if let record {
+            fullSendCompletedAt = record.fullSendCompletedAt
+            sendOwnerRecoveredAt = record.originalSendOwnerRecoveredAt
+        } else if pending.sendPhase == .sent {
+            // parkCleanupPendingForTesting models the already-sent legacy cleanup path.
+            fullSendCompletedAt = deadlines.intentAt
+            sendOwnerRecoveredAt = deadlines.intentAt
+        } else {
+            fullSendCompletedAt = nil
+            sendOwnerRecoveredAt = nil
+        }
+
+        let disposition = deadlines.disposition(
+            for: event,
+            at: eventTime,
+            fullSendCompletedAt: fullSendCompletedAt,
+            finalAcceptedAt: record?.finalAcceptedAt,
+            sendOwnerRecoveredAt: sendOwnerRecoveredAt
+        )
+        switch disposition {
+        case .beforeSoft:
+            break
+        case .completedBeforeSoft:
+            clearCleanupSoftDeadline(messageId: messageId, pending: &pending, record: record)
+        case .draining, .completedAfterSoft:
+            enterCleanupDrain(messageId: messageId, pending: &pending, record: record, deadlines: deadlines)
+        case .terminal:
+            if let record { record.wire = .sessionTerminal }
+            pendingResponses[messageId] = pending
+            beginSessionFaultTerminalization(
+                cause: "cleanup_deadline_at_or_after_fixed_boundary",
+                error: SMBTransportError.timedOut
+            )
+        }
+        return disposition
+    }
+
+    private func clearCleanupSoftDeadline(
+        messageId: UInt64,
+        pending: inout SMBPendingResponse,
+        record: SMBSessionActiveRequestRecord?
+    ) {
+        record?.cleanupTimeoutTask?.cancel()
+        if let record {
+            record.cleanupTimeoutTask = nil
+            record.cleanupTimeoutIdentity = nil
+        }
+        pending.cleanupTimeoutTask?.cancel()
+        pending.cleanupTimeoutTask = nil
+        pending.cleanupTimeoutIdentity = nil
+        if let tree = pending.cleanupTreeIdentity,
+           var intent = treeCleanupIntents[tree], intent.owner == pending.requestIdentity {
+            intent.timeoutTask?.cancel()
+            intent.timeoutTask = nil
+            intent.timeoutIdentity = nil
+            treeCleanupIntents[tree] = intent
+        }
+        pendingResponses[messageId] = pending
+    }
+
+    private func enterCleanupDrain(
+        messageId: UInt64,
+        pending: inout SMBPendingResponse,
+        record: SMBSessionActiveRequestRecord?,
+        deadlines: SMBCleanupDeadlines
+    ) {
+        let owner = pending.requestIdentity
+        clearCleanupSoftDeadline(messageId: messageId, pending: &pending, record: record)
+        pending.cleanupTombstone = true
+        let shouldResumeCaller = !pending.continuationResumed
+        pending.continuationResumed = true
+        record?.caller = .timedOut
+        if let fileId = pending.cleanupFileId {
+            transitionCleanupLedger(fileId, owner: owner, .beginDrain(messageId: messageId))
+        }
+        if let tree = pending.cleanupTreeIdentity {
+            _ = transitionTreeCleanupLedger(tree, owner: owner, event: .beginDrain(messageId: messageId))
+        }
+        if pending.cleanupDrainIdentity == nil {
+            let timerIdentity = UUID()
+            pending.cleanupDrainIdentity = timerIdentity
+            pending.cleanupDrainTask = startCleanupHardDeadline(
+                messageId: messageId,
+                owner: owner,
+                timerIdentity: timerIdentity,
+                deadlines: deadlines
+            )
+        }
+        pendingResponses[messageId] = pending
+        if shouldResumeCaller {
+            resolvePendingCompletion(
+                pending.completionTarget,
+                with: .failure(SMBTransportError.timedOut)
+            )
+        }
+        cleanupSoftDeadlineAppliedHookForTesting?()
     }
 
     private func stopReadTransferForEarlyFinal(
@@ -11438,6 +12931,11 @@ actor SMBSession {
                 return
             }
         }
+        if let pending = pendingResponses[messageId] {
+            updateActivePostAuthRecord(pending.requestIdentity) {
+                if $0.caller == .pending { $0.caller = .success }
+            }
+        }
         guard var pending = removePendingResponse(messageId: messageId) else { return }
         pending.timeoutTask?.cancel()
         pending.cleanupTimeoutTask?.cancel()
@@ -11448,6 +12946,31 @@ actor SMBSession {
                 cleanupFileId,
                 owner: pending.requestIdentity,
                 .finalResponse(messageId: messageId, succeeded: status == SMB2Status.success)
+            )
+            softExpiredCleanupOwners.remove(pending.requestIdentity)
+        }
+        if let cleanupTree = pending.cleanupTreeIdentity {
+            _ = transitionTreeCleanupLedger(
+                cleanupTree,
+                owner: pending.requestIdentity,
+                event: .finalResponse(messageId: messageId, succeeded: status == SMB2Status.success)
+            )
+            _ = transitionTreeLifecycle(
+                cleanupTree,
+                owner: pending.requestIdentity,
+                event: status == SMB2Status.success ? .retire : .retireUnknown
+            )
+            if status == SMB2Status.success {
+                _ = transitionCleanupLedger(
+                    nil,
+                    owner: pending.requestIdentity,
+                    .treeDisconnected(cleanupTree)
+                )
+            }
+            finishTreeCleanupIntent(
+                cleanupTree,
+                owner: pending.requestIdentity,
+                forgetRetired: status == SMB2Status.success
             )
         }
         if !pending.continuationResumed {
@@ -11475,10 +12998,11 @@ actor SMBSession {
         }
     }
 
-    private func dispatchReceivedPacket(_ frame: SMBReceivedFrame) throws {
+    private func dispatchReceivedPacket(_ frame: SMBReceivedFrame) async throws {
         guard isGenerationActive(frame.generation) else { return }
         let effects = try validateResponseFrame(frame)
         try commitResponseEffects(effects, generation: frame.generation)
+        await completeReadyOperationBarriers()
     }
 
     private func markSendStarted(messageId: UInt64, generation: UInt64) -> Bool {
@@ -11539,6 +13063,17 @@ actor SMBSession {
            let activeRecord = activePostAuthRequestRecords[pending.requestIdentity] {
             let ownerRecoveredAt = sessionTime.now()
             originalOwnerRecoveredAt = ownerRecoveredAt
+            if pending.cleanupDeadlines != nil {
+                let disposition = applyCleanupDeadlineEvent(
+                    .sendOwnerRecovered,
+                    at: ownerRecoveredAt,
+                    messageId: messageId,
+                    pending: &pending,
+                    record: activeRecord
+                )
+                if disposition == .terminal { return nil }
+            }
+            activeRecord.originalSendOwnerRecoveredAt = ownerRecoveredAt
             if let deadline = activeRecord.wireDrainDeadline, ownerRecoveredAt >= deadline {
                 pending.wireDrainExpired = true
                 updateActivePostAuthRecord(pending.requestIdentity) { $0.wire = .sessionTerminal }
@@ -11562,6 +13097,7 @@ actor SMBSession {
         }
         if pending.usesSenderLoop,
            pending.cleanupFileId == nil,
+           pending.cleanupTreeIdentity == nil,
            requestTimeout == nil,
            !isTransferRequest {
             requestSentCountForTestingStorage += 1
@@ -11571,6 +13107,7 @@ actor SMBSession {
                 activeRecord.originalSendOwned = false
             }
             pendingResponses[messageId] = pending
+            completeOperationBarrierIfWireWorkIsComplete(for: pending.requestIdentity)
             resumeRequestSentCountWaiters()
             completeOrdinaryDrainIfReady(
                 messageId: messageId,
@@ -11587,6 +13124,7 @@ actor SMBSession {
             }
         }
         pendingResponses[messageId] = pending
+        completeOperationBarrierIfWireWorkIsComplete(for: pending.requestIdentity)
         resumeRequestSentCountWaiters()
         if case .transfer(let ticket) = pending.completionTarget {
             let transferStopped: Bool
@@ -11634,8 +13172,9 @@ actor SMBSession {
             )
             return nil
         }
-        if let cleanupFileId = pending.cleanupFileId {
-            transitionCleanupLedger(cleanupFileId, owner: pending.requestIdentity, .beginDrain(messageId: messageId))
+        if pending.cleanupFileId != nil || pending.cleanupTreeIdentity != nil {
+            // A full send stays in `sending` until the absolute soft deadline. The deadline
+            // transition alone creates the caller tombstone and hard-drain timer.
         } else if pending.cancellationRequested {
             // Keep the cancellation tombstone: a later interim must still be able to
             // store its AsyncId so the final response can be correlated (issues/078).
@@ -11819,6 +13358,7 @@ actor SMBSession {
                 record.queuedRequestOwned = false
                 record.unselectedControlOwned = false
             }
+            completeOperationBarrierIfWireWorkIsComplete(for: identity)
         }
         for item in queued {
             failQueuedPostAuthRequest(item, error: error)
@@ -11886,7 +13426,13 @@ actor SMBSession {
         readerLifecycle.activeGeneration == generation && wireFailure == nil
     }
 
-    private func reserveCredit(_ packet: [UInt8], generation: UInt64) async throws -> UInt16 {
+    private func reserveCredit(
+        _ packet: [UInt8],
+        generation: UInt64,
+        treeIdentity: SMBTreeIdentity? = nil,
+        requestIdentity: SMBRequestIdentity? = nil,
+        cancellationToken: SMBTreeCreditCancellationToken? = nil
+    ) async throws -> UInt16 {
         guard isGenerationActive(generation) else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
@@ -11905,16 +13451,56 @@ actor SMBSession {
         // would let charge-0 requests inflate the window (each response still grants), so
         // the effective charge is what gets reserved and later refunded on send failure.
         let effectiveCharge = max(1, header.creditCharge)
-        if creditWindow.reserveIfAvailable(charge: effectiveCharge) != nil {
+        let fastReservation: UInt32?
+        if let treeIdentity, let requestIdentity {
+            if let cancellationToken {
+                fastReservation = creditWindow.reserveIfAvailable(
+                    charge: effectiveCharge,
+                    treeIdentity: treeIdentity,
+                    requestIdentity: requestIdentity,
+                    cancellationToken: cancellationToken
+                )
+            } else {
+                fastReservation = creditWindow.reserveIfAvailable(
+                    charge: effectiveCharge,
+                    treeIdentity: treeIdentity,
+                    requestIdentity: requestIdentity
+                )
+            }
+        } else {
+            fastReservation = creditWindow.reserveIfAvailable(charge: effectiveCharge)
+        }
+        if fastReservation != nil {
             sessionExecutor.recordExecutionContextForTesting(.creditReservationFastPath)
             debugLine("SMB credit charge=\(effectiveCharge) balance=\(creditWindow.balanceSnapshot)")
             return effectiveCharge
         }
-        let balance = try await creditWindow.reserve(
-            charge: effectiveCharge,
-            messageId: header.messageId,
-            command: header.command
-        )
+        let balance: UInt32
+        if let treeIdentity, let requestIdentity {
+            let scopedToken: SMBTreeCreditCancellationToken
+            if let cancellationToken {
+                scopedToken = cancellationToken
+            } else {
+                scopedToken = SMBTreeCreditCancellationToken(
+                    tree: treeIdentity,
+                    request: requestIdentity,
+                    refundInterleavingHookForTesting: cleanupCreditRefundInterleavingHookForTesting
+                )
+                activePostAuthRequestRecords[requestIdentity]?.creditCancellationToken = scopedToken
+            }
+            balance = try await creditWindow.reserve(
+                charge: effectiveCharge,
+                treeIdentity: treeIdentity,
+                requestIdentity: requestIdentity,
+                cancellationToken: scopedToken
+            )
+        } else {
+            balance = try await creditWindow.reserve(
+                charge: effectiveCharge,
+                messageId: header.messageId,
+                command: header.command
+            )
+        }
         guard isGenerationActive(generation) else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
@@ -11926,10 +13512,19 @@ actor SMBSession {
         _ packet: [UInt8],
         header suppliedHeader: SMB2Header? = nil,
         generation: UInt64,
-        creditReservation: SMBPreReservedCredit?
+        creditReservation: SMBPreReservedCredit?,
+        treeIdentity: SMBTreeIdentity? = nil,
+        requestIdentity: SMBRequestIdentity? = nil,
+        cancellationToken: SMBTreeCreditCancellationToken? = nil
     ) async throws -> UInt16 {
         guard let creditReservation else {
-            return try await reserveCredit(packet, generation: generation)
+            return try await reserveCredit(
+                packet,
+                generation: generation,
+                treeIdentity: treeIdentity,
+                requestIdentity: requestIdentity,
+                cancellationToken: cancellationToken
+            )
         }
         guard isGenerationActive(generation) else {
             throw wireFailure ?? SMBTransportError.connectionClosed
@@ -11963,33 +13558,221 @@ actor SMBSession {
     private func reserveVariableCredit(
         maximumPayloadLength: UInt32,
         command: UInt16,
-        generation: UInt64
+        generation: UInt64,
+        treeIdentity: SMBTreeIdentity?,
+        requestIdentity: SMBRequestIdentity
     ) async throws -> SMBPreReservedCredit {
         guard maximumPayloadLength > 0, isGenerationActive(generation) else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
+        guard let treeIdentity else {
+            throw SMBError.treeUnavailable(treeId: 0, operation: command == SMB2Commands.read ? "READ" : "WRITE")
+        }
+        let operation = command == SMB2Commands.read ? "READ" : "WRITE"
+        try validateTreeAdmission(
+            treeId: treeIdentity.treeId,
+            command: command,
+            operation: operation,
+            owner: requestIdentity,
+            cleanupTreeIdentity: nil
+        )
         let maximumCharge = SMB2Credit.charge(forPayloadLength: UInt64(maximumPayloadLength))
         let charge: UInt16
-        if let immediateCharge = creditWindow.reserveUpToIfAvailable(maximumCharge: maximumCharge) {
+        if let immediateCharge = creditWindow.reserveUpToIfAvailable(
+            maximumCharge: maximumCharge,
+            treeIdentity: treeIdentity,
+            requestIdentity: requestIdentity
+        ) {
             sessionExecutor.recordExecutionContextForTesting(.creditReservationFastPath)
             charge = immediateCharge
         } else {
-            charge = try await creditWindow.reserveUpTo(
-                maximumCharge: maximumCharge,
-                command: command
+            let cancellationToken = SMBTreeCreditCancellationToken(tree: treeIdentity, request: requestIdentity)
+            treeCreditPreparations[requestIdentity] = SMBTreeCreditPreparation(
+                treeIdentity: treeIdentity,
+                cancellationToken: cancellationToken
+            )
+            do {
+                charge = try await creditWindow.reserveUpTo(
+                    maximumCharge: maximumCharge,
+                    treeIdentity: treeIdentity,
+                    requestIdentity: requestIdentity,
+                    cancellationToken: cancellationToken
+                )
+            } catch {
+                if cancellationToken.isCancelled || treeLifecycle[treeIdentity] != nil {
+                    treeCreditPreparations.removeValue(forKey: requestIdentity)
+                    completeOperationBarrierIfWireWorkIsComplete(
+                        for: requestIdentity,
+                        progress: .precommitRetirementSettled
+                    )
+                    await completeReadyOperationBarriers()
+                    throw SMBError.treeUnavailable(treeId: treeIdentity.treeId, operation: operation)
+                }
+                treeCreditPreparations.removeValue(forKey: requestIdentity)
+                completeOperationBarrierIfWireWorkIsComplete(
+                    for: requestIdentity,
+                    progress: .precommitRetirementSettled
+                )
+                await completeReadyOperationBarriers()
+                throw error
+            }
+            if treeLifecycle[treeIdentity] != nil {
+                await refundCredit(charge: charge)
+                treeCreditPreparations.removeValue(forKey: requestIdentity)
+                completeOperationBarrierIfWireWorkIsComplete(
+                    for: requestIdentity,
+                    progress: .precommitRetirementSettled
+                )
+                await completeReadyOperationBarriers()
+                throw SMBError.treeUnavailable(treeId: treeIdentity.treeId, operation: operation)
+            }
+            treeCreditPreparations.removeValue(forKey: requestIdentity)
+            return SMBPreReservedCredit(
+                charge: charge,
+                treeIdentity: treeIdentity,
+                requestIdentity: requestIdentity,
+                cancellationToken: cancellationToken
             )
         }
         guard isGenerationActive(generation) else {
             await refundCredit(charge: charge)
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        return SMBPreReservedCredit(charge: charge)
+        guard treeLifecycle[treeIdentity] == nil else {
+            await refundCredit(charge: charge)
+            throw SMBError.treeUnavailable(treeId: treeIdentity.treeId, operation: operation)
+        }
+        return SMBPreReservedCredit(
+            charge: charge,
+            treeIdentity: treeIdentity,
+            requestIdentity: requestIdentity
+        )
     }
 
     private func refundUnclaimedCredit(_ reservation: SMBPreReservedCredit) async {
         if let charge = reservation.releaseUnclaimed() {
             await refundCredit(charge: charge)
         }
+    }
+
+    private func reserveTransferCredit(
+        maximumCharge: UInt16,
+        waitIfUnavailable: Bool,
+        command: UInt16,
+        treeId: UInt32,
+        generation: UInt64
+    ) async throws -> SMBTransferCreditPreparation {
+        guard isGenerationActive(generation),
+              let treeIdentity = treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId) else {
+            throw wireFailure ?? SMBTransportError.connectionClosed
+        }
+        let operation = command == SMB2Commands.read ? "READ" : "WRITE"
+        let requestIdentity = makeRequestIdentity(generation: generation)
+        try validateTreeAdmission(
+            treeId: treeId,
+            command: command,
+            operation: operation,
+            owner: requestIdentity,
+            cleanupTreeIdentity: nil
+        )
+
+        let shouldRegisterRetirementToken = waitIfUnavailable
+        if waitIfUnavailable, let hook = transferCreditSnapshotHookForTesting {
+            let observedBalance = creditWindow.balanceSnapshot
+            await hook(treeIdentity, observedBalance)
+        }
+        try validateTreeAdmission(
+            treeId: treeId,
+            command: command,
+            operation: operation,
+            owner: requestIdentity,
+            cleanupTreeIdentity: nil
+        )
+
+        if waitIfUnavailable,
+           let reservation = creditWindow.reserveUpToIfAvailableWithBalance(
+               maximumCharge: maximumCharge,
+               treeIdentity: treeIdentity,
+               requestIdentity: requestIdentity
+           ) {
+            sessionExecutor.recordExecutionContextForTesting(.creditReservationFastPath)
+            return SMBTransferCreditPreparation(
+                charge: reservation.charge,
+                balance: reservation.balance,
+                requestIdentity: requestIdentity,
+                treeIdentity: treeIdentity,
+                cancellationToken: nil
+            )
+        }
+
+        let cancellationToken: SMBTreeCreditCancellationToken?
+        if shouldRegisterRetirementToken {
+            let token = SMBTreeCreditCancellationToken(tree: treeIdentity, request: requestIdentity)
+            cancellationToken = token
+            treeCreditPreparations[requestIdentity] = SMBTreeCreditPreparation(
+                treeIdentity: treeIdentity,
+                cancellationToken: token
+            )
+        } else {
+            cancellationToken = nil
+        }
+
+        let reservation: (charge: UInt16, balance: UInt32)
+        do {
+            if let cancellationToken {
+                reservation = try await creditWindow.reserveUpToWithBalance(
+                    maximumCharge: maximumCharge,
+                    waitIfUnavailable: waitIfUnavailable,
+                    treeIdentity: treeIdentity,
+                    requestIdentity: requestIdentity,
+                    cancellationToken: cancellationToken
+                )
+            } else {
+                reservation = try await creditWindow.reserveUpToWithBalance(
+                    maximumCharge: maximumCharge,
+                    waitIfUnavailable: waitIfUnavailable,
+                    command: command
+                )
+            }
+        } catch {
+            if cancellationToken?.isCancelled == true || treeLifecycle[treeIdentity] != nil {
+                if let hook = transferCreditRetirementHookForTesting {
+                    await hook(requestIdentity)
+                }
+                treeCreditPreparations.removeValue(forKey: requestIdentity)
+                completeOperationBarrierIfWireWorkIsComplete(
+                    for: requestIdentity,
+                    progress: .precommitRetirementSettled
+                )
+                await completeReadyOperationBarriers()
+                throw SMBError.treeUnavailable(treeId: treeId, operation: operation)
+            }
+            treeCreditPreparations.removeValue(forKey: requestIdentity)
+            completeOperationBarrierIfWireWorkIsComplete(
+                for: requestIdentity,
+                progress: .precommitRetirementSettled
+            )
+            await completeReadyOperationBarriers()
+            throw error
+        }
+        if treeLifecycle[treeIdentity] != nil {
+            if reservation.charge > 0 { await refundCredit(charge: reservation.charge) }
+            treeCreditPreparations.removeValue(forKey: requestIdentity)
+            completeOperationBarrierIfWireWorkIsComplete(
+                for: requestIdentity,
+                progress: .precommitRetirementSettled
+            )
+            await completeReadyOperationBarriers()
+            throw SMBError.treeUnavailable(treeId: treeId, operation: operation)
+        }
+        treeCreditPreparations.removeValue(forKey: requestIdentity)
+        return SMBTransferCreditPreparation(
+            charge: reservation.charge,
+            balance: reservation.balance,
+            requestIdentity: requestIdentity,
+            treeIdentity: treeIdentity,
+            cancellationToken: cancellationToken
+        )
     }
 
     private func applyCreditRequest(to packet: inout [UInt8]) {
@@ -12262,7 +14045,7 @@ extension SMBSession {
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        try validateFileIdAdmission(command: SMB2Commands.write, fileId: fileId, cleanupFileId: nil)
+        try validateFileIdAdmission(command: SMB2Commands.write, treeId: treeId, fileId: fileId, cleanupFileId: nil)
         nextTransferIdentifier &+= 1
         let handle = SMBWriteTransferHandle(identifier: nextTransferIdentifier, generation: generation)
         writeTransfers[handle.identifier] = SMBSessionWriteTransfer(
@@ -12586,18 +14369,26 @@ extension SMBSession {
         let revisionBeforeReservation = state.revision
         let creditRevisionBeforeReservation = state.creditRevision
         state.window.markPreparingReservationPending(slotIndex: slotIndex)
-        let reserved: (charge: UInt16, balance: UInt32)
+        let preparationCredit: SMBTransferCreditPreparation
         do {
-            reserved = try await creditWindow.reserveUpToWithBalance(
+            preparationCredit = try await reserveTransferCredit(
                 maximumCharge: maximumCharge,
                 waitIfUnavailable: waitIfUnavailable,
-                command: SMB2Commands.write
+                command: SMB2Commands.write,
+                treeId: state.treeId,
+                generation: generation
             )
         } catch {
             let failureTime = sessionTime.now()
             _ = state.window.revokePreparing(slotIndex: slotIndex, at: failureTime)
             if Task.isCancelled {
                 stopWriteTransferForOwnerCancellation(state, at: failureTime)
+            } else if isTreeUnavailable(error) {
+                stopWriteTransfer(
+                    state,
+                    for: .offsetFailure(offset: offset, error: error),
+                    at: failureTime
+                )
             } else {
                 stopWriteTransfer(
                     state,
@@ -12607,6 +14398,7 @@ extension SMBSession {
             }
             return .stopped(revision: state.revision)
         }
+        let reserved = (charge: preparationCredit.charge, balance: preparationCredit.balance)
 
         let afterReservationTime = sessionTime.now()
         let operationDeadlineReached = state.operationDeadline.map { afterReservationTime >= $0 } ?? false
@@ -12644,14 +14436,19 @@ extension SMBSession {
             Int(clamping: UInt64(reserved.charge) * UInt64(SMB2Credit.unitSize))
         )
         let requestData = Array(sourceBuffer[sourceIndex..<(sourceIndex + requestLength)])
-        let creditReservation = SMBPreReservedCredit(charge: reserved.charge)
+        let creditReservation = SMBPreReservedCredit(
+            charge: reserved.charge,
+            treeIdentity: preparationCredit.treeIdentity,
+            requestIdentity: preparationCredit.requestIdentity,
+            cancellationToken: preparationCredit.cancellationToken
+        )
         let requestMessageID = nextMessageId(
             charge: SMB2Credit.charge(forPayloadLength: UInt64(requestLength))
         )
         let packet: [UInt8]
         let requestHeader: SMB2Header
         do {
-            try validateFileIdAdmission(command: SMB2Commands.write, fileId: state.fileId, cleanupFileId: nil)
+            try validateFileIdAdmission(command: SMB2Commands.write, treeId: state.treeId, fileId: state.fileId, cleanupFileId: nil)
             packet = try SMB2Write.encodeRequest(
                 messageId: requestMessageID,
                 sessionId: sessionId,
@@ -12673,7 +14470,7 @@ extension SMBSession {
             return .stopped(revision: state.revision)
         }
 
-        let requestIdentity = makeRequestIdentity(generation: generation)
+        let requestIdentity = preparationCredit.requestIdentity
         guard let ticket = state.window.commit(
             slotIndex: slotIndex,
             requestIdentity: requestIdentity,
@@ -12707,13 +14504,20 @@ extension SMBSession {
                     requestTimeoutPolicy: .eligible,
                     responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
                     cleanupKey: nil,
+                    treeIdentity: preparationCredit.treeIdentity,
+                    cleanupTreeIdentity: nil,
+                    cleanupDeadlines: nil,
                     creditReservation: creditReservation,
                     sendKind: .signed,
                     transferTicket: ticket
                 )
             } catch {
-                terminateTransferAdmissionFailure(ticket, error: error)
-                await creditFailureTask?.value
+                if isTreeUnavailable(error) {
+                    refuseTransferRequestForTree(ticket, error: error)
+                } else {
+                    terminateTransferAdmissionFailure(ticket, error: error)
+                    await creditFailureTask?.value
+                }
                 await refundUnclaimedCredit(creditReservation)
                 return .stopped(revision: state.revision)
             }
@@ -12856,7 +14660,7 @@ extension SMBSession {
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        try validateFileIdAdmission(command: SMB2Commands.read, fileId: fileId, cleanupFileId: nil)
+        try validateFileIdAdmission(command: SMB2Commands.read, treeId: treeId, fileId: fileId, cleanupFileId: nil)
         nextTransferIdentifier &+= 1
         let handle = SMBReadTransferHandle(identifier: nextTransferIdentifier, generation: generation)
         readTransfers[handle.identifier] = SMBSessionReadTransfer(
@@ -12923,24 +14727,33 @@ extension SMBSession {
         let waitIfUnavailable = state.window.committedSlotCount == 0
         let revisionBeforeReservation = state.revision
         let creditRevisionBeforeReservation = state.creditRevision
-        let reserved: (charge: UInt16, balance: UInt32)
+        let preparationCredit: SMBTransferCreditPreparation
         do {
-            reserved = try await creditWindow.reserveUpToWithBalance(
+            preparationCredit = try await reserveTransferCredit(
                 maximumCharge: maximumCharge,
                 waitIfUnavailable: waitIfUnavailable,
-                command: SMB2Commands.read
+                command: SMB2Commands.read,
+                treeId: state.treeId,
+                generation: state.generation
             )
         } catch {
             let failureTime = sessionTime.now()
             _ = state.window.revokePreparing(slotIndex: slotIndex, at: failureTime)
             if Task.isCancelled {
                 stopReadTransferForOwnerCancellation(state, at: failureTime)
+            } else if isTreeUnavailable(error) {
+                stopReadTransfer(
+                    state,
+                    for: .offsetFailure(offset: requestFrontier, error: error),
+                    at: failureTime
+                )
             } else {
                 stopReadTransfer(state, for: .sessionFailure(wireFailure ?? error), at: failureTime)
             }
             signalReadTransfer(state)
             return .stopped(revision: state.revision)
         }
+        let reserved = (charge: preparationCredit.charge, balance: preparationCredit.balance)
 
         let afterReservationTime: ContinuousClock.Instant?
         let operationDeadlineReached: Bool
@@ -12985,7 +14798,12 @@ extension SMBSession {
             )
         }
 
-        let reservation = SMBPreReservedCredit(charge: reserved.charge)
+        let reservation = SMBPreReservedCredit(
+            charge: reserved.charge,
+            treeIdentity: preparationCredit.treeIdentity,
+            requestIdentity: preparationCredit.requestIdentity,
+            cancellationToken: preparationCredit.cancellationToken
+        )
         let deadlineReachedBeforeSend: Bool
         if let deadline = state.operationDeadline {
             deadlineReachedBeforeSend = sessionTime.now() >= deadline
@@ -13022,7 +14840,7 @@ extension SMBSession {
         let packet: [UInt8]
         let requestHeader: SMB2Header
         do {
-            try validateFileIdAdmission(command: SMB2Commands.read, fileId: state.fileId, cleanupFileId: nil)
+            try validateFileIdAdmission(command: SMB2Commands.read, treeId: state.treeId, fileId: state.fileId, cleanupFileId: nil)
             packet = try SMB2Read.encodeRequest(
                 messageId: requestMessageID,
                 sessionId: sessionId,
@@ -13046,7 +14864,7 @@ extension SMBSession {
         }
 
         let generation = state.generation
-        let requestIdentity = makeRequestIdentity(generation: generation)
+        let requestIdentity = preparationCredit.requestIdentity
         let ticket = state.window.commit(
             slotIndex: slotIndex,
             requestIdentity: requestIdentity,
@@ -13075,13 +14893,20 @@ extension SMBSession {
                     requestTimeoutPolicy: .eligible,
                     responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
                     cleanupKey: nil,
+                    treeIdentity: preparationCredit.treeIdentity,
+                    cleanupTreeIdentity: nil,
+                    cleanupDeadlines: nil,
                     creditReservation: reservation,
                     sendKind: .signed,
                     transferTicket: ticket
                 )
             } catch {
-                terminateTransferAdmissionFailure(ticket, error: error)
-                await creditFailureTask?.value
+                if isTreeUnavailable(error) {
+                    refuseTransferRequestForTree(ticket, error: error)
+                } else {
+                    terminateTransferAdmissionFailure(ticket, error: error)
+                    await creditFailureTask?.value
+                }
                 await refundUnclaimedCredit(reservation)
                 return .stopped(revision: state.revision)
             }

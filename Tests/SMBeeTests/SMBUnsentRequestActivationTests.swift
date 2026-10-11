@@ -88,7 +88,7 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         try await withHangGuard("FLUSH waits behind the in-flight frame") {
             await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 1)
         }
-        await session.retireFileIdForTesting(fileId)
+        await session.retireFileIdForTesting(fileId, treeId: 0xA)
         transport.releaseNextSend(command: SMB2Commands.echo)
 
         let race = SMBActivationRace()
@@ -1122,6 +1122,46 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         XCTAssertEqual(outsideLines, [], "cleanupLedger written outside transitionCleanupLedger at lines \(outsideLines)")
     }
 
+    func testSourceShapeTreeCleanupStatesStayInsideOwnerTransitions() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = projectRoot.appendingPathComponent("Sources/SMBee/SMBClient.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let nsSource = source as NSString
+        let mutation = try NSRegularExpression(
+            pattern: "treeLifecycle\\s*\\[[^\\]]*\\]\\s*=(?!=)"
+                + "|treeLifecycle\\.(removeValue|removeAll|updateValue|merge|remove)\\b"
+                + "|treeCleanupLedger\\s*\\[[^\\]]*\\]\\s*=(?!=)"
+                + "|treeCleanupLedger\\.(removeValue|removeAll|updateValue|merge|remove)\\b"
+        )
+        let matches = mutation.matches(in: source, range: NSRange(location: 0, length: nsSource.length))
+        XCTAssertFalse(matches.isEmpty, "the scan must observe Tree state writes")
+
+        var transitionRanges: [NSRange] = []
+        for signature in ["private func transitionTreeLifecycle(", "private func transitionTreeCleanupLedger("] {
+            let start = nsSource.range(of: signature)
+            XCTAssertNotEqual(start.location, NSNotFound, "missing Tree transition: \(signature)")
+            let afterStart = NSRange(
+                location: start.location + start.length,
+                length: nsSource.length - start.location - start.length
+            )
+            let nextMember = try NSRegularExpression(pattern: "\\n    (private |fileprivate |nonisolated )*(func|var|let) ")
+                .firstMatch(in: source, range: afterStart)
+            let end = nextMember?.range.location ?? nsSource.length
+            transitionRanges.append(NSRange(location: start.location, length: end - start.location))
+        }
+
+        let outside = matches.filter { match in
+            !transitionRanges.contains { NSLocationInRange(match.range.location, $0) }
+        }
+        let lines = outside.map { match in
+            nsSource.substring(to: match.range.location).filter { $0 == "\n" }.count + 1
+        }
+        XCTAssertEqual(lines, [], "Tree cleanup state writes escaped owner transitions at lines \(lines)")
+    }
+
     func testSourceShapeSenderHotPathHasNoNestedTasksOrGlobalExecutorHops() throws {
         // E6 puts the one sender-loop Task on the session executor, but that does not remove
         // the per-frame cost of accidentally adding more Tasks. Runtime placement is covered
@@ -1510,7 +1550,7 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
             reservationAcquired.signal()
             await releaseReservation.wait()
         }
-        await session.setCleanupCloseCancellationAppliedHookForTesting {
+        await session.setCleanupSoftDeadlineAppliedHookForTesting {
             cancellationApplied.signal()
         }
 
@@ -1551,11 +1591,11 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         XCTAssertTrue(transport.sentPackets.isEmpty)
 
         await session.setCreditReservationAcquiredHookForTesting(nil)
-        await session.setCleanupCloseCancellationAppliedHookForTesting(nil)
+        await session.setCleanupSoftDeadlineAppliedHookForTesting(nil)
         await session.closeTransportAndWait(cause: "cleanup_close_credit_reservation_race_test")
     }
 
-    func testCleanupDeadlineCatchRetiresPostAuthCloseBeforeCancellationHandlerApplies() async throws {
+    func testCleanupSoftDeadlineUsesOneAbsoluteTimerForParkedCreditWait() async throws {
         let transport = SMBActivationEventTransport()
         let clock = SMBActivationTestClock()
         let fileId = [UInt8](repeating: 0xD2, count: 16)
@@ -1571,13 +1611,7 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         )
         await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 100)
 
-        let cancellationHandlerEntered = SMBActivationEvent()
-        let releaseCancellationHandler = SMBActivationUncancelledGate()
         let creditWaitCatchRetired = SMBActivationEvent()
-        await session.setCleanupCloseCancellationWillApplyHookForTesting {
-            cancellationHandlerEntered.signal()
-            await releaseCancellationHandler.wait()
-        }
         await session.setCleanupCloseCreditWaitCatchHookForTesting {
             creditWaitCatchRetired.signal()
         }
@@ -1589,30 +1623,930 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         try await withHangGuard("cleanup CLOSE catch-path credit waiter is registered") {
             await session.waitForCreditWaiterCountForTesting(atLeast: 1)
         }
+        let cleanupTimerCount = clock.sleepCallCount
+        XCTAssertEqual(cleanupTimerCount, 1, "cleanup has one intent-owned soft timer")
         clock.advance(by: .seconds(5), resumeDueSleeps: true)
-        try await withHangGuard("cleanup cancellation handler is held before ledger lookup") {
-            await cancellationHandlerEntered.wait()
-        }
         try await withHangGuard("credit waiter catch establishes FileId retirement first") {
             await creditWaitCatchRetired.wait()
         }
 
-        let stateBeforeCancellationHandler = await session.cleanupAttemptStateForTesting(fileId: fileId)
-        let activeRecordsBeforeCancellationHandler = await session.activePostAuthRequestRecordCountForTesting()
-        XCTAssertEqual(stateBeforeCancellationHandler, "retiredUnknown")
-        XCTAssertEqual(activeRecordsBeforeCancellationHandler, 0)
+        let stateAfterRetirement = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        let activeRecordsAfterRetirement = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertEqual(stateAfterRetirement, "retiredUnknown")
+        XCTAssertEqual(activeRecordsAfterRetirement, 0)
         XCTAssertTrue(transport.sentPackets.isEmpty)
 
-        await releaseCancellationHandler.signal()
         try await withHangGuard("cleanup CLOSE catch-path task returns") { await close.value }
         let finalState = await session.cleanupAttemptStateForTesting(fileId: fileId)
         let nextMessageId = await session.nextMessageIdForTesting()
         XCTAssertEqual(finalState, "retiredUnknown", "the later handler must not need the removed request record to retire the FileId")
         XCTAssertEqual(nextMessageId, 100)
 
-        await session.setCleanupCloseCancellationWillApplyHookForTesting(nil)
         await session.setCleanupCloseCreditWaitCatchHookForTesting(nil)
         await session.closeTransportAndWait(cause: "cleanup_close_credit_wait_catch_race_test")
+    }
+
+    func testCleanupFullSendAtSoftDeadlineExactAndAfterIsTerminal() async throws {
+        for (index, lateness) in [Duration.zero, .nanoseconds(1)].enumerated() {
+            let transport = SMBActivationEventTransport()
+            let clock = SMBActivationTestClock()
+            let session = makeSession(transport: transport, initialCredits: 1, clock: clock)
+            await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 100)
+            let close = Task {
+                await session.bestEffortClose(
+                    treeId: 0xA,
+                    fileId: [UInt8](repeating: UInt8(0xD3 + index), count: 16)
+                )
+            }
+            try await withHangGuard("cleanup CLOSE reaches the held full-send boundary") {
+                try await transport.waitForSendCount(1)
+            }
+            let packet = try XCTUnwrap(transport.sentPackets.first)
+            let header = try SMB2Header.decode(packet)
+            XCTAssertEqual(header.command, SMB2Commands.close)
+            XCTAssertEqual(header.messageId, 100)
+            try await withHangGuard("cleanup soft timer is registered before full-send") {
+                await clock.waitForSleepCount(atLeast: 1)
+            }
+
+            clock.advance(by: .seconds(5) + lateness, resumeDueSleeps: false)
+            transport.releaseNextSend(command: SMB2Commands.close)
+            try await withHangGuard("the exact/late full-send terminalizes the session") {
+                await transport.waitForCloseCount(atLeast: 1)
+            }
+            await close.value
+            let closed = await session.isTransportClosedForTesting()
+            let pending = await session.wirePendingRecordCountForTesting()
+            let credits = await session.creditBalanceForTesting()
+            let requestSentCount = await session.requestSentCountForTesting()
+            XCTAssertTrue(closed, "full-send at (lateness) must lose to softAt")
+            XCTAssertEqual(pending, 0)
+            XCTAssertEqual(requestSentCount, 0, "terminal is observed from the close event, never the sent-count waiter")
+            XCTAssertEqual(credits, 0, "a committed cleanup charge is never refunded")
+            await session.closeTransportAndWait(cause: "cleanup_soft_boundary_test_complete")
+        }
+    }
+
+    func testCleanupFullSendBeforeSoftWinsWhileSendOwnerCallbackIsDelayed() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(transport: transport, initialCredits: 1, clock: clock)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 100)
+        let fullSendCompleted = SMBActivationEvent()
+        let releaseSendOwner = SMBActivationUncancelledGate()
+        await session.setCleanupFullSendBoundaryHookForTesting { _ in
+            fullSendCompleted.signal()
+            await releaseSendOwner.wait()
+        }
+        let fileId = [UInt8](repeating: 0xC6, count: 16)
+        let close = Task { await session.bestEffortClose(treeId: 0xA, fileId: fileId) }
+
+        try await withHangGuard("cleanup CLOSE reaches its held sender") {
+            try await transport.waitForSendCount(1)
+        }
+        let header = try SMB2Header.decode(try XCTUnwrap(transport.sentPackets.first))
+        XCTAssertEqual(header.command, SMB2Commands.close)
+        XCTAssertEqual(header.messageId, 100)
+        try await withHangGuard("absolute cleanup soft sleeper is registered") {
+            await clock.waitForSleepCount(atLeast: 1)
+        }
+        transport.releaseNextSend(command: SMB2Commands.close)
+        do {
+            try await withHangGuard("plain cleanup full-send boundary is observed") {
+                await fullSendCompleted.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "early_cleanup_final_full_send_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+
+        // The transport send has returned before softAt, while the actor callback which
+        // normally marks the request sent is deliberately paused.
+        clock.advance(by: .seconds(5), resumeDueSleeps: true)
+        let terminalizedInsteadOfDraining = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await transport.waitForCloseCount(atLeast: 1)
+                return true
+            }
+            group.addTask {
+                await clock.waitForSleepCount(atLeast: 2)
+                return false
+            }
+            let first = await group.next() ?? true
+            group.cancelAll()
+            return first
+        }
+        XCTAssertFalse(
+            terminalizedInsteadOfDraining,
+            "pre-soft full-send must become a soft timeout tombstone even when owner recovery runs later"
+        )
+        guard !terminalizedInsteadOfDraining else {
+            await releaseSendOwner.signal()
+            await close.value
+            await session.closeTransportAndWait(cause: "cleanup_full_send_time_repro_cleanup")
+            return
+        }
+
+        try await withHangGuard("soft timeout returns the best-effort caller") { await close.value }
+        let drainingState = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertTrue(drainingState?.hasPrefix("draining:") == true)
+        await releaseSendOwner.signal()
+        try await withHangGuard("delayed sender callback records full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let stillOpenAfterOwnerRecovery = await session.isTransportClosedForTesting()
+        XCTAssertFalse(stillOpenAfterOwnerRecovery)
+
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: header.messageId,
+            sessionId: header.sessionId,
+            treeId: header.treeId,
+            credits: 0
+        ))
+        try await withHangGuard("late cleanup final completes before fixed hardAt") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 1)
+        }
+        let ledgerAfterFinal = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        let stillOpenAfterFinal = await session.isTransportClosedForTesting()
+        XCTAssertNil(ledgerAfterFinal)
+        XCTAssertFalse(stillOpenAfterFinal)
+        await session.setCleanupFullSendBoundaryHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "cleanup_full_send_pre_soft_test_complete")
+    }
+
+    func testEarlyCleanupFinalKeepsSoftAndHardDeadlinesUntilSendOwnerReturns() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(transport: transport, initialCredits: 1, clock: clock)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 110)
+        let fullSendCompleted = SMBActivationEvent()
+        let releaseSendOwner = SMBActivationUncancelledGate()
+        await session.setCleanupFullSendBoundaryHookForTesting { _ in
+            fullSendCompleted.signal()
+            await releaseSendOwner.wait()
+        }
+        let softDeadlineApplied = SMBActivationEvent()
+        await session.setCleanupSoftDeadlineAppliedHookForTesting { softDeadlineApplied.signal() }
+        let fileId = [UInt8](repeating: 0xC7, count: 16)
+        let closeReturned = SMBActivationEvent()
+        let close = Task {
+            await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+            closeReturned.signal()
+        }
+
+        try await withHangGuard("CLOSE reaches the transport") {
+            try await transport.waitForSendCount(1)
+        }
+        let header = try SMB2Header.decode(try XCTUnwrap(transport.sentPackets.first))
+        try await withHangGuard("cleanup soft deadline is registered") {
+            await clock.waitForSleepCount(atLeast: 1)
+        }
+        transport.releaseNextSend(command: SMB2Commands.close)
+        do {
+            try await withHangGuard("plain cleanup full-send boundary is observed while its owner stays held") {
+                await fullSendCompleted.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "cleanup_final_before_soft_full_send_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: header.messageId,
+            sessionId: header.sessionId,
+            treeId: header.treeId,
+            credits: 0
+        ))
+        try await withHangGuard("early final is accepted while the original send owner is held") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 1)
+        }
+
+        clock.advance(by: .seconds(5), resumeDueSleeps: true)
+        do {
+            try await withHangGuard("early final still lets the soft deadline apply") {
+                await softDeadlineApplied.wait()
+            }
+            try await withHangGuard("soft deadline releases the cleanup caller despite the early final") {
+                await closeReturned.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "early_cleanup_final_deadline_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+
+        let draining = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertTrue(draining?.hasPrefix("draining:") == true)
+        let openAtSoft = await session.isTransportClosedForTesting()
+        XCTAssertFalse(openAtSoft, "a full-send before softAt retains the finite wire drain")
+        await releaseSendOwner.signal()
+        try await withHangGuard("the original send owner returns after the soft deadline") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let stillOpenAfterOwnerRecovery = await session.isTransportClosedForTesting()
+        XCTAssertFalse(stillOpenAfterOwnerRecovery)
+        let activeRecords = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertEqual(activeRecords, 0, "the already accepted final completes after owner recovery")
+        await session.setCleanupFullSendBoundaryHookForTesting(nil)
+        await session.setCleanupSoftDeadlineAppliedHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "early_cleanup_final_deadline_test_complete")
+    }
+
+    func testCleanupFinalAfterSoftButBeforeSoftCallbackUsesFixedHardDeadline() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(transport: transport, initialCredits: 1, clock: clock)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 120)
+        let fullSendCompleted = SMBActivationEvent()
+        let releaseSendOwner = SMBActivationUncancelledGate()
+        await session.setCleanupFullSendBoundaryHookForTesting { _ in
+            fullSendCompleted.signal()
+            await releaseSendOwner.wait()
+        }
+        let softDeadlineApplied = SMBActivationEvent()
+        await session.setCleanupSoftDeadlineAppliedHookForTesting { softDeadlineApplied.signal() }
+        let fileId = [UInt8](repeating: 0xC8, count: 16)
+        let closeReturned = SMBActivationEvent()
+        let close = Task {
+            await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+            closeReturned.signal()
+        }
+
+        try await withHangGuard("CLOSE reaches the transport") {
+            try await transport.waitForSendCount(1)
+        }
+        let header = try SMB2Header.decode(try XCTUnwrap(transport.sentPackets.first))
+        try await withHangGuard("cleanup soft deadline is registered") {
+            await clock.waitForSleepCount(atLeast: 1)
+        }
+        transport.releaseNextSend(command: SMB2Commands.close)
+        do {
+            try await withHangGuard("plain cleanup full-send boundary is observed before the delayed soft callback") {
+                await fullSendCompleted.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "cleanup_final_before_soft_callback_full_send_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+        clock.advance(by: .seconds(5), resumeDueSleeps: false)
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: header.messageId,
+            sessionId: header.sessionId,
+            treeId: header.treeId,
+            credits: 0
+        ))
+        try await withHangGuard("final at softAt is handled before the delayed soft callback") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 1)
+        }
+        do {
+            try await withHangGuard("final acceptance applies the fixed soft deadline") {
+                await softDeadlineApplied.wait()
+            }
+            try await withHangGuard("the soft outcome returns independently of the held send owner") {
+                await closeReturned.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "cleanup_final_before_soft_callback_deadline_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+        let closedBeforeOwnerRecovery = await session.isTransportClosedForTesting()
+        XCTAssertFalse(closedBeforeOwnerRecovery, "pre-soft full-send is draining until fixed hardAt")
+        let drainSleeperCount = clock.sleepCallCount
+        XCTAssertGreaterThanOrEqual(drainSleeperCount, 2, "sent soft timeout owns the fixed hard sleeper")
+
+        await releaseSendOwner.signal()
+        try await withHangGuard("the original send owner recovers before hardAt") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let stateAfterOwnerRecovery = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertNil(stateAfterOwnerRecovery, "the valid final and recovered owner drain the request")
+        let closedAfterDrain = await session.isTransportClosedForTesting()
+        XCTAssertFalse(closedAfterDrain)
+        await session.setCleanupFullSendBoundaryHookForTesting(nil)
+        await session.setCleanupSoftDeadlineAppliedHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "cleanup_final_before_soft_callback_test_complete")
+    }
+
+    func testCleanupOwnerRecoveryAtHardDeadlineWinsBeforeDelayedHardCallback() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(
+            transport: transport,
+            initialCredits: 1,
+            clock: clock,
+            requestTimeout: .seconds(3)
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 125)
+        let fullSendCompleted = SMBActivationEvent()
+        let releaseSendOwner = SMBActivationUncancelledGate()
+        await session.setCleanupFullSendBoundaryHookForTesting { _ in
+            fullSendCompleted.signal()
+            await releaseSendOwner.wait()
+        }
+        let softDeadlineApplied = SMBActivationEvent()
+        await session.setCleanupSoftDeadlineAppliedHookForTesting { softDeadlineApplied.signal() }
+        let fileId = [UInt8](repeating: 0xC8, count: 16)
+        let closeReturned = SMBActivationEvent()
+        let close = Task {
+            await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+            closeReturned.signal()
+        }
+
+        try await withHangGuard("CLOSE reaches the transport") {
+            try await transport.waitForSendCount(1)
+        }
+        let header = try SMB2Header.decode(try XCTUnwrap(transport.sentPackets.first))
+        try await withHangGuard("cleanup soft deadline is registered") {
+            await clock.waitForSleepCount(atLeast: 1)
+        }
+        transport.releaseNextSend(command: SMB2Commands.close)
+        do {
+            try await withHangGuard("cleanup full-send is recorded while sender owner remains active") {
+                await fullSendCompleted.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "cleanup_hard_owner_recovery_full_send_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+
+        clock.advance(by: .seconds(5), resumeDueSleeps: true)
+        do {
+            try await withHangGuard("soft timeout returns while the owner and final remain outstanding") {
+                await softDeadlineApplied.wait()
+            }
+            try await withHangGuard("soft timeout returns while the owner and final remain outstanding") {
+                await closeReturned.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "cleanup_hard_owner_recovery_soft_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+        try await withHangGuard("the hard sleeper is registered at the fixed hardAt") {
+            await clock.waitForSleepCount(atLeast: 2)
+        }
+        let draining = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertTrue(draining?.hasPrefix("draining:") == true)
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: header.messageId,
+            sessionId: header.sessionId,
+            treeId: header.treeId,
+            credits: 0
+        ))
+        try await withHangGuard("the final is accepted after softAt but before hardAt") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: 1)
+        }
+        clock.advance(by: .seconds(3), resumeDueSleeps: false)
+        await releaseSendOwner.signal()
+        do {
+            try await withHangGuard("owner recovery at hardAt terminalizes before the delayed hard callback") {
+                await transport.waitForCloseCount(atLeast: 1)
+            }
+        } catch {
+            await session.closeTransportAndWait(cause: "cleanup_hard_owner_recovery_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+        let closed = await session.isTransportClosedForTesting()
+        XCTAssertTrue(closed, "hardAt owner recovery is terminal even when the timer callback is delayed")
+        await session.setCleanupFullSendBoundaryHookForTesting(nil)
+        await session.setCleanupSoftDeadlineAppliedHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "cleanup_hard_owner_recovery_test_complete")
+    }
+
+    func testEncryptedCleanupFullSendIsRecordedBeforeSoftExpiry() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(transport: transport, initialCredits: 1, clock: clock)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 130)
+        await session.installEncryptionStateForTesting(
+            encryptionKey: [UInt8](repeating: 0x31, count: 16),
+            decryptionKey: [UInt8](repeating: 0x31, count: 16),
+            sessionId: 1
+        )
+        let sendReturned = SMBActivationEvent()
+        let releaseSendOwner = SMBActivationUncancelledGate()
+        await session.setCleanupFullSendBoundaryHookForTesting { _ in
+            sendReturned.signal()
+            await releaseSendOwner.wait()
+        }
+        let softDeadlineApplied = SMBActivationEvent()
+        await session.setCleanupSoftDeadlineAppliedHookForTesting { softDeadlineApplied.signal() }
+        let closeReturned = SMBActivationEvent()
+        let fileId = [UInt8](repeating: 0xC9, count: 16)
+        let close = Task {
+            await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+            closeReturned.signal()
+        }
+
+        try await withHangGuard("encrypted CLOSE reaches the transport") {
+            try await transport.waitForSendCount(1)
+        }
+        try await withHangGuard("encrypted cleanup soft deadline is registered") {
+            await clock.waitForSleepCount(atLeast: 1)
+        }
+        transport.releaseNextSend()
+        do {
+            try await withHangGuard("encrypted cleanup full-send boundary is observed") {
+                await sendReturned.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "encrypted_cleanup_full_send_boundary_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+        clock.advance(by: .seconds(5), resumeDueSleeps: true)
+        do {
+            try await withHangGuard("encrypted pre-soft full-send becomes a bounded drain") {
+                await softDeadlineApplied.wait()
+            }
+            try await withHangGuard("encrypted soft deadline returns to its caller") {
+                await closeReturned.wait()
+            }
+        } catch {
+            await releaseSendOwner.signal()
+            await session.closeTransportAndWait(cause: "encrypted_cleanup_full_send_repro_cleanup")
+            _ = await close.result
+            throw error
+        }
+        let closedAtSoft = await session.isTransportClosedForTesting()
+        XCTAssertFalse(closedAtSoft, "encrypted and plaintext sends share full-send deadline recording")
+        await releaseSendOwner.signal()
+        try await withHangGuard("encrypted send owner returns after the soft deadline") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        await session.setCleanupFullSendBoundaryHookForTesting(nil)
+        await session.setCleanupSoftDeadlineAppliedHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "encrypted_cleanup_full_send_test_complete")
+    }
+
+    func testOrdinaryFullSendReadsNoCleanupClockMetadata() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(transport: transport, initialCredits: 1, clock: clock)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 140)
+
+        let request = Task { try await session.echoThroughSenderLoopForTesting() }
+        try await withHangGuard("ordinary ECHO reaches its held send") {
+            try await transport.waitForSendCount(1)
+        }
+        let clockReadsBeforeFullSend = clock.nowCallCount
+        transport.releaseNextSend(command: SMB2Commands.echo)
+        try await withHangGuard("ordinary ECHO owner returns") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let fullSendClockReads = clock.nowCallCount - clockReadsBeforeFullSend
+        XCTAssertEqual(fullSendClockReads, 1, "only ordinary owner-recovery time is read; cleanup full-send metadata is skipped")
+
+        try transport.enqueueResponse(try echoResponse(messageId: 140, sessionId: 1, credits: 0))
+        try await withHangGuard("ordinary ECHO final returns") { try await request.value }
+        await session.closeTransportAndWait(cause: "ordinary_full_send_cleanup_metadata_test_complete")
+    }
+
+    func testTransferCreditBalanceSnapshotIsLimitedToTestingHook() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = root.appendingPathComponent("Sources/SMBee/SMBClient.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "private func reserveTransferCredit("))
+        let end = try XCTUnwrap(source.range(of: "private func applyCreditRequest(", range: start.lowerBound..<source.endIndex))
+        let body = source[start.lowerBound..<end.lowerBound]
+        let normalizedBody = Self.normalizedSource(String(body))
+        let normalizedSource = Self.normalizedSource(source)
+        let hook = try XCTUnwrap(
+            normalizedBody.range(of: "ifwaitIfUnavailable,lethook=transferCreditSnapshotHookForTesting")
+        )
+        let snapshot = try XCTUnwrap(normalizedBody.range(of: "creditWindow.balanceSnapshot"))
+        XCTAssertLessThan(hook.lowerBound, snapshot.lowerBound, "the lock-taking snapshot is inside the optional hook")
+        let hookOpenBrace = try XCTUnwrap(normalizedBody[hook.upperBound...].firstIndex(of: "{"))
+        var cursor = hookOpenBrace
+        var depth = 0
+        var hookCloseBrace: String.Index?
+        while cursor < normalizedBody.endIndex {
+            switch normalizedBody[cursor] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    hookCloseBrace = cursor
+                }
+            default: break
+            }
+            if hookCloseBrace != nil { break }
+            normalizedBody.formIndex(after: &cursor)
+        }
+        let closeBrace = try XCTUnwrap(hookCloseBrace)
+        XCTAssertLessThan(hookOpenBrace, snapshot.lowerBound)
+        XCTAssertLessThan(
+            snapshot.lowerBound,
+            closeBrace,
+            "the balance snapshot must stay within the optional testing hook body"
+        )
+        XCTAssertEqual(
+            normalizedBody.components(separatedBy: "creditWindow.balanceSnapshot").count - 1,
+            1,
+            "the only snapshot read belongs inside the optional testing hook"
+        )
+        XCTAssertEqual(
+            normalizedSource.components(separatedBy: "creditWindow.balanceSnapshot").count - 1,
+            3,
+            "only the reserve hook, credit diagnostic, and packet patch may read this snapshot"
+        )
+    }
+
+    func testWireReceiptCompletionHasOneOwnerBeforeEveryActiveRecordRemoval() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = root.appendingPathComponent("Sources/SMBee/SMBClient.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let normalized = Self.normalizedSource(source)
+        let activeRecordRemovalToken = "activePostAuthRequestRecords.removeValue(forKey:"
+        let removal = try XCTUnwrap(normalized.range(of: activeRecordRemovalToken))
+        XCTAssertEqual(
+            normalized.components(separatedBy: activeRecordRemovalToken).count - 1,
+            1,
+            "only the guarded reclamation function may remove an individual active record"
+        )
+        XCTAssertNil(
+            normalized.range(of: #"activePostAuthRequestRecords\[[^\]]+\]=nil"#, options: .regularExpression),
+            "active records may not be deleted through a nil subscript assignment"
+        )
+        XCTAssertFalse(normalized.contains("markOperationBarrierComplete"))
+
+        let helperStart = try XCTUnwrap(
+            normalized.range(of: "privatefuncreclaimActivePostAuthRequestRecordIfEligible(")
+        )
+        let helperOpenBrace = try XCTUnwrap(normalized[helperStart.upperBound...].firstIndex(of: "{"))
+        var cursor = helperOpenBrace
+        var depth = 0
+        var helperCloseBrace: String.Index?
+        while cursor < normalized.endIndex {
+            switch normalized[cursor] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 { helperCloseBrace = cursor }
+            default: break
+            }
+            if helperCloseBrace != nil { break }
+            normalized.formIndex(after: &cursor)
+        }
+        let helperEnd = try XCTUnwrap(helperCloseBrace)
+        XCTAssertTrue(
+            helperStart.lowerBound <= removal.lowerBound && removal.lowerBound < helperEnd,
+            "the sole removeValue must be inside the guarded reclamation function"
+        )
+        let helperBody = normalized[helperStart.lowerBound..<helperEnd]
+        let receiptCheck = try XCTUnwrap(helperBody.range(of: "completeOperationBarrierIfWireWorkIsComplete(for:identity)"))
+        let helperRemoval = try XCTUnwrap(helperBody.range(of: activeRecordRemovalToken))
+        XCTAssertLessThan(receiptCheck.lowerBound, helperRemoval.lowerBound)
+
+        let removeAllToken = "activePostAuthRequestRecords.removeAll()"
+        XCTAssertEqual(normalized.components(separatedBy: removeAllToken).count - 1, 1)
+        let terminalJoinFunction = try XCTUnwrap(normalized.range(of: "funccloseTransportAndWait("))
+        let terminalJoin = try XCTUnwrap(normalized.range(of: "progress:.terminalJoinCompleted"))
+        let activeRecordRemovalAll = try XCTUnwrap(
+            normalized.range(of: removeAllToken, range: terminalJoin.lowerBound..<normalized.endIndex)
+        )
+        XCTAssertLessThan(terminalJoinFunction.lowerBound, terminalJoin.lowerBound)
+        XCTAssertLessThan(terminalJoin.lowerBound, activeRecordRemovalAll.lowerBound)
+    }
+
+    private static func normalizedSource(_ source: String) -> String {
+        let withoutSelf = source.replacingOccurrences(
+            of: #"self\s*\.\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+        let compact = withoutSelf.replacingOccurrences(of: #"\s+"#, with: "", options: .regularExpression)
+        var normalized = compact
+        while true {
+            let withoutReceiverParens = normalized.replacingOccurrences(
+                of: #"\((activePostAuthRequestRecords|creditWindow)\)"#,
+                with: "$1",
+                options: .regularExpression
+            )
+            guard withoutReceiverParens != normalized else { return normalized }
+            normalized = withoutReceiverParens
+        }
+    }
+
+    func testFinalBeforeSoftInvalidatesAnAlreadyWokenCleanupTimeout() async throws {
+        let transport = SMBActivationEventTransport()
+        let time = SMBActivationTestClock()
+        let timeoutSleeper = ManualSMBSleeper()
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 1,
+            cleanupTimeout: .seconds(5),
+            sessionTime: time.source,
+            cleanupTimeoutSleeper: { try await timeoutSleeper.sleep(for: $0) }
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 100)
+
+        let timeoutWakeEntered = SMBActivationEvent()
+        let releaseTimeoutWake = SMBActivationUncancelledGate()
+        let timeoutIdentityCheck = SMBContinuationBooleanLatch()
+        let creditGrantEntered = SMBActivationEvent()
+        let releaseCreditGrant = SMBActivationUncancelledGate()
+        let recordReaped = SMBActivationEvent()
+        await session.setCleanupTimeoutDeliveryHooksForTesting(
+            onWake: { _ in
+                timeoutWakeEntered.signal()
+                await releaseTimeoutWake.wait()
+            },
+            onIdentityCheck: { isCurrent in timeoutIdentityCheck.signal(isCurrent) }
+        )
+        await session.setCreditGrantAfterAwaitHookForTesting {
+            creditGrantEntered.signal()
+            await releaseCreditGrant.wait()
+        }
+        await session.setActivePostAuthRequestRecordReapedHookForTesting { _ in recordReaped.signal() }
+
+        let fileId = [UInt8](repeating: 0xF1, count: 16)
+        let close = Task { await session.bestEffortClose(treeId: 0xA, fileId: fileId) }
+        try await withHangGuard("cleanup CLOSE reaches transport") {
+            try await transport.waitForSendCount(1)
+        }
+        let header = try SMB2Header.decode(try XCTUnwrap(transport.sentPackets.first))
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("cleanup CLOSE owner recovers before its final") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        try await withHangGuard("cleanup timeout sleeper is registered") {
+            try await timeoutSleeper.waitUntilCallCount(
+                atLeast: 1,
+                timeout: .seconds(60),
+                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
+            )
+        }
+
+        XCTAssertTrue(timeoutSleeper.fireNext(), "the timeout task is now waiting to deliver its callback")
+        await timeoutWakeEntered.wait()
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: header.messageId,
+            sessionId: header.sessionId,
+            treeId: header.treeId,
+            credits: 1
+        ))
+        await creditGrantEntered.wait()
+        try await withHangGuard("accepted CLOSE final completes before credit acknowledgement") { await close.value }
+
+        let recordWhileAcknowledgementIsHeld = await session.postAuthRequestRecordSnapshotForTesting(messageId: header.messageId)
+        XCTAssertEqual(recordWhileAcknowledgementIsHeld?.send, .fullySent)
+        XCTAssertEqual(recordWhileAcknowledgementIsHeld?.wire, .finalAccepted)
+        XCTAssertEqual(recordWhileAcknowledgementIsHeld?.outstandingAcknowledgements, 1)
+
+        // The detached timeout job already woke, but its actor callback has not been
+        // delivered. Final acceptance invalidates the identity before this callback resumes.
+        await releaseTimeoutWake.signal()
+        let timeoutWasStillCurrent = await timeoutIdentityCheck.wait()
+        XCTAssertFalse(timeoutWasStillCurrent)
+        let recordAfterLateTimeoutDelivery = await session.postAuthRequestRecordSnapshotForTesting(messageId: header.messageId)
+        XCTAssertEqual(recordAfterLateTimeoutDelivery?.send, .fullySent)
+        XCTAssertEqual(recordAfterLateTimeoutDelivery?.wire, .finalAccepted)
+        let closedAfterLateTimeoutDelivery = await session.isTransportClosedForTesting()
+        XCTAssertFalse(closedAfterLateTimeoutDelivery)
+
+        await releaseCreditGrant.signal()
+        await recordReaped.wait()
+        let remainingRecords = await session.activePostAuthRequestRecordCountForTesting()
+        let remainingLedger = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertEqual(remainingRecords, 0)
+        XCTAssertNil(remainingLedger)
+        await session.setCleanupTimeoutDeliveryHooksForTesting(onWake: nil, onIdentityCheck: nil)
+        await session.setCreditGrantAfterAwaitHookForTesting(nil)
+        await session.setActivePostAuthRequestRecordReapedHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "final_invalidates_cleanup_timeout")
+    }
+
+    func testSoftExpiredFileOwnersAreRemovedWhenTheirFinalsArrive() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 1,
+            cleanupTimeout: .seconds(5),
+            sessionTime: clock.source,
+            cleanupTimeoutSleeper: { try await clock.source.sleep($0) }
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 400)
+
+        for iteration in 0..<8 {
+            let catchEntered = SMBActivationEvent()
+            let releaseCatch = SMBActivationUncancelledGate()
+            await session.setCleanupFileCloseCatchHookForTesting { _ in
+                catchEntered.signal()
+                await releaseCatch.wait()
+            }
+            let fileId = [UInt8](repeating: UInt8(iteration + 1), count: 16)
+            let close = Task { try await session.closeCreatedHandle(treeId: 0xA, fileId: fileId) }
+            try await withHangGuard("File CLOSE \(iteration) is sent") {
+                try await transport.waitForSendCount(iteration + 1)
+            }
+            let packet = try XCTUnwrap(transport.sentPackets.last)
+            let header = try SMB2Header.decode(packet)
+            transport.releaseNextSend(command: SMB2Commands.close)
+            try await withHangGuard("File CLOSE \(iteration) owner completes") {
+                await session.waitForRequestSentCountForTesting(atLeast: iteration + 1)
+            }
+            try await withHangGuard("File CLOSE \(iteration) soft timer is registered") {
+                await clock.waitForSleepCount(atLeast: iteration * 2 + 1)
+            }
+
+            clock.advance(by: .seconds(5), resumeDueSleeps: true)
+            await catchEntered.wait()
+            let dispatchBase = await session.receivedPacketDispatchCountForTesting()
+            try transport.enqueueResponse(try statusResponse(
+                command: SMB2Commands.close,
+                messageId: header.messageId,
+                sessionId: header.sessionId,
+                treeId: header.treeId,
+                credits: 1
+            ))
+            try await withHangGuard("File CLOSE \(iteration) final settles while its timeout catch is paused") {
+                await session.waitForReceivedPacketDispatchCountForTesting(atLeast: dispatchBase + 1)
+            }
+            let ledgerAfterFinal = await session.cleanupAttemptStateForTesting(fileId: fileId)
+            let expiredOwnersAfterFinal = await session.softExpiredCleanupOwnerCountForTesting()
+            XCTAssertNil(ledgerAfterFinal)
+            XCTAssertEqual(expiredOwnersAfterFinal, 0, "settled File owners do not accumulate across CLOSE attempts")
+
+            await releaseCatch.signal()
+            do {
+                try await close.value
+                XCTFail("the soft cleanup deadline should be reported to the original caller")
+            } catch SMBTransportError.timedOut {
+            }
+        }
+        await session.setCleanupFileCloseCatchHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "soft_expired_file_owner_reclamation")
+    }
+
+    func testLateFileCloseCatchCannotRetireANewerAttemptForTheSameFileId() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let timeoutSleeper = ManualSMBSleeper()
+        let session = SMBSession(
+            host: "test",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 1,
+            cleanupTimeout: .seconds(5),
+            sessionTime: clock.source,
+            cleanupTimeoutSleeper: { try await timeoutSleeper.sleep(for: $0) }
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 500)
+        let catchEntered = SMBActivationEvent()
+        let releaseCatch = SMBActivationUncancelledGate()
+        await session.setCleanupFileCloseCatchHookForTesting { _ in
+            catchEntered.signal()
+            await releaseCatch.wait()
+        }
+        let fileId = [UInt8](repeating: 0x9D, count: 16)
+        let closeA = Task { try await session.closeCreatedHandle(treeId: 0xA, fileId: fileId) }
+        try await withHangGuard("CLOSE A is sent") { try await transport.waitForSendCount(1) }
+        let packetA = try XCTUnwrap(transport.sentPackets.first)
+        let headerA = try SMB2Header.decode(packetA)
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("CLOSE A full-send is observed") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        try await withHangGuard("CLOSE A soft timer registers") {
+            try await timeoutSleeper.waitUntilCallCount(
+                atLeast: 1,
+                timeout: .seconds(60),
+                sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
+            )
+        }
+
+        clock.advance(by: .seconds(5), resumeDueSleeps: false)
+        XCTAssertTrue(timeoutSleeper.fireNext())
+        await catchEntered.wait()
+        let dispatchBase = await session.receivedPacketDispatchCountForTesting()
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: headerA.messageId,
+            sessionId: headerA.sessionId,
+            treeId: headerA.treeId,
+            credits: 1
+        ))
+        try await withHangGuard("CLOSE A final removes its attempt before the paused catch resumes") {
+            await session.waitForReceivedPacketDispatchCountForTesting(atLeast: dispatchBase + 1)
+        }
+        let ledgerAfterA = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertNil(ledgerAfterA)
+
+        let closeB = Task { try await session.closeCreatedHandle(treeId: 0xA, fileId: fileId) }
+        try await withHangGuard("CLOSE B starts a new owner for the same FileId") {
+            try await transport.waitForSendCount(2)
+        }
+        let headerB = try SMB2Header.decode(try XCTUnwrap(transport.sentPackets.last))
+        let ledgerOwnedByB = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertEqual(ledgerOwnedByB, "sending")
+
+        await releaseCatch.signal()
+        do {
+            try await closeA.value
+            XCTFail("CLOSE A's soft deadline should still be returned")
+        } catch SMBTransportError.timedOut {
+        }
+        let ledgerAfterLateCatch = await session.cleanupAttemptStateForTesting(fileId: fileId)
+        XCTAssertEqual(ledgerAfterLateCatch, "sending", "the owner-matched transition leaves CLOSE B intact")
+        let closedAfterLateCatch = await session.isTransportClosedForTesting()
+        XCTAssertFalse(closedAfterLateCatch)
+
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("CLOSE B full-send is observed") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
+        }
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: headerB.messageId,
+            sessionId: headerB.sessionId,
+            treeId: headerB.treeId,
+            credits: 0
+        ))
+        try await closeB.value
+        await session.setCleanupFileCloseCatchHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "late_file_close_catch_owner_guard")
+    }
+
+    func testCleanupFinalAtExactHardDeadlineIsTerminal() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(
+            transport: transport,
+            initialCredits: 1,
+            clock: clock,
+            requestTimeout: .seconds(3)
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 100)
+        let close = Task {
+            await session.bestEffortClose(
+                treeId: 0xA,
+                fileId: [UInt8](repeating: 0xD4, count: 16)
+            )
+        }
+        try await withHangGuard("cleanup CLOSE reaches transport") {
+            try await transport.waitForSendCount(1)
+        }
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("cleanup CLOSE full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        try await withHangGuard("cleanup soft timer is registered") {
+            await clock.waitForSleepCount(atLeast: 1)
+        }
+        clock.advance(by: .seconds(5), resumeDueSleeps: true)
+        try await withHangGuard("soft timeout returns to best-effort caller") { await close.value }
+        try await withHangGuard("fixed hard timer uses the remaining request timeout") {
+            await clock.waitForSleepCount(atLeast: 2)
+        }
+
+        clock.advance(by: .seconds(3), resumeDueSleeps: false)
+        let dispatchBase = await session.receivedPacketDispatchCountForTesting()
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: 100,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 0
+        ))
+        await session.waitForReceivedPacketDispatchCountForTesting(atLeast: dispatchBase + 1)
+        let closed = await session.isTransportClosedForTesting()
+        let pending = await session.wirePendingRecordCountForTesting()
+        XCTAssertTrue(closed)
+        XCTAssertEqual(pending, 0)
+        await session.closeTransportAndWait(cause: "cleanup_hard_boundary_test_complete")
     }
 
     func testEarlyFinalThenCancellationDoesNotQueueCancelAndSendOwnerDrains() async throws {
@@ -2144,11 +3078,20 @@ final class SMBActivationTestClock: @unchecked Sendable {
     private var instant = ContinuousClock().now
     private var sleepers: [Sleeper] = []
     private var sleepCount = 0
+    private var nowCount = 0
     private var countWaiters: [CountWaiter] = []
+
+    var sleepCallCount: Int { lock.withLock { sleepCount } }
+    var nowCallCount: Int { lock.withLock { nowCount } }
 
     var source: SMBSessionMonotonicTime {
         SMBSessionMonotonicTime(
-            now: { self.lock.withLock { self.instant } },
+            now: {
+                self.lock.withLock {
+                    self.nowCount += 1
+                    return self.instant
+                }
+            },
             sleep: { duration in try await self.sleep(for: duration) }
         )
     }
@@ -2287,7 +3230,12 @@ private final class SMBActivationEventTransport: SMBTransport, @unchecked Sendab
 
     func send(_ bytes: [UInt8]) async throws {
         let packet = try Self.unframe(bytes)
-        let header = try SMB2Header.decode(packet)
+        let command: UInt16
+        if packet.starts(with: [0xfd, 0x53, 0x4d, 0x42]) {
+            command = UInt16.max
+        } else {
+            command = try SMB2Header.decode(packet).command
+        }
         let injectedError = lock.withLock { () -> Error? in
             defer { nextSendError = nil }
             return nextSendError
@@ -2302,7 +3250,7 @@ private final class SMBActivationEventTransport: SMBTransport, @unchecked Sendab
                     packetStorage.append(packet)
                     blockedSends.append(PendingSend(
                         id: sendID,
-                        command: header.command,
+                        command: command,
                         bytes: bytes,
                         continuation: continuation
                     ))

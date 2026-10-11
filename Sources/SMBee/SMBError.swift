@@ -1,3 +1,10 @@
+/// The resource whose cleanup attempt failed. File IDs are scoped to their Tree.
+public enum SMBCleanupFailureResource: Equatable, Sendable {
+    case file(treeId: UInt32, fileId: [UInt8])
+    case tree(treeId: UInt32)
+    case session
+}
+
 public enum SMBError: Error, Equatable, Sendable {
     case notFound(status: UInt32, operation: String)
     case accessDenied(status: UInt32, operation: String)
@@ -19,6 +26,12 @@ public enum SMBError: Error, Equatable, Sendable {
     case protocolError(String)
     case invalidRecursion(String)
     case recursiveOperationIncomplete(failures: [SMBRecursiveFailure])
+    /// A scoped Tree is closing or has been retired, so the operation was refused locally.
+    /// This does not mean the shared SMB session or another Tree has failed.
+    case treeUnavailable(treeId: UInt32, operation: String)
+    /// A scoped cleanup request failed. `resource` identifies the File, Tree, or session;
+    /// `underlying` preserves the originating status or failure description.
+    case cleanupFailed(resource: SMBCleanupFailureResource, underlying: String)
 }
 
 enum SMBErrorMapper {

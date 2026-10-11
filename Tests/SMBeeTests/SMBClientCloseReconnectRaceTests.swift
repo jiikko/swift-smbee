@@ -368,6 +368,118 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
         await session.closeTransportAndWait(cause: "finite_tree_hard_deadline_test_complete")
     }
 
+    func testTreeDisconnectSoftExpiryKeepsOtherTreeOperationsAliveThroughDrain() async throws {
+        let cleanupClock = ManualSMBSleeper()
+        let transport = SMBTreeCleanupDrainTransport()
+        let session = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: transport,
+            initialCredits: 8,
+            cleanupTimeout: .seconds(5),
+            requestTimeout: nil,
+            sessionTime: cleanupClock.sessionTime,
+            cleanupTimeoutSleeper: { try await cleanupClock.sleep(for: $0) }
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 0x1122_3344_5566_7788, firstMessageId: 10)
+
+        let treeAId: UInt32 = 0x00a
+        let treeBId: UInt32 = 0x00b
+        let optionalTreeAIdentity = await session.ensureTreeIdentity(treeId: treeAId)
+        let optionalTreeBIdentity = await session.ensureTreeIdentity(treeId: treeBId)
+        let treeAIdentity = try XCTUnwrap(optionalTreeAIdentity)
+        let treeBIdentity = try XCTUnwrap(optionalTreeBIdentity)
+        let treeA = SMBClientTreeSession(session: session, treeId: treeAId, treeIdentity: treeAIdentity)
+        let treeB = SMBClientTreeSession(session: session, treeId: treeBId, treeIdentity: treeBIdentity)
+        let softDeadlineApplied = SMBContinuationCountBarrier()
+        await session.setCleanupSoftDeadlineAppliedHookForTesting {
+            softDeadlineApplied.signal()
+        }
+        defer {
+            if transport.closeCount == 0 { transport.failConnection() }
+            cleanupClock.reset()
+        }
+
+        let closeTreeA = Task { await treeA.close() }
+        try await smbIssue102AwaitWithTimeout("Tree A TREE_DISCONNECT before its soft deadline") {
+            try await transport.waitForCommand(SMB2Commands.treeDisconnect)
+        }
+        XCTAssertEqual(transport.sentTreeDisconnectTreeIDs, [treeAId])
+        try await cleanupClock.waitUntilCallCount(
+            atLeast: 1,
+            timeout: .seconds(1),
+            sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
+        )
+
+        let inFlightOnTreeB = Task { try await treeB.stat(path: "in-flight-before-soft") }
+        let inFlightQuery = try await smbIssue102AwaitWithTimeout("Tree B QUERY_INFO is held before Tree A soft expiry") {
+            try await transport.waitForQueryInfo(treeId: treeBId)
+        }
+        XCTAssertEqual(inFlightQuery.treeId, treeBId)
+        let tombstonesBeforeSoftExpiry = await session.cleanupTombstoneCountForTesting()
+        XCTAssertEqual(tombstonesBeforeSoftExpiry, 0)
+
+        XCTAssertTrue(cleanupClock.fireNext(), "expire Tree A cleanup soft deadline while Tree B QUERY_INFO is held")
+        try await smbIssue102AwaitWithTimeout("Tree A cleanup caller returns at soft expiry") {
+            await closeTreeA.value
+        }
+        guard transport.closeCount == 0 else {
+            XCTFail("soft expiry must leave the shared transport open; closeCount=\(transport.closeCount)")
+            return
+        }
+        try await smbIssue102AwaitWithTimeout("Tree A cleanup enters its tombstone drain") {
+            try await softDeadlineApplied.waitForCount(1)
+        }
+        try await cleanupClock.waitUntilCallCount(
+            atLeast: 2,
+            timeout: .seconds(1),
+            sleeper: { try await ManualSMBSleeper().sleep(for: $0) }
+        )
+        XCTAssertEqual(cleanupClock.requestedDurations, [.seconds(5), .seconds(60)])
+        let tombstonesDuringDrain = await session.cleanupTombstoneCountForTesting()
+        XCTAssertEqual(tombstonesDuringDrain, 1)
+        XCTAssertEqual(transport.closeCount, 0, "Tree A is draining while the shared transport remains open")
+
+        try transport.completeQueryInfo(inFlightQuery, fileSize: 101)
+        let inFlightResult = try await smbIssue102AwaitWithTimeout("Tree B operation sent before soft expiry succeeds during drain") {
+            try await inFlightOnTreeB.value
+        }
+        XCTAssertEqual(inFlightResult.size, 101)
+        XCTAssertEqual(transport.closeCount, 0)
+
+        let startedDuringDrain = Task { try await treeB.stat(path: "started-during-drain") }
+        let drainingQuery = try await smbIssue102AwaitWithTimeout("new Tree B QUERY_INFO starts during Tree A drain") {
+            try await transport.waitForQueryInfo(treeId: treeBId)
+        }
+        XCTAssertEqual(drainingQuery.treeId, treeBId)
+        try transport.completeQueryInfo(drainingQuery, fileSize: 202)
+        let drainingResult = try await smbIssue102AwaitWithTimeout("new Tree B operation succeeds during Tree A drain") {
+            try await startedDuringDrain.value
+        }
+        XCTAssertEqual(drainingResult.size, 202)
+        let tombstonesAfterConcurrentDrainOperations = await session.cleanupTombstoneCountForTesting()
+        XCTAssertEqual(tombstonesAfterConcurrentDrainOperations, 1)
+        XCTAssertEqual(transport.closeCount, 0)
+
+        try transport.completeTreeDisconnect()
+        let usableAfterDrain = Task { try await treeB.stat(path: "after-drain") }
+        let afterDrainQuery = try await smbIssue102AwaitWithTimeout("Tree B QUERY_INFO after Tree A final") {
+            try await transport.waitForQueryInfo(treeId: treeBId)
+        }
+        try transport.completeQueryInfo(afterDrainQuery, fileSize: 303)
+        let afterDrainResult = try await smbIssue102AwaitWithTimeout("Tree B remains usable after the cleanup final") {
+            try await usableAfterDrain.value
+        }
+        XCTAssertEqual(afterDrainResult.size, 303)
+        let tombstonesAfterFinal = await session.cleanupTombstoneCountForTesting()
+        XCTAssertEqual(tombstonesAfterFinal, 0)
+        XCTAssertEqual(transport.closeCount, 0)
+
+        await session.setCleanupSoftDeadlineAppliedHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "tree_disconnect_soft_expiry_isolation_test_complete")
+    }
+
     func testTreeLocalRefusalDoesNotTriggerWatchReconnect() async throws {
         let transport = SMBContinuationWatchTransport()
         let session = SMBSession(

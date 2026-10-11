@@ -1032,6 +1032,116 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
     }
 }
 
+/// Answers CREATE immediately and lets tests release QUERY_INFO finals by the request
+/// header that was actually sent. Requests are matched by TreeId rather than by a global
+/// command ordinal, so unrelated traffic cannot shift which response a test releases.
+final class SMBTreeCleanupDrainTransport: SMBContinuationWatchTransport, @unchecked Sendable {
+    private struct QueryInfoWaiter {
+        let id: UUID
+        let continuation: CheckedContinuation<SMB2Header, Error>
+    }
+
+    private enum QueryInfoWaitRegistration {
+        case cancelled
+        case request(SMB2Header)
+        case waiting
+    }
+
+    private let queryInfoLock = NSLock()
+    private var queryInfoRequests: [UInt32: [SMB2Header]] = [:]
+    private var queryInfoWaiters: [UInt32: [QueryInfoWaiter]] = [:]
+
+    override func send(_ bytes: [UInt8]) async throws {
+        guard let packet = try smbPacketInDirectTCPStream(bytes) else {
+            try await super.send(bytes)
+            return
+        }
+        let header = try SMB2Header.decode(packet)
+        try await super.send(bytes)
+
+        switch header.command {
+        case SMB2Commands.create:
+            try respondToCreate(header, credits: 1)
+        case SMB2Commands.queryInfo:
+            let waiter = queryInfoLock.withLock { () -> QueryInfoWaiter? in
+                if var waiters = queryInfoWaiters[header.treeId], !waiters.isEmpty {
+                    let waiter = waiters.removeFirst()
+                    queryInfoWaiters[header.treeId] = waiters.isEmpty ? nil : waiters
+                    return waiter
+                }
+                queryInfoRequests[header.treeId, default: []].append(header)
+                return nil
+            }
+            waiter?.continuation.resume(returning: header)
+        default:
+            break
+        }
+    }
+
+    func waitForQueryInfo(treeId: UInt32) async throws -> SMB2Header {
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let registration = queryInfoLock.withLock { () -> QueryInfoWaitRegistration in
+                    if Task.isCancelled { return .cancelled }
+                    if var requests = queryInfoRequests[treeId], !requests.isEmpty {
+                        let request = requests.removeFirst()
+                        queryInfoRequests[treeId] = requests.isEmpty ? nil : requests
+                        return .request(request)
+                    }
+                    queryInfoWaiters[treeId, default: []].append(QueryInfoWaiter(
+                        id: waiterID,
+                        continuation: continuation
+                    ))
+                    return .waiting
+                }
+                switch registration {
+                case .cancelled:
+                    continuation.resume(throwing: CancellationError())
+                case .request(let request):
+                    continuation.resume(returning: request)
+                case .waiting:
+                    break
+                }
+            }
+        } onCancel: {
+            cancelQueryInfoWaiter(waiterID)
+        }
+    }
+
+    func completeQueryInfo(_ request: SMB2Header, fileSize: UInt64) throws {
+        var response = try SMB2Header(
+            command: SMB2Commands.queryInfo,
+            credits: 4,
+            messageId: request.messageId,
+            treeId: request.treeId,
+            sessionId: request.sessionId
+        ).encode()
+        response.append(contentsOf: [9, 0, 72, 0, 56, 0, 0, 0])
+        var information = Array(repeating: UInt8(0), count: 56)
+        writeUInt64LE(fileSize, to: &information, at: 40)
+        response.append(contentsOf: information)
+        try enqueue(response)
+    }
+
+    private func cancelQueryInfoWaiter(_ waiterID: UUID) {
+        let continuation = queryInfoLock.withLock { () -> CheckedContinuation<SMB2Header, Error>? in
+            for treeId in queryInfoWaiters.keys {
+                guard var waiters = queryInfoWaiters[treeId],
+                      let index = waiters.firstIndex(where: { $0.id == waiterID })
+                else {
+                    continue
+                }
+                let waiter = waiters.remove(at: index)
+                queryInfoWaiters[treeId] = waiters.isEmpty ? nil : waiters
+                return waiter.continuation
+            }
+            return nil
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
 class SMBReadPipelineScriptTransport: SMBContinuationWatchTransport, @unchecked Sendable {
     struct ReadRequest: Equatable, Sendable {
         let header: SMB2Header

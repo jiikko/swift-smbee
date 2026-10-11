@@ -300,6 +300,16 @@ commit の分け方（各 commit が単独で契約を満たす）:
     すべて gate（−15% / +25%）の内側（"within noise" 判定）。Commit 4 で増えた判定の分の上乗せと見て、深追いしない（ユーザー指示）
   - 懸念（実装後のレビューで判定する）: A で M3d の production の A/B 所有者のテスト（`testLateCleanupDeadlineCatchForCloseADoesNotRetireCloseBForSameFileId`）と
     M3b の 2 本を消したが、`retireCleanupFileIdForDeadlineIfNeeded` はまだ在る
+- 実装後のレビュー（2026-10-11、4 観点 + merger、25 件 → 15 件）。P1 が 6 件:
+  - F2 / F3: 設計の中核の Tree の barrier（wire / retirement の receipt）が production に接続されていない（`beginBarrier` / `completeBarrier` の呼び出しが無い）。
+    File CLOSE の wire の drain が残っていても TREE_DISCONNECT を送る。試験は receipt を手で登録していて素通りした
+  - F1: transfer の credit の待ちが、残高を見た後に消費されると scope の無い経路で park し、Tree の隔離で解除されない
+  - F4: callback の中で始めた親の close が、子の close まで「開始だけ」で戻り、子の lease を待たずに後始末へ進む
+  - F5: Tree の後始末が成功しても、その incarnation の File の台帳が残り、64 件に達すると共有 transport を閉じる
+  - F6: full-send の成立時刻と owner の回収時刻を区別できない
+  - P2: lease / facade の記録が履歴に比例して増える（F7）、64 件の上限を File と Tree の合計で数えない（F8）、消した A/B の所有者の production の試験（F9）、
+    遅れて届く soft の callback（F10 / F11）、テストの素通り 4 件（F12〜F15）
+  - 次: 指摘ごとに再現テスト → master と比較 → 本物を直す（codex）
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

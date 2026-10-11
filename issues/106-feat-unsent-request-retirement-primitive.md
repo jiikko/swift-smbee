@@ -346,7 +346,17 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - 変異: 12 件それぞれに修正を戻す変異を当てて red（codex が実行）
   - 検証（自分で実行）: macOS 823 件・Linux 830 件 green、strict lint 0、期限の 3 テストを 20 回連続 green
   - codex が開発の途中で起こした xctest が 1 つ、T4 のテストの待ちで止まったまま孤児で残っていた。最終の版の 20 回の繰り返しでは止まらなかったので、途中の版の残骸と判断した（stack は採ってから止めた）
-- 3 周目の敵対レビュー（c374f62 に対して 3 観点）を実行中
+- 3 周目の敵対レビュー（c374f62 に対して 3 観点）:
+  - 期限の判定は収束した。`disposition` を 192 組（event 4 種 × full-send 3 区分 × final 4 区分 × owner 回収 4 区分）で列挙して、§9・§10 に反する組を見つけられなかった。
+    同じ request に event が複数届いたときの二重の caller 再開・二重の hard timer・台帳の二重遷移も見つからなかった
+  - wire の receipt の完了の判定で再び破られた（2 周目に続いて 2 回目）:
+    - P1: final の受理で record が先に回収され、`markOperationBarrierComplete` の guard が `nil == 0` で失敗し、receipt が terminal まで残る（2 観点が独立に指摘）
+    - P2: grant の精算だけで receipt を外し、send owner が未回収のまま Tree の後始末が進む
+    - P2: 親の付け替えの後に旧親の waiter を起こさない
+  - テストの素通り: ack が先・owner の回収が後の順序が無い、拒否した request の record の回収を見ていない、`disposition` の `== softAt` の境界、
+    付け替えの旧祖先の減算、子の期限の callback の完了を待たない（P2 が 4 件、snapshot の source の検査の範囲が P3）
+  - 次: receipt の完了の判定が 3 か所（final・ack・refund）に分かれて続けて食い違ったので、条件を継ぎ足さず、「wire の仕事が全部済んだか」を判定する 1 関数に寄せ、
+    record の回収より前に評価する形にする（codex luna-max に指示、実行中）
 
 ## 関連
 

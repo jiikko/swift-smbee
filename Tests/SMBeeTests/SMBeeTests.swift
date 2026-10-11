@@ -10587,6 +10587,9 @@ final class SMBeeTests: XCTestCase {
         let disconnect = Task { await session.disconnect(treeId: treeId) }
         let clock = ManualSMBSleeper()
         try await waitForOutboundFrameCount(1, transport: transport)
+        try await awaitWithTimeout("TREE_DISCONNECT send completes before the reader assertion") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
         let firstReaderHandle = await session.readerHandleForTesting()
         let readerRunningDuringTreeDisconnect = await session.receiveLoopRunningForTesting()
         XCTAssertNotNil(firstReaderHandle)

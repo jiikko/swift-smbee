@@ -1541,15 +1541,28 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
         let releaseSender = SMBAsyncCallbackSuspensionGate()
         let reservationAtCreditActor = SMBContinuationCountBarrier()
         let releaseReservation = SMBAsyncCallbackSuspensionGate()
+        let refundStarted = SMBContinuationCountBarrier()
+        let releaseRefund = SMBAsyncCallbackSuspensionGate()
         let catchFinished = SMBContinuationCountBarrier()
         defer {
             releaseSender.release()
             releaseReservation.release()
+            releaseRefund.release()
         }
         await session.setSenderPrecommitAdmissionHookForTesting { command in
             guard command == SMB2Commands.flush else { return }
             senderAtPrecommit.signal()
             await releaseSender.suspend()
+        }
+        await session.setCleanupCreditRefundInterleavingHookForTesting { point in
+            switch point {
+            case .grantClaimedBeforeAccept:
+                break
+            case .refundPending(let charge):
+                XCTAssertEqual(charge, 1, "Tree quarantine refunds the isolated FLUSH reservation")
+                refundStarted.signal()
+                await releaseRefund.suspend()
+            }
         }
         await session.setCleanupCloseCreditWaitCatchHookForTesting { catchFinished.signal() }
 
@@ -1588,6 +1601,9 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
         try await smbIssue102AwaitWithTimeout("Tree isolation fails the queued request continuation") {
             try await catchFinished.waitForCount(1)
         }
+        try await smbIssue102AwaitWithTimeout("Tree quarantine reaches its held credit refund") {
+            try await refundStarted.waitForCount(1)
+        }
         let recordCountBeforeRefundAcknowledgement = await session.activePostAuthRequestRecordCountForTesting()
         XCTAssertEqual(
             recordCountBeforeRefundAcknowledgement,
@@ -1595,6 +1611,7 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
             "the isolated request record must survive its catch until Tree quarantine refunds its reserved credit"
         )
 
+        releaseRefund.release()
         releaseReservation.release()
         releaseSender.release()
         if recordCountBeforeRefundAcknowledgement == 3 {
@@ -1618,6 +1635,7 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
             "Tree quarantine reclaims its locally refused request; only the two other-Tree requests remain"
         )
         await session.setCreditReservationAcquiredHookForTesting(nil)
+        await session.setCleanupCreditRefundInterleavingHookForTesting(nil)
         await session.setSenderPrecommitAdmissionHookForTesting(nil)
         await session.setCleanupCloseCreditWaitCatchHookForTesting(nil)
         await session.closeTransportAndWait(cause: "tree_quarantine_refund_receipt_test_complete")

@@ -8138,7 +8138,11 @@ actor SMBSession {
             )
         }
         for charge in lateGrantRefunds { await refundCredit(charge: charge) }
-        for charge in refunds { await refundCredit(charge: charge) }
+        for charge in refunds {
+            // Let tests hold Tree quarantine's queued-credit refund before it is acknowledged.
+            await cleanupCreditRefundInterleavingHookForTesting?(.refundPending(charge: charge))
+            await refundCredit(charge: charge)
+        }
         for requestIdentity in retiredByTreePreparation {
             updateActivePostAuthRecord(requestIdentity) { $0.credit = .refunded }
             reclaimActivePostAuthRequestRecordIfEligible(requestIdentity)

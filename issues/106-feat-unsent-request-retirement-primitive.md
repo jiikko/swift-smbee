@@ -362,7 +362,13 @@ commit の分け方（各 commit が単独で契約を満たす）:
   親の付け替えの後に旧親の waiter を起こす。テストの素通り 6 件を直した（`disposition` の D−1ns / D / D+1ns の表のテストを含む）
   - 変異: 各指摘の修正を戻す変異で red（codex）。receipt の評価を reap の後へ移す変異は、動作のテストでは緑のままで、source の形の検査が red にする
   - 検証（自分で実行）: macOS 829 件・Linux 836 件 green、strict lint 0、race 系の 2 suite を 10 回連続 green
-- 4 周目の敵対レビュー（100cde8 に対して 2 観点: receipt の取りこぼしと早すぎる完了 / テストの素通り）を実行中。期限の判定は 3 周目で収束したので外した
+- 4 周目の敵対レビュー（100cde8 に対して 2 観点: receipt の取りこぼしと早すぎる完了 / テストの素通り。期限の判定は 3 周目で収束したので外した）:
+  - 判定の関数そのものの早すぎる完了・取りこぼしは見つからなかった（record を更新する全箇所を照合した表つき）
+  - P1: Tree の隔離の refund が suspend している間に request の catch が走ると、未精算の credit のまま record を消し、後の refund の側が判定できず receipt が残る
+    （cleanup の soft の退役の経路にも同型）。record を消す箇所が 7 か所に散っていて、うち 1 か所が判定を待たずに消していた
+  - P2: catch の経路の判定の呼び出しを消してもテストが通る。P3: snapshot の件数の検査が表記の揺れを数えない
+  - 次: 「record を消す前に receipt を判定する」が 3・4 周目と別々の箇所で破られたので、record の回収も 1 関数に寄せ、
+    それ以外の removeValue を source の形の検査で禁じる（codex luna-max、実行中）
 
 ## 関連
 

@@ -369,6 +369,12 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - P2: catch の経路の判定の呼び出しを消してもテストが通る。P3: snapshot の件数の検査が表記の揺れを数えない
   - 次: 「record を消す前に receipt を判定する」が 3・4 周目と別々の箇所で破られたので、record の回収も 1 関数に寄せ、
     それ以外の removeValue を source の形の検査で禁じる（codex luna-max、実行中）
+- 4 周目の指摘の修正（worktree の d3822e7）: active record の回収を `reclaimActivePostAuthRequestRecordIfEligible` の 1 関数に寄せ、直接 removeValue していた 6 か所を置き換えた。
+  catch は credit の refund が終わるまで record を残す（`creditRefundPending`）。record の削除と snapshot の参照は source の形の検査で固定した
+  - 検証（自分で実行）: macOS 832 件を 5 回連続 green（各 10 分の上限つき。hang なし）、Linux 839 件 green、strict lint 0
+  - codex の作業の途中で、最終の版より前の binary の xctest が既存のテスト（`testEarlyFinalThenCancellation...`）で止まったまま孤児で残っていた（2 回目）。
+    stack は async の待ちしか映らず原因は読めなかった。最終の版の 5 回の全件の実行では止まらなかった
+- 5 周目の敵対レビュー（d3822e7 に対して 2 観点: 回収されない record と二度と呼ばれない回収 / テストの素通り）を実行中
 
 ## 関連
 

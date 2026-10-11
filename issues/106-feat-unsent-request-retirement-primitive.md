@@ -357,6 +357,12 @@ commit の分け方（各 commit が単独で契約を満たす）:
     付け替えの旧祖先の減算、子の期限の callback の完了を待たない（P2 が 4 件、snapshot の source の検査の範囲が P3）
   - 次: receipt の完了の判定が 3 か所（final・ack・refund）に分かれて続けて食い違ったので、条件を継ぎ足さず、「wire の仕事が全部済んだか」を判定する 1 関数に寄せ、
     record の回収より前に評価する形にする（codex luna-max に指示、実行中）
+- 3 周目の指摘の修正（worktree の 100cde8）: receipt の完了の判定を `completeOperationBarrierIfWireWorkIsComplete` の 1 関数に寄せた。record を回収する前に評価し、
+  record が無いことを「済んだ」と推測しない。final の受理・send owner の回収・grant の ack・refund・precommit の拒否・catch・cleanup の期限・terminal の join から呼ぶ。
+  親の付け替えの後に旧親の waiter を起こす。テストの素通り 6 件を直した（`disposition` の D−1ns / D / D+1ns の表のテストを含む）
+  - 変異: 各指摘の修正を戻す変異で red（codex）。receipt の評価を reap の後へ移す変異は、動作のテストでは緑のままで、source の形の検査が red にする
+  - 検証（自分で実行）: macOS 829 件・Linux 836 件 green、strict lint 0、race 系の 2 suite を 10 回連続 green
+- 4 周目の敵対レビュー（100cde8 に対して 2 観点: receipt の取りこぼしと早すぎる完了 / テストの素通り）を実行中。期限の判定は 3 周目で収束したので外した
 
 ## 関連
 

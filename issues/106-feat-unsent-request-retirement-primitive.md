@@ -284,7 +284,7 @@ commit の分け方（各 commit が単独で契約を満たす）:
 
 ### Commit 4（issue 069 M2 の統合、2026-10-11〜、codex-drive）
 
-- 設計の差分（codex sol-high が今の master に対して書いた。worktree の `tmp/design-c4.md`。要点をここに残す）:
+- 設計の差分（codex sol-high が今の master に対して書いた。本体の checkout の `tmp/c4/design-c4.md`（ignore されていて手元にしか無い。§13 が最新の決定）。要点をここに残す）:
   - 所有者を 3 種類にする: request（既存の `SMBRequestIdentity`）、Tree の incarnation（session・generation・TreeId・連番。TreeId の再利用と reconnect で取り違えない）、
     facade / close / operation の lease。Tree の状態も cleanup の台帳と同じく遷移を 1 関数に寄せる
   - 実装は P1（operation lease と parent-child barrier の型と harness）→ P2（資源の discriminator・Tree 単位の credit の取消の型）→
@@ -384,6 +384,20 @@ commit の分け方（各 commit が単独で契約を満たす）:
     この検査が止めるのは書き戻しの退行で、意図的な迂回は対象にしない（振る舞いは実行型のテストが別に押さえる）
   - 周回の打ち切り: 5 周目の修正はテストの追加だけで、判定のロジックを新設せず、各テストは変異で直接確かめるので、
     規定の例外として周回をここで打ち切る
+- 5 周目のテストの穴の修正: Tree に拒否された request の record が session の close の前に 0 件になる assert、accept 前の grant を soft で取り消して
+  refund が終わるまで record を残すテスト（決定的に止めるため testing hook を 1 つ足した。codex は未設定でも claim と accept の間に suspension を作る
+  呼び方をしていたので、既存の hook と同じ optional chaining に直した）。`creditRefundPending` を立てる行を消す変異で red（`mutate-verify` で自分で確認）
+- **master へ（29359db、1 マイルストーン = 1 commit に squash）**。macOS 833 件（3 回連続）/ Linux 840 件 green、strict lint 0、smoke 3 profile
+  - CI: Test・E2E は success。Performance（run 38165701238、前回の成功した master との 20 組）: read throughput −6.1%・user CPU +7.7%、
+    write −2.4%・user CPU +2.1%。すべて gate の内側（PASS）
+  - issue 069 の完了条件のテストを続けて足した（fef6c44。Tree の後始末が soft を過ぎて drain している間も別の Tree の操作が成功する）
+  - fef6c44 の CI の Test で 2 本が落ちた（どちらもテストの待ち方。29359db の CI と手元の繰り返しでは通っていた）→ c03014c で直した:
+    - `testTreeQuarantineCatchKeepsRecordUntilCreditRefundAcknowledgement`（macOS）: credit の actor の hook で suspend すれば Tree の隔離の refund が止まる、
+      という前提が actor の再入で崩れ、refund が catch より先に済む順序で record が先に回収された。refund の直前の hook と catch の両方の合図を待つ形にした。
+      修正前は手元の連続実行の 9 回目に CI と同じ形で落ちた
+    - `testGracefulDisconnectKeepsTheReaderUntilLogoffResponse`（Linux。issue 010 M3 の既存のテスト）: 待つ合図（frame の記録）と assert する事象（reader の起動）の
+      すき間。手元では再現しなかった。送信の完了を待ってから assert する（retro 110 の 5 と同じ形）
+- Commit 5（READ / WRITE の ticket と delivery の統合）がこの上に積む次の段
 
 ## 関連
 

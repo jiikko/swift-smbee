@@ -65,7 +65,7 @@ InMemoryTransport）で再現する unit を書き、現挙動を固定してか
 
 ## 2026-09-08 追記: CI で実際に発火した（構築シナリオではない観測）
 
-issue [`done/080`](done/080-bug-ci-multiflight-connection-closed.md) の調査で、
+issue [`done/080`](080-bug-ci-multiflight-connection-closed.md) の調査で、
 **「症状（未再現・レビュー由来の構造指摘）」に書いた発火条件 1〜4 が CI で実際に起きていた**
 ことが分かった。起票時は「実測はしていない」だったが、以後はそうではない。
 
@@ -98,7 +98,7 @@ CANCEL request failed: connectionClosed
 
 | 案 | 内容 | 前提・懸念 |
 |---|---|---|
-| A. tombstone drain + bounded quarantine | deadline 超過で transport を閉じず、その CLOSE を tombstone として残して drain する（[`done/062`](done/062-design-cancel-tears-down-shared-session.md) の機構の再利用） | **drop-in 再利用では足りない**: `bestEffortClose` は detached task の完了を await しており、tombstone 化だけでは await を解除できない。CLOSE の最終応答 / `STATUS_CANCELLED` / handle state unknown / tombstone 上限 / quarantine 中の新規操作の可否を全部定義する必要がある |
+| A. tombstone drain + bounded quarantine | deadline 超過で transport を閉じず、その CLOSE を tombstone として残して drain する（[`done/062`](062-design-cancel-tears-down-shared-session.md) の機構の再利用） | **drop-in 再利用では足りない**: `bestEffortClose` は detached task の完了を await しており、tombstone 化だけでは await を解除できない。CLOSE の最終応答 / `STATUS_CANCELLED` / handle state unknown / tombstone 上限 / quarantine 中の新規操作の可否を全部定義する必要がある |
 | B. soft deadline + session quarantine | 即 close せず quarantine 状態にして新規 admission を止める | 復帰条件が要る |
 | C. cleanup の直列化 / 新規 operation の admission 停止 | cleanup 中は新規操作を受けない | 保持 session の応答性が落ちる |
 | D. handle 生成時点から専用 session | cleanup が共有 wire を巻き込まない | 既存の「consumer 側で session を分ける」案と同根（obaket 437） |
@@ -116,8 +116,8 @@ CANCEL request failed: connectionClosed
 ## 関連
 
 - `issues/done/065-leak-cleanup-wire-operations-have-no-deadline.md`（状態 done。cleanup timeout の実装。本 issue はその timeout が「効いたとき」の巻き添え範囲の話）
-- [`done/080`](done/080-bug-ci-multiflight-connection-closed.md)（本 issue の発火を CI で観測した調査。2026-09-08 追記の出典）
-- [`075`](done/075-perf-linux-aes-ccm-pure-swift-throughput.md)（CI で receive loop を塞いでいる throughput）。2026-10-01 に 075 で解消（Linux の CCM は release の実転送で 1 MiB read 68 → 10 ms、debug の micro-bench で約 55 倍）。この issue の cleanup deadline の構造問題は継続
+- [`done/080`](080-bug-ci-multiflight-connection-closed.md)（本 issue の発火を CI で観測した調査。2026-09-08 追記の出典）
+- [`075`](075-perf-linux-aes-ccm-pure-swift-throughput.md)（CI で receive loop を塞いでいる throughput）。2026-10-01 に 075 で解消（Linux の CCM は release の実転送で 1 MiB read 68 → 10 ms、debug の micro-bench で約 55 倍）。この issue の cleanup deadline の構造問題は継続
 - obaket `macOS/issues/437`（session 分離で consumer 側に吸収する案）
 
 ## 2026-10-01: M1（FileId の CLOSE）を実装した（codex-drive）
@@ -128,7 +128,7 @@ CANCEL request failed: connectionClosed
 - **M2（未着手）**: scoped TREE_DISCONNECT（`bestEffortTreeDisconnect`）。同じ TreeId の操作が終わるのを待つ barrier と、隔離した TreeId の admission が要るので分けた。
   `disconnect` は session 全体の明示的な終了なので、今まで通り transport を閉じる（変えない）。[`102`](102-task-architecture-review-2026-10-01.md) の #9（`withTree` が TREE_DISCONNECT の失敗を結果に反映しない）も M2 で扱う
 
-### M1 の契約（正本は [`done/065`](done/065-leak-cleanup-wire-operations-have-no-deadline.md) の 2026-10-01 追記）
+### M1 の契約（正本は [`done/065`](065-leak-cleanup-wire-operations-have-no-deadline.md) の 2026-10-01 追記）
 
 - cleanup の期限は caller の待ちだけを終える。送信済みの CLOSE は tombstone として残し、遅延応答を受け取る。SMB CANCEL は送らない
 - 未解決の FileId は ledger（sending / draining / retiredUnknown）で持ち、後続の wire 操作を admission で拒否する
@@ -163,3 +163,15 @@ TREE_DISCONNECT の期限切れで共有 session が落ちたことが観測さ�
   - 元の M2 の設計と敵対レビューの指摘 N1〜N5 も、ここに反映済み。
 - M2 は issue 106 の Commit 4 で実装する。Commit 4 は Commit 3（新しい送信経路）の上に積む。
 - Commit 3 は 2026-10-05 に revert して、いったん停止した。M2 もそれまで待つ。
+
+## 2026-10-12: M2 を issue 106 の Commit 4 として master へ入れた
+
+- commit `feat(session): issue 106 Commit 4 — issue 069 M2 の統合 (Tree の隔離と scoped な後始末、固定の soft / hard の期限、結果の報告)`。
+  設計・敵対レビュー（実装後 5 周）・変異の記録は [`106`](../106-feat-unsent-request-retirement-primitive.md) の「Commit 4」節が正本
+- 完了条件（追記）の 2 つ:
+  - 「cleanup が deadline を超えても同じ session の他の in-flight 操作が失敗しない」: File の CLOSE は M1 で固定済み。Tree の後始末は
+    `testTreeDisconnectSoftExpiryKeepsOtherTreeOperationsAliveThroughDrain` で固定した（Tree A の TREE_DISCONNECT が soft を過ぎて drain している間に、
+    期限前から in-flight の Tree B の操作と drain 中に始めた操作が成功し、transport が閉じない。manual clock で、壁時計に依存しない。
+    soft で `.terminal` を返す変異で red）。commit `test(session): issue 069 — Tree の後始末が soft の期限を過ぎて drain している間も、同じ session の別の Tree の操作が成功することを固定する`
+  - 065 の「cleanup failure で transport を閉じる」不変条件の変化: [`done/065`](065-leak-cleanup-wire-operations-have-no-deadline.md) の 2026-10-12 追記に書いた
+- [`102`](102-task-architecture-review-2026-10-01.md) の #9（`withTree` が TREE_DISCONNECT の失敗を結果に反映しない）も解消した（`SMBError.cleanupFailed`）

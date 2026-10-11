@@ -6,7 +6,7 @@
 - 関連: `Tests/SMBeeTests/SMBeeSharedSessionRangedReadE2ETests.swift`
   (`testSharedSessionRangedReadsHaveMultipleWireResponsesInFlight`) / `Sources/SMBee/SMBClient.swift` /
   [`075`](075-perf-linux-aes-ccm-pure-swift-throughput.md) /
-  [`069`](../069-bug-cleanup-failure-kills-shared-session.md) /
+  [`069`](069-bug-cleanup-failure-kills-shared-session.md) /
   [`done/062`](062-design-cancel-tears-down-shared-session.md) /
   [`done/065`](065-leak-cleanup-wire-operations-have-no-deadline.md) / obaket issue 462
 
@@ -145,7 +145,7 @@ keepalive failure (`814-830`) / send・setup failure (`5631`, `5674` 他)。
   述べていたので、本 issue の結論に合わせて更新した。
 - cleanup deadline 超過が共有セッション全体を落とす件は、issue 065 で**意図的に入れた
   session invalidation policy** であり、遅い実 NAS でも起こりうる。この問題は
-  [`069`](../069-bug-cleanup-failure-kills-shared-session.md) が 2026-07-27 から扱っているので、
+  [`069`](069-bug-cleanup-failure-kills-shared-session.md) が 2026-07-27 から扱っているので、
   **新規 issue は立てず 069 の本文へ観測を追記した** (069 の「未再現・レビュー由来の構造指摘」が
   CI で実際に発火していたことの証拠になる)。
 

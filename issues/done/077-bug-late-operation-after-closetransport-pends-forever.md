@@ -4,7 +4,7 @@
 - 重要度: medium（P2。codex 反証レビュー 2026-08-01 で「反証できず、症状は記述より悪い」と確認済み）
 - 起票: 2026-08-01（issue 069 再現テスト作成時の敵対レビューで検出）
 - 関連: `Sources/SMBee/SMBClient.swift`（`demuxedWireTransaction` / `reserveCredit` / `closeTransport`）
-- 関連issue: `issues/069-bug-cleanup-failure-kills-shared-session.md`
+- 関連issue: `issues/done/069-bug-cleanup-failure-kills-shared-session.md`
 
 ## 症状（静的指摘・未再現）
 

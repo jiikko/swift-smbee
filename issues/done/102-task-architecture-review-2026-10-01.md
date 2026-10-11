@@ -15,12 +15,12 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 
 | # | 重要度 | 指摘 | 確認した事実 |
 |---|---|---|---|
-| 1 | P1 | SMB 3.0.x で、中間者が NEGOTIATE 応答の「署名必須」ビットを消すと、署名なしの応答を受け入れる（downgrade） | `FSCTL_VALIDATE_NEGOTIATE_INFO` の実装が無い（`grep` で 0 件）。[`done/021`](done/021-security-signed-session-accepts-unsigned-responses.md) の主題は「署名した session が署名なし応答を受け入れる」で、NEGOTIATE の段階の改ざんは別の経路（なお 021 は done/ にあるが本文の状態表記は open のまま）。SMB 3.1.1 は preauth integrity で守られる |
+| 1 | P1 | SMB 3.0.x で、中間者が NEGOTIATE 応答の「署名必須」ビットを消すと、署名なしの応答を受け入れる（downgrade） | `FSCTL_VALIDATE_NEGOTIATE_INFO` の実装が無い（`grep` で 0 件）。[`done/021`](021-security-signed-session-accepts-unsigned-responses.md) の主題は「署名した session が署名なし応答を受け入れる」で、NEGOTIATE の段階の改ざんは別の経路（なお 021 は done/ にあるが本文の状態表記は open のまま）。SMB 3.1.1 は preauth integrity で守られる |
 | 10 | P2 | profile 別の E2E が、filter の空振りや XCTSkip でも緑になる | `.github/workflows/e2e.yml` で `required_test`（`bin/ci/require-xctest-passed`）を持つのは smb302-encrypted-required だけ。smb311-signing / smb311-encrypted / guest / msdfs / smb422-reparse の 5 profile は終了コードだけを見る |
-| 11 | P2 | `SMBClient.connect(..., credential:)` が平文の credential を保持し続ける | `SMBClient.swift` の overload が `credentialProvider: { credential }` で値を closure に閉じ込め、`ReconnectInfo` に残る。[`done/037`](done/037-security-session-retains-plaintext-credentials-after-authentication.md)（done/ にあるが本文の状態表記は open のまま）の対象は下位の `SMBSession` 側で、この closure は残る |
+| 11 | P2 | `SMBClient.connect(..., credential:)` が平文の credential を保持し続ける | `SMBClient.swift` の overload が `credentialProvider: { credential }` で値を closure に閉じ込め、`ReconnectInfo` に残る。[`done/037`](037-security-session-retains-plaintext-credentials-after-authentication.md)（done/ にあるが本文の状態表記は open のまま）の対象は下位の `SMBSession` 側で、この closure は残る |
 | 7 | P2 | auto-reconnect が `close()` の後に session を開き直せる | `reconnect()` は `connect()` / `treeConnect()` を await した後に `session` を差し替え、その間に `isClosed` が立ったかを見直さない |
 | 8 | P3 | `STATUS_CANCELLED` が経路によって別の型で返る | 一般の経路は `SMBErrorMapper.throwIfFailure`（`CancellationError`）、SESSION_SETUP#1 だけが `SMBErrorMapper.map`（`SMBError.cancelled`）を直接呼ぶ。レビュワーが挙げた IOCTL は、許可外の status を `SMB2ReadCodecs` で `throwIfFailure` に渡しており該当しない（反証レビューで訂正） |
-| 12 | P2 | ACL の `AceCount`（最大 65,535）で、中身の検証前に容量を確保する | `SMB2ReadCodecs.swift` の `decodeACL` が `aclSize` の検証の後、`entries.reserveCapacity(aceCount)` を ACE を読む前に行う。[`done/027`](done/027-robustness-ndr-count-validation-allows-inconsistent-arrays.md) は NDR 配列が対象で、この経路は含まない |
+| 12 | P2 | ACL の `AceCount`（最大 65,535）で、中身の検証前に容量を確保する | `SMB2ReadCodecs.swift` の `decodeACL` が `aclSize` の検証の後、`entries.reserveCapacity(aceCount)` を ACE を読む前に行う。[`done/027`](027-robustness-ndr-count-validation-allows-inconsistent-arrays.md) は NDR 配列が対象で、この経路は含まない |
 | 13 | P3 | SMB 署名の比較が constant-time でない | `verifyResponseSignature` が `expected == header.signature`（`Array ==`）。CCM の tag は `constantTimeEqual`。遠隔からの測定可能性は未確認 |
 | 16 | P2 | POSIX の部分受信のたびに、残りの全量を確保してゼロ初期化する | `POSIXSocketTransport.receiveBlocking(maxLength:)` が毎回、`maxLength` 個のゼロで初期化した配列を作る。小さい部分読みが続くと確保と初期化が残量に比例して繰り返される（効果の大きさは未実測） |
 
@@ -29,13 +29,13 @@ merger が 23 件を 21 件に統合した（全数採用、脱落 0）。各レ
 | # | 重要度 | 指摘 | 既存 issue |
 |---|---|---|---|
 | 2 | P2 | `docs/api-stability.md` が「actor が呼び出し全体を直列化する」と読める（actor は await をまたいで排他しない） | — |
-| 3 | P2 | handle の cleanup 失敗が共有 session の全操作を終わらせる | [069](069-bug-cleanup-failure-kills-shared-session.md)（対応中） |
+| 3 | P2 | handle の cleanup 失敗が共有 session の全操作を終わらせる | [069](069-bug-cleanup-failure-kills-shared-session.md)（解消。2026-10-12） |
 | 4 | P2 | 公開の入口（`SMBee` と `SMBClient`）と安定性契約が揃っていない（custom transport は `SMBClient.connect` からしか渡せない） | — |
-| 5 | P2 | credit waiter が永久に待つ順序がある（CreditCharge 未満の grant を返すサーバの存在は未確認） | [010](done/010-bug-linux-unit-suite-hang-multiflight-demux.md) |
-| 6 | P2 | 送信後に cancel した request の tombstone に終端の期限が無い | [010](done/010-bug-linux-unit-suite-hang-multiflight-demux.md) |
+| 5 | P2 | credit waiter が永久に待つ順序がある（CreditCharge 未満の grant を返すサーバの存在は未確認） | [010](010-bug-linux-unit-suite-hang-multiflight-demux.md) |
+| 6 | P2 | 送信後に cancel した request の tombstone に終端の期限が無い | [010](010-bug-linux-unit-suite-hang-multiflight-demux.md) |
 | 9 | P2 | `withTree` が TREE_DISCONNECT の失敗（transport を閉じる）を結果に反映しない | 069 で後回しにした TREE_DISCONNECT の経路と関係（069 本文の「M2」） |
 | 14 | P2 | READ streaming が 1 request ずつ応答を待つ（RTT のある経路で帯域を使い切れない。未実測） | — |
-| 15 | P2 | WRITE も 1 chunk ずつ応答を待つ（未実測） | [done/015](done/015-perf-upload-write-chunk-and-pipeline.md)（本文の 64 KiB の上限の記述が今の実装と食い違う、とレビュワー） |
+| 15 | P2 | WRITE も 1 chunk ずつ応答を待つ（未実測） | [done/015](015-perf-upload-write-chunk-and-pipeline.md)（本文の 64 KiB の上限の記述が今の実装と食い違う、とレビュワー） |
 | 17 | P3 | 並行に呼んだ 2 回目の `close()` が、1 回目の後始末の完了を待たない | — |
 | 18 | P3 | 転送 API の間で、全体の deadline の指定方法が揃っていない | — |
 | 19 | P3 | `SMBEE_TRACE_WIRE_FULL=1` で、暗号化 session でも平文のファイル内容が stderr に出る | — |
@@ -218,3 +218,7 @@ gate が落ちたら上書きせず相談する。
   この test の経路（単発の READ の send の cancellation）は M3 の変更で挙動が変わらない（非 transfer の cancellation は refund の前に閉じない）。再実行で様子を見る。
 - #14 #15 #16 はこれで完了。102 に残るのは #9（069 M2。issue 106 の Commit 3 待ち）だけ。
 
+
+- **#9（対応済み、2026-10-12）**: issue 069 M2（issue 106 Commit 4）で、`withTree` の後始末の失敗を `SMBError.cleanupFailed(resource:underlying:)` で返すようにした
+  （body が成功しても後始末が失敗したら throw する。watch の再接続・`withSession` の再試行の対象にしない）。commit
+  `feat(session): issue 106 Commit 4 — issue 069 M2 の統合 (Tree の隔離と scoped な後始末、固定の soft / hard の期限、結果の報告)`。102 の全項目がこれで決着した

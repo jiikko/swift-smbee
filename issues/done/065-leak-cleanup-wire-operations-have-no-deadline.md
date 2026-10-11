@@ -125,3 +125,14 @@ FileId の `bestEffortClose` / `closeCreatedHandle` は issue 069 M1 で次の�
 - ledger に未解決または `retiredUnknown` として残る FileId の後続 wire 操作は admission で拒否する。成功応答後に同じ FileId を使う内部経路は監査で見つからなかった。
 
 receive failure、send failure、frame / 相関 / 署名異常は、cleanup CLOSE の caller が既に戻った後でも共有 transport を閉じ、pending response と credit waiter を失敗させる。credit を保持した CLOSE に応答がない場合、他の credit waiter は drain 上限まで待つことがある。
+
+## 2026-10-12 追記: issue 069 M2（issue 106 Commit 4）による TREE_DISCONNECT と期限の契約の変更
+
+上の「cleanup failure/timeout 時は transport を閉じる」は、**TREE_DISCONNECT にも適用しなくなった**（`disconnect` は session 全体の明示的な終了なので、今まで通り閉じる）。
+
+- 後始末の期限は soft / hard の 2 段で、intent の時点で固定する（hard は既定 60 秒で必ず有限。`requestTimeout == nil` でも有限）。File の CLOSE も同じ規則に揃えた
+- soft の期限: 呼び出し元の待ちだけを終え、`withTree` などは `SMBError.cleanupFailed(resource:underlying:)` を返す。全送信が soft より前に済んでいれば、
+  応答を cleanup tombstone として hard まで drain し、共有 transport は閉じない。未送信なら MID を取らずに局所的に退役する。送信中に soft を過ぎたら session を閉じる
+- hard の期限: drain が済んでいなければ session を閉じる（wire fault と同じ扱い）
+- 隔離した Tree への新しい request は MID を取らずに `SMBError.treeUnavailable(treeId:operation:)` で断る。どちらのエラーも watch の再接続・`withSession` の再試行の対象にしない
+- 判定の正本は `SMBCleanupDeadlines.disposition`（`Sources/SMBee/SMBCleanupPreparation.swift`）。soft の callback・final の受理・send owner の回収のどの順で届いても同じ規則で比べる

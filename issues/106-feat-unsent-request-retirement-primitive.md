@@ -323,6 +323,16 @@ commit の分け方（各 commit が単独で契約を満たす）:
     実際にはテストが実行されて落ちている（log で確認）
   - 検証: macOS 812 件 green・strict lint 0（自分で再実行）。Linux 819 件 green・analyzer 0 は codex の報告
   - codex の最後の段（手元の container で master と 20 組を比べる計測）は Bash の時間上限で止まった。手元の負荷で数字が汚れるので container を止め、性能は CI の x86 gate で見る
+- 修正への敵対レビュー 2 周目（2026-10-11、3 観点。barrier・台帳の観点は codex の使用上限で落ち、23:34 のリセット後に再実行する）:
+  - 期限・credit の観点（P1 が 4 件、P2 が 1 件）:
+    - final を soft の前に受けると、send owner が残っていても soft の timer の identity を消すので、send が戻らなければ期限を超えて待つ
+    - draining の後に owner の回収が hard を過ぎても、`hardAt` を照合しない
+    - `fullSendCompletedAt` を `sendEncrypted` で記録しない（暗号化 profile で F6 の修正が効かない。裏取り済み）
+    - soft と hard の間に final を受けたときは full-send の時刻を見ず terminal にするので、soft の callback と final の到着順で結果が変わる
+    - P2: 残高の snapshot を hook の外で毎回取る・full-send の時刻を cleanup 以外でも取る（hot path の lock と時計の読み。裏取り済み）
+  - テストの観点（P2 が 3 件）: positive snapshot の試験は旧条件へ戻しても通る（競合の順序を固定していない）、Tree 台帳の回収の試験は別 Tree の誤回収を検出しない、
+    lifecycle の回収の試験は `facadeParents` などの件数を数えていない
+  - 壊せなかった: fast path の隔離後の予約、token の refund の二重と漏れ、final 後の nil の identity を timeout と誤読する経路
 
 ## 関連
 

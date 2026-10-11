@@ -293,6 +293,13 @@ commit の分け方（各 commit が単独で契約を満たす）:
   P1 を単独で production に入れると credit 待ちと循環待ちになる（P1 は harness まで、接続は A へ）、外側の operation の期限が保存した body のエラーより優先する
 - ユーザー判断（2026-10-11）: 公開のエラーを 2 つ足す（`treeUnavailable` と後始末の失敗を包む case。watch の再接続・withSession の再試行の対象にしない）、
   使用中の lease を持つ callback の中からの close は後始末を始めて戻る（外からは完了を待つ）、後始末の hard の期限は既定 60 秒で必ず有限
+- 準備段（P1 / P2、9e31197）: operation lease・barrier・Tree の incarnation・固定の soft / hard の期限・Tree 単位の credit の取消の型と harness。production は未接続
+- 有効化（A、0fc688b）: Tree の隔離と受付、scoped な後始末と結果の報告（102 #9）、固定の soft / hard の期限、公開のエラー 2 つ。R1〜R10 の変異はすべて red。
+  macOS 799 件 / Linux 806 件が green、smoke 3 profile
+  - x86（run 38123382488、20 組、比較の相手は Commit 3 を含む master 129eb64）: read throughput −6.8%・user CPU +9.3%、write −1.3%・user CPU +3.5%。
+    すべて gate（−15% / +25%）の内側（"within noise" 判定）。Commit 4 で増えた判定の分の上乗せと見て、深追いしない（ユーザー指示）
+  - 懸念（実装後のレビューで判定する）: A で M3d の production の A/B 所有者のテスト（`testLateCleanupDeadlineCatchForCloseADoesNotRetireCloseBForSameFileId`）と
+    M3b の 2 本を消したが、`retireCleanupFileIdForDeadlineIfNeeded` はまだ在る
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

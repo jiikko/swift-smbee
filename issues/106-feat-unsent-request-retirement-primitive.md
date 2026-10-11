@@ -281,6 +281,18 @@ commit の分け方（各 commit が単独で契約を満たす）:
   write +7.8%・user CPU −16.2%。issue 010 の P2-2 はこれで閉じた（010 を done へ）
 - 計測用の branch `perf/106-commit3` / `perf/106-commit3-e6` は削除した
 - Commit 4（069 M2）と Commit 5（READ / WRITE の ticket と delivery の統合）はこの上に積む
+
+### Commit 4（issue 069 M2 の統合、2026-10-11〜、codex-drive）
+
+- 設計の差分（codex sol-high が今の master に対して書いた。worktree の `tmp/design-c4.md`。要点をここに残す）:
+  - 所有者を 3 種類にする: request（既存の `SMBRequestIdentity`）、Tree の incarnation（session・generation・TreeId・連番。TreeId の再利用と reconnect で取り違えない）、
+    facade / close / operation の lease。Tree の状態も cleanup の台帳と同じく遷移を 1 関数に寄せる
+  - 実装は P1（operation lease と parent-child barrier の型と harness）→ P2（資源の discriminator・Tree 単位の credit の取消の型）→
+    A（一体の有効化: Tree の隔離と受付、scoped TREE_DISCONNECT、soft / hard の期限を intent 時に固定、cleanup の結果の報告 = 102 #9）
+- 設計の敵対レビュー（2 観点）で採用: 列で待つ cleanup が softAt の後に MID を得る（採番の直前に照合）、解放済みの lease を継承した Task の close が join を省く、
+  P1 を単独で production に入れると credit 待ちと循環待ちになる（P1 は harness まで、接続は A へ）、外側の operation の期限が保存した body のエラーより優先する
+- ユーザー判断（2026-10-11）: 公開のエラーを 2 つ足す（`treeUnavailable` と後始末の失敗を包む case。watch の再接続・withSession の再試行の対象にしない）、
+  使用中の lease を持つ callback の中からの close は後始末を始めて戻る（外からは完了を待つ）、後始末の hard の期限は既定 60 秒で必ず有限
   削る方向は「frame ごとの sender loop の起床」を減らすこと（承認済み設計の「session-level wake は drain 中に一つだけ」と両立させる必要がある）
 - 次: M1（profile に基づく性能の削減）→ M2（flaky なテストと P3）→ 敵対レビュー → gate を通して master へ
 

@@ -431,7 +431,18 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - P1 / P2: ticket を作らず終わる準備（EOF・charge 0・retry・supplier の失敗）の終端が未定義。chunk の caller と転送の caller を分けないと待ちが循環する
   - P2: 古い ack と再利用された slot、既存の receipt（lock 付き）との整合と shell の寿命、charge 0 の終了で lock / Task を使わないこと（R7）、
     冗長な guard で変異が隠れること、M1 で既存の Tree の経路を新しい入口に通すこと
-  - D2（統合と詳細化）でこの 8 点に答えさせる（codex luna-max、実行中）
+  - D2（統合と詳細化）でこの 8 点に答えさせた
+- D2（2026-10-12、luna-max。設計書は本体の checkout の `tmp/c5/d2/design.md`。ignore されていて手元にしか無いので、要点をここに残す）:
+  - G1: terminal で removeAll に頼らず、join を根拠に send / wire / credit / timer を固定する表で終端化し、外部 owner（callback / supplier / decode）を持つ転送の record だけ残す。通常の request にも同じ表を当てる
+  - G2: sender が取り出した item は、選択済みの owner として receipt の条件に入れる（packet を手放して返却の ack を出すまで閉じない）
+  - G3: chunk の record の caller と転送の caller を分け、ticket を作らない終端（EOF・charge 0・retry・supplier の失敗）は内部の `noWireWork` で同期に閉じる（receipt・lock・Task を作らない）
+  - G4: event の有効性（record と effect）と slot を変える資格（slot の binding の完全一致）を分ける。G5: 既存の SMBRetirementReceipt を使い、handle が receipt を保持し、session に履歴を残さない
+  - G6: 外部の joiner がある退役にだけ、需要駆動の pump を 1 つ使う。G7: 変異ごとに、残る guard と独立した fixture を表にした。G8: M1 から既存の Tree の経路を新しい遷移の入口に通す
+- D3（sol-high、敵対 / 整合の 2 本）: P1 が 2 件（外部 owner の無い転送の終端の行が G1 に無い、short READ の後に readiness の判定を破棄の前に置くと永久に待つ）、
+  P2 が 6 件（pump が await 中に足された work を拾わない、M1 と M2 の中間状態で refund の前の rebase の窓が残る、最後の ack で waiter を起こす規則が無い、
+  変異の表が epochReady の定義と合わない、chunk ごとに UUID を作る記述（既存の requestSequence と食い違う）、M1 の receipt の oracle が M2 に依存）、P3 が 1 件（allocation は artifact で測れない）。
+  FileId の再利用の前提は、cleanup 台帳ではなく「CLOSE の前に転送を await する規則」が支えている（READ の公開経路で確認。全 File 操作は未確認）
+  - 全部を設計の改訂（D2 v2）で直す（codex luna-max、実行中）
 
 ## 関連
 

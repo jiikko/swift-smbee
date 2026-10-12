@@ -397,6 +397,10 @@ commit の分け方（各 commit が単独で契約を満たす）:
       修正前は手元の連続実行の 9 回目に CI と同じ形で落ちた
     - `testGracefulDisconnectKeepsTheReaderUntilLogoffResponse`（Linux。issue 010 M3 の既存のテスト）: 待つ合図（frame の記録）と assert する事象（reader の起動）の
       すき間。手元では再現しなかった。送信の完了を待ってから assert する（retro 110 の 5 と同じ形）
+- 2026-10-12: Commit 4 の後に CI の Cancel の stress（`KeepAlive|Cancel` を 20 回）で `testCallerCancellationDrainsCommittedWritesWithoutNewCommitOrCancel` が 1 回落ちた
+  （過去 25 回の失敗した run では初めて。手元の 40 回では再現せず）。原因はテスト側: WRITE を待つ helper が「要求が無い」を確かめてから signal の件数を読み、
+  その間の signal を取りこぼしていた。cancel の後の待ちも、Commit 4 から CLOSE の後始末の timer が同じ sleeper を使うので drain の timer と区別できなかった。
+  commit `test(write): CI の cancel の stress で 1 回落ちた WRITE の cancel のテストの待ち方を直す`（CI は Test・E2E・Performance が success）
 - Commit 5（READ / WRITE の ticket と delivery の統合）がこの上に積む次の段
 
 ## 関連

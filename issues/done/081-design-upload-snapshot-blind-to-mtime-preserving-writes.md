@@ -38,8 +38,8 @@ fstat の `st_dev` / `st_ino` / `st_size` / `st_mtimespec`) を転送前後で�
 
 ## 受け入れ条件
 
-- [ ] `SMBLocalFileSnapshot` の docstring に検出限界が明記されている
-- [ ] ctime 追加の採否が評価され、採用時は「xattr/chmod で spurious fail する」ことを
+- [x] `SMBLocalFileSnapshot` の docstring に検出限界が明記されている
+- [x] ctime 追加の採否が評価され、採用時は「xattr/chmod で spurious fail する」ことを
       テストで pin、不採用時は理由をコメントで残す
 
 ## 関連
@@ -52,3 +52,12 @@ fstat の `st_dev` / `st_ino` / `st_size` / `st_mtimespec`) を転送前後で�
 
 - 2026-08-21: codex は usage limit のため未レビュー (解除後に反証レビューを通す)。
   file:line は obaket セッションの main agent が実コードで裏取り済み
+
+## 2026-10-12: 完了
+
+- commit `docs(upload): issue 081 — SMBLocalFileSnapshot の検出の限界を書き、ctime を照合に足さない理由を残す`
+- 受け入れ条件:
+  - [x] docstring に検出の限界（mtime を戻す書き込み・MAP_SHARED の遅れた mtime・粒度の粗い FS、同じ fd の dev/ino は変わらない）を書いた
+  - [x] ctime は採らない。実験（codex）: macOS 26.7 arm64 と Linux（Ubuntu 24.04 の container、arm64）で、utimes による mtime の復元・`chmod 600`・`xattr -w` の
+    どれでも ctime が進んだ。Finder のタグや quarantine の付与で、内容の変わらない upload が失敗するため。再評価の条件（メタデータの変更を競合と扱う契約になる /
+    内容だけの変化の合図が安く手に入る）をコードに残した

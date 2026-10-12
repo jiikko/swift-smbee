@@ -163,14 +163,14 @@ thread-sanitizer-smoke:
 
 ### Phase 1 完了条件
 
-- [ ] `SMBeeResourceLifecycleTests.swift` を追加する。
-- [ ] `CloseCountingTransport` を追加する。
-- [ ] success path で `transport.close()` が呼ばれることを assert する。
-- [ ] throw path で `transport.close()` が呼ばれることを assert する。
-- [ ] cancellation path で pending continuation が resume されることを assert する。
-- [ ] `SMBClientSession.close()` が idempotent であることを assert する。
-- [ ] `SMBClientSession.close()` 後の operation が明示的に失敗することを assert する。
-- [ ] CI に `resource-lifecycle` job を追加する。
+- [x] `SMBeeResourceLifecycleTests.swift` を追加する。（2026-10-12）
+- [x] ~~`CloseCountingTransport` を追加する。~~ 不要: 既存の `SMBValidateNegotiateScriptTransport.closeCount` で数えられるので、fake を重複させない
+- [x] success path で `transport.close()` が呼ばれることを assert する。（`testOneShotSuccessClosesTransportAfterGracefulTeardown`、2026-10-12）
+- [x] throw path で `transport.close()` が呼ばれることを assert する。（既存: `testValidateNegotiateRejectsDowngradedNegotiateSecurityModeFixture`、`testSessionSendFailureClosesTransportAndFailsOtherPendingRequests`）
+- [x] cancellation path で pending continuation が resume されることを assert する。（既存: `testClientSessionStreamDeadlineWaitsForCloseCompletion`、`testCallerCancellationDrainsCommittedReadsWithoutCancelPackets`、`testVNITransportReceiveTokensAndTerminalClose`）
+- [x] `SMBClientSession.close()` が idempotent であることを assert する。（既存: `testClientSessionCloseSendsTreeDisconnectAndLogoff` が close を 2 回呼ぶ）
+- [x] `SMBClientSession.close()` 後の operation が明示的に失敗することを assert する。（`testOperationAfterSessionCloseFailsExplicitly`、2026-10-12）
+- [x] ~~CI に `resource-lifecycle` job を追加する。~~ 不要: 通常の Test job の `swift test` で走る。専用の job は macOS runner の費用が増えるだけ
 
 ### Phase 2 完了条件
 
@@ -199,3 +199,12 @@ thread-sanitizer-smoke:
 - Semgrep custom rule は所有権移譲を完全には理解できないため、誤検知を前提にする。
 - 実行時 contract test はテストした経路しか保証しない。
 - それでも、この repo では socket fd / transport / continuation / session close の境界が明確なので、まず contract test を入れる費用対効果が高い。
+
+## 2026-10-12: Phase 1 を閉じ、残りの判断を書く
+
+- Phase 1 の各項目を今のコードと突き合わせた（上の完了条件に根拠を書いた）。未着手だった 2 つを足した。commit
+  `test(lifecycle): issue 094 — 公開 API の成功時の後始末と、close 後の操作の失敗を固定する`（成功時の teardown を外す・`ensureOpen` を no-op にする変異で red）
+- Phase 2（Semgrep）と Phase 3（sanitizer）は未着手。CI の費用と運用の判断が要るので、ユーザーの判断を待つ:
+  - 今ある sanitizer: `test.yml` の `linux-asan`（`detect_leaks=0`。LeakSanitizer は XCTest / Swift の runtime 側の leak を拾うため）と `macos-tsan`（通常の Test workflow の中）
+  - Phase 3 の `detect_leaks=1` を進めるなら、harness 側の leak の切り分けと、ASan を手動・advisory・必須のどれで回すかを決める
+  - Phase 2 を進めるなら、rule の対象と正例・負例の fixture、誤検知の整理、advisory の期間の後に必須にするかを決める

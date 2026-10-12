@@ -183,14 +183,14 @@ PERF_INFO read_stream.wall_clock_ms value=42
 
 ### Phase 1 完了条件
 
-- [ ] `SMBeePerformanceRegressionTests` を追加する。
-- [ ] CI に `performance-regression` job を追加する。
-- [ ] read streaming の `READ` count / chunk count / byte count を deterministic metric で assert する。
-- [ ] write streaming の `WRITE` count / chunk count / byte count を deterministic metric で assert する。
-- [ ] persistent session reuse の `NEGOTIATE` / `SESSION_SETUP` / `TREE_CONNECT` count を assert する。
-- [ ] pass/fail 条件に wall-clock time を使わない。
-- [ ] job のログに `PERF_METRIC ... actual=... expected=...` を出す。
-- [ ] `docs/testing.md` に「性能テストは実時間ではなく計算量 proxy を見る」方針を追記する。
+- [x] `SMBeePerformanceRegressionTests` を追加する。
+- [x] ~~CI に `performance-regression` job を追加する。~~ 方針変更: `performance.yml` の `resource-performance` job が回帰テストも実行する。重複の job は足さない
+- [x] read streaming の `READ` count / chunk count / byte count を deterministic metric で assert する。
+- [x] write streaming の `WRITE` count / chunk count / byte count を deterministic metric で assert する。
+- [x] persistent session reuse の `NEGOTIATE` / `SESSION_SETUP` / `TREE_CONNECT` count を assert する。
+- [x] pass/fail 条件に wall-clock time を使わない。（回帰テストは満たす。同じファイルの `SMBeeResourcePerformanceTests` は throughput と時間の下限を持ち `resource-performance` で走る。こちらは x86 の 20 組の gate の計測なので別物として扱う）
+- [x] job のログに `PERF_METRIC ... actual=... expected=...` を出す。
+- [x] `docs/testing.md` に「性能テストは実時間ではなく計算量 proxy を見る」方針を追記する。
 
 ### Phase 2 完了条件
 
@@ -199,7 +199,7 @@ PERF_INFO read_stream.wall_clock_ms value=42
   - 2026-06-30: `SMBSession.copyDirectory` / `deleteRecursively` は directory page を配列集約せず、
     `queryDirectory(... onEntry:)` callback traversal で処理するよう修正済み。残る計測対象は
     one-shot `downloadDirectory` と recursive upload/download/copy の operation count proxy。
-- [ ] 必要なら CLI が streaming 経路を使うことを test-only hook で確認する。
+- [x] ~~必要なら CLI が streaming 経路を使うことを test-only hook で確認する。~~ 不要: CLI の `ls` / `cat` / file の `get` / `put` は公開の streaming API を直接呼ぶ。directory の `get` は下の scaling の項目に残る
 
 ## やらないこと
 
@@ -207,3 +207,10 @@ PERF_INFO read_stream.wall_clock_ms value=42
 - 実 Samba / macOS SMB server の実転送時間を CI gate にすること。
 - micro benchmark framework 導入。必要になるまで XCTest + deterministic counter で十分。
 - command count を無差別に固定すること。固定するのは「性能 contract として守りたい数」だけにする。
+
+## 2026-10-12: 完了条件を今のコードと突き合わせた
+
+- Phase 1 はすべて済み（根拠: `Tests/SMBeeTests/SMBeePerformanceRegressionTests.swift`、`.github/workflows/performance.yml` の `resource-performance`、`docs/testing.md`）。
+  専用の `performance-regression` job は、`resource-performance` が回帰テストも実行するので足さない
+- 残り（Phase 2）: directory streaming の `QUERY_DIRECTORY` の回数と `onEntry` の回数、recursive の download / upload / copy の O(n) の scaling の counter。
+  既存の facade のテストは entry の中身を見るが回数は固定していない。`downloadDirectoryRecursive` は今 `list()` を使うので、計測の fixture と走査の方針を決めてから着手する

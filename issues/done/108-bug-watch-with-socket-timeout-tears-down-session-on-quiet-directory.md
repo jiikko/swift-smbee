@@ -68,5 +68,15 @@ request 単位の `requestTimeout` に寄せると、この約束の意味が変
   - 監視専用 session の回避策を足した
   - 関数名を `withChangeNotifications` に直した
   - 経路の中心（SO_RCVTIMEO → `.timedOut` → transport の終了）は反証されなかった
-- [ ] 再現テスト
-- [ ] 方針の決定（ユーザー）
+- [x] 再現テスト（2026-10-12）
+- [x] 方針の決定（ユーザー。2026-10-12 に C）
+
+## 2026-10-12: 方針 C（ユーザー決定）で完了
+
+- 挙動は変えない。commit `docs(watch): issue 108 — 受信 timeout を持つ POSIX transport で CHANGE_NOTIFY を待つ間の切断を、挙動は変えずに doc で案内しテストで固定する`
+- doc: 公開 API の `timeout:` と `withChangeNotifications` の説明、DocC の `SessionsAndTrees`（「Watch directories with CHANGE_NOTIFY」）に、
+  影響と回避策（監視専用の session を `timeout: nil` で分ける）と transport の選び方の条件を書いた
+- 現状の挙動を固定するテスト（挙動を変えるなら書き換える）:
+  - `SMBChangeNotifyReceiveTimeoutTests.testQuietChangeNotifyTimesOutAndEndsWatchWithoutAutoReconnect`（loopback の server が CHANGE_NOTIFY に応答せず、受信 timeout 200 ms で `.timedOut`）
+  - `testRepeatedReconnectableReceiveFailuresReportOverflowEachTime`（`autoReconnect: true` で `.overflow` を繰り返す）
+  - POSIX の受信 timeout を無効にする変異で red（codex）

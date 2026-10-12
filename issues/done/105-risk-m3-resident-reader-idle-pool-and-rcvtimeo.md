@@ -88,5 +88,5 @@ M3 の入れ直しの前提条件にするかは、下の再現テストで実�
   - 同じ変異で red（`timedOut`）。macOS swift test 652 件（skip 37）失敗 0、新しいテストは 3 回連続 green。
 - [x] 扱いの決定（2026-10-07）
   - 1 と 2 の idle の切断は、需要駆動の reader（M3 の入れ直し）で起きなくなり、上のテストで固定した。この issue は閉じる。
-  - long-poll（CHANGE_NOTIFY）が outstanding の間の `.timedOut` は M3 より前からある既存の問題なので、[`108`](../108-bug-watch-with-socket-timeout-tears-down-session-on-quiet-directory.md) に切り出した。
+  - long-poll（CHANGE_NOTIFY）が outstanding の間の `.timedOut` は M3 より前からある既存の問題なので、[`108`](108-bug-watch-with-socket-timeout-tears-down-session-on-quiet-directory.md) に切り出した。
     `watch` を `timeout:` 付きで使うと、変化の無いディレクトリで timeout ごとに session が落ちて再接続と `.overflow` が起きる。

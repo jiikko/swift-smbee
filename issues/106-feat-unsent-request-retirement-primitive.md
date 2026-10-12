@@ -449,6 +449,13 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - 境界外の committed B の破棄の資格を grant ack に依存させると、ack の後も slot が occupied のまま owner 数が 0 にならず循環する → 破棄は ack に依存させず、record だけを ack まで残す（設計に反映した）
   - FileId の前提: watch の cancel の経路では、caller だけ先に返って CHANGE_NOTIFY の wire の owner が残ったまま `bestEffortClose` が CLOSE を送る。「CLOSE の前に利用の完了を await」は caller の完了でしか成り立たない → **ユーザー決定: M3 で直す**（cancel / timeout の catch から CLOSE の前に、その request の wire の barrier を固定期限の中で待つ。File incarnation は足さない）
 - **ユーザーが設計を承認した（2026-10-12）**。実装の順: M1+M2（1 つの有効化単位）→ M3（局所 scope と watch の cancel → CLOSE の待ち）→ M4（統合検証と性能 gate）
+- M1+M2 の実装（2026-10-12〜13、codex luna-max。worktree の cd52b72、未 push）:
+  - 所有の変更を `transitionTransferRequest` に集め、preparation の開始で request key・handle・canonical な record を登録。terminal の join は設計の表で終端化し、外部 owner の残る record だけ保持して返却の後に回収。
+    no-ticket の終端は同期に閉じる。Tree の refusal は共通の遷移を呼ぶ adapter。未送信の退役の receipt を共通化し、slot は refund の ack まで `retiringUnsent`。epoch の readiness は 3 条件
+  - 設計で未指定だった判断: refund の effect の pump の worker を 2 に固定（A の refund の ack の待ちで B を塞がないため）→ 敵対レビューで見る
+  - 変異 21 本（G7 の M1・M2 の分）がすべて red（codex）。検証（自分で実行）: macOS 851 件 × 2 / Linux 858 件 green、cancel の stress 10 回 green、strict lint 0、smoke 3 profile
+  - macOS の全件の所要が 11 秒 → 23〜31 秒に見えたが、マシンの負荷（load average 9 前後）だった。master と交互に 3 回ずつ回した pipeline のテスト（52 / 54 件）は 5.6〜6.0 秒 / 5.8〜6.1 秒で差は無い
+  - 次: 敵対レビュー 1 周目（所有と終端 / 並行 / テストと性能の 3 観点。codex の 5h 枠のリセットの後）
 
 ## 関連
 

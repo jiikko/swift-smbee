@@ -403,7 +403,22 @@ commit の分け方（各 commit が単独で契約を満たす）:
   commit `test(write): CI の cancel の stress で 1 回落ちた WRITE の cancel のテストの待ち方を直す`（CI は Test・E2E・Performance が success）
 - Commit 5（READ / WRITE の ticket と delivery の統合）がこの上に積む次の段。**着手前に要否と範囲を洗い直す**: 承認済み設計（2026-10-04）の後に、
   READ / WRITE の pipelining が issue 102 の #14〜#16（2026-10-07〜09、`done/102` の「進捗チェックポイント」節）で別に入った。
-  §8 の Commit 5 の受け入れ条件のうち、どれが既に満たされ、どれが残る（delivery terminal・lease receipt・共通の commit core への載せ替え）かを、今のコードと突き合わせてから設計する（未着手）
+  §8 の Commit 5 の受け入れ条件のうち、どれが既に満たされ、どれが残る（delivery terminal・lease receipt・共通の commit core への載せ替え）かを、今のコードと突き合わせてから設計する
+- Commit 5 の洗い直し（2026-10-12、codex sol-high の read-only 2 本: 受け入れ条件 / red mutation。master bc401ac）:
+  - 既に満たす / 不要: READ / WRITE の pipelining と、共通の sender・MID の採番（認証後の `nextMessageId` は placeholder で、実の採番は sender の `commitNextMessageId`）。
+    20 組の Performance gate は issue 102 の M2 / M4 と Commit 3 で通っている（Commit 5 の変更には改めて要る）。転送の cancel で CANCEL を送らないのは issue 102 の設計で決めた変更で、未実装ではない。
+    独立した byte の枠の管理は issue 102 で採らないと決めた（最大 4 slot × 1 MiB の slot をそのまま使う）
+  - 一部 / 満たさない:
+    - 未送信の ticket の退役が receipt を持たない: `retireStoppedTransferRequestBeforeCommit` は slot を空けて通知してから、別の関数で refund を待つので、
+      epoch の切り替え（`beginNextEpoch` は wire の drain と全 slot の空きだけを見る）が refund の完了を待たない窓がある（静的に確認。実行での再現はまだ）
+    - stop は queue から直接除かず、sender が取り出すまで待つ
+    - File の拒否は Tree と違い局所退役にならず、sender の precommit の catch から session の terminal へ進む（`terminateTransferAdmissionFailure`）
+    - record の回収が delivery より先に起きうる: `reclaimActivePostAuthRequestRecordIfEligible` は delivery と slot の解放を見ない（§2.2・§9.16 と食い違う）。
+      既存のテスト `testSuspendedAsyncReadCallbackDoesNotHoldSessionOrTerminalWireLease` は「terminal の join の後、callback 中でも active record = 0、delivery lease = 1」を明示的に求めている
+  - 欠けているテスト: delivery と slot の解放を待たずに epoch を進める変異を落とす負例、READ / WRITE / 通常の request が混ざったときの MID の列、
+    正常終了の後に session を開いたまま record・transfer の状態が 0 に戻ること（今は terminal の removeAll が隠す）、refund を止めたまま epoch を進めない順序
+  - 設計の判断が残る: canonical な record を delivery の終わりまで保持するか（§2.2 どおり。既存のテストを変える）、wire の record と transfer の ticket の所有者を分けるか
+  - 次: codex-drive の設計（D1〜D3）→ ユーザーの承認 → 実装
 
 ## 関連
 

@@ -6418,6 +6418,7 @@ actor SMBSession {
     private var cleanupFileCloseCatchHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
     private var cleanupTimeoutWakeHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
     private var cleanupTimeoutIdentityCheckHookForTesting: (@Sendable (Bool) -> Void)?
+    private var writeTransferDrainTimerScheduledHookForTesting: (@Sendable () -> Void)?
     private var treeCleanupIntentPreparedHookForTesting: (@Sendable (SMBTreeIdentity) async -> Void)?
     private var transferCreditSnapshotHookForTesting: (@Sendable (SMBTreeIdentity, UInt32) async -> Void)?
     private var transferCreditRetirementHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
@@ -8517,6 +8518,10 @@ actor SMBSession {
     ) {
         cleanupTimeoutWakeHookForTesting = onWake
         cleanupTimeoutIdentityCheckHookForTesting = onIdentityCheck
+    }
+
+    func setWriteTransferDrainTimerScheduledHookForTesting(_ hook: (@Sendable () -> Void)?) {
+        writeTransferDrainTimerScheduledHookForTesting = hook
     }
 
     func setTreeCleanupIntentPreparedHookForTesting(_ hook: (@Sendable (SMBTreeIdentity) async -> Void)?) {
@@ -15577,6 +15582,7 @@ extension SMBSession {
             executor.recordExecutionContextForTesting(.writeTransferDrainTimerWake)
             await self?.writeTransferDrainDeadlineDidFire(transferIdentifier, identity: identity)
         }
+        writeTransferDrainTimerScheduledHookForTesting?()
     }
 
     private func writeTransferDrainDeadlineDidFire(_ identifier: UInt64, identity: UUID) {

@@ -1384,10 +1384,12 @@ class SMBWritePipelineScriptTransport: SMBReadPipelineScriptTransport, @unchecke
 
     func waitForWrite(atOffset offset: UInt64) async throws -> WriteRequest {
         while true {
+            // Snapshot before checking the predicate so a request signaled between the two
+            // operations either satisfies the predicate or this waiter's target count.
+            let nextSignal = writeRequestBarrier.currentCount + 1
             if let request = writeLock.withLock({ writeRequestsStorage.first { $0.offset == offset } }) {
                 return request
             }
-            let nextSignal = writeRequestBarrier.currentCount + 1
             try await writeRequestBarrier.waitForCount(nextSignal)
         }
     }

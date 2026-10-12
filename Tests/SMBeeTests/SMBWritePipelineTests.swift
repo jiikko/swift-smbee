@@ -825,13 +825,17 @@ final class SMBWritePipelineTests: XCTestCase {
     }
 
     func testCallerCancellationDrainsCommittedWritesWithoutNewCommitOrCancel() async throws {
-        let transport = SMBWritePipelineScriptTransport()
+        let ordering = SMBWriteCancelOrderProbe()
+        let transport = SMBWritePipelineCancellationTransport(ordering: ordering)
         let cleanupSleeper = ManualSMBSleeper()
         let session = makeSession(
             transport: transport,
             credits: 81,
             cleanupTimeoutSleeper: { try await cleanupSleeper.sleep(for: $0) }
         )
+        await session.setWriteTransferDrainTimerScheduledHookForTesting {
+            ordering.record(.writeDrainTimerScheduled)
+        }
         let client = SMBClientSession(session: session, treeId: 1)
         let data = patternedBytes(count: chunkSize * 5)
         defer {
@@ -847,9 +851,16 @@ final class SMBWritePipelineTests: XCTestCase {
         try await waitForWrites(transport, offsets: (0..<4).map { UInt64($0 * chunkSize) })
         try await waitForActiveSendTasks(session, label: "cancelled WRITE send owners")
         operation.cancel()
-        try await waitForSleeperCall(cleanupSleeper, count: 1, label: "cancelled WRITE drain timer")
+        let firstCancellationEvent = try await smbIssue102AwaitWithTimeout("WRITE cancellation drain or CLOSE") {
+            try await ordering.waitForFirstEvent()
+        }
+        XCTAssertEqual(
+            firstCancellationEvent,
+            .writeDrainTimerScheduled,
+            "the committed WRITE drain starts before upload cleanup sends CLOSE"
+        )
         for offset in (0..<4).reversed() {
-            try transport.respond(to: request(at: UInt64(offset * chunkSize), in: transport))
+            try transport.respondAndRecord(to: request(at: UInt64(offset * chunkSize), in: transport))
         }
 
         do {
@@ -857,6 +868,22 @@ final class SMBWritePipelineTests: XCTestCase {
             XCTFail("cancelled WRITE unexpectedly succeeded")
         } catch is CancellationError {
             // The committed four requests drain before cancellation is returned.
+        }
+        let orderingEvents = ordering.events
+        let writeResponseIndices = orderingEvents.indices.filter { index in
+            if case .writeResponse = orderingEvents[index] { return true }
+            return false
+        }
+        let closeRequestIndex = orderingEvents.firstIndex(of: .closeRequest)
+        XCTAssertEqual(writeResponseIndices.count, 4, "all committed WRITE responses were delivered")
+        if let closeRequestIndex, let lastWriteResponseIndex = writeResponseIndices.last {
+            XCTAssertGreaterThan(
+                closeRequestIndex,
+                lastWriteResponseIndex,
+                "upload cleanup CLOSE waits until all committed WRITEs drain"
+            )
+        } else {
+            XCTFail("expected upload cleanup CLOSE after the committed WRITE responses")
         }
         XCTAssertEqual(transport.writeRequests.count, 4)
         XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
@@ -1399,5 +1426,90 @@ private final class SMBWritePipelineVirtualClock: @unchecked Sendable {
 
     func waitForNowCallCount(_ count: Int) async throws {
         try await nowCallBarrier.waitForCount(count)
+    }
+}
+
+private final class SMBWriteCancelOrderProbe: @unchecked Sendable {
+    enum Event: Equatable, Sendable {
+        case writeDrainTimerScheduled
+        case closeRequest
+        case writeResponse(UInt64)
+    }
+
+    private enum WaiterRegistration {
+        case cancelled
+        case ready(Event)
+        case waiting
+    }
+
+    private let lock = NSLock()
+    private var eventStorage: [Event] = []
+    private var firstEvent: Event?
+    private var waiters: [UUID: CheckedContinuation<Event, Error>] = [:]
+
+    var events: [Event] { lock.withLock { eventStorage } }
+
+    func record(_ event: Event) {
+        let ready = lock.withLock { () -> [CheckedContinuation<Event, Error>] in
+            eventStorage.append(event)
+            guard firstEvent == nil else { return [] }
+            firstEvent = event
+            defer { waiters.removeAll() }
+            return Array(waiters.values)
+        }
+        ready.forEach { $0.resume(returning: event) }
+    }
+
+    func waitForFirstEvent() async throws -> Event {
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let registration = lock.withLock { () -> WaiterRegistration in
+                    if Task.isCancelled { return .cancelled }
+                    if let firstEvent { return .ready(firstEvent) }
+                    waiters[waiterID] = continuation
+                    return .waiting
+                }
+                switch registration {
+                case .cancelled:
+                    continuation.resume(throwing: CancellationError())
+                case .ready(let event):
+                    continuation.resume(returning: event)
+                case .waiting:
+                    break
+                }
+            }
+        } onCancel: {
+            self.cancelWaiter(waiterID)
+        }
+    }
+
+    private func cancelWaiter(_ waiterID: UUID) {
+        let continuation = lock.withLock { waiters.removeValue(forKey: waiterID) }
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
+private final class SMBWritePipelineCancellationTransport: SMBWritePipelineScriptTransport, @unchecked Sendable {
+    private let ordering: SMBWriteCancelOrderProbe
+
+    init(ordering: SMBWriteCancelOrderProbe) {
+        self.ordering = ordering
+        super.init()
+    }
+
+    override func send(_ bytes: [UInt8]) async throws {
+        if bytes.count >= SMB2Header.encodedSize + 4,
+           Array(bytes[4..<8]) == [0xfe, 0x53, 0x4d, 0x42],
+           let header = try? SMB2Header.decode(Array(bytes.dropFirst(4))),
+           header.command == SMB2Commands.close {
+            ordering.record(.closeRequest)
+        }
+        try await super.send(bytes)
+    }
+
+    func respondAndRecord(to request: WriteRequest) throws {
+        ordering.record(.writeResponse(request.header.messageId))
+        try respond(to: request)
     }
 }

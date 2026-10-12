@@ -35,6 +35,18 @@ private func smbFileSizeValue(from attributes: [FileAttributeKey: Any]) -> UInt6
     return nil
 }
 
+/// Best-effort detection of changes to an opened upload source. Writes that restore mtime (`utimes`,
+/// `touch -r`, or `rsync -t --inplace`), `MAP_SHARED` writes whose timestamp update is deferred, and
+/// filesystems with coarse mtime granularity (such as exFAT/FAT) can pass undetected. Comparing
+/// device and inode on repeated stats of the same descriptor adds no signal: those values stay fixed,
+/// and replacing the path leaves the descriptor reading the old inode. Size and mtime are the only
+/// effective fields here.
+///
+/// `ctime` is deliberately excluded. It advances when mtime is restored, but also for metadata-only
+/// changes such as chmod and xattr updates (including Finder tags or quarantine), which could fail
+/// an upload while its file contents remain unchanged. Reconsider if upload semantics explicitly
+/// make those metadata changes conflicts, or a content-only change signal becomes available without
+/// unacceptable upload cost. Content checksums are outside this snapshot's scope.
 private struct SMBLocalFileSnapshot: Equatable {
     let device: UInt64
     let inode: UInt64

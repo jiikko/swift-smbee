@@ -442,7 +442,12 @@ commit の分け方（各 commit が単独で契約を満たす）:
   P2 が 6 件（pump が await 中に足された work を拾わない、M1 と M2 の中間状態で refund の前の rebase の窓が残る、最後の ack で waiter を起こす規則が無い、
   変異の表が epochReady の定義と合わない、chunk ごとに UUID を作る記述（既存の requestSequence と食い違う）、M1 の receipt の oracle が M2 に依存）、P3 が 1 件（allocation は artifact で測れない）。
   FileId の再利用の前提は、cleanup 台帳ではなく「CLOSE の前に転送を await する規則」が支えている（READ の公開経路で確認。全 File 操作は未確認）
-  - 全部を設計の改訂（D2 v2）で直す（codex luna-max、実行中）
+  - 全部を設計の改訂（D2 v2）で直した。主な変更: G1 に転送の終端表（外部 owner の無い配送待ちは discarded・未送信は notApplicable）、転送の完了処理を「破棄・終端・slot の解放」→「readiness の判定」の順に分ける、
+    pump の終了と再起動を非 suspension 区間で確定、**M1 と M2 を 1 つの有効化単位にする**（M1 だけだと owner の数が epoch を guard しない）、最後の ack で owner 数が 0 になったら同じ transaction で waiter を起こす、
+    preparation key は既存の SMBRequestIdentity（requestSequence）、allocation は artifact で未計測と明記
+- D3 の 2 周目（改訂した部分への敵対 1 本）: P1 なし。P2 が 2 件:
+  - 境界外の committed B の破棄の資格を grant ack に依存させると、ack の後も slot が occupied のまま owner 数が 0 にならず循環する → 破棄は ack に依存させず、record だけを ack まで残す（設計に反映した）
+  - FileId の前提: watch の cancel の経路では、caller だけ先に返って CHANGE_NOTIFY の wire の owner が残ったまま `bestEffortClose` が CLOSE を送る。「CLOSE の前に利用の完了を await」は caller の完了でしか成り立たない → 範囲はユーザーの判断
 
 ## 関連
 

@@ -365,7 +365,7 @@ commit の分け方（各 commit が単独で契約を満たす）:
 - 4 周目の敵対レビュー（100cde8 に対して 2 観点: receipt の取りこぼしと早すぎる完了 / テストの素通り。期限の判定は 3 周目で収束したので外した）:
   - 判定の関数そのものの早すぎる完了・取りこぼしは見つからなかった（record を更新する全箇所を照合した表つき）
   - P1: Tree の隔離の refund が suspend している間に request の catch が走ると、未精算の credit のまま record を消し、後の refund の側が判定できず receipt が残る
-    （cleanup の soft の退役の経路にも同型）。record を消す箇所が 7 か所に散っていて、うち 1 か所が判定を待たずに消していた
+    （cleanup の soft の退役の経路にも同型）。record を消す箇所が 7 か所に散っていて、catch の 1 か所は判定の関数を呼んだ後、判定が「まだ」と返しても消していた
   - P2: catch の経路の判定の呼び出しを消してもテストが通る。P3: snapshot の件数の検査が表記の揺れを数えない
   - 次: 「record を消す前に receipt を判定する」が 3・4 周目と別々の箇所で破られたので、record の回収も 1 関数に寄せ、
     それ以外の removeValue を source の形の検査で禁じる（codex luna-max、実行中）
@@ -401,7 +401,9 @@ commit の分け方（各 commit が単独で契約を満たす）:
   （過去 25 回の失敗した run では初めて。手元の 40 回では再現せず）。原因はテスト側: WRITE を待つ helper が「要求が無い」を確かめてから signal の件数を読み、
   その間の signal を取りこぼしていた。cancel の後の待ちも、Commit 4 から CLOSE の後始末の timer が同じ sleeper を使うので drain の timer と区別できなかった。
   commit `test(write): CI の cancel の stress で 1 回落ちた WRITE の cancel のテストの待ち方を直す`（CI は Test・E2E・Performance が success）
-- Commit 5（READ / WRITE の ticket と delivery の統合）がこの上に積む次の段
+- Commit 5（READ / WRITE の ticket と delivery の統合）がこの上に積む次の段。**着手前に要否と範囲を洗い直す**: 承認済み設計（2026-10-04）の後に、
+  READ / WRITE の pipelining が issue 102 の #14〜#16（2026-10-07〜09、`done/102` の「進捗チェックポイント」節）で別に入った。
+  §8 の Commit 5 の受け入れ条件のうち、どれが既に満たされ、どれが残る（delivery terminal・lease receipt・共通の commit core への載せ替え）かを、今のコードと突き合わせてから設計する（未着手）
 
 ## 関連
 

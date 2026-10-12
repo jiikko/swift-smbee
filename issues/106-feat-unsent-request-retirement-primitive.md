@@ -455,7 +455,12 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - 設計で未指定だった判断: refund の effect の pump の worker を 2 に固定（A の refund の ack の待ちで B を塞がないため）→ 敵対レビューで見る
   - 変異 21 本（G7 の M1・M2 の分）がすべて red（codex）。検証（自分で実行）: macOS 851 件 × 2 / Linux 858 件 green、cancel の stress 10 回 green、strict lint 0、smoke 3 profile
   - macOS の全件の所要が 11 秒 → 23〜31 秒に見えたが、マシンの負荷（load average 9 前後）だった。master と交互に 3 回ずつ回した pipeline のテスト（52 / 54 件）は 5.6〜6.0 秒 / 5.8〜6.1 秒で差は無い
-  - 次: 敵対レビュー 1 周目（所有と終端 / 並行 / テストと性能の 3 観点。codex の 5h 枠のリセットの後）
+- M1+M2 の敵対レビュー 1 周目（2026-10-13、sol-high 3 観点 + merger。8 件 → 5 件）:
+  - D1（P1、2 観点が独立に指摘。main agent が裏取り）: terminal の join（terminalSendOwnersJoined）の前に callback / decode が返ると、`releaseTerminalOwnedSlot` が false を返し、
+    `finishDelivery` も false で戻って返却の event が失われる。driver は再送しないので、slot / record が残り epoch も転送も終わらない
+  - D2（P2、3 観点）: refund の effect の pump の worker を 2 に固定したため、A と B の refund の await の間に C が dispatch されない（設計 G6 の「ack 待ちで別の effect を塞がない」に反する）
+  - D3〜D5（P2、テストと検査）: 旧い ack のテストが production の ack の経路を通らない、既存 2 本が設計 §5 の 3 段を全部見ていない、所有の書き込みの source 検査の正規表現が optional chaining を拾わない
+  - 5 件すべてを codex（luna-max）に直させる（実行中）
 
 ## 関連
 

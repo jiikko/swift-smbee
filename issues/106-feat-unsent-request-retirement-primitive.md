@@ -447,7 +447,8 @@ commit の分け方（各 commit が単独で契約を満たす）:
     preparation key は既存の SMBRequestIdentity（requestSequence）、allocation は artifact で未計測と明記
 - D3 の 2 周目（改訂した部分への敵対 1 本）: P1 なし。P2 が 2 件:
   - 境界外の committed B の破棄の資格を grant ack に依存させると、ack の後も slot が occupied のまま owner 数が 0 にならず循環する → 破棄は ack に依存させず、record だけを ack まで残す（設計に反映した）
-  - FileId の前提: watch の cancel の経路では、caller だけ先に返って CHANGE_NOTIFY の wire の owner が残ったまま `bestEffortClose` が CLOSE を送る。「CLOSE の前に利用の完了を await」は caller の完了でしか成り立たない → 範囲はユーザーの判断
+  - FileId の前提: watch の cancel の経路では、caller だけ先に返って CHANGE_NOTIFY の wire の owner が残ったまま `bestEffortClose` が CLOSE を送る。「CLOSE の前に利用の完了を await」は caller の完了でしか成り立たない → **ユーザー決定: M3 で直す**（cancel / timeout の catch から CLOSE の前に、その request の wire の barrier を固定期限の中で待つ。File incarnation は足さない）
+- **ユーザーが設計を承認した（2026-10-12）**。実装の順: M1+M2（1 つの有効化単位）→ M3（局所 scope と watch の cancel → CLOSE の待ち）→ M4（統合検証と性能 gate）
 
 ## 関連
 

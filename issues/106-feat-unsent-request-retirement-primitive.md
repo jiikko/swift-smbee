@@ -419,6 +419,19 @@ commit の分け方（各 commit が単独で契約を満たす）:
     正常終了の後に session を開いたまま record・transfer の状態が 0 に戻ること（今は terminal の removeAll が隠す）、refund を止めたまま epoch を進めない順序
   - 設計の判断が残る: canonical な record を delivery の終わりまで保持するか（§2.2 どおり。既存のテストを変える）、wire の record と transfer の ticket の所有者を分けるか
   - 次: codex-drive の設計（D1〜D3）→ ユーザーの承認 → 実装
+- Commit 5 の設計 D1（2026-10-12、sol-high の独立 4 案）: 4 案とも同じ結論に収束した。
+  - Q1: canonical な record を delivery の終わりまで保持する（§2.2 どおり）。既存の 2 本のテスト（READ の suspended callback / WRITE の suspended supplier）の
+    「terminal の後 active record = 0」を「wire の owner・pending・barrier = 0、callback / supplier の所有の record だけ残る、返却後に全部 0」に変える。wire の barrier と transport の join は callback を待たない
+  - Q2: receipt の正本は record。window は epoch ごとの未決着の owner 数を持つ。未送信の slot は refund などが決着するまで空けない
+  - Q3: File / Tree の拒否を型付きの admission refusal にし、同じ局所退役を通す（`SMBCodecError` を一律に局所扱いしない）
+  - Q4: p4 の 4 段（所有期間 → 未送信の退役と epoch → 局所 scope → 統合検証。receipt と epoch の接続は同じ milestone）を土台にする
+- D1.5（p3 と p4 へのクロス批評、sol-high 2 本）: 両方が同じ穴を挙げた。
+  - P1: terminal の後始末（今は最後の removeAll が、send が `.committed` で owner が残る record を隠している。回収の条件を増やすなら、join で何を何に固定するかの表が要る）
+  - P1: sender が取り出して precommit で止まっている item の packet の所有が receipt の条件に無い
+  - P1 / P2: ticket を作らず終わる準備（EOF・charge 0・retry・supplier の失敗）の終端が未定義。chunk の caller と転送の caller を分けないと待ちが循環する
+  - P2: 古い ack と再利用された slot、既存の receipt（lock 付き）との整合と shell の寿命、charge 0 の終了で lock / Task を使わないこと（R7）、
+    冗長な guard で変異が隠れること、M1 で既存の Tree の経路を新しい入口に通すこと
+  - D2（統合と詳細化）でこの 8 点に答えさせる（codex luna-max、実行中）
 
 ## 関連
 

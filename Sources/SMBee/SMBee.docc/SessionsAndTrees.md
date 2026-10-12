@@ -29,6 +29,51 @@ Actors serialize session and tree state. Closures and progress callbacks are
 blocking behavior, and the progress-queue exception are described in
 ``Callbacks``.
 
+## Watch directories with CHANGE_NOTIFY
+
+`withChangeNotifications` uses a long-poll request: the server may leave it pending
+until a change occurs. A finite receive timeout on the default POSIX transport still
+applies while SMBee waits for that response. If the connection receives no data before
+the timeout (including no `STATUS_PENDING` interim response), the receive fails and
+the session is closed. Other operations sharing that session fail with it. The
+per-request `requestTimeout` does not bound CHANGE_NOTIFY; long-poll requests are
+excluded from that timer.
+
+The public `timeout:` argument configures the transport only when SMBee creates the
+default transport. That default is `POSIXSocketTransport` on both macOS and Linux, and
+its receive timeout uses the socket's `SO_RCVTIMEO`. If you pass `makeTransport`, that
+factory takes precedence and `timeout:` is not passed to it. `NWConnectionTransport`
+does not have a receive timeout, while a custom factory can create a POSIX transport
+with a finite timeout even when the API's `timeout:` is `nil`.
+
+Keep a watch on a dedicated session with `timeout: nil`, separate from the session used
+for ordinary work. Ordinary requests on their own session remain bounded by the default
+`requestTimeout` of 60 seconds unless you set it to `nil`.
+
+```swift
+let watchSession = try await SMBee.connect(
+    host: "files.example.com",
+    credential: credential,
+    share: "public",
+    timeout: nil
+)
+let workSession = try await SMBee.connect(
+    host: "files.example.com",
+    credential: credential,
+    share: "public"
+)
+
+let watchTask = Task {
+    try await watchSession.withChangeNotifications(path: "reports") { event in
+        if event.requiresRescan {
+            // Reconcile the directory contents.
+        }
+    }
+}
+let entries = try await workSession.list(path: "reports")
+watchTask.cancel()
+```
+
 File and scoped Tree cleanup has a soft deadline and a finite hard deadline. The default
 soft budget is five seconds; the hard grace is at most sixty seconds and is shortened by
 `requestTimeout` when configured. If a cleanup request is still waiting for credit or a

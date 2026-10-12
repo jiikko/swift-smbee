@@ -716,6 +716,7 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     private var preloadedResponses: [[UInt8]]
     private var pendingReceive: SMBContinuationPendingReceive?
     private var closed = false
+    private var terminalReceiveError: Error = SMBTransportError.connectionClosed
     private var closeCountStorage = 0
     private let closeCountBarrier = SMBContinuationCountBarrier()
     private var commandCounts: [UInt16: Int] = [:]
@@ -760,19 +761,19 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     func receive(maxLength: Int) async throws -> [UInt8] {
         try Task.checkCancellation()
         return try await withCheckedThrowingContinuation { continuation in
-            let decision = lock.withLock { () -> (bytes: [UInt8]?, closed: Bool) in
+            let decision = lock.withLock { () -> (bytes: [UInt8]?, error: Error?) in
                 if !inbound.isEmpty {
                     let count = min(maxLength, inbound.count)
                     let bytes = Array(inbound.prefix(count))
                     inbound.removeFirst(count)
-                    return (bytes, false)
+                    return (bytes, nil)
                 }
-                if closed { return (nil, true) }
+                if closed { return (nil, terminalReceiveError) }
                 pendingReceive = SMBContinuationPendingReceive(maxLength: maxLength, continuation: continuation)
-                return (nil, false)
+                return (nil, nil)
             }
-            if decision.closed {
-                continuation.resume(throwing: SMBTransportError.connectionClosed)
+            if let error = decision.error {
+                continuation.resume(throwing: error)
             } else if let bytes = decision.bytes {
                 continuation.resume(returning: bytes)
             }
@@ -806,8 +807,17 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
     }
 
     func close() {
+        close(failingWith: SMBTransportError.connectionClosed)
+    }
+
+    func failConnection(with error: Error) {
+        close(failingWith: error)
+    }
+
+    private func close(failingWith error: Error) {
         let result = lock.withLock { () -> (SMBContinuationPendingReceive?, [CheckedContinuation<Void, Error>]) in
             closed = true
+            terminalReceiveError = error
             closeCountStorage += 1
             let pending = pendingReceive
             pendingReceive = nil
@@ -816,7 +826,7 @@ class SMBContinuationScriptTransport: SMBTransport, @unchecked Sendable {
             commandWaiters.removeAll()
             return (pending, waiters)
         }
-        result.0?.continuation.resume(throwing: SMBTransportError.connectionClosed)
+        result.0?.continuation.resume(throwing: error)
         result.1.forEach { $0.resume(throwing: SMBTransportError.connectionClosed) }
         closeCountBarrier.signal()
     }
@@ -1029,6 +1039,54 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
             sessionId: request.sessionId
         ).encode()
         try enqueue(response)
+    }
+}
+
+/// Drives the repeated watch reconnect path with a scripted reconnectable receive failure.
+/// The loopback test covers the actual POSIX `SO_RCVTIMEO` behavior.
+final class SMBIssue108WatchFaultTransport: SMBContinuationScriptTransport, @unchecked Sendable {
+    override init(inbound: [UInt8]) {
+        super.init(inbound: inbound)
+    }
+
+    override func send(_ bytes: [UInt8]) async throws {
+        guard let packet = try smbPacketInDirectTCPStream(bytes) else {
+            try await super.send(bytes)
+            return
+        }
+        let header = try SMB2Header.decode(packet)
+        try await super.send(bytes)
+
+        switch header.command {
+        case SMB2Commands.create:
+            var response = try SMB2Header(
+                command: SMB2Commands.create,
+                credits: 1,
+                messageId: header.messageId,
+                treeId: header.treeId,
+                sessionId: header.sessionId
+            ).encode()
+            response.append(contentsOf: Array(repeating: 0, count: 88))
+            writeUInt16LE(89, to: &response, at: 64)
+            response.replaceSubrange(128..<144, with: Array(repeating: 0x55, count: 16))
+            try enqueue(response)
+        case SMB2Commands.changeNotify:
+            // Inject `.timedOut` so this repeated overflow path is deterministic and does
+            // not wait on the kernel clock. The loopback test covers SO_RCVTIMEO itself.
+            failConnection(with: SMBTransportError.timedOut)
+        case SMB2Commands.treeDisconnect, SMB2Commands.logoff:
+            var response = try SMB2Header(
+                command: header.command,
+                credits: 1,
+                messageId: header.messageId,
+                treeId: header.treeId,
+                sessionId: header.sessionId
+            ).encode()
+            response.append(contentsOf: [4, 0, 0, 0])
+            try enqueue(response)
+        default:
+            break
+        }
     }
 }
 

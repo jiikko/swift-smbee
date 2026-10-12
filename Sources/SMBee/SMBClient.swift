@@ -1488,6 +1488,13 @@ public actor SMBClientSession {
     /// Watch `path` for changes, delivering each event to `onChange` until the task is
     /// cancelled.
     ///
+    /// A finite receive timeout on this session's POSIX transport also applies while the
+    /// reader waits for a long-poll CHANGE_NOTIFY response. If no data arrives before that
+    /// timeout, the receive failure closes the session and affects its other operations.
+    /// Use a dedicated watch session created with `timeout: nil` to avoid this; ordinary
+    /// requests on a separate session remain bounded by `requestTimeout`. See
+    /// <doc:SessionsAndTrees> for transport selection details.
+    ///
     /// - Parameter autoReconnect: when true and this session was created via `connect(...)`,
     ///   a dropped connection (transport failure / connection lost) triggers a reconnect and
     ///   the watch resubscribes, rather than propagating the error. Because CHANGE_NOTIFY only
@@ -2672,7 +2679,9 @@ public enum SMBClient {
     public static let defaultRequestTimeout: Duration = .seconds(60)
 
     /// - Parameters:
-    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall
+    ///     operation deadline. On the default POSIX transport, it also applies to long-poll
+    ///     CHANGE_NOTIFY receives on the returned session. See <doc:SessionsAndTrees>.
     ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
     ///     request is sent. This is independent of the socket-level `timeout`. Defaults to
     ///     `defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
@@ -2697,7 +2706,9 @@ public enum SMBClient {
     }
 
     /// - Parameters:
-    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall
+    ///     operation deadline. On the default POSIX transport, it also applies to long-poll
+    ///     CHANGE_NOTIFY receives on the returned session. See <doc:SessionsAndTrees>.
     ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
     ///     request is sent. This is independent of the socket-level `timeout`. Defaults to
     ///     `defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
@@ -3044,7 +3055,11 @@ public enum SMBClient {
         )
     }
 
-    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall watch deadline.
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an
+    ///   overall watch deadline. On the default POSIX transport it also applies while waiting for
+    ///   a long-poll CHANGE_NOTIFY response; a quiet receive can close the session and fail its
+    ///   other operations. Use a dedicated watch session with `timeout: nil`, and keep ordinary
+    ///   requests on a separate session with `requestTimeout`. See <doc:SessionsAndTrees>.
     /// - Parameter onChange: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func withChangeNotifications(
         host: String,

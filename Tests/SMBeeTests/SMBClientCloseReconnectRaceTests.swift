@@ -2769,6 +2769,48 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
         XCTAssertFalse(try outboundCommands(candidate.outbound).contains(SMB2Commands.create))
     }
 
+    func testRepeatedReconnectableReceiveFailuresReportOverflowEachTime() async throws {
+        let reconnectFrames = try SMBIssue102WireFixtures.framed(
+            SMBIssue102WireFixtures.anonymousSessionResponses()
+        )
+        let candidateTransports = (0..<2).map { _ in
+            SMBIssue108WatchFaultTransport(
+                inbound: reconnectFrames
+            )
+        }
+        let transports = SMBContinuationTransportFactory(transports: candidateTransports)
+        let oldTransport = SMBIssue108WatchFaultTransport(inbound: [])
+        let oldSession = SMBSession(
+            host: "server",
+            port: 445,
+            credential: .anonymous,
+            transport: oldTransport,
+            initialCredits: 4
+        )
+        let client = makeClientSession(
+            session: oldSession,
+            credentialProvider: { .anonymous },
+            makeTransport: { transports.makeTransport() }
+        )
+        let overflowCount = SMBIssue108OverflowCount()
+        let watcher = Task {
+            try await client.withChangeNotifications(path: "dir", autoReconnect: true) { event in
+                guard event == .overflow else { return }
+                if overflowCount.signalAndRead() == 2 {
+                    await client.close()
+                }
+            }
+        }
+
+        try await smbIssue102AwaitWithTimeout("watch ends after two receive failures") {
+            try await watcher.value
+        }
+        await client.close()
+
+        XCTAssertEqual(overflowCount.value, 2)
+        XCTAssertEqual(transports.makeCount, 2)
+    }
+
     func testCloseDuringCandidateTreeConnectClosesCandidateWithoutPublishingIt() async throws {
         let oldSession = SMBSession(
             host: "server",
@@ -3172,6 +3214,22 @@ final class SMBClientCloseReconnectRaceTests: XCTestCase {
             cursor = end
         }
         return commands
+    }
+}
+
+private final class SMBIssue108OverflowCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var countStorage = 0
+
+    var value: Int {
+        lock.withLock { countStorage }
+    }
+
+    func signalAndRead() -> Int {
+        lock.withLock {
+            countStorage += 1
+            return countStorage
+        }
     }
 }
 

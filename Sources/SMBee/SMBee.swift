@@ -11,7 +11,9 @@ public enum SMBee {
     public static let version = "0.0.1"
 
     /// - Parameters:
-    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall
+    ///     operation deadline. On the default POSIX transport, it also applies to long-poll
+    ///     CHANGE_NOTIFY receives on the returned session. See <doc:SessionsAndTrees>.
     ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
     ///     request is sent. This is independent of the socket-level `timeout`. Defaults to
     ///     `SMBClient.defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
@@ -34,7 +36,9 @@ public enum SMBee {
     }
 
     /// - Parameters:
-    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall operation deadline.
+    ///   - timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall
+    ///     operation deadline. On the default POSIX transport, it also applies to long-poll
+    ///     CHANGE_NOTIFY receives on the returned session. See <doc:SessionsAndTrees>.
     ///   - requestTimeout: Per-request response timeout that starts only after the complete SMB
     ///     request is sent. This is independent of the socket-level `timeout`. Defaults to
     ///     `SMBClient.defaultRequestTimeout`; pass `nil` explicitly to keep response waits unbounded.
@@ -249,7 +253,11 @@ public enum SMBee {
         )
     }
 
-    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an overall watch deadline.
+    /// - Parameter timeout: Socket-level timeout for connect and each recv/send I/O. This is not an
+    ///   overall watch deadline. On the default POSIX transport it also applies while waiting for
+    ///   a long-poll CHANGE_NOTIFY response; a quiet receive can close the session. Use a dedicated
+    ///   watch session with `timeout: nil` and a separate session for ordinary requests. See
+    ///   <doc:SessionsAndTrees>.
     /// - Parameter onChange: Runs on the session's serial executor (S). Keep it short; see ``Callbacks``.
     public static func withChangeNotifications(
         host: String,

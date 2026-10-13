@@ -490,7 +490,12 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - 効かずに戻した案: ticket の hash を MessageId だけにする、read の経路で write の map の lookup を省く
   - 検証: macOS の unit 859 件・失敗 0、strict lint 違反 0、Release のテストのビルド成功（main agent が実行）。Linux arm64 の unit と Release のビルドは codex の報告のみ（main agent は未実行）。TSan のテストは B の slot が fullySent かつ sendOwnerFinished になるまで待つ形に直し、20 回連続で通過（codex の報告）
   - **x86 の gate は未実測**。前回は arm64 の −16.5% / +26.1% が CI の x86 で −19.3% / +29.2% になった。同じ比率なら今回は x86 で約 −13.5% / +14.5% の見積もり（gate は −15% / +25%）。throughput の余裕が小さい
-  - 残差を詰める案（未実装）: session ローカルの generation 付き record の slot table。handle から配列の slot を引き、generation と identity / key を照合して record に届く形にし、遷移ごとの identity の hash lookup を減らす。slot の再利用を receipt・epoch の条件と結び付ける設計とテストが要る
+  - **x86 の実測（2026-10-14）**: 一時 branch `tmp/issue106-c5-perf-candidate` に a89bc8a を push し、Performance を手動起動（run 38470270865、reference_sha=304f77f、20 組）。
+    gate は PASS だが余裕が無い: read throughput −14.7%（paired −14.43%、95% CI −15.08〜−13.72%）、user CPU +22.7%（+22.09%、+20.66〜+23.49%）。write は −5.4% / +6.8%。
+    artifact を落として `bin/ci/compare-resource-performance --fail-on-regression` を手元で当て、同じ判定を再現した（`verify-agent-performance` は push の run しか見ないので使えない）。
+    arm64 の −11.5% / +12.9% は x86 では縮まなかった（前回の比率から見積もった −13.5% より悪い）。smoke（3 プロファイル）と Linux（unit 866 件・失敗 0、Release のテストのビルド）は通過
+  - 判断（ユーザー、2026-10-14）: このまま入れず、slot table まで詰めて x86 で余裕を作ってから入れる
+  - 残差を詰める案（着手）: session ローカルの generation 付き record の slot table。handle から配列の slot を引き、generation と identity / key を照合して record に届く形にし、遷移ごとの identity の hash lookup を減らす。slot の再利用を receipt・epoch の条件と結び付ける設計とテストが要る
 
 ## 関連
 

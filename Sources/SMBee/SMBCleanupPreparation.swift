@@ -191,6 +191,7 @@ final class SMBTreeCreditCancellationToken: @unchecked Sendable {
     private var state: State = .active
     let refundInterleavingHookForTesting:
         (@Sendable (SMBCleanupCreditRefundInterleavingPoint) async -> Void)?
+    let grantClaimedBeforeAcceptForTesting: (@Sendable (UInt16) -> Task<Void, Never>?)?
     let tree: SMBTreeIdentity
     let request: SMBRequestIdentity
 
@@ -198,11 +199,13 @@ final class SMBTreeCreditCancellationToken: @unchecked Sendable {
         tree: SMBTreeIdentity,
         request: SMBRequestIdentity,
         refundInterleavingHookForTesting:
-            (@Sendable (SMBCleanupCreditRefundInterleavingPoint) async -> Void)? = nil
+            (@Sendable (SMBCleanupCreditRefundInterleavingPoint) async -> Void)? = nil,
+        grantClaimedBeforeAcceptForTesting: (@Sendable (UInt16) -> Task<Void, Never>?)? = nil
     ) {
         self.tree = tree
         self.request = request
         self.refundInterleavingHookForTesting = refundInterleavingHookForTesting
+        self.grantClaimedBeforeAcceptForTesting = grantClaimedBeforeAcceptForTesting
     }
 
     var isCancelled: Bool {

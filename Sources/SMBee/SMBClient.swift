@@ -7,6 +7,9 @@ import Darwin
 #endif
 
 enum SMBDownloadTestSeams {
+    /// Lets a deterministic READ test suspend the production decode-return edge.
+    @TaskLocal static var beforeReadDecodeFinishForTesting:
+        (@Sendable (SMBTransferTicket) -> Task<Void, Never>?)?
     /// Lets deterministic tests hold resume-prefix validation at an async boundary.
     @TaskLocal static var beforeResumePrefixComparison: (@Sendable () async throws -> Void)?
     /// Lets deterministic tests hold after prefix equality has been computed and before it is acted on.
@@ -4262,6 +4265,9 @@ public enum SMBClient {
                     } catch {
                         result = .failure(error: error, isSessionFatal: false)
                     }
+                    if let decodeReturnGate = SMBDownloadTestSeams.beforeReadDecodeFinishForTesting?(work.ticket) {
+                        await decodeReturnGate.value
+                    }
                     finishing = .decodedRead(ticket: work.ticket, result: result)
                 case .retirement(let retirement):
                     switch retirement.result {
@@ -5194,6 +5200,7 @@ struct SMBSessionMonotonicTime: Sendable {
 
 enum SMBRequestCallerState: Equatable, Sendable {
     case pending
+    case noWireWork
     case success
     case localRefusal
     case cancelled
@@ -5218,6 +5225,7 @@ enum SMBRequestWireState: Equatable, Sendable {
 }
 
 enum SMBRequestCreditState: Equatable, Sendable {
+    case notApplicable
     case waiting
     case reserved(maximumCharge: UInt16)
     case prepared(maximumCharge: UInt16, actualCharge: UInt16)
@@ -5297,6 +5305,25 @@ struct SMBRetirementReceipt: Sendable, Equatable {
 
     static func == (lhs: SMBRetirementReceipt, rhs: SMBRetirementReceipt) -> Bool {
         lhs.receiptUUID == rhs.receiptUUID
+    }
+}
+
+/// Preparation identity and the only post-reclamation route to its retirement receipt.
+/// `receiptSlot` is read and written only by the owning SMBSession actor.
+final class SMBTransferRequestHandle: @unchecked Sendable, Hashable {
+    let key: SMBTransferRequestKey
+    fileprivate var receiptSlot: SMBRetirementReceipt?
+
+    init(key: SMBTransferRequestKey) {
+        self.key = key
+    }
+
+    static func == (lhs: SMBTransferRequestHandle, rhs: SMBTransferRequestHandle) -> Bool {
+        lhs.key == rhs.key
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(key)
     }
 }
 
@@ -5483,7 +5510,7 @@ actor SMBUnsentRequestRecord {
             actualCharge = reservedCharge
         case .prepared(_, let preparedCharge):
             actualCharge = preparedCharge
-        case .waiting, .committed, .refunded, .discardedOnTerminal:
+        case .notApplicable, .waiting, .committed, .refunded, .discardedOnTerminal:
             return false
         }
         credit = .committed(actualCharge: actualCharge)
@@ -5616,7 +5643,7 @@ actor SMBUnsentRequestRecord {
             residual = reservedCharge
         case .prepared(_, let actualCharge):
             residual = actualCharge
-        case .waiting, .committed, .refunded, .discardedOnTerminal:
+        case .notApplicable, .waiting, .committed, .refunded, .discardedOnTerminal:
             return
         }
         guard residual > 0 else { return }
@@ -5983,7 +6010,7 @@ private enum SMBPostAuthSendKind {
 
 private struct SMBQueuedPostAuthRequest {
     let identity: SMBRequestIdentity
-    var packet: [UInt8]
+    var packet: [UInt8]?
     let command: UInt16
     let sessionId: UInt64
     let treeId: UInt32
@@ -6005,6 +6032,238 @@ private struct SMBQueuedPostAuthRequest {
 private struct SMBQueuedControlSend {
     let requestIdentity: SMBRequestIdentity
     let generation: UInt64
+}
+
+private enum SMBTransferDeliveryState: Equatable {
+    case pending
+    case active
+    case delivered
+    case failed
+    case discarded
+    case notApplicable
+}
+
+enum SMBTransferRecordReclamation {
+    static func isReady(
+        hasExternalOwner: Bool,
+        reservationPending: Bool,
+        slotReleased: Bool,
+        deliveryUnresolved: Bool,
+        retirementReceiptComplete: Bool,
+        outstandingCreditGrantAcknowledgements: Int
+    ) -> Bool {
+        !hasExternalOwner
+            && !reservationPending
+            && slotReleased
+            && !deliveryUnresolved
+            && retirementReceiptComplete
+            && outstandingCreditGrantAcknowledgements == 0
+    }
+}
+
+enum SMBTransferRetiringSlotRelease {
+    static func isReady(
+        hasReceipt: Bool,
+        queueRemovalAcknowledged: Bool,
+        refundAcknowledged: Bool,
+        refundsPending: Int,
+        timerAcknowledged: Bool,
+        reservationPending: Bool,
+        hasExternalOwner: Bool,
+        packetOwned: Bool
+    ) -> Bool {
+        hasReceipt
+            && queueRemovalAcknowledged
+            && refundAcknowledged
+            && refundsPending == 0
+            && timerAcknowledged
+            && !reservationPending
+            && !hasExternalOwner
+            && !packetOwned
+    }
+}
+
+enum SMBTransferRetirementReceiptReadiness {
+    static func isReady(
+        hasReceipt: Bool,
+        queueRemovalAcknowledged: Bool,
+        refundAcknowledged: Bool,
+        refundsPending: Int,
+        timerAcknowledged: Bool,
+        reservationPending: Bool,
+        supplierOwned: Bool,
+        decodeOwned: Bool,
+        deliveryOwned: Bool,
+        selectedPrecommitOwned: Bool,
+        packetOwned: Bool,
+        slotReleased: Bool
+    ) -> Bool {
+        hasReceipt
+            && queueRemovalAcknowledged
+            && refundAcknowledged
+            && refundsPending == 0
+            && timerAcknowledged
+            && !reservationPending
+            && !supplierOwned
+            && !decodeOwned
+            && !deliveryOwned
+            && !selectedPrecommitOwned
+            && !packetOwned
+            && slotReleased
+    }
+}
+
+struct SMBTransferRequestOwnershipSnapshot: Equatable, Sendable {
+    let identity: SMBRequestIdentity
+    let command: UInt16
+    let transferIdentifier: UInt64
+    let slotIndex: Int
+    let slotSequence: UInt64
+    let caller: SMBRequestCallerState
+    let send: SMBRequestSendState
+    let wire: SMBRequestWireState
+    let credit: SMBRequestCreditState
+    let packetOwned: Bool
+    let selectedPrecommitOwned: Bool
+    let slotReleased: Bool
+    let slotVacant: Bool
+    let duplicateRetirementObserved: Bool
+    let offset: UInt64?
+    let supplierOwned: Bool
+    let decodeOwned: Bool
+    let deliveryUnresolved: Bool
+    let deliveryOwned: Bool
+    let deliveryDiscarded: Bool
+    let reservedCharge: UInt16
+    let outstandingCreditGrantAcknowledgements: Int
+    let retirementReceiptIdentifier: UUID?
+    let retirementReceiptComplete: Bool
+    let retirementRefundsPending: Int
+    let epochOutstandingOwnerCount: Int
+}
+
+private struct SMBTransferRequestOwner {
+    let handle: SMBTransferRequestHandle
+    let window: SMBTransferWindow
+    var ticket: SMBTransferTicket?
+    var supplierOwned: Bool
+    var decodeOwned = false
+    var deliveryOwned = false
+    var selectedPrecommitOwned = false
+    var packetOwned = false
+    var reservationPending = false
+    var slotReleased = false
+    var deliveryState: SMBTransferDeliveryState = .pending
+    var reservedCharge: UInt16 = 0
+    var retirementReceipt: SMBRetirementReceipt?
+    var retirementQueueRemovalAcknowledged = false
+    var retirementRefundAcknowledged = false
+    var retirementRefundsPending = 0
+    var retirementTimerAcknowledged = true
+
+    var hasExternalOwner: Bool {
+        supplierOwned || decodeOwned || deliveryOwned || selectedPrecommitOwned
+    }
+
+    var canCloseRetirementReceipt: Bool {
+        SMBTransferRetirementReceiptReadiness.isReady(
+            hasReceipt: retirementReceipt != nil,
+            queueRemovalAcknowledged: retirementQueueRemovalAcknowledged,
+            refundAcknowledged: retirementRefundAcknowledged,
+            refundsPending: retirementRefundsPending,
+            timerAcknowledged: retirementTimerAcknowledged,
+            reservationPending: reservationPending,
+            supplierOwned: supplierOwned,
+            decodeOwned: decodeOwned,
+            deliveryOwned: deliveryOwned,
+            selectedPrecommitOwned: selectedPrecommitOwned,
+            packetOwned: packetOwned,
+            slotReleased: slotReleased
+        )
+    }
+
+    var canReleaseRetiringSlot: Bool {
+        SMBTransferRetiringSlotRelease.isReady(
+            hasReceipt: retirementReceipt != nil,
+            queueRemovalAcknowledged: retirementQueueRemovalAcknowledged,
+            refundAcknowledged: retirementRefundAcknowledged,
+            refundsPending: retirementRefundsPending,
+            timerAcknowledged: retirementTimerAcknowledged,
+            reservationPending: reservationPending,
+            hasExternalOwner: hasExternalOwner,
+            packetOwned: packetOwned
+        )
+    }
+}
+
+private struct SMBTransferRetirementRefundWork: Sendable {
+    let requestIdentity: SMBRequestIdentity
+    let transferIdentifier: UInt64
+    let ticket: SMBTransferTicket?
+    let charge: UInt16
+}
+
+private enum SMBTransferRequestTransition {
+    case beginPreparing(
+        identity: SMBRequestIdentity,
+        candidateLength: UInt32,
+        countsTowardWireDrain: Bool,
+        supplierOwned: Bool
+    )
+    case reservationPending(slotIndex: Int)
+    case reservationSettled(slotIndex: Int, charge: UInt16, cancellationToken: SMBTreeCreditCancellationToken?)
+    case selectedPrecommit(SMBTransferTicket)
+    case precommitRejected(SMBTransferTicket, caller: SMBRequestCallerState)
+    case selectedPrecommitReturned(SMBTransferTicket, at: ContinuousClock.Instant)
+    case wireCommitted(SMBTransferTicket, messageId: UInt64, charge: UInt16)
+    case wireStatusPending(SMBTransferTicket, asyncId: UInt64)
+    case wireFinalAccepted(SMBTransferTicket, at: ContinuousClock.Instant, hasGrant: Bool)
+    case finalCreditGrantAcknowledged(SMBTransferTicket)
+    case callerTerminal(SMBTransferTicket, state: SMBRequestCallerState, wire: SMBRequestWireState?)
+    case retirementRefundAcknowledged(SMBTransferTicket, at: ContinuousClock.Instant)
+    case preparationRetirementAcknowledged(SMBRequestIdentity, at: ContinuousClock.Instant)
+    case treeRefusal(SMBTransferTicket, error: Error, at: ContinuousClock.Instant)
+    case treeRefusalPreparation(SMBRequestIdentity, error: Error, at: ContinuousClock.Instant)
+    case revokePreparing(slotIndex: Int, at: ContinuousClock.Instant?)
+    case sourceEOF(slotIndex: Int, at: ContinuousClock.Instant)
+    case supplierReturned(slotIndex: Int)
+    case commit(
+        slotIndex: Int,
+        identity: SMBRequestIdentity,
+        messageID: UInt64,
+        requestedLength: UInt32,
+        at: ContinuousClock.Instant?
+    )
+    case sendStarted(SMBTransferTicket)
+    case retireUnsent(SMBTransferTicket, at: ContinuousClock.Instant)
+    case finishUnsentRetirement(SMBTransferTicket, at: ContinuousClock.Instant)
+    case fullySent(SMBTransferTicket, responseDeadline: ContinuousClock.Instant?, at: ContinuousClock.Instant?)
+    case sendOwnerReturned(SMBTransferTicket, at: ContinuousClock.Instant?)
+    case acceptFinal(SMBTransferTicket, result: SMBTransferFinalResult, at: ContinuousClock.Instant?)
+    case finishDecode(SMBTransferTicket, result: SMBTransferFinalResult, at: ContinuousClock.Instant?)
+    case beginDecode(SMBTransferTicket)
+    case beginDelivery
+    case finishDelivery(
+        SMBTransferTicket,
+        advanceFrontier: Bool,
+        outcome: SMBTransferDeliveryState
+    )
+    case releaseSlot(SMBTransferTicket)
+    case discardCompleted(SMBTransferTicket, forStop: Bool)
+    case stop(SMBTransferStopReason, at: ContinuousClock.Instant, cleanupTimeout: Duration, operationDeadline: ContinuousClock.Instant?)
+    case terminalClose
+    case terminalJoin(at: ContinuousClock.Instant)
+    case beginNextEpoch(offset: UInt64)
+}
+
+private enum SMBTransferRequestTransitionResult {
+    case slot(Int?)
+    case ticket(SMBTransferTicket?)
+    case retirement(SMBTransferRetirement?)
+    case bool(Bool)
+    case epoch(Bool)
+    case retirementDecision(SMBUnsentRetirementDecision, shouldStartPump: Bool)
+    case none
 }
 
 /// The session actor's canonical state for a post-auth request. The pending-response
@@ -6045,6 +6304,7 @@ private final class SMBSessionActiveRequestRecord {
     var wireDrainTimerIdentity: UUID?
     var finalAcceptedAt: ContinuousClock.Instant?
     var outstandingCreditGrantAcknowledgements = 0
+    var transferOwner: SMBTransferRequestOwner?
 
     init(
         identity: SMBRequestIdentity,
@@ -6232,6 +6492,11 @@ private enum SMBReadTransferDrainResult: @unchecked Sendable {
     case finished(Error?)
 }
 
+private enum SMBWriteTransferDrainResult: @unchecked Sendable {
+    case wait(revision: UInt64)
+    case finished(Error?)
+}
+
 /// The session owns transfer protocol state. The caller's task owns this record's driver,
 /// callback execution, ordered retirement, draining, and any terminal join.
 private final class SMBSessionReadTransfer {
@@ -6374,6 +6639,11 @@ actor SMBSession {
     private var writeTransfers: [UInt64: SMBSessionWriteTransfer] = [:]
     private var nextTransferIdentifier: UInt64 = 0
     private var activePostAuthRequestRecords: [SMBRequestIdentity: SMBSessionActiveRequestRecord] = [:]
+    private var transferRetirementRefundWorklist: [SMBTransferRetirementRefundWork] = []
+    private var transferRetirementEffectPumpTask: Task<Void, Never>?
+    private var transferRetirementEffectPumpWakeContinuation: CheckedContinuation<Void, Never>?
+    private var transferRetirementEffectPumpWakeRevision: UInt64 = 0
+    private var transferRetirementEffectPumpCompletedChildren = 0
     private var pendingMessageIdByIdentity: [SMBRequestIdentity: UInt64] = [:]
     private var queuedPostAuthRequests: [SMBQueuedPostAuthRequest] = []
     private var queuedControlSends: [SMBQueuedControlSend] = []
@@ -6409,11 +6679,16 @@ actor SMBSession {
     private var readerTaskJoinSnapshotHookForTesting: (@Sendable (Int) -> Void)?
     private var readerTaskJoinWillAwaitHookForTesting: (@Sendable (UUID) -> Void)?
     private var activePostAuthRequestRecordReapedHookForTesting: (@Sendable (UInt64) -> Void)?
+    private var terminalJoinCompletedHookForTesting: (@Sendable () -> Void)?
     private var finalCreditGrantAcknowledgedHookForTesting: (@Sendable () -> Void)?
+    private var transferRequestOwnershipHookForTesting:
+        (@Sendable (SMBTransferRequestOwnershipSnapshot) -> Void)?
     private var responseSliceValidatedHookForTesting: (@Sendable (Int) -> Void)?
     private var cleanupSoftDeadlineAppliedHookForTesting: (@Sendable () -> Void)?
     private var cleanupCreditRefundInterleavingHookForTesting:
         (@Sendable (SMBCleanupCreditRefundInterleavingPoint) async -> Void)?
+    private var transferCreditGrantAcceptanceGateForTesting:
+        (@Sendable (SMBRequestIdentity, UInt16) -> Task<Void, Never>?)?
     private var cleanupCloseCreditWaitCatchHookForTesting: (@Sendable () -> Void)?
     private var cleanupFileCloseCatchHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
     private var cleanupTimeoutWakeHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
@@ -7109,7 +7384,9 @@ actor SMBSession {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
         try validateFileIdAdmission(command: SMB2Commands.read, treeId: treeId, fileId: fileId, cleanupFileId: nil)
-        let requestIdentity = makeRequestIdentity(generation: generation)
+        guard let requestIdentity = makeRequestIdentity(generation: generation) else {
+            throw SMBCodecError.invalidValue("SMB request sequence exhausted")
+        }
         let treeIdentity = treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId)
         let maximumLength = UInt32(min(UInt64(negotiatedReadChunkSize()), length))
         let reservation = try await reserveVariableCredit(
@@ -7562,7 +7839,9 @@ actor SMBSession {
             guard maximumLength > 0 else {
                 throw SMBCodecError.invalidValue("SMB negotiated write size is zero")
             }
-            let requestIdentity = makeRequestIdentity(generation: generation)
+            guard let requestIdentity = makeRequestIdentity(generation: generation) else {
+                throw SMBCodecError.invalidValue("SMB request sequence exhausted")
+            }
             let treeIdentity = treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId)
             let reservation = try await reserveVariableCredit(
                 maximumPayloadLength: UInt32(maximumLength),
@@ -8009,7 +8288,7 @@ actor SMBSession {
         if let existing = treeCleanupIntents[identity] { return existing }
         guard treeLifecycle[identity] == nil else { return nil }
 
-        let owner = makeRequestIdentity(generation: identity.generation)
+        guard let owner = makeRequestIdentity(generation: identity.generation) else { return nil }
         let deadlines = SMBCleanupDeadlines(
             intentAt: sessionTime.now(),
             softBudget: cleanupTimeout,
@@ -8023,6 +8302,54 @@ actor SMBSession {
         }
         _ = transitionTreeLifecycle(identity, owner: owner, event: .beginQuarantine)
         _ = transitionTreeCleanupLedger(identity, owner: owner, event: .beginAttempt)
+
+        let refusal = SMBError.treeUnavailable(treeId: identity.treeId, operation: "TREE_DISCONNECT")
+        let refusalTime = sessionTime.now()
+        let transferQueuedItems = queuedPostAuthRequests.filter { item in
+            guard item.treeIdentity == identity,
+                  item.cleanupTreeIdentity == nil,
+                  case .transfer = item.completionTarget else { return false }
+            return true
+        }
+        var shouldStartTransferRetirementPump = false
+        var treeTransferPreparationRetirementIDs = Set<SMBRequestIdentity>()
+        let transferRecords = Array(activePostAuthRequestRecords.values.filter {
+            $0.treeIdentity == identity && $0.cleanupTreeIdentity == nil && $0.transferOwner != nil
+        })
+        for record in transferRecords {
+            let transitionResult: SMBTransferRequestTransitionResult
+            if let ticket = record.transferOwner?.ticket, record.messageId == nil {
+                transitionResult = transitionTransferRequest(
+                    ticket.transferIdentifier,
+                    .treeRefusal(ticket, error: refusal, at: refusalTime)
+                )
+            } else if record.transferOwner?.ticket == nil {
+                if record.transferOwner?.reservationPending == true {
+                    treeTransferPreparationRetirementIDs.insert(record.identity)
+                }
+                transitionResult = transitionTransferRequest(
+                    record.transferOwner?.handle.key.transferIdentifier ?? 0,
+                    .treeRefusalPreparation(record.identity, error: refusal, at: refusalTime)
+                )
+            } else {
+                transitionResult = .none
+            }
+            if case .retirementDecision(_, let startPump) = transitionResult {
+                shouldStartTransferRetirementPump = shouldStartTransferRetirementPump || startPump
+            }
+        }
+        for item in transferQueuedItems {
+            failQueuedPostAuthRequest(item, error: refusal)
+        }
+        if shouldStartTransferRetirementPump { startTransferRetirementEffectPumpIfNeeded() }
+        for state in readTransfers.values where treeIdentityByTreeId[state.treeId] == identity {
+            scheduleReadTransferDrainTimer(state)
+            signalReadTransfer(state)
+        }
+        for state in writeTransfers.values where treeIdentityByTreeId[state.treeId] == identity {
+            scheduleWriteTransferDrainTimer(state)
+            signalWriteTransfer(state)
+        }
 
         let committedRequestIdentities = pendingResponses.values.compactMap { pending -> SMBRequestIdentity? in
             guard let record = activePostAuthRequestRecords[pending.requestIdentity],
@@ -8102,15 +8429,19 @@ actor SMBSession {
         )
         treeCleanupIntents[identity] = intent
 
-        let refusal = SMBError.treeUnavailable(treeId: identity.treeId, operation: "TREE_DISCONNECT")
         var selected = Set<SMBRequestIdentity>()
         var retiredByTreePreparation = Set<SMBRequestIdentity>()
         var refunds: [UInt16] = []
         var lateGrantRefunds: [UInt16] = []
+        var transferLateGrantRefunds: [(identity: SMBRequestIdentity, charge: UInt16)] = []
         for (requestIdentity, preparation) in treeCreditPreparations where preparation.treeIdentity == identity {
             selected.insert(requestIdentity)
             if let charge = preparation.cancellationToken.cancel() {
-                lateGrantRefunds.append(charge)
+                if activePostAuthRequestRecords[requestIdentity]?.transferOwner != nil {
+                    transferLateGrantRefunds.append((requestIdentity, charge))
+                } else {
+                    lateGrantRefunds.append(charge)
+                }
             }
         }
         var retained: [SMBQueuedPostAuthRequest] = []
@@ -8143,6 +8474,7 @@ actor SMBSession {
         queuedPostAuthRequests = retained
         for record in activePostAuthRequestRecords.values where record.treeIdentity == identity
             && record.cleanupTreeIdentity == nil {
+            if record.transferOwner != nil { continue }
             if case .notStarted = record.send {
                 selected.insert(record.identity)
                 if let token = record.creditCancellationToken, let charge = token.cancel() {
@@ -8164,6 +8496,33 @@ actor SMBSession {
                 requestIdentities: selected,
                 error: refusal
             )
+        }
+        for requestIdentity in treeTransferPreparationRetirementIDs {
+            let matchingRefunds = transferLateGrantRefunds.filter { $0.identity == requestIdentity }
+            if let record = activePostAuthRequestRecords[requestIdentity],
+               let transferOwner = record.transferOwner {
+                if matchingRefunds.isEmpty {
+                    _ = transitionTransferRequest(
+                        transferOwner.handle.key.transferIdentifier,
+                        .preparationRetirementAcknowledged(requestIdentity, at: sessionTime.now())
+                    )
+                } else {
+                    for refund in matchingRefunds {
+                        transferRetirementRefundWorklist.append(
+                            SMBTransferRetirementRefundWork(
+                                requestIdentity: requestIdentity,
+                                transferIdentifier: transferOwner.handle.key.transferIdentifier,
+                                ticket: nil,
+                                charge: refund.charge
+                            )
+                        )
+                    }
+                    shouldStartTransferRetirementPump = true
+                }
+            }
+        }
+        if shouldStartTransferRetirementPump {
+            startTransferRetirementEffectPumpIfNeeded()
         }
         for charge in lateGrantRefunds { await refundCredit(charge: charge) }
         for charge in refunds {
@@ -8361,6 +8720,11 @@ actor SMBSession {
     func closeTransportAndWait(cause: String = "unspecified", diagnosticError: Error? = nil) async {
         sessionExecutor.recordExecutionContextForTesting(.closeJoin)
         closeTransport(cause: cause, diagnosticError: diagnosticError)
+        let requestTimerTasks = Array(activePostAuthRequestRecords.values).flatMap { record in
+            [record.cleanupTimeoutTask, record.wireDrainTask].compactMap { $0 }
+        }
+        for task in requestTimerTasks { task.cancel() }
+        for task in requestTimerTasks { await task.value }
         // closeTransport made the lifecycle terminal before this snapshot, so no reader
         // can be added after it. Keep overlapping old/new readers in the same join set.
         let readers = Array(readerTasks)
@@ -8376,6 +8740,14 @@ actor SMBSession {
             await reader.value
         }
         await creditFailureTask?.value
+        while true {
+            startTransferRetirementEffectPumpIfNeeded()
+            guard let retirementPump = transferRetirementEffectPumpTask else {
+                if transferRetirementRefundWorklist.isEmpty { break }
+                continue
+            }
+            await retirementPump.value
+        }
         markReadTransfersTerminalJoinComplete()
         markWriteTransfersTerminalJoinComplete()
         for identity in Array(operationBarrierByRequest.keys) {
@@ -8384,8 +8756,16 @@ actor SMBSession {
                 progress: .terminalJoinCompleted
             )
         }
-        activePostAuthRequestRecords.removeAll()
+        for record in Array(activePostAuthRequestRecords.values) where record.transferOwner == nil {
+            normalizeActiveRequestRecordAtTerminalJoin(record)
+            completeOperationBarrierIfWireWorkIsComplete(
+                for: record.identity,
+                progress: .terminalJoinCompleted
+            )
+            reclaimActivePostAuthRequestRecordIfEligible(record.identity)
+        }
         await completeReadyOperationBarriers()
+        terminalJoinCompletedHookForTesting?()
     }
 
     private func finishConnectAttempt() {
@@ -8488,6 +8868,16 @@ actor SMBSession {
         activePostAuthRequestRecordReapedHookForTesting = hook
     }
 
+    func setTerminalJoinCompletedHookForTesting(_ hook: (@Sendable () -> Void)?) {
+        terminalJoinCompletedHookForTesting = hook
+    }
+
+    func setTransferRequestOwnershipHookForTesting(
+        _ hook: (@Sendable (SMBTransferRequestOwnershipSnapshot) -> Void)?
+    ) {
+        transferRequestOwnershipHookForTesting = hook
+    }
+
     func setResponseSliceValidatedHookForTesting(_ hook: (@Sendable (Int) -> Void)?) {
         responseSliceValidatedHookForTesting = hook
     }
@@ -8500,6 +8890,12 @@ actor SMBSession {
         _ hook: (@Sendable (SMBCleanupCreditRefundInterleavingPoint) async -> Void)?
     ) {
         cleanupCreditRefundInterleavingHookForTesting = hook
+    }
+
+    func setTransferCreditGrantAcceptanceGateForTesting(
+        _ hook: (@Sendable (SMBRequestIdentity, UInt16) -> Task<Void, Never>?)?
+    ) {
+        transferCreditGrantAcceptanceGateForTesting = hook
     }
 
     func setCleanupCloseCreditWaitCatchHookForTesting(_ hook: (@Sendable () -> Void)?) {
@@ -8598,7 +8994,9 @@ actor SMBSession {
         responseProtectionPolicy: SMBResponseProtectionPolicy = .sessionDefault,
         onRegistered: @Sendable () -> Void = {}
     ) async throws {
-        let identity = makeRequestIdentity(generation: Self.initialWireGeneration)
+        guard let identity = makeRequestIdentity(generation: Self.initialWireGeneration) else {
+            throw SMBCodecError.invalidValue("SMB request sequence exhausted")
+        }
         _ = try await withCheckedThrowingContinuation { continuation in
             storePendingResponse(messageId: messageId, pending: SMBPendingResponse(
                 requestIdentity: identity,
@@ -8631,6 +9029,45 @@ actor SMBSession {
     func activePostAuthRequestRecordCountForTesting() -> Int {
         activePostAuthRequestRecords.count
     }
+
+#if DEBUG
+    func transferLifecycleCountsForTesting() -> (
+        readTransfers: Int,
+        writeTransfers: Int,
+        pendingReadDecodes: Int,
+        readTimers: Int,
+        writeTimers: Int,
+        supplierLeases: Int,
+        deliveryLeases: Int,
+        slotLeases: Int,
+        wireOperationBarriers: Int
+    ) {
+        let owners = activePostAuthRequestRecords.values.compactMap(\.transferOwner)
+        return (
+            readTransfers.count,
+            writeTransfers.count,
+            readTransfers.values.reduce(into: 0) { $0 += $1.pendingReadDecodes.count },
+            readTransfers.values.filter { $0.drainTimer != nil || $0.drainTimerIdentity != nil }.count,
+            writeTransfers.values.filter { $0.drainTimer != nil || $0.drainTimerIdentity != nil }.count,
+            owners.filter(\.supplierOwned).count,
+            owners.filter { $0.deliveryOwned || $0.decodeOwned }.count,
+            owners.filter { !$0.slotReleased }.count,
+            operationBarrierByRequest.count
+        )
+    }
+
+    func transferSlotSnapshotForTesting(
+        transferIdentifier: UInt64,
+        slotIndex: Int
+    ) -> SMBTransferWindowSlotSnapshotForTesting? {
+        readTransfers[transferIdentifier]?.window.slotSnapshotForTesting(slotIndex)
+            ?? writeTransfers[transferIdentifier]?.window.slotSnapshotForTesting(slotIndex)
+    }
+
+    func senderTaskCountForTesting() -> Int {
+        activeSendTasks.count + activeCancelTasks.count + (senderLoopTask == nil ? 0 : 1)
+    }
+#endif
 
     func activePostAuthRequestDeadlineCountForTesting() -> Int {
         activePostAuthRequestRecords.values.filter { $0.operationDeadline != nil }.count
@@ -8736,7 +9173,9 @@ actor SMBSession {
     ) async throws {
         let treeIdentity = ensureTreeIdentity(treeId: treeId) ?? registerTreeIdentity(treeId: treeId)
         let fileKey = SMBFileIdLedgerKey(bytes: fileId, treeIdentity: treeIdentity)
-        let requestIdentity = makeRequestIdentity(generation: Self.initialWireGeneration)
+        guard let requestIdentity = makeRequestIdentity(generation: Self.initialWireGeneration) else {
+            throw SMBCodecError.invalidValue("SMB request sequence exhausted")
+        }
         let deadlines = SMBCleanupDeadlines(
             intentAt: sessionTime.now(),
             softBudget: cleanupTimeout,
@@ -8977,7 +9416,7 @@ actor SMBSession {
         let key = cleanupLedger.keys.first(where: {
             $0.firstWord == words.firstWord && $0.secondWord == words.secondWord
         }) ?? words
-        let owner = makeRequestIdentity(generation: Self.initialWireGeneration)
+        guard let owner = makeRequestIdentity(generation: Self.initialWireGeneration) else { return }
         if cleanupLedger[key] == nil {
             transitionCleanupLedger(key, owner: owner, .beginAttempt)
         }
@@ -9252,7 +9691,14 @@ actor SMBSession {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
         let requestIdentity: SMBRequestIdentity
-        if let suppliedIdentity { requestIdentity = suppliedIdentity } else { requestIdentity = makeRequestIdentity(generation: generation) }
+        if let suppliedIdentity {
+            requestIdentity = suppliedIdentity
+        } else {
+            guard let identity = makeRequestIdentity(generation: generation) else {
+                throw SMBCodecError.invalidValue("SMB request sequence exhausted")
+            }
+            requestIdentity = identity
+        }
         let cleanupDeadlines: SMBCleanupDeadlines?
         if let suppliedCleanupDeadlines {
             cleanupDeadlines = suppliedCleanupDeadlines
@@ -9321,7 +9767,9 @@ actor SMBSession {
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        let requestIdentity = makeRequestIdentity(generation: generation)
+        guard let requestIdentity = makeRequestIdentity(generation: generation) else {
+            throw SMBCodecError.invalidValue("SMB request sequence exhausted")
+        }
         let frame = try await withTaskCancellationHandler {
             try await demuxedWireTransaction(
                 packet: packet,
@@ -9369,7 +9817,9 @@ actor SMBSession {
         guard let generation = readerLifecycle.activeGeneration else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
-        let requestIdentity = makeRequestIdentity(generation: generation)
+        guard let requestIdentity = makeRequestIdentity(generation: generation) else {
+            throw SMBCodecError.invalidValue("SMB request sequence exhausted")
+        }
         let response = try await withTaskCancellationHandler {
             try await demuxedWireTransaction(
                 packet: packet,
@@ -9441,7 +9891,14 @@ actor SMBSession {
             throw wireFailure
         }
         let requestIdentity: SMBRequestIdentity
-        if let suppliedIdentity { requestIdentity = suppliedIdentity } else { requestIdentity = makeRequestIdentity(generation: generation) }
+        if let suppliedIdentity {
+            requestIdentity = suppliedIdentity
+        } else {
+            guard let identity = makeRequestIdentity(generation: generation) else {
+                throw SMBCodecError.invalidValue("SMB request sequence exhausted")
+            }
+            requestIdentity = identity
+        }
         let treeOperation = responseLabel.hasSuffix(" response")
             ? String(responseLabel.dropLast(" response".count))
             : responseLabel
@@ -9530,7 +9987,7 @@ actor SMBSession {
     private func registerPendingResponse(
         packet: [UInt8],
         requestHeader: SMB2Header,
-        requestIdentity: SMBRequestIdentity? = nil,
+        requestIdentity: SMBRequestIdentity,
         generation: UInt64? = nil,
         label: String,
         longPoll: Bool = false,
@@ -9543,7 +10000,7 @@ actor SMBSession {
         send: @escaping SMBWireSendClosure
     ) {
         let generation = generation ?? readerLifecycle.activeGeneration ?? Self.initialWireGeneration
-        let identity = requestIdentity ?? makeRequestIdentity(generation: generation)
+        let identity = requestIdentity
         let cleanupTimer: (identity: UUID, task: Task<Void, Never>)?
         if let cleanupTreeIdentity, let intent = treeCleanupIntents[cleanupTreeIdentity], intent.owner == identity,
            let timerIdentity = intent.timeoutIdentity,
@@ -9668,25 +10125,27 @@ actor SMBSession {
         } else {
             requestFileId = nil
         }
-        activePostAuthRequestRecords[identity] = SMBSessionActiveRequestRecord(
-            identity: identity,
-            command: header.command,
-            sessionId: header.sessionId,
-            treeId: header.treeId,
-            fileId: requestFileId,
-            cleanupKey: cleanupKey,
-            treeIdentity: treeIdentity,
-            cleanupTreeIdentity: cleanupTreeIdentity,
-            cleanupDeadlines: cleanupDeadlines,
-            creditCancellationToken: creditCancellationToken,
-            cleanupTimeoutTask: cleanupTimeoutTask,
-            cleanupTimeoutIdentity: cleanupTimeoutIdentity,
-            maximumCreditCharge: maximumCreditCharge,
-            longPoll: longPoll,
-            requestTimeoutPolicy: requestTimeoutPolicy,
-            responseProtectionPolicy: responseProtectionPolicy,
-            operationDeadline: SMBOperationDeadline.operationContext?.deadline
-        )
+        if transferTicket == nil {
+            activePostAuthRequestRecords[identity] = SMBSessionActiveRequestRecord(
+                identity: identity,
+                command: header.command,
+                sessionId: header.sessionId,
+                treeId: header.treeId,
+                fileId: requestFileId,
+                cleanupKey: cleanupKey,
+                treeIdentity: treeIdentity,
+                cleanupTreeIdentity: cleanupTreeIdentity,
+                cleanupDeadlines: cleanupDeadlines,
+                creditCancellationToken: creditCancellationToken,
+                cleanupTimeoutTask: cleanupTimeoutTask,
+                cleanupTimeoutIdentity: cleanupTimeoutIdentity,
+                maximumCreditCharge: maximumCreditCharge,
+                longPoll: longPoll,
+                requestTimeoutPolicy: requestTimeoutPolicy,
+                responseProtectionPolicy: responseProtectionPolicy,
+                operationDeadline: SMBOperationDeadline.operationContext?.deadline
+            )
+        }
 
         var reservedCharge: UInt16 = 0
         do {
@@ -9917,24 +10376,28 @@ actor SMBSession {
         return false
     }
 
+    private func transferTreeRefusalError(for record: SMBSessionActiveRequestRecord) -> SMBError {
+        SMBError.treeUnavailable(
+            treeId: record.treeId,
+            operation: record.command == SMB2Commands.read ? "READ" : "WRITE"
+        )
+    }
+
     private func refuseTransferRequestForTree(_ ticket: SMBTransferTicket, error: Error) {
         let now = sessionTime.now()
-        if let state = readTransfers[ticket.transferIdentifier], ticket.epoch == state.window.epoch {
-            stopReadTransfer(
-                state,
-                for: .offsetFailure(offset: ticket.offset, error: error),
-                at: now
-            )
-            if state.window.retireUnsent(ticket, at: now) { signalReadTransfer(state) }
-            return
+        if case .retirementDecision(_, let shouldStartPump) = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .treeRefusal(ticket, error: error, at: now)
+        ), shouldStartPump {
+            startTransferRetirementEffectPumpIfNeeded()
         }
-        if let state = writeTransfers[ticket.transferIdentifier], ticket.epoch == state.window.epoch {
-            stopWriteTransfer(
-                state,
-                for: .offsetFailure(offset: ticket.offset, error: error),
-                at: now
-            )
-            if state.window.retireUnsent(ticket, at: now) { signalWriteTransfer(state) }
+        resumeSatisfiedTestingCountWaiters()
+        if let state = readTransfers[ticket.transferIdentifier] {
+            scheduleReadTransferDrainTimer(state)
+            signalReadTransfer(state)
+        } else if let state = writeTransfers[ticket.transferIdentifier] {
+            scheduleWriteTransferDrainTimer(state)
+            signalWriteTransfer(state)
         }
     }
 
@@ -9977,16 +10440,51 @@ actor SMBSession {
                   case .notStarted = activeRecord.send else {
                 continue
             }
+            if case .transfer(let ticket) = item.completionTarget {
+                _ = transitionTransferRequest(ticket.transferIdentifier, .selectedPrecommit(ticket))
+            }
 
             // Synchronous on purpose: the stop check, MID allocation and send ownership stay in one
             // actor turn. Only the retired path suspends (credit refund), and it never commits.
             if retireStoppedTransferRequestBeforeCommit(item) {
-                await finishRetiredStoppedTransferRequest(item)
+                item.packet = nil
+                if case .transfer(let ticket) = item.completionTarget {
+                    _ = transitionTransferRequest(
+                        ticket.transferIdentifier,
+                        .selectedPrecommitReturned(ticket, at: sessionTime.now())
+                    )
+                    await completeReadyOperationBarriers()
+                }
                 continue
             }
 
             if let hook = senderPrecommitAdmissionHookForTesting {
                 await hook(item.command)
+            }
+
+            if retireStoppedTransferRequestBeforeCommit(item) {
+                item.packet = nil
+                if case .transfer(let ticket) = item.completionTarget {
+                    _ = transitionTransferRequest(
+                        ticket.transferIdentifier,
+                        .selectedPrecommitReturned(ticket, at: sessionTime.now())
+                    )
+                    await completeReadyOperationBarriers()
+                }
+                continue
+            }
+            guard activeRecord.caller == .pending,
+                  case .notStarted = activeRecord.send,
+                  var packet = item.packet else {
+                item.packet = nil
+                if case .transfer(let ticket) = item.completionTarget {
+                    _ = transitionTransferRequest(
+                        ticket.transferIdentifier,
+                        .selectedPrecommitReturned(ticket, at: sessionTime.now())
+                    )
+                    await completeReadyOperationBarriers()
+                }
+                continue
             }
 
             var committedMessageId: UInt64?
@@ -10000,9 +10498,9 @@ actor SMBSession {
                 }
                 if let registeredFileId = activeRecord.fileId {
                     guard let offset = Self.fileIdOffsetInRequest(command: activeRecord.command),
-                          offset + 16 <= item.packet.count,
+                          offset + 16 <= packet.count,
                           let treeIdentity = activeRecord.treeIdentity,
-                          SMBFileIdLedgerKey(packet: item.packet, offset: offset, treeIdentity: treeIdentity) == registeredFileId else {
+                          SMBFileIdLedgerKey(packet: packet, offset: offset, treeIdentity: treeIdentity) == registeredFileId else {
                         throw SMBCodecError.invalidValue("post-auth request FileId changed before commit")
                     }
                 }
@@ -10018,7 +10516,7 @@ actor SMBSession {
                     cleanupTreeIdentity: item.cleanupTreeIdentity
                 )
                 try validateFileIdAdmission(
-                    packet: item.packet,
+                    packet: packet,
                     command: activeRecord.command,
                     cleanupKey: activeRecord.cleanupKey,
                     treeIdentity: activeRecord.treeIdentity
@@ -10026,17 +10524,30 @@ actor SMBSession {
                 guard isGenerationActive(generation) else {
                     throw wireFailure ?? SMBTransportError.connectionClosed
                 }
+                guard activeRecord.caller == .pending,
+                      case .notStarted = activeRecord.send else {
+                    throw CancellationError()
+                }
                 let selectedMessageId = commitNextMessageId(charge: item.reservedCharge)
                 committedMessageId = selectedMessageId
-                updateActivePostAuthRecord(item.identity) {
-                    $0.send = .committed(messageId: selectedMessageId, charge: item.reservedCharge)
-                    $0.credit = .committed(actualCharge: item.reservedCharge)
-                    $0.wire = .waiting
-                    $0.queuedRequestOwned = false
-                    $0.originalSendOwned = true
+                if case .transfer(let ticket) = item.completionTarget {
+                    item.packet = nil
+                    _ = transitionTransferRequest(
+                        ticket.transferIdentifier,
+                        .wireCommitted(ticket, messageId: selectedMessageId, charge: item.reservedCharge)
+                    )
+                } else {
+                    updateActivePostAuthRecord(item.identity) {
+                        $0.send = .committed(messageId: selectedMessageId, charge: item.reservedCharge)
+                        $0.credit = .committed(actualCharge: item.reservedCharge)
+                        $0.wire = .waiting
+                        $0.queuedRequestOwned = false
+                        $0.originalSendOwned = true
+                    }
+                    activeRecord.messageId = selectedMessageId
                 }
-                activeRecord.messageId = selectedMessageId
-                Self.patchMessageId(&item.packet, to: selectedMessageId)
+                Self.patchMessageId(&packet, to: selectedMessageId)
+                item.packet = nil
                 let pending = SMBPendingResponse(
                     requestIdentity: item.identity,
                     generation: generation,
@@ -10076,7 +10587,7 @@ actor SMBSession {
                 switch item.sendKind {
                 case .signed:
                     try await sendSigned(
-                        item.packet,
+                        packet,
                         messageId: selectedMessageId,
                         generation: generation,
                         preparedCreditCharge: item.reservedCharge,
@@ -10084,7 +10595,7 @@ actor SMBSession {
                     )
                 case .validateNegotiate(let encrypt):
                     try await sendValidateNegotiateSigned(
-                        item.packet,
+                        packet,
                         messageId: selectedMessageId,
                         encrypt: encrypt,
                         generation: generation,
@@ -10113,19 +10624,36 @@ actor SMBSession {
                     beginSessionFaultTerminalization(cause: "post_auth_send_failure", error: error)
                     break
                 }
-                updateActivePostAuthRecord(item.identity) {
-                    if error is CancellationError {
-                        $0.caller = .cancelled
-                    } else if error is SMBCodecError {
-                        $0.caller = .localRefusal
-                    } else {
-                        $0.caller = .transportError
+                let precommitCaller: SMBRequestCallerState
+                if error is CancellationError {
+                    precommitCaller = .cancelled
+                } else if error is SMBCodecError {
+                    precommitCaller = .localRefusal
+                } else {
+                    precommitCaller = .transportError
+                }
+                if case .transfer(let ticket) = item.completionTarget {
+                    _ = transitionTransferRequest(
+                        ticket.transferIdentifier,
+                        .precommitRejected(ticket, caller: precommitCaller)
+                    )
+                } else {
+                    updateActivePostAuthRecord(item.identity) {
+                        $0.caller = precommitCaller
+                        $0.send = .neverSubmitted
+                        $0.queuedRequestOwned = false
+                        $0.cleanupTimeoutTask?.cancel()
+                        $0.cleanupTimeoutTask = nil
+                        $0.cleanupTimeoutIdentity = nil
                     }
-                    $0.send = .neverSubmitted
-                    $0.queuedRequestOwned = false
-                    $0.cleanupTimeoutTask?.cancel()
-                    $0.cleanupTimeoutTask = nil
-                    $0.cleanupTimeoutIdentity = nil
+                }
+                item.packet = nil
+                if case .transfer(let ticket) = item.completionTarget {
+                    _ = transitionTransferRequest(
+                        ticket.transferIdentifier,
+                        .selectedPrecommitReturned(ticket, at: sessionTime.now())
+                    )
+                    await completeReadyOperationBarriers()
                 }
                 if let cleanupKey = item.cleanupKey {
                     transitionCleanupLedger(cleanupKey, owner: item.identity, .abandonUnsent)
@@ -10144,9 +10672,9 @@ actor SMBSession {
                         await creditFailureTask?.value
                     }
                 }
-                await refundCredit(charge: item.reservedCharge)
-                updateActivePostAuthRecord(item.identity) { $0.credit = .refunded }
                 if transferTicket == nil {
+                    await refundCredit(charge: item.reservedCharge)
+                    updateActivePostAuthRecord(item.identity) { $0.credit = .refunded }
                     failQueuedPostAuthRequest(item, error: error)
                 }
                 reclaimActivePostAuthRequestRecordIfEligible(item.identity)
@@ -10189,54 +10717,12 @@ actor SMBSession {
             return false
         }
         guard isStopped else { return false }
-
-        let now = sessionTime.now()
-        let retired: Bool
-        if let readState {
-            retired = readState.window.retireUnsent(ticket, at: now)
-            if retired { signalReadTransfer(readState) }
-        } else if let writeState {
-            retired = writeState.window.retireUnsent(ticket, at: now)
-            if retired { signalWriteTransfer(writeState) }
-        } else {
-            retired = false
+        switch retireUnsentTransferRequest(ticket) {
+        case .retiredLocally, .alreadyRetired:
+            return true
+        case .committedNeedsWireDrain:
+            return false
         }
-        guard retired else { return false }
-
-        let callerState: SMBRequestCallerState
-        let stopReason: SMBTransferStopReason?
-        if let readState {
-            stopReason = readState.window.selectedStopReason()
-        } else if let writeState {
-            stopReason = writeState.window.selectedStopReason()
-        } else {
-            stopReason = nil
-        }
-        switch stopReason {
-        case .operationDeadline:
-            callerState = .timedOut
-        case .sessionFailure:
-            callerState = .transportError
-        case .callerCancelled, .offsetFailure, .readBoundary, nil:
-            callerState = .cancelled
-        }
-        updateActivePostAuthRecord(item.identity) {
-            $0.caller = callerState
-            $0.send = .neverSubmitted
-            $0.queuedRequestOwned = false
-            $0.cleanupTimeoutTask?.cancel()
-            $0.cleanupTimeoutTask = nil
-            $0.cleanupTimeoutIdentity = nil
-        }
-        return true
-    }
-
-    private func finishRetiredStoppedTransferRequest(_ item: SMBQueuedPostAuthRequest) async {
-        await refundCredit(charge: item.reservedCharge)
-        updateActivePostAuthRecord(item.identity) { $0.credit = .refunded }
-        reclaimActivePostAuthRequestRecordIfEligible(item.identity)
-        await completeReadyOperationBarriers()
-        resumeSatisfiedTestingCountWaiters()
     }
 
     private func sendQueuedControl(_ control: SMBQueuedControlSend) async throws {
@@ -10570,8 +11056,9 @@ actor SMBSession {
         }
     }
 
-    private func makeRequestIdentity(generation: UInt64) -> SMBRequestIdentity {
-        nextRequestSequence &+= 1
+    private func makeRequestIdentity(generation: UInt64) -> SMBRequestIdentity? {
+        guard nextRequestSequence < UInt64.max else { return nil }
+        nextRequestSequence += 1
         return SMBRequestIdentity(
             sessionInstance: sessionInstanceIdentity,
             generation: generation,
@@ -10707,6 +11194,8 @@ actor SMBSession {
             workIsComplete = true
         } else if let record = activePostAuthRequestRecords[requestIdentity] {
             guard record.outstandingCreditGrantAcknowledgements == 0,
+                  !record.creditRefundPending,
+                  record.transferOwner?.retirementReceipt?.isComplete != false,
                   !record.queuedRequestOwned,
                   !record.unselectedControlOwned,
                   !record.originalSendOwned,
@@ -10719,7 +11208,7 @@ actor SMBSession {
             case .neverSubmitted:
                 workIsComplete = record.caller != .pending
                     && record.messageId == nil
-                    && record.credit == .refunded
+                    && (record.credit == .refunded || record.credit == .notApplicable)
             case .fullySent:
                 workIsComplete = record.wire == .finalAccepted
                     && record.originalSendOwnerRecoveredAt != nil
@@ -10890,7 +11379,8 @@ actor SMBSession {
         _ identity: SMBRequestIdentity,
         _ update: (inout SMBSessionActiveRequestRecord) -> Void
     ) {
-        guard var record = activePostAuthRequestRecords[identity] else { return }
+        guard var record = activePostAuthRequestRecords[identity],
+              record.transferOwner == nil else { return }
         update(&record)
     }
 
@@ -10901,6 +11391,35 @@ actor SMBSession {
     private func storePendingResponse(messageId: UInt64, pending: SMBPendingResponse) {
         pendingMessageIdByIdentity[pending.requestIdentity] = messageId
         pendingResponses[messageId] = pending
+    }
+
+    private func normalizeActiveRequestRecordAtTerminalJoin(_ record: SMBSessionActiveRequestRecord) {
+        if record.caller == .pending {
+            record.caller = wireFailure is CancellationError ? .cancelled : .transportError
+        }
+        switch record.send {
+        case .notStarted:
+            record.send = .neverSubmitted
+        case .committed:
+            record.send = .failed
+        case .neverSubmitted, .fullySent, .failed:
+            break
+        }
+        record.wire = .sessionTerminal
+        record.credit = .discardedOnTerminal
+        record.creditRefundPending = false
+        record.queuedRequestOwned = false
+        record.unselectedControlOwned = false
+        record.originalSendOwned = false
+        record.selectedCancelOwned = false
+        record.outstandingCreditGrantAcknowledgements = 0
+        record.cleanupTimeoutTask = nil
+        record.cleanupTimeoutIdentity = nil
+        record.wireDrainDeadline = nil
+        record.wireDrainTask = nil
+        record.wireDrainTimerIdentity = nil
+        record.creditCancellationToken = nil
+        treeCreditPreparations.removeValue(forKey: record.identity)
     }
 
     @discardableResult
@@ -10914,9 +11433,9 @@ actor SMBSession {
     }
 
     private func reclaimActivePostAuthRequestRecordIfEligible(_ identity: SMBRequestIdentity) {
-        guard let record = activePostAuthRequestRecords[identity],
+        guard let record = activePostAuthRequestRecords[identity] else { return }
+        guard
               record.caller != .pending,
-              record.outstandingCreditGrantAcknowledgements == 0,
               !record.creditRefundPending,
               !record.queuedRequestOwned,
               !record.unselectedControlOwned,
@@ -10929,6 +11448,26 @@ actor SMBSession {
               record.wireDrainTimerIdentity == nil,
               treeCreditPreparations[identity] == nil,
               pendingMessageIdByIdentity[identity] == nil else {
+            return
+        }
+
+        if let owner = record.transferOwner {
+            let deliveryUnresolved: Bool
+            switch owner.deliveryState {
+            case .pending, .active: deliveryUnresolved = true
+            case .delivered, .failed, .discarded, .notApplicable: deliveryUnresolved = false
+            }
+            guard SMBTransferRecordReclamation.isReady(
+                hasExternalOwner: owner.hasExternalOwner,
+                reservationPending: owner.reservationPending,
+                slotReleased: owner.slotReleased,
+                deliveryUnresolved: deliveryUnresolved,
+                retirementReceiptComplete: owner.retirementReceipt.map(\.isComplete) ?? true,
+                outstandingCreditGrantAcknowledgements: record.outstandingCreditGrantAcknowledgements
+            ) else {
+                return
+            }
+        } else if record.outstandingCreditGrantAcknowledgements > 0 {
             return
         }
 
@@ -10945,7 +11484,7 @@ actor SMBSession {
             case .waiting, .statusPending, .finalAccepted: return
             }
             switch record.credit {
-            case .refunded, .discardedOnTerminal: break
+            case .notApplicable, .refunded, .discardedOnTerminal: break
             case .waiting, .reserved, .prepared, .committed: return
             }
         case .fullySent:
@@ -10956,12 +11495,12 @@ actor SMBSession {
             }
             switch record.credit {
             case .committed, .refunded, .discardedOnTerminal: break
-            case .waiting, .reserved, .prepared: return
+            case .notApplicable, .waiting, .reserved, .prepared: return
             }
         case .failed:
             guard record.wire == .sessionTerminal else { return }
             switch record.credit {
-            case .refunded, .discardedOnTerminal: break
+            case .notApplicable, .refunded, .discardedOnTerminal: break
             case .waiting, .reserved, .prepared, .committed: return
             }
         case .notStarted, .committed:
@@ -10971,6 +11510,10 @@ actor SMBSession {
         completeOperationBarrierIfWireWorkIsComplete(for: identity)
         guard operationBarrierByRequest[identity] == nil else { return }
         guard activePostAuthRequestRecords.removeValue(forKey: identity) != nil else { return }
+        if let owner = record.transferOwner {
+            owner.window.reclaimEpochOwner()
+            signalTransferWindowOwnerChange(owner.handle.key.transferIdentifier)
+        }
         if let messageId = record.messageId {
             activePostAuthRequestRecordReapedHookForTesting?(messageId)
         }
@@ -10984,8 +11527,15 @@ actor SMBSession {
               record.outstandingCreditGrantAcknowledgements > 0 else {
             return
         }
-        record.outstandingCreditGrantAcknowledgements -= 1
-        reclaimActivePostAuthRequestRecordIfEligible(identity)
+        if let owner = record.transferOwner, let ticket = owner.ticket {
+            _ = transitionTransferRequest(
+                owner.handle.key.transferIdentifier,
+                .finalCreditGrantAcknowledged(ticket)
+            )
+        } else {
+            record.outstandingCreditGrantAcknowledgements -= 1
+            reclaimActivePostAuthRequestRecordIfEligible(identity)
+        }
         finalCreditGrantAcknowledgedHookForTesting?()
         sessionExecutor.recordExecutionContextForTesting(.creditGrantAcknowledgement)
     }
@@ -12615,7 +13165,14 @@ actor SMBSession {
             pending.asyncId = asyncId
             pending.pendingCount = pendingCount
             pendingResponses[effect.messageId] = pending
-            updateActivePostAuthRecord(identity) { $0.wire = .statusPending(asyncId: asyncId) }
+            if case .transfer(let ticket) = pending.completionTarget {
+                _ = transitionTransferRequest(
+                    ticket.transferIdentifier,
+                    .wireStatusPending(ticket, asyncId: asyncId)
+                )
+            } else {
+                updateActivePostAuthRecord(identity) { $0.wire = .statusPending(asyncId: asyncId) }
+            }
             debugLine("\(pending.label) accepted interim STATUS_PENDING AsyncId=\(asyncId)")
         case .final(let asyncId, let pendingCount, let frame, let status, let sendPhase, let acceptedAt):
             guard advanceCleanupAtFinalAcceptance(messageId: effect.messageId, acceptedAt: acceptedAt) else {
@@ -12635,6 +13192,14 @@ actor SMBSession {
                 return
             }
             lastFinalAcceptanceForTestingStorage = acceptedAt
+            if let pending = pendingResponses[effect.messageId],
+               pending.requestIdentity == identity,
+               case .transfer(let ticket) = pending.completionTarget {
+                _ = transitionTransferRequest(
+                    ticket.transferIdentifier,
+                    .wireFinalAccepted(ticket, at: acceptedAt, hasGrant: effect.credits != nil)
+                )
+            }
             if var pending = pendingResponses[effect.messageId],
                pending.requestIdentity == identity,
                pending.usesSenderLoop {
@@ -12642,7 +13207,14 @@ actor SMBSession {
                 guard let activeRecord else { return }
                 if let deadline = activeRecord.wireDrainDeadline, acceptedAt >= deadline {
                     pending.wireDrainExpired = true
-                    updateActivePostAuthRecord(identity) { $0.wire = .sessionTerminal }
+                    if case .transfer(let ticket) = pending.completionTarget {
+                        _ = transitionTransferRequest(
+                            ticket.transferIdentifier,
+                            .callerTerminal(ticket, state: .timedOut, wire: .sessionTerminal)
+                        )
+                    } else {
+                        updateActivePostAuthRecord(identity) { $0.wire = .sessionTerminal }
+                    }
                     if let timerIdentity = activeRecord.wireDrainTimerIdentity {
                         terminalWireDrainTimerIdentities.insert(timerIdentity)
                     }
@@ -12673,10 +13245,14 @@ actor SMBSession {
                         at: acceptedAt
                     )
                 }
-                activeRecord.wire = .finalAccepted
-                activeRecord.finalAcceptedAt = acceptedAt
-                if effect.credits != nil {
-                    activeRecord.outstandingCreditGrantAcknowledgements += 1
+                if case .transfer = pending.completionTarget {
+                    // Transfer wire state is projected through transitionTransferRequest above.
+                } else {
+                    activeRecord.wire = .finalAccepted
+                    activeRecord.finalAcceptedAt = acceptedAt
+                    if effect.credits != nil {
+                        activeRecord.outstandingCreditGrantAcknowledgements += 1
+                    }
                 }
                 if pending.cancelQueued {
                     queuedControlSends.removeAll { $0.requestIdentity == identity }
@@ -13154,9 +13730,13 @@ actor SMBSession {
         requestSentCountForTestingStorage += 1
         pending.sendPhase = .sent
         if pending.usesSenderLoop {
-            updateActivePostAuthRecord(pending.requestIdentity) {
-                $0.send = .fullySent
-                $0.originalSendOwned = false
+            if case .transfer = pending.completionTarget {
+                // Transfer send ownership is updated only by transitionTransferRequest.
+            } else {
+                updateActivePostAuthRecord(pending.requestIdentity) {
+                    $0.send = .fullySent
+                    $0.originalSendOwned = false
+                }
             }
         }
         pendingResponses[messageId] = pending
@@ -13276,9 +13856,16 @@ actor SMBSession {
                 return
             }
         }
-        updateActivePostAuthRecord(current.requestIdentity) {
-            $0.caller = .timedOut
-            $0.wire = .sessionTerminal
+        if case .transfer(let ticket) = current.completionTarget {
+            _ = transitionTransferRequest(
+                ticket.transferIdentifier,
+                .callerTerminal(ticket, state: .timedOut, wire: .sessionTerminal)
+            )
+        } else {
+            updateActivePostAuthRecord(current.requestIdentity) {
+                $0.caller = .timedOut
+                $0.wire = .sessionTerminal
+            }
         }
         guard var pending = removePendingResponse(messageId: messageId) else { return }
         pending.timeoutTask?.cancel()
@@ -13302,6 +13889,24 @@ actor SMBSession {
 
     private func failPendingResponse(messageId: UInt64, error: Error) {
         guard var pending = pendingResponses[messageId] else { return }
+        if case .transfer(let ticket) = pending.completionTarget {
+            let callerState: SMBRequestCallerState
+            if error is CancellationError {
+                callerState = .cancelled
+            } else if let transportError = error as? SMBTransportError, transportError == .timedOut {
+                callerState = .timedOut
+            } else {
+                callerState = .transportError
+            }
+            _ = transitionTransferRequest(
+                ticket.transferIdentifier,
+                .callerTerminal(
+                    ticket,
+                    state: callerState,
+                    wire: error is CancellationError ? nil : .sessionTerminal
+                )
+            )
+        }
         pending.timeoutTask?.cancel()
         pending.timeoutTask = nil
         pending.timeoutIdentity = nil
@@ -13384,6 +13989,7 @@ actor SMBSession {
         resumeCancelledRequestDrainWaiters()
         cancelledBeforeEnqueue.removeAll()
         for identity in Array(activePostAuthRequestRecords.keys) {
+            guard activePostAuthRequestRecords[identity]?.transferOwner == nil else { continue }
             updateActivePostAuthRecord(identity) { record in
                 if record.caller == .pending {
                     record.caller = error is CancellationError ? .cancelled : .transportError
@@ -13696,14 +14302,14 @@ actor SMBSession {
         waitIfUnavailable: Bool,
         command: UInt16,
         treeId: UInt32,
-        generation: UInt64
+        generation: UInt64,
+        requestIdentity: SMBRequestIdentity
     ) async throws -> SMBTransferCreditPreparation {
         guard isGenerationActive(generation),
               let treeIdentity = treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId) else {
             throw wireFailure ?? SMBTransportError.connectionClosed
         }
         let operation = command == SMB2Commands.read ? "READ" : "WRITE"
-        let requestIdentity = makeRequestIdentity(generation: generation)
         try validateTreeAdmission(
             treeId: treeId,
             command: command,
@@ -13743,7 +14349,17 @@ actor SMBSession {
 
         let cancellationToken: SMBTreeCreditCancellationToken?
         if shouldRegisterRetirementToken {
-            let token = SMBTreeCreditCancellationToken(tree: treeIdentity, request: requestIdentity)
+            let grantAcceptanceGate: (@Sendable (UInt16) -> Task<Void, Never>?)?
+            if let hook = transferCreditGrantAcceptanceGateForTesting {
+                grantAcceptanceGate = { charge in hook(requestIdentity, charge) }
+            } else {
+                grantAcceptanceGate = nil
+            }
+            let token = SMBTreeCreditCancellationToken(
+                tree: treeIdentity,
+                request: requestIdentity,
+                grantClaimedBeforeAcceptForTesting: grantAcceptanceGate
+            )
             cancellationToken = token
             treeCreditPreparations[requestIdentity] = SMBTreeCreditPreparation(
                 treeIdentity: treeIdentity,
@@ -14071,6 +14687,754 @@ actor SMBSession {
 }
 
 extension SMBSession {
+    private func transitionTransferRequest(
+        _ transferIdentifier: UInt64,
+        _ event: SMBTransferRequestTransition
+    ) -> SMBTransferRequestTransitionResult {
+        let readState = readTransfers[transferIdentifier]
+        let writeState = writeTransfers[transferIdentifier]
+        guard let window = readState?.window ?? writeState?.window else { return .none }
+
+        switch event {
+        case .beginPreparing(let identity, let candidateLength, let countsTowardWireDrain, let supplierOwned):
+            guard activePostAuthRequestRecords[identity] == nil,
+                  let slotIndex = window.beginPreparing(
+                    candidateLength: candidateLength,
+                    countsTowardWireDrain: countsTowardWireDrain,
+                    requestIdentity: identity,
+                    externalOwner: supplierOwned
+                  ),
+                  let key = window.preparingRequestKey(slotIndex: slotIndex) else {
+                return .slot(nil)
+            }
+            let treeId = readState?.treeId ?? writeState?.treeId ?? 0
+            guard let treeIdentity = treeIdentityByTreeId[treeId] ?? ensureTreeIdentity(treeId: treeId) else {
+                _ = window.revokePreparing(slotIndex: slotIndex, at: nil)
+                return .slot(nil)
+            }
+            let fileId = readState?.fileId ?? writeState?.fileId ?? []
+            let command = readState == nil ? SMB2Commands.write : SMB2Commands.read
+            let deadline = readState?.operationDeadline ?? writeState?.operationDeadline
+            let requestHandle = SMBTransferRequestHandle(key: key)
+            let record = SMBSessionActiveRequestRecord(
+                identity: identity,
+                command: command,
+                sessionId: sessionId,
+                treeId: treeId,
+                fileId: SMBFileIdLedgerKey(bytes: fileId, treeIdentity: treeIdentity),
+                cleanupKey: nil,
+                treeIdentity: treeIdentity,
+                cleanupTreeIdentity: nil,
+                cleanupDeadlines: nil,
+                creditCancellationToken: nil,
+                maximumCreditCharge: max(1, SMB2Credit.charge(forPayloadLength: UInt64(candidateLength))),
+                longPoll: false,
+                requestTimeoutPolicy: .eligible,
+                responseProtectionPolicy: encryptionKey == nil ? .sessionDefault : .encryptedRequest,
+                operationDeadline: deadline
+            )
+            record.transferOwner = SMBTransferRequestOwner(
+                handle: requestHandle,
+                window: window,
+                supplierOwned: supplierOwned
+            )
+            window.registerEpochOwner()
+            activePostAuthRequestRecords[identity] = record
+            return .slot(slotIndex)
+
+        case .reservationPending(let slotIndex):
+            window.markPreparingReservationPending(slotIndex: slotIndex)
+            if let key = window.preparingRequestKey(slotIndex: slotIndex),
+               let record = activePostAuthRequestRecords[key.requestIdentity],
+               record.transferOwner?.handle.key == key {
+                record.transferOwner?.reservationPending = true
+                record.credit = .waiting
+            }
+            return .none
+
+        case .reservationSettled(let slotIndex, let charge, let cancellationToken):
+            guard let key = window.preparingRequestKey(slotIndex: slotIndex),
+                  let record = activePostAuthRequestRecords[key.requestIdentity],
+                  record.transferOwner?.handle.key == key else { return .none }
+            record.transferOwner?.reservationPending = false
+            record.transferOwner?.reservedCharge = charge
+            record.creditCancellationToken = cancellationToken
+            if charge > 0 {
+                record.credit = .reserved(maximumCharge: record.maximumCreditCharge)
+            } else {
+                record.credit = .notApplicable
+            }
+            return .none
+
+        case .supplierReturned(let slotIndex):
+            guard let key = window.preparingRequestKey(slotIndex: slotIndex),
+                  let record = activePostAuthRequestRecords[key.requestIdentity],
+                  record.transferOwner?.handle.key == key else {
+                return .none
+            }
+            record.transferOwner?.supplierOwned = false
+            window.clearPreparingExternalOwner(slotIndex: slotIndex)
+            return .none
+
+        case .sourceEOF(let slotIndex, let time):
+            guard let key = window.preparingRequestKey(slotIndex: slotIndex),
+                  let record = activePostAuthRequestRecords[key.requestIdentity],
+                  record.transferOwner?.handle.key == key else {
+                _ = window.revokePreparingForSourceEOF(slotIndex: slotIndex, at: time)
+                return .none
+            }
+            record.transferOwner?.supplierOwned = false
+            _ = window.revokePreparingForSourceEOF(slotIndex: slotIndex, at: time)
+            closeNoTicketTransferRequest(record, refunded: false)
+            reportTransferRequestOwnershipForTesting(record)
+            reclaimActivePostAuthRequestRecordIfEligible(key.requestIdentity)
+            return .none
+
+        case .revokePreparing(let slotIndex, let time):
+            let key = window.preparingRequestKey(slotIndex: slotIndex)
+            guard window.revokePreparing(slotIndex: slotIndex, at: time) else { return .bool(false) }
+            if let key, let record = activePostAuthRequestRecords[key.requestIdentity],
+               record.transferOwner?.handle.key == key {
+                record.transferOwner?.supplierOwned = false
+                if record.transferOwner?.retirementReceipt != nil {
+                    record.transferOwner?.slotReleased = true
+                    if record.transferOwner?.retirementRefundsPending == 0 {
+                        record.transferOwner?.retirementRefundAcknowledged = true
+                        record.creditRefundPending = false
+                    }
+                } else {
+                    closeNoTicketTransferRequest(record, refunded: (record.transferOwner?.reservedCharge ?? 0) > 0)
+                }
+                closeTransferRetirementReceiptIfReady(record)
+                reportTransferRequestOwnershipForTesting(record)
+                reclaimActivePostAuthRequestRecordIfEligible(key.requestIdentity)
+            }
+            return .bool(true)
+
+        case .commit(let slotIndex, let identity, let messageID, let requestedLength, let time):
+            guard let record = activePostAuthRequestRecords[identity],
+                  let owner = record.transferOwner,
+                  let ticket = window.commit(
+                    slotIndex: slotIndex,
+                    requestIdentity: identity,
+                    messageID: messageID,
+                    requestedLength: requestedLength,
+                    at: time,
+                    requestHandle: owner.handle
+                  ) else {
+                return .ticket(nil)
+            }
+            record.transferOwner?.ticket = ticket
+            record.credit = .prepared(
+                maximumCharge: record.maximumCreditCharge,
+                actualCharge: record.transferOwner?.reservedCharge ?? 0
+            )
+            return .ticket(ticket)
+
+        case .selectedPrecommit(let ticket):
+            guard let record = transferRecord(for: ticket),
+                  window.setExternalOwner(true, for: ticket) else { return .none }
+            record.queuedRequestOwned = false
+            record.transferOwner?.selectedPrecommitOwned = true
+            record.transferOwner?.packetOwned = true
+            reportTransferRequestOwnershipForTesting(record)
+            return .none
+
+        case .precommitRejected(let ticket, let caller):
+            guard let record = transferRecord(for: ticket) else { return .none }
+            if record.caller == .pending { record.caller = caller }
+            if case .notStarted = record.send { record.send = .neverSubmitted }
+            record.queuedRequestOwned = false
+            return .none
+
+        case .selectedPrecommitReturned(let ticket, let time):
+            guard let record = transferRecord(for: ticket) else { return .none }
+            record.transferOwner?.selectedPrecommitOwned = false
+            record.transferOwner?.packetOwned = false
+            _ = window.setExternalOwner(false, for: ticket)
+            finishUnsentRetirementSlotIfReady(record, ticket: ticket, window: window, at: time)
+            closeTransferRetirementReceiptIfReady(record)
+            reportTransferRequestOwnershipForTesting(record)
+            reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            return .none
+
+        case .wireCommitted(let ticket, let messageId, let charge):
+            guard let record = transferRecord(for: ticket) else { return .none }
+            record.transferOwner?.selectedPrecommitOwned = false
+            record.transferOwner?.packetOwned = false
+            _ = window.setExternalOwner(false, for: ticket)
+            record.messageId = messageId
+            record.send = .committed(messageId: messageId, charge: charge)
+            record.credit = .committed(actualCharge: charge)
+            record.wire = .waiting
+            record.queuedRequestOwned = false
+            record.originalSendOwned = true
+            return .none
+
+        case .wireStatusPending(let ticket, let asyncId):
+            guard let record = transferRecord(for: ticket) else { return .none }
+            record.wire = .statusPending(asyncId: asyncId)
+            return .none
+
+        case .wireFinalAccepted(let ticket, let acceptedAt, let hasGrant):
+            guard let record = transferRecord(for: ticket) else { return .none }
+            record.wire = .finalAccepted
+            record.finalAcceptedAt = acceptedAt
+            if hasGrant { record.outstandingCreditGrantAcknowledgements += 1 }
+            return .none
+
+        case .finalCreditGrantAcknowledged(let ticket):
+            guard let record = transferRecord(for: ticket),
+                  record.outstandingCreditGrantAcknowledgements > 0 else { return .none }
+            record.outstandingCreditGrantAcknowledgements -= 1
+            closeTransferRetirementReceiptIfReady(record)
+            reportTransferRequestOwnershipForTesting(record)
+            reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            return .none
+
+        case .callerTerminal(let ticket, let callerState, let wireState):
+            guard let record = transferRecord(for: ticket) else { return .none }
+            if record.caller == .pending { record.caller = callerState }
+            if let wireState { record.wire = wireState }
+            return .none
+
+        case .retirementRefundAcknowledged(let ticket, let time):
+            guard let record = transferRecord(for: ticket) else { return .none }
+            if let pendingRefunds = record.transferOwner?.retirementRefundsPending, pendingRefunds > 0 {
+                record.transferOwner?.retirementRefundsPending = pendingRefunds - 1
+                let refundsComplete = pendingRefunds == 1
+                record.transferOwner?.retirementRefundAcknowledged = refundsComplete
+                if refundsComplete {
+                    record.credit = .refunded
+                    record.creditRefundPending = false
+                }
+            } else if record.wire != .sessionTerminal {
+                record.credit = .refunded
+                record.creditRefundPending = false
+            }
+            finishUnsentRetirementSlotIfReady(record, ticket: ticket, window: window, at: time)
+            closeTransferRetirementReceiptIfReady(record)
+            reportTransferRequestOwnershipForTesting(record)
+            reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            signalTransferWindowOwnerChange(transferIdentifier)
+            return .none
+
+        case .preparationRetirementAcknowledged(let identity, _):
+            guard let record = activePostAuthRequestRecords[identity],
+                  let pendingRefunds = record.transferOwner?.retirementRefundsPending,
+                  pendingRefunds > 0 else { return .none }
+            record.transferOwner?.retirementRefundsPending = pendingRefunds - 1
+            record.transferOwner?.retirementRefundAcknowledged = pendingRefunds == 1
+            if pendingRefunds == 1 { record.creditRefundPending = false }
+            closeTransferRetirementReceiptIfReady(record)
+            reportTransferRequestOwnershipForTesting(record)
+            reclaimActivePostAuthRequestRecordIfEligible(identity)
+            return .none
+
+        case .sendStarted(let ticket):
+            return .bool(window.markSendStarted(ticket))
+
+        case .retireUnsent(let ticket, let time):
+            return retireUnsentTransferRequestInTransition(ticket, window: window, at: time)
+
+        case .treeRefusal(let ticket, _, let time):
+            guard let record = transferRecord(for: ticket), record.messageId == nil else {
+                return retireUnsentTransferRequestInTransition(ticket, window: window, at: time)
+            }
+            let refusal = transferTreeRefusalError(for: record)
+            let reason = SMBTransferStopReason.offsetFailure(offset: ticket.offset, error: refusal)
+            window.stop(
+                for: reason,
+                at: time,
+                cleanupTimeout: cleanupTimeout,
+                operationDeadline: readState?.operationDeadline ?? writeState?.operationDeadline
+            )
+            return retireUnsentTransferRequestInTransition(ticket, window: window, at: time)
+
+        case .treeRefusalPreparation(let identity, _, let time):
+            guard let record = activePostAuthRequestRecords[identity],
+                  let owner = record.transferOwner else { return .none }
+            let refusal = transferTreeRefusalError(for: record)
+            let reason = SMBTransferStopReason.offsetFailure(offset: owner.window.requestFrontier, error: refusal)
+            owner.window.stop(
+                for: reason,
+                at: time,
+                cleanupTimeout: cleanupTimeout,
+                operationDeadline: record.operationDeadline
+            )
+            record.caller = .noWireWork
+            record.send = .neverSubmitted
+            record.wire = .notApplicable
+            record.transferOwner?.deliveryState = .notApplicable
+            if owner.reservationPending, record.transferOwner?.retirementReceipt == nil {
+                let receipt = SMBRetirementReceipt(
+                    identity: identity,
+                    completion: SMBRetirementReceiptCompletion()
+                )
+                record.transferOwner?.retirementReceipt = receipt
+                owner.handle.receiptSlot = receipt
+                record.transferOwner?.retirementQueueRemovalAcknowledged = true
+                record.transferOwner?.retirementRefundAcknowledged = false
+                record.transferOwner?.retirementRefundsPending = 1
+                record.creditRefundPending = true
+            }
+            if !owner.reservationPending, !owner.supplierOwned, owner.reservedCharge == 0 {
+                let slotIndex = owner.handle.key.slotIndex
+                _ = owner.window.revokePreparing(slotIndex: slotIndex, at: time)
+                closeNoTicketTransferRequest(record, refunded: false)
+                reportTransferRequestOwnershipForTesting(record)
+                closeTransferRetirementReceiptIfReady(record)
+                reclaimActivePostAuthRequestRecordIfEligible(identity)
+            }
+            reportTransferRequestOwnershipForTesting(record)
+            return .none
+
+        case .finishUnsentRetirement(let ticket, let time):
+            guard let record = transferRecord(for: ticket),
+                  record.transferOwner?.canReleaseRetiringSlot == true,
+                  window.finishUnsentRetirement(ticket, at: time) else { return .bool(false) }
+            record.transferOwner?.slotReleased = true
+            closeTransferRetirementReceiptIfReady(record)
+            reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            signalTransferWindowOwnerChange(transferIdentifier)
+            return .bool(true)
+
+        case .fullySent(let ticket, let responseDeadline, let time):
+            guard window.markFullySent(ticket, responseDeadline: responseDeadline, at: time),
+                  let record = transferRecord(for: ticket) else { return .bool(false) }
+            record.send = .fullySent
+            record.originalSendOwned = false
+            return .bool(true)
+
+        case .sendOwnerReturned(let ticket, let time):
+            return .bool(window.markSendOwnerFinished(ticket, at: time))
+
+        case .acceptFinal(let ticket, let result, let time):
+            guard window.acceptFinal(result, for: ticket, at: time),
+                  let record = transferRecord(for: ticket) else { return .bool(false) }
+            if record.caller == .pending { record.caller = .success }
+            if record.messageId == nil {
+                if case .notStarted = record.send { record.send = .neverSubmitted }
+                record.wire = .notApplicable
+            } else {
+                record.wire = .finalAccepted
+            }
+            reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            return .bool(true)
+
+        case .finishDecode(let ticket, let result, let time):
+            let completed: Bool
+            if window.terminallyClosed,
+               let record = transferRecord(for: ticket),
+               record.transferOwner?.decodeOwned == true {
+                completed = window.releaseTerminalOwnedSlot(ticket)
+                if completed {
+                    record.transferOwner?.decodeOwned = false
+                    record.transferOwner?.deliveryState = .discarded
+                    record.transferOwner?.slotReleased = window.isSlotVacant(ticket.slotIndex)
+                }
+            } else {
+                completed = window.finishPendingReadDecode(result, for: ticket, at: time)
+            }
+            if completed, let record = transferRecord(for: ticket) {
+                record.transferOwner?.decodeOwned = false
+                if !window.terminallyClosed {
+                    _ = window.setExternalOwner(false, for: ticket)
+                }
+                reportTransferRequestOwnershipForTesting(record)
+                reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            }
+            return .bool(completed)
+
+        case .beginDecode(let ticket):
+            guard let record = transferRecord(for: ticket), window.isPendingReadDecode(for: ticket) else {
+                return .bool(false)
+            }
+            record.transferOwner?.decodeOwned = true
+            _ = window.setExternalOwner(true, for: ticket)
+            reportTransferRequestOwnershipForTesting(record)
+            return .bool(true)
+
+        case .beginDelivery:
+            guard let retirement = window.beginNextRetirement(),
+                  let record = transferRecord(for: retirement.ticket) else {
+                return .retirement(nil)
+            }
+            record.transferOwner?.deliveryOwned = true
+            record.transferOwner?.deliveryState = .active
+            _ = window.setExternalOwner(true, for: retirement.ticket)
+            reportTransferRequestOwnershipForTesting(record)
+            return .retirement(retirement)
+
+        case .finishDelivery(let ticket, let advanceFrontier, let outcome):
+            guard let record = transferRecord(for: ticket) else { return .bool(false) }
+            let finished: Bool
+            if window.terminallyClosed, record.transferOwner?.deliveryOwned == true {
+                finished = window.releaseTerminalOwnedSlot(ticket)
+            } else {
+                finished = window.finishRetirement(ticket, advanceFrontier: advanceFrontier)
+                    && window.releaseRetiredSlot(ticket)
+            }
+            guard finished else { return .bool(false) }
+            record.transferOwner?.deliveryOwned = false
+            record.transferOwner?.deliveryState = window.terminallyClosed ? .discarded : outcome
+            record.transferOwner?.slotReleased = window.isSlotVacant(ticket.slotIndex)
+            if !window.terminallyClosed {
+                _ = window.setExternalOwner(false, for: ticket)
+            }
+            reportTransferRequestOwnershipForTesting(record)
+            reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            signalTransferWindowOwnerChange(transferIdentifier)
+            return .bool(true)
+
+        case .releaseSlot(let ticket):
+            let released = window.releaseRetiredSlot(ticket)
+            if released, let record = transferRecord(for: ticket) {
+                record.transferOwner?.slotReleased = true
+                reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            }
+            return .bool(released)
+
+        case .discardCompleted(let ticket, let forStop):
+            let discarded = forStop
+                ? window.discardCompletedSlotForStop(ticket)
+                : window.discardCompletedSlot(ticket)
+            guard discarded, let record = transferRecord(for: ticket) else { return .bool(false) }
+            _ = window.releaseRetiredSlot(ticket)
+            record.transferOwner?.deliveryState = .discarded
+            record.transferOwner?.deliveryOwned = false
+            record.transferOwner?.slotReleased = true
+            reportTransferRequestOwnershipForTesting(record)
+            reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+            return .bool(true)
+
+        case .stop(let reason, let time, let cleanupTimeout, let operationDeadline):
+            window.stop(for: reason, at: time, cleanupTimeout: cleanupTimeout, operationDeadline: operationDeadline)
+            return .none
+
+        case .terminalClose:
+            window.markTerminalClose()
+            return .none
+
+        case .terminalJoin(let time):
+            window.markTerminalSendOwnersJoined(at: time)
+            let ownedRecords = Array(activePostAuthRequestRecords.values.filter { $0.transferOwner?.window === window })
+            for record in ownedRecords {
+                normalizeActiveRequestRecordAtTerminalJoin(record)
+                guard var owner = record.transferOwner else { continue }
+                owner.reservationPending = false
+                owner.selectedPrecommitOwned = false
+                owner.packetOwned = false
+                owner.retirementRefundsPending = 0
+                owner.retirementRefundAcknowledged = true
+                owner.retirementTimerAcknowledged = true
+                if owner.ticket == nil {
+                    owner.deliveryState = owner.hasExternalOwner ? owner.deliveryState : .notApplicable
+                } else if !owner.hasExternalOwner, owner.deliveryState == .pending {
+                    owner.deliveryState = .discarded
+                }
+                record.transferOwner = owner
+                if let ticket = owner.ticket {
+                    _ = window.setExternalOwner(owner.hasExternalOwner, for: ticket)
+                }
+            }
+            window.reclaimSlotsAfterTerminalJoin()
+            for record in ownedRecords {
+                if let owner = record.transferOwner,
+                   !owner.hasExternalOwner,
+                   window.isSlotVacant(owner.handle.key.slotIndex) {
+                    record.transferOwner?.slotReleased = true
+                }
+                closeTransferRetirementReceiptIfReady(record)
+                reportTransferRequestOwnershipForTesting(record)
+                reclaimActivePostAuthRequestRecordIfEligible(record.identity)
+            }
+            return .none
+
+        case .beginNextEpoch(let offset):
+            return .epoch(window.beginNextEpoch(at: offset))
+        }
+    }
+
+    private func transferRecord(for ticket: SMBTransferTicket) -> SMBSessionActiveRequestRecord? {
+        guard let record = activePostAuthRequestRecords[ticket.requestIdentity],
+              record.transferOwner?.handle.key == ticket.requestKey else { return nil }
+        return record
+    }
+
+    private func closeNoTicketTransferRequest(_ record: SMBSessionActiveRequestRecord, refunded: Bool) {
+        guard var owner = record.transferOwner else { return }
+        let terminallyClosed = owner.window.terminallyClosed
+        owner.deliveryState = .notApplicable
+        owner.slotReleased = true
+        owner.supplierOwned = false
+        owner.reservationPending = false
+        record.transferOwner = owner
+        if !terminallyClosed {
+            record.caller = .noWireWork
+            record.send = .neverSubmitted
+            record.wire = .notApplicable
+            if owner.reservedCharge == 0 {
+                record.credit = .notApplicable
+            } else if refunded {
+                record.credit = .refunded
+            }
+        }
+    }
+
+    private func closeTransferRetirementReceiptIfReady(_ record: SMBSessionActiveRequestRecord) {
+        guard let owner = record.transferOwner,
+              owner.canCloseRetirementReceipt,
+              record.outstandingCreditGrantAcknowledgements == 0,
+              !record.creditRefundPending,
+              let receipt = owner.retirementReceipt,
+              !receipt.isComplete else { return }
+        receipt.markComplete()
+    }
+
+    private func finishUnsentRetirementSlotIfReady(
+        _ record: SMBSessionActiveRequestRecord,
+        ticket: SMBTransferTicket,
+        window: SMBTransferWindow,
+        at time: ContinuousClock.Instant
+    ) {
+        guard record.transferOwner?.canReleaseRetiringSlot == true,
+              window.finishUnsentRetirement(ticket, at: time) else { return }
+        record.transferOwner?.slotReleased = true
+    }
+
+    private func retireUnsentTransferRequestInTransition(
+        _ ticket: SMBTransferTicket,
+        window: SMBTransferWindow,
+        at time: ContinuousClock.Instant
+    ) -> SMBTransferRequestTransitionResult {
+        guard let record = transferRecord(for: ticket) else {
+            if let receipt = ticket.requestHandle.receiptSlot {
+                return .retirementDecision(.alreadyRetired(receipt), shouldStartPump: false)
+            }
+            return .retirementDecision(.committedNeedsWireDrain(ticket.requestIdentity), shouldStartPump: false)
+        }
+        if let receipt = record.transferOwner?.retirementReceipt {
+            reportTransferRequestOwnershipForTesting(record, duplicateRetirementObserved: true)
+            return .retirementDecision(.alreadyRetired(receipt), shouldStartPump: false)
+        }
+        guard window.retireUnsent(ticket, at: time) else {
+            return .retirementDecision(.committedNeedsWireDrain(ticket.requestIdentity), shouldStartPump: false)
+        }
+        let receipt = SMBRetirementReceipt(
+            identity: ticket.requestIdentity,
+            completion: SMBRetirementReceiptCompletion()
+        )
+        record.transferOwner?.retirementReceipt = receipt
+        ticket.requestHandle.receiptSlot = receipt
+        if let queuedIndex = queuedPostAuthRequests.firstIndex(where: { $0.identity == ticket.requestIdentity }) {
+            _ = queuedPostAuthRequests.remove(at: queuedIndex)
+        }
+        record.queuedRequestOwned = false
+        record.transferOwner?.deliveryState = .notApplicable
+        record.transferOwner?.retirementQueueRemovalAcknowledged = true
+        record.transferOwner?.retirementRefundAcknowledged = false
+        record.caller = .noWireWork
+        record.send = .neverSubmitted
+        record.wire = .notApplicable
+        record.transferOwner?.supplierOwned = false
+        let lateGrant = record.creditCancellationToken?.cancel() ?? 0
+        let reservedCharge = record.transferOwner?.reservedCharge ?? 0
+        let refunds = [reservedCharge, lateGrant].filter { $0 > 0 }
+        record.transferOwner?.retirementRefundsPending = refunds.count
+        record.transferOwner?.retirementRefundAcknowledged = refunds.isEmpty
+        let shouldStartPump = !refunds.isEmpty
+        reportTransferRequestOwnershipForTesting(record)
+        if shouldStartPump {
+            record.creditRefundPending = true
+            for charge in refunds {
+                transferRetirementRefundWorklist.append(
+                    SMBTransferRetirementRefundWork(
+                        requestIdentity: ticket.requestIdentity,
+                        transferIdentifier: ticket.transferIdentifier,
+                        ticket: ticket,
+                        charge: charge
+                    )
+                )
+            }
+        } else {
+            record.credit = .notApplicable
+            finishUnsentRetirementSlotIfReady(record, ticket: ticket, window: window, at: time)
+            closeTransferRetirementReceiptIfReady(record)
+            reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)
+        }
+        return .retirementDecision(.retiredLocally(receipt), shouldStartPump: shouldStartPump)
+    }
+
+    private func reportTransferRequestOwnershipForTesting(
+        _ record: SMBSessionActiveRequestRecord,
+        duplicateRetirementObserved: Bool = false
+    ) {
+        guard let hook = transferRequestOwnershipHookForTesting,
+              let owner = record.transferOwner else { return }
+        let key = owner.handle.key
+        hook(SMBTransferRequestOwnershipSnapshot(
+            identity: record.identity,
+            command: record.command,
+            transferIdentifier: key.transferIdentifier,
+            slotIndex: key.slotIndex,
+            slotSequence: key.slotSequence,
+            caller: record.caller,
+            send: record.send,
+            wire: record.wire,
+            credit: record.credit,
+            packetOwned: owner.packetOwned,
+            selectedPrecommitOwned: owner.selectedPrecommitOwned,
+            slotReleased: owner.slotReleased,
+            slotVacant: owner.window.isSlotVacant(key.slotIndex),
+            duplicateRetirementObserved: duplicateRetirementObserved,
+            offset: owner.ticket?.offset,
+            supplierOwned: owner.supplierOwned,
+            decodeOwned: owner.decodeOwned,
+            deliveryUnresolved: owner.deliveryState == .pending || owner.deliveryState == .active,
+            deliveryOwned: owner.deliveryOwned,
+            deliveryDiscarded: owner.deliveryState == .discarded,
+            reservedCharge: owner.reservedCharge,
+            outstandingCreditGrantAcknowledgements: record.outstandingCreditGrantAcknowledgements,
+            retirementReceiptIdentifier: owner.retirementReceipt?.id,
+            retirementReceiptComplete: owner.retirementReceipt?.isComplete ?? false,
+            retirementRefundsPending: owner.retirementRefundsPending,
+            epochOutstandingOwnerCount: owner.window.epochOutstandingOwnerCount
+        ))
+    }
+
+    private func signalTransferWindowOwnerChange(_ transferIdentifier: UInt64) {
+        if let state = readTransfers[transferIdentifier] {
+            signalReadTransfer(state)
+        } else if let state = writeTransfers[transferIdentifier] {
+            signalWriteTransfer(state)
+        }
+    }
+
+    private func retireStoppedTransferTickets(in window: SMBTransferWindow) {
+        let tickets = activePostAuthRequestRecords.values.compactMap { record -> SMBTransferTicket? in
+            guard record.transferOwner?.window === window,
+                  let ticket = record.transferOwner?.ticket,
+                  record.messageId == nil else { return nil }
+            return ticket
+        }
+        for ticket in tickets {
+            _ = retireUnsentTransferRequest(ticket)
+        }
+    }
+
+    private func retireUnsentTransferRequest(
+        _ ticket: SMBTransferTicket
+    ) -> SMBUnsentRetirementDecision {
+        guard case .retirementDecision(let decision, let shouldStartPump) = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .retireUnsent(ticket, at: sessionTime.now())
+        ) else {
+            if let receipt = ticket.requestHandle.receiptSlot {
+                return .alreadyRetired(receipt)
+            }
+            return .committedNeedsWireDrain(ticket.requestIdentity)
+        }
+        resumeSatisfiedTestingCountWaiters()
+        if shouldStartPump {
+            startTransferRetirementEffectPumpIfNeeded()
+        }
+        return decision
+    }
+
+    private func startTransferRetirementEffectPumpIfNeeded() {
+        guard !transferRetirementRefundWorklist.isEmpty else { return }
+        if transferRetirementEffectPumpTask != nil {
+            wakeTransferRetirementEffectPump()
+            return
+        }
+        // This coordinator owns one structured child Task per dispatched refund. The live child
+        // Task count is bounded by the number of currently running retirement effects; queued
+        // effects do not create Tasks until the pump registers them with its task group. A fixed
+        // worker count would serialize independent retirement effects and is intentionally avoided.
+        transferRetirementEffectPumpCompletedChildren = 0
+        transferRetirementEffectPumpTask = Task(executorPreference: sessionExecutor) { [weak self] in
+            await self?.runTransferRetirementEffectPump()
+        }
+    }
+
+    private func wakeTransferRetirementEffectPump() {
+        transferRetirementEffectPumpWakeRevision &+= 1
+        let continuation = transferRetirementEffectPumpWakeContinuation
+        transferRetirementEffectPumpWakeContinuation = nil
+        continuation?.resume()
+    }
+
+    private func waitForTransferRetirementEffectPumpWake(after revision: UInt64) async {
+        guard transferRetirementEffectPumpWakeRevision == revision else { return }
+        await withCheckedContinuation { continuation in
+            guard transferRetirementEffectPumpWakeRevision == revision else {
+                continuation.resume()
+                return
+            }
+            transferRetirementEffectPumpWakeContinuation = continuation
+        }
+    }
+
+    private func transferRetirementEffectPumpChildDidComplete() {
+        transferRetirementEffectPumpCompletedChildren += 1
+        wakeTransferRetirementEffectPump()
+    }
+
+    private func runTransferRetirementEffectPump() async {
+        await withTaskGroup(of: Void.self) { group in
+            var activeChildCount = 0
+            while true {
+                let observedWakeRevision = transferRetirementEffectPumpWakeRevision
+                while !transferRetirementRefundWorklist.isEmpty {
+                    let work = transferRetirementRefundWorklist.removeFirst()
+                    activeChildCount += 1
+                    group.addTask { [weak self] in
+                        guard let self else { return }
+                        await self.runTransferRetirementRefundEffect(work)
+                        await self.transferRetirementEffectPumpChildDidComplete()
+                    }
+                }
+                while transferRetirementEffectPumpCompletedChildren > 0 {
+                    _ = await group.next()
+                    transferRetirementEffectPumpCompletedChildren -= 1
+                    activeChildCount -= 1
+                }
+                if activeChildCount == 0 && transferRetirementRefundWorklist.isEmpty {
+                    break
+                }
+                await waitForTransferRetirementEffectPumpWake(after: observedWakeRevision)
+            }
+        }
+        transferRetirementEffectPumpWakeContinuation = nil
+        transferRetirementEffectPumpTask = nil
+        if !transferRetirementRefundWorklist.isEmpty {
+            startTransferRetirementEffectPumpIfNeeded()
+        }
+    }
+
+    private func runTransferRetirementRefundEffect(
+        _ work: SMBTransferRetirementRefundWork
+    ) async {
+        if let hook = cleanupCreditRefundInterleavingHookForTesting {
+            await hook(.refundPending(charge: work.charge))
+        }
+        await refundCredit(charge: work.charge)
+        if let ticket = work.ticket {
+            _ = transitionTransferRequest(
+                work.transferIdentifier,
+                .retirementRefundAcknowledged(ticket, at: sessionTime.now())
+            )
+        } else {
+            _ = transitionTransferRequest(
+                work.transferIdentifier,
+                .preparationRetirementAcknowledged(work.requestIdentity, at: sessionTime.now())
+            )
+        }
+        await completeReadyOperationBarriers()
+        resumeSatisfiedTestingCountWaiters()
+    }
+
     fileprivate func beginWriteTransfer(
         treeId: UInt32,
         fileId: [UInt8],
@@ -14113,9 +15477,15 @@ extension SMBSession {
         var bufferCursor = sourceCursor
         switch finishing {
         case .retired(let ticket, let advanceFrontier):
-            guard let state = writeTransfers[handle.identifier] else { return .complete }
-            _ = state.window.finishRetirement(ticket, advanceFrontier: advanceFrontier)
-            _ = state.window.releaseRetiredSlot(ticket)
+            guard writeTransfers[handle.identifier] != nil else { return .complete }
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .finishDelivery(
+                    ticket,
+                    advanceFrontier: advanceFrontier,
+                    outcome: advanceFrontier ? .delivered : .discarded
+                )
+            )
         case .protocolFailure(let ticket, let error):
             guard let state = writeTransfers[handle.identifier] else { return .complete }
             stopWriteTransfer(
@@ -14125,13 +15495,16 @@ extension SMBSession {
             )
         case .sourceEOF(let slotIndex):
             guard let state = writeTransfers[handle.identifier] else { return .complete }
-            _ = state.window.revokePreparingForSourceEOF(slotIndex: slotIndex, at: sessionTime.now())
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .sourceEOF(slotIndex: slotIndex, at: sessionTime.now())
+            )
             state.sourceEOF = true
             signalWriteTransfer(state)
         case .sourceFailure(let slotIndex, let offset, let error):
             guard let state = writeTransfers[handle.identifier] else { return .complete }
             let now = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: now))
             if Task.isCancelled {
                 stopWriteTransferForOwnerCancellation(state, at: now)
             } else if let deadline = state.operationDeadline, now >= deadline {
@@ -14143,6 +15516,7 @@ extension SMBSession {
             guard let sourceBuffer else {
                 return .failed(SMBCodecError.invalidValue("WRITE source buffer was not retained by its owner"))
             }
+            _ = transitionTransferRequest(handle.identifier, .supplierReturned(slotIndex: slotIndex))
             let commit = await commitWriteTransferRequest(
                 handle,
                 slotIndex: slotIndex,
@@ -14192,22 +15566,40 @@ extension SMBSession {
                     return .committed(length: committedBytesFromBuffer)
                 }
                 await closeTransportAndWait(cause: "write_transfer_terminal_drain")
-                if let error = await finishWriteTransferAfterDrain(handle) { return .failed(error) }
-                return .complete
+                switch await finishWriteTransferAfterDrain(handle) {
+                case .wait(let revision):
+                    await waitForWriteTransferEvent(handle, after: revision)
+                    continue
+                case .finished(let error):
+                    if let error { return .failed(error) }
+                    return .complete
+                }
             }
             if state.window.isStopped, state.window.wireDrained {
                 if committedBytesFromBuffer > 0 {
                     return .committed(length: committedBytesFromBuffer)
                 }
-                if let error = await finishWriteTransferAfterDrain(handle) { return .failed(error) }
-                return .complete
+                switch await finishWriteTransferAfterDrain(handle) {
+                case .wait(let revision):
+                    await waitForWriteTransferEvent(handle, after: revision)
+                    continue
+                case .finished(let error):
+                    if let error { return .failed(error) }
+                    return .complete
+                }
             }
             if state.sourceEOF, state.window.wireDrained {
                 if committedBytesFromBuffer > 0 {
                     return .committed(length: committedBytesFromBuffer)
                 }
-                if let error = await finishWriteTransferAfterDrain(handle) { return .failed(error) }
-                return .complete
+                switch await finishWriteTransferAfterDrain(handle) {
+                case .wait(let revision):
+                    await waitForWriteTransferEvent(handle, after: revision)
+                    continue
+                case .finished(let error):
+                    if let error { return .failed(error) }
+                    return .complete
+                }
             }
             if let creditWaitRevision {
                 if creditWaitRevision == state.creditRevision {
@@ -14247,10 +15639,25 @@ extension SMBSession {
                     continue
                 }
                 let supplierPreparation = sourceBuffer == nil && sourceNeedsCreditHint
-                guard let slotIndex = state.window.beginPreparing(
-                    candidateLength: UInt32(candidateLength),
-                    countsTowardWireDrain: !supplierPreparation
-                ) else {
+                guard let preparationIdentity = makeRequestIdentity(generation: state.generation) else {
+                    let error = SMBCodecError.invalidValue("SMB request sequence exhausted")
+                    stopWriteTransfer(
+                        state,
+                        for: .offsetFailure(offset: state.window.requestFrontier, error: error),
+                        at: sessionTime.now()
+                    )
+                    continue
+                }
+                let preparing = transitionTransferRequest(
+                    handle.identifier,
+                    .beginPreparing(
+                        identity: preparationIdentity,
+                        candidateLength: UInt32(candidateLength),
+                        countsTowardWireDrain: !supplierPreparation,
+                        supplierOwned: sourceBuffer == nil
+                    )
+                )
+                guard case .slot(let slotIndex?) = preparing else {
                     await waitForWriteTransferEvent(handle, after: state.revision)
                     continue
                 }
@@ -14296,7 +15703,7 @@ extension SMBSession {
                     let now = sessionTime.now()
                     let admissionBlocked = isWriteTransferAdmissionBlocked(state, at: now)
                     if Task.isCancelled || admissionBlocked {
-                        _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+                        _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: now))
                         if Task.isCancelled {
                             stopWriteTransferForOwnerCancellation(state, at: now)
                         } else if let deadline = state.operationDeadline, now >= deadline {
@@ -14314,7 +15721,7 @@ extension SMBSession {
                         if state.window.committedSlotCount == 0 {
                             supplierLength = min(candidateLength, SMB2Credit.unitSize)
                         } else {
-                            _ = state.window.revokePreparing(slotIndex: slotIndex, at: nil)
+                            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: nil))
                             creditWaitRevision = revisionBeforeBalance
                             continue
                         }
@@ -14356,6 +15763,10 @@ extension SMBSession {
         maximumLength: Int
     ) async -> SMBWriteTransferCommitResult {
         guard let state = writeTransfers[handle.identifier] else { return .complete }
+        guard let preparationKey = state.window.preparingRequestKey(slotIndex: slotIndex) else {
+            return .stopped(revision: state.revision)
+        }
+        let requestIdentity = preparationKey.requestIdentity
         guard let preparation = state.window.preparingOffsetAndLength(slotIndex: slotIndex),
               preparation.offset == offset,
               sourceIndex >= 0,
@@ -14364,7 +15775,7 @@ extension SMBSession {
               maximumLength <= sourceBuffer.count - sourceIndex,
               maximumLength <= Int(preparation.candidateLength) else {
             let now = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: now))
             let error = SMBCodecError.invalidValue("invalid SMB WRITE transfer preparation")
             stopWriteTransfer(state, for: .offsetFailure(offset: offset, error: error), at: now)
             return .stopped(revision: state.revision)
@@ -14374,7 +15785,10 @@ extension SMBSession {
         let windowStopped = state.window.isStopped
         let generationActive = isGenerationActive(state.generation)
         if Task.isCancelled || windowStopped || deadlineReachedBeforeReservation || !generationActive {
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: admissionCheckTime)
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .revokePreparing(slotIndex: slotIndex, at: admissionCheckTime)
+            )
             if Task.isCancelled {
                 stopWriteTransferForOwnerCancellation(state, at: admissionCheckTime)
             } else if deadlineReachedBeforeReservation {
@@ -14391,7 +15805,7 @@ extension SMBSession {
         guard let generation = readerLifecycle.activeGeneration,
               generation == state.generation else {
             let now = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: now))
             stopWriteTransfer(
                 state,
                 for: .sessionFailure(wireFailure ?? SMBTransportError.connectionClosed),
@@ -14404,7 +15818,7 @@ extension SMBSession {
         let waitIfUnavailable = state.window.committedSlotCount == 0
         let revisionBeforeReservation = state.revision
         let creditRevisionBeforeReservation = state.creditRevision
-        state.window.markPreparingReservationPending(slotIndex: slotIndex)
+        _ = transitionTransferRequest(handle.identifier, .reservationPending(slotIndex: slotIndex))
         let preparationCredit: SMBTransferCreditPreparation
         do {
             preparationCredit = try await reserveTransferCredit(
@@ -14412,11 +15826,19 @@ extension SMBSession {
                 waitIfUnavailable: waitIfUnavailable,
                 command: SMB2Commands.write,
                 treeId: state.treeId,
-                generation: generation
+                generation: generation,
+                requestIdentity: requestIdentity
             )
         } catch {
             let failureTime = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: failureTime)
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .reservationSettled(slotIndex: slotIndex, charge: 0, cancellationToken: nil)
+            )
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .revokePreparing(slotIndex: slotIndex, at: failureTime)
+            )
             if Task.isCancelled {
                 stopWriteTransferForOwnerCancellation(state, at: failureTime)
             } else if isTreeUnavailable(error) {
@@ -14432,8 +15854,17 @@ extension SMBSession {
                     at: failureTime
                 )
             }
+            await completeReadyOperationBarriers()
             return .stopped(revision: state.revision)
         }
+        _ = transitionTransferRequest(
+            handle.identifier,
+            .reservationSettled(
+                slotIndex: slotIndex,
+                charge: preparationCredit.charge,
+                cancellationToken: preparationCredit.cancellationToken
+            )
+        )
         let reserved = (charge: preparationCredit.charge, balance: preparationCredit.balance)
 
         let afterReservationTime = sessionTime.now()
@@ -14444,7 +15875,10 @@ extension SMBSession {
         if reservationCancelled || windowStoppedAfterReservation || operationDeadlineReached
             || !generationActiveAfterReservation {
             if reserved.charge > 0 { await refundCredit(charge: reserved.charge) }
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: sessionTime.now())
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .revokePreparing(slotIndex: slotIndex, at: sessionTime.now())
+            )
             if reservationCancelled {
                 stopWriteTransferForOwnerCancellation(state, at: afterReservationTime)
             } else if operationDeadlineReached {
@@ -14460,7 +15894,7 @@ extension SMBSession {
         }
 
         guard reserved.charge > 0 else {
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: nil)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: nil))
             return .wait(
                 revision: revisionBeforeReservation,
                 creditRevision: creditRevisionBeforeReservation
@@ -14497,7 +15931,10 @@ extension SMBSession {
         } catch {
             await refundUnclaimedCredit(creditReservation)
             let failureTime = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: failureTime)
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .revokePreparing(slotIndex: slotIndex, at: failureTime)
+            )
             stopWriteTransfer(
                 state,
                 for: .offsetFailure(offset: offset, error: error),
@@ -14506,17 +15943,19 @@ extension SMBSession {
             return .stopped(revision: state.revision)
         }
 
-        let requestIdentity = preparationCredit.requestIdentity
-        guard let ticket = state.window.commit(
-            slotIndex: slotIndex,
-            requestIdentity: requestIdentity,
-            messageID: requestMessageID,
-            requestedLength: UInt32(requestLength),
-            at: nil
+        guard case .ticket(let ticket?) = transitionTransferRequest(
+            handle.identifier,
+            .commit(
+                slotIndex: slotIndex,
+                identity: requestIdentity,
+                messageID: requestMessageID,
+                requestedLength: UInt32(requestLength),
+                at: nil
+            )
         ) else {
             await refundUnclaimedCredit(creditReservation)
             let now = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: now)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: now))
             if !state.window.isStopped {
                 stopWriteTransfer(
                     state,
@@ -14558,6 +15997,10 @@ extension SMBSession {
                 return .stopped(revision: state.revision)
             }
         } else {
+            _ = transitionTransferRequest(
+                ticket.transferIdentifier,
+                .wireCommitted(ticket, messageId: requestHeader.messageId, charge: reserved.charge)
+            )
             registerPendingResponse(
                 packet: packet,
                 requestHeader: requestHeader,
@@ -14755,7 +16198,25 @@ extension SMBSession {
             remaining,
             UInt64(min(negotiatedReadChunkSize(), Int(SMBTransferWindow.maximumSlotLength)))
         ))
-        guard let slotIndex = state.window.beginPreparing(candidateLength: candidateLength) else {
+        guard let preparationIdentity = makeRequestIdentity(generation: state.generation) else {
+            let error = SMBCodecError.invalidValue("SMB request sequence exhausted")
+            stopReadTransfer(
+                state,
+                for: .offsetFailure(offset: requestFrontier, error: error),
+                at: sessionTime.now()
+            )
+            return .stopped(revision: state.revision)
+        }
+        let preparing = transitionTransferRequest(
+            handle.identifier,
+            .beginPreparing(
+                identity: preparationIdentity,
+                candidateLength: candidateLength,
+                countsTowardWireDrain: true,
+                supplierOwned: false
+            )
+        )
+        guard case .slot(let slotIndex?) = preparing else {
             return .wait(revision: state.revision, creditRevision: nil)
         }
 
@@ -14763,6 +16224,7 @@ extension SMBSession {
         let waitIfUnavailable = state.window.committedSlotCount == 0
         let revisionBeforeReservation = state.revision
         let creditRevisionBeforeReservation = state.creditRevision
+        _ = transitionTransferRequest(handle.identifier, .reservationPending(slotIndex: slotIndex))
         let preparationCredit: SMBTransferCreditPreparation
         do {
             preparationCredit = try await reserveTransferCredit(
@@ -14770,11 +16232,19 @@ extension SMBSession {
                 waitIfUnavailable: waitIfUnavailable,
                 command: SMB2Commands.read,
                 treeId: state.treeId,
-                generation: state.generation
+                generation: state.generation,
+                requestIdentity: preparationIdentity
             )
         } catch {
             let failureTime = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: failureTime)
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .reservationSettled(slotIndex: slotIndex, charge: 0, cancellationToken: nil)
+            )
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .revokePreparing(slotIndex: slotIndex, at: failureTime)
+            )
             if Task.isCancelled {
                 stopReadTransferForOwnerCancellation(state, at: failureTime)
             } else if isTreeUnavailable(error) {
@@ -14787,8 +16257,17 @@ extension SMBSession {
                 stopReadTransfer(state, for: .sessionFailure(wireFailure ?? error), at: failureTime)
             }
             signalReadTransfer(state)
+            await completeReadyOperationBarriers()
             return .stopped(revision: state.revision)
         }
+        _ = transitionTransferRequest(
+            handle.identifier,
+            .reservationSettled(
+                slotIndex: slotIndex,
+                charge: preparationCredit.charge,
+                cancellationToken: preparationCredit.cancellationToken
+            )
+        )
         let reserved = (charge: preparationCredit.charge, balance: preparationCredit.balance)
 
         let afterReservationTime: ContinuousClock.Instant?
@@ -14807,7 +16286,10 @@ extension SMBSession {
             if reserved.charge > 0 {
                 await refundCredit(charge: reserved.charge)
             }
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: sessionTime.now())
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .revokePreparing(slotIndex: slotIndex, at: sessionTime.now())
+            )
             if reservationCancelled {
                 stopReadTransferForOwnerCancellation(state, at: observedAt)
             } else if operationDeadlineReached {
@@ -14822,12 +16304,12 @@ extension SMBSession {
                 await refundCredit(charge: reserved.charge)
             }
             let time = state.window.isStopped ? sessionTime.now() : nil
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: time)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: time))
             return .retry
         }
 
         guard reserved.charge > 0 else {
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: nil)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: nil))
             return .wait(
                 revision: revisionBeforeReservation,
                 creditRevision: creditRevisionBeforeReservation
@@ -14853,7 +16335,7 @@ extension SMBSession {
         if Task.isCancelled || windowStopped || !generationActive || deadlineReachedBeforeSend {
             await refundUnclaimedCredit(reservation)
             let observedAt = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: observedAt)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: observedAt))
             if Task.isCancelled {
                 stopReadTransferForOwnerCancellation(state, at: observedAt)
             } else if let deadline = state.operationDeadline, observedAt >= deadline {
@@ -14889,7 +16371,7 @@ extension SMBSession {
         } catch {
             await refundUnclaimedCredit(reservation)
             let failureTime = sessionTime.now()
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: failureTime)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: failureTime))
             stopReadTransfer(
                 state,
                 for: .offsetFailure(offset: requestFrontier, error: error),
@@ -14900,18 +16382,20 @@ extension SMBSession {
         }
 
         let generation = state.generation
-        let requestIdentity = preparationCredit.requestIdentity
-        let ticket = state.window.commit(
-            slotIndex: slotIndex,
-            requestIdentity: requestIdentity,
-            messageID: requestMessageID,
-            requestedLength: requestLength,
-            at: nil
-        )
-        guard let ticket else {
+        let requestIdentity = preparationIdentity
+        guard case .ticket(let ticket?) = transitionTransferRequest(
+            handle.identifier,
+            .commit(
+                slotIndex: slotIndex,
+                identity: requestIdentity,
+                messageID: requestMessageID,
+                requestedLength: requestLength,
+                at: nil
+            )
+        ) else {
             await refundUnclaimedCredit(reservation)
             let time = state.window.isStopped ? sessionTime.now() : nil
-            _ = state.window.revokePreparing(slotIndex: slotIndex, at: time)
+            _ = transitionTransferRequest(handle.identifier, .revokePreparing(slotIndex: slotIndex, at: time))
             signalReadTransfer(state)
             return .stopped(revision: state.revision)
         }
@@ -14947,6 +16431,10 @@ extension SMBSession {
                 return .stopped(revision: state.revision)
             }
         } else {
+            _ = transitionTransferRequest(
+                ticket.transferIdentifier,
+                .wireCommitted(ticket, messageId: requestHeader.messageId, charge: reservation.charge)
+            )
             registerPendingResponse(
                 packet: packet,
                 requestHeader: requestHeader,
@@ -14978,7 +16466,10 @@ extension SMBSession {
             discardCompletedReadTransferSlots(state)
             return nil
         }
-        return state.window.beginNextRetirement()
+        if case .retirement(let retirement) = transitionTransferRequest(handle.identifier, .beginDelivery) {
+            return retirement
+        }
+        return nil
     }
 
     fileprivate func nextReadTransferDecode(_ handle: SMBReadTransferHandle) -> SMBReadTransferDecodeWork? {
@@ -14987,7 +16478,7 @@ extension SMBSession {
             return nil
         }
         state.pendingReadDecodes.removeValue(forKey: ticket)
-        guard state.window.isPendingReadDecode(for: ticket) else { return nil }
+        guard case .bool(true) = transitionTransferRequest(handle.identifier, .beginDecode(ticket)) else { return nil }
         return SMBReadTransferDecodeWork(ticket: ticket, frame: frame)
     }
 
@@ -15009,8 +16500,23 @@ extension SMBSession {
                 at: now
             )
         }
-        _ = state.window.finishRetirement(ticket, advanceFrontier: advanceFrontier && callbackError == nil && !callerCancelled)
-        _ = state.window.releaseRetiredSlot(ticket)
+        let deliveryOutcome: SMBTransferDeliveryState
+        if let callbackError {
+            _ = callbackError
+            deliveryOutcome = .failed
+        } else if callerCancelled || !advanceFrontier {
+            deliveryOutcome = .discarded
+        } else {
+            deliveryOutcome = .delivered
+        }
+        _ = transitionTransferRequest(
+            handle.identifier,
+            .finishDelivery(
+                ticket,
+                advanceFrontier: advanceFrontier && callbackError == nil && !callerCancelled,
+                outcome: deliveryOutcome
+            )
+        )
     }
 
     private func finishReadTransferDecode(
@@ -15025,7 +16531,10 @@ extension SMBSession {
         } else {
             completionTime = state.window.isStopped ? sessionTime.now() : nil
         }
-        guard state.window.finishPendingReadDecode(result, for: ticket, at: completionTime) else { return }
+        guard case .bool(true) = transitionTransferRequest(
+            handle.identifier,
+            .finishDecode(ticket, result: result, at: completionTime)
+        ) else { return }
         if case .failure(let error, _) = result {
             stopReadTransfer(
                 state,
@@ -15048,11 +16557,14 @@ extension SMBSession {
 
         let drainedAt = sessionTime.now()
         if state.window.drainDeadlineHasWon(at: drainedAt) {
-            state.window.stop(
-                for: .sessionFailure(SMBTransportError.timedOut),
-                at: drainedAt,
-                cleanupTimeout: cleanupTimeout,
-                operationDeadline: state.operationDeadline
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .stop(
+                    .sessionFailure(SMBTransportError.timedOut),
+                    at: drainedAt,
+                    cleanupTimeout: cleanupTimeout,
+                    operationDeadline: state.operationDeadline
+                )
             )
             await closeTransportAndWait(
                 cause: "read_transfer_drain_timeout",
@@ -15061,16 +16573,24 @@ extension SMBSession {
         }
 
         if state.window.terminallyClosed {
-            state.window.reclaimSlotsAfterTerminalJoin()
+            _ = transitionTransferRequest(handle.identifier, .terminalJoin(at: sessionTime.now()))
         } else {
             discardCompletedReadTransferSlots(state)
+        }
+
+        guard state.window.epochReady() else {
+            return .wait(revision: state.revision)
         }
 
         if case .readBoundary(let boundaryOffset, let requestedLength, let receivedLength)? = state.window.selectedStopReason(),
            receivedLength > 0,
            receivedLength < requestedLength {
             let (nextOffset, overflow) = boundaryOffset.addingReportingOverflow(UInt64(receivedLength))
-            guard !overflow, state.window.beginNextEpoch(at: nextOffset) else {
+            guard !overflow,
+                  case .epoch(true) = transitionTransferRequest(
+                    handle.identifier,
+                    .beginNextEpoch(offset: nextOffset)
+                  ) else {
                 let error = SMBCodecError.invalidValue("invalid short READ rebase offset")
                 await removeReadTransfer(state)
                 return .finished(error)
@@ -15163,7 +16683,10 @@ extension SMBSession {
             }
         }
         let acceptanceTime = state.window.isStopped ? sessionTime.now() : nil
-        guard state.window.acceptFinal(result, for: ticket, at: acceptanceTime) else { return }
+        guard case .bool(true) = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .acceptFinal(ticket, result: result, at: acceptanceTime)
+        ) else { return }
         if let deferredDecodeFrame {
             state.pendingReadDecodes[ticket] = deferredDecodeFrame
         }
@@ -15209,17 +16732,19 @@ extension SMBSession {
     private func failReadTransferRequest(_ ticket: SMBTransferTicket, error: Error) {
         guard let state = readTransfers[ticket.transferIdentifier], ticket.epoch == state.window.epoch else { return }
         let failureTime = sessionTime.now()
-        _ = state.window.acceptFinal(
-            .failure(error: error, isSessionFatal: true),
-            for: ticket,
-            at: failureTime
+        _ = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .acceptFinal(ticket, result: .failure(error: error, isSessionFatal: true), at: failureTime)
         )
         stopReadTransfer(state, for: .sessionFailure(error), at: failureTime)
     }
 
     private func readTransferSendStarted(_ ticket: SMBTransferTicket) {
         guard let state = readTransfers[ticket.transferIdentifier] else { return }
-        if state.window.markSendStarted(ticket), state.window.isStopped { signalReadTransfer(state) }
+        if case .bool(true) = transitionTransferRequest(ticket.transferIdentifier, .sendStarted(ticket)),
+           state.window.isStopped {
+            signalReadTransfer(state)
+        }
     }
 
     private func readTransferFullySent(
@@ -15228,7 +16753,10 @@ extension SMBSession {
         at time: ContinuousClock.Instant?
     ) {
         guard let state = readTransfers[ticket.transferIdentifier] else { return }
-        if state.window.markFullySent(ticket, responseDeadline: responseDeadline, at: time) {
+        if case .bool(true) = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .fullySent(ticket, responseDeadline: responseDeadline, at: time)
+        ) {
             if state.window.isStopped {
                 scheduleReadTransferDrainTimer(state)
                 signalReadTransfer(state)
@@ -15239,7 +16767,10 @@ extension SMBSession {
     private func readTransferSendOwnerFinished(_ ticket: SMBTransferTicket) {
         guard let state = readTransfers[ticket.transferIdentifier] else { return }
         let time = state.window.isStopped ? sessionTime.now() : nil
-        if state.window.markSendOwnerFinished(ticket, at: time), state.window.isStopped {
+        if case .bool(true) = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .sendOwnerReturned(ticket, at: time)
+        ), state.window.isStopped {
             signalReadTransfer(state)
         }
     }
@@ -15258,12 +16789,11 @@ extension SMBSession {
         at time: ContinuousClock.Instant
     ) {
         if case .operationDeadline = reason { state.operationDeadlineStopRecorded = true }
-        state.window.stop(
-            for: reason,
-            at: time,
-            cleanupTimeout: cleanupTimeout,
-            operationDeadline: state.operationDeadline
+        _ = transitionTransferRequest(
+            state.handle.identifier,
+            .stop(reason, at: time, cleanupTimeout: cleanupTimeout, operationDeadline: state.operationDeadline)
         )
+        retireStoppedTransferTickets(in: state.window)
         scheduleReadTransferDrainTimer(state)
         signalReadTransfer(state)
     }
@@ -15295,11 +16825,14 @@ extension SMBSession {
         state.drainTimerIdentity = nil
         let now = sessionTime.now()
         if state.window.drainDeadlineHasWon(at: now) {
-            state.window.stop(
-                for: .sessionFailure(SMBTransportError.timedOut),
-                at: now,
-                cleanupTimeout: cleanupTimeout,
-                operationDeadline: state.operationDeadline
+            _ = transitionTransferRequest(
+                identifier,
+                .stop(
+                    .sessionFailure(SMBTransportError.timedOut),
+                    at: now,
+                    cleanupTimeout: cleanupTimeout,
+                    operationDeadline: state.operationDeadline
+                )
             )
             signalReadTransfer(state)
             beginTransferDrainTerminalization(
@@ -15312,9 +16845,13 @@ extension SMBSession {
 
     private func discardCompletedReadTransferSlots(_ state: SMBSessionReadTransfer) {
         var changed = false
-        for ticket in state.window.completedTickets where state.window.discardCompletedSlotForStop(ticket) {
-            _ = state.window.releaseRetiredSlot(ticket)
-            changed = true
+        for ticket in state.window.completedTickets {
+            if case .bool(true) = transitionTransferRequest(
+                state.handle.identifier,
+                .discardCompleted(ticket, forStop: true)
+            ) {
+                changed = true
+            }
         }
         if changed { signalReadTransfer(state) }
     }
@@ -15380,7 +16917,10 @@ extension SMBSession {
             status: status
         )
         let completionTime = state.window.isStopped ? sessionTime.now() : nil
-        guard state.window.acceptFinal(result, for: ticket, at: completionTime) else { return }
+        guard case .bool(true) = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .acceptFinal(ticket, result: result, at: completionTime)
+        ) else { return }
         if case .failure(let error, _) = result {
             stopWriteTransfer(
                 state,
@@ -15395,18 +16935,24 @@ extension SMBSession {
     }
 
     private func retireWritePrefixWithoutCallback(_ state: SMBSessionWriteTransfer) {
-        while let retirement = state.window.beginNextRetirement() {
+        while case .retirement(let retirement?) = transitionTransferRequest(
+            state.handle.identifier,
+            .beginDelivery
+        ) {
             let advanceFrontier: Bool
             if case .success = retirement.result {
                 advanceFrontier = true
             } else {
                 advanceFrontier = false
             }
-            _ = state.window.finishRetirement(
-                retirement.ticket,
-                advanceFrontier: advanceFrontier
+            _ = transitionTransferRequest(
+                state.handle.identifier,
+                .finishDelivery(
+                    retirement.ticket,
+                    advanceFrontier: advanceFrontier,
+                    outcome: advanceFrontier ? .delivered : .discarded
+                )
             )
-            _ = state.window.releaseRetiredSlot(retirement.ticket)
             guard advanceFrontier else { break }
         }
     }
@@ -15456,6 +17002,18 @@ extension SMBSession {
     }
 
     private func failTransferRequest(_ ticket: SMBTransferTicket, error: Error) {
+        let callerState: SMBRequestCallerState
+        if error is CancellationError {
+            callerState = .cancelled
+        } else if let transportError = error as? SMBTransportError, transportError == .timedOut {
+            callerState = .timedOut
+        } else {
+            callerState = .transportError
+        }
+        _ = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .callerTerminal(ticket, state: callerState, wire: nil)
+        )
         if readTransfers[ticket.transferIdentifier] != nil {
             failReadTransferRequest(ticket, error: error)
             return
@@ -15463,10 +17021,9 @@ extension SMBSession {
         guard let state = writeTransfers[ticket.transferIdentifier],
               ticket.epoch == state.window.epoch else { return }
         let failureTime = sessionTime.now()
-        _ = state.window.acceptFinal(
-            .failure(error: error, isSessionFatal: true),
-            for: ticket,
-            at: failureTime
+        _ = transitionTransferRequest(
+            ticket.transferIdentifier,
+            .acceptFinal(ticket, result: .failure(error: error, isSessionFatal: true), at: failureTime)
         )
         stopWriteTransfer(state, for: .sessionFailure(error), at: failureTime)
     }
@@ -15475,7 +17032,8 @@ extension SMBSession {
         if readTransfers[ticket.transferIdentifier] != nil {
             readTransferSendStarted(ticket)
         } else if let state = writeTransfers[ticket.transferIdentifier],
-                  state.window.markSendStarted(ticket), state.window.isStopped {
+                  case .bool(true) = transitionTransferRequest(ticket.transferIdentifier, .sendStarted(ticket)),
+                  state.window.isStopped {
             signalWriteTransfer(state)
         }
     }
@@ -15488,7 +17046,10 @@ extension SMBSession {
         if readTransfers[ticket.transferIdentifier] != nil {
             readTransferFullySent(ticket, responseDeadline: responseDeadline, at: time)
         } else if let state = writeTransfers[ticket.transferIdentifier],
-                  state.window.markFullySent(ticket, responseDeadline: responseDeadline, at: time) {
+                  case .bool(true) = transitionTransferRequest(
+                    ticket.transferIdentifier,
+                    .fullySent(ticket, responseDeadline: responseDeadline, at: time)
+                  ) {
             if state.window.isStopped {
                 scheduleWriteTransferDrainTimer(state)
                 signalWriteTransfer(state)
@@ -15501,7 +17062,10 @@ extension SMBSession {
             readTransferSendOwnerFinished(ticket)
         } else if let state = writeTransfers[ticket.transferIdentifier] {
             let time = state.window.isStopped ? sessionTime.now() : nil
-            if state.window.markSendOwnerFinished(ticket, at: time), state.window.isStopped {
+            if case .bool(true) = transitionTransferRequest(
+                ticket.transferIdentifier,
+                .sendOwnerReturned(ticket, at: time)
+            ), state.window.isStopped {
                 signalWriteTransfer(state)
             }
         }
@@ -15515,7 +17079,10 @@ extension SMBSession {
             discardCompletedWriteTransferSlots(state)
             return nil
         }
-        return state.window.beginNextRetirement()
+        if case .retirement(let retirement) = transitionTransferRequest(handle.identifier, .beginDelivery) {
+            return retirement
+        }
+        return nil
     }
 
     private func waitForWriteTransferEvent(_ handle: SMBWriteTransferHandle, after revision: UInt64) async {
@@ -15546,12 +17113,11 @@ extension SMBSession {
         at time: ContinuousClock.Instant
     ) {
         if case .operationDeadline = reason { state.operationDeadlineStopRecorded = true }
-        state.window.stop(
-            for: reason,
-            at: time,
-            cleanupTimeout: cleanupTimeout,
-            operationDeadline: state.operationDeadline
+        _ = transitionTransferRequest(
+            state.handle.identifier,
+            .stop(reason, at: time, cleanupTimeout: cleanupTimeout, operationDeadline: state.operationDeadline)
         )
+        retireStoppedTransferTickets(in: state.window)
         scheduleWriteTransferDrainTimer(state)
         signalWriteTransfer(state)
     }
@@ -15592,11 +17158,14 @@ extension SMBSession {
         state.drainTimerDeadline = nil
         let now = sessionTime.now()
         if state.window.drainDeadlineHasWon(at: now) {
-            state.window.stop(
-                for: .sessionFailure(SMBTransportError.timedOut),
-                at: now,
-                cleanupTimeout: cleanupTimeout,
-                operationDeadline: state.operationDeadline
+            _ = transitionTransferRequest(
+                identifier,
+                .stop(
+                    .sessionFailure(SMBTransportError.timedOut),
+                    at: now,
+                    cleanupTimeout: cleanupTimeout,
+                    operationDeadline: state.operationDeadline
+                )
             )
             signalWriteTransfer(state)
             beginTransferDrainTerminalization(
@@ -15618,16 +17187,19 @@ extension SMBSession {
         }
     }
 
-    private func finishWriteTransferAfterDrain(_ handle: SMBWriteTransferHandle) async -> Error? {
-        guard let state = writeTransfers[handle.identifier] else { return nil }
-        guard state.window.wireDrained else { return nil }
+    private func finishWriteTransferAfterDrain(_ handle: SMBWriteTransferHandle) async -> SMBWriteTransferDrainResult {
+        guard let state = writeTransfers[handle.identifier] else { return .finished(nil) }
+        guard state.window.wireDrained else { return .wait(revision: state.revision) }
         let drainedAt = sessionTime.now()
         if state.window.drainDeadlineHasWon(at: drainedAt) {
-            state.window.stop(
-                for: .sessionFailure(SMBTransportError.timedOut),
-                at: drainedAt,
-                cleanupTimeout: cleanupTimeout,
-                operationDeadline: state.operationDeadline
+            _ = transitionTransferRequest(
+                handle.identifier,
+                .stop(
+                    .sessionFailure(SMBTransportError.timedOut),
+                    at: drainedAt,
+                    cleanupTimeout: cleanupTimeout,
+                    operationDeadline: state.operationDeadline
+                )
             )
             await closeTransportAndWait(
                 cause: "write_transfer_drain_timeout",
@@ -15635,10 +17207,11 @@ extension SMBSession {
             )
         }
         if state.window.terminallyClosed {
-            state.window.reclaimSlotsAfterTerminalJoin()
+            _ = transitionTransferRequest(handle.identifier, .terminalJoin(at: sessionTime.now()))
         } else {
             discardCompletedWriteTransferSlots(state)
         }
+        guard state.window.epochReady() else { return .wait(revision: state.revision) }
         let error: Error?
         if let selected = state.window.selectedError() {
             error = selected
@@ -15648,12 +17221,15 @@ extension SMBSession {
             error = nil
         }
         await removeWriteTransfer(state)
-        return error
+        return .finished(error)
     }
 
     private func discardCompletedWriteTransferSlots(_ state: SMBSessionWriteTransfer) {
-        for ticket in state.window.completedTickets where state.window.discardCompletedSlotForStop(ticket) {
-            _ = state.window.releaseRetiredSlot(ticket)
+        for ticket in state.window.completedTickets {
+            _ = transitionTransferRequest(
+                state.handle.identifier,
+                .discardCompleted(ticket, forStop: true)
+            )
         }
     }
 
@@ -15694,12 +17270,16 @@ extension SMBSession {
             if !state.window.isStopped {
                 stopWriteTransfer(state, for: .sessionFailure(error), at: now)
             } else {
-                state.window.stop(
-                    for: .sessionFailure(error),
-                    at: now,
-                    cleanupTimeout: cleanupTimeout,
-                    operationDeadline: state.operationDeadline
+                _ = transitionTransferRequest(
+                    state.handle.identifier,
+                    .stop(
+                        .sessionFailure(error),
+                        at: now,
+                        cleanupTimeout: cleanupTimeout,
+                        operationDeadline: state.operationDeadline
+                    )
                 )
+                retireStoppedTransferTickets(in: state.window)
                 signalWriteTransfer(state)
             }
         }
@@ -15708,15 +17288,17 @@ extension SMBSession {
     private func markWriteTransfersTerminalClose(_ error: Error) {
         markWriteTransfersSessionFailure(error)
         for state in writeTransfers.values {
-            state.window.markTerminalClose()
+            _ = transitionTransferRequest(state.handle.identifier, .terminalClose)
             signalWriteTransfer(state)
         }
     }
 
     private func markWriteTransfersTerminalJoinComplete() {
         for state in writeTransfers.values {
-            state.window.markTerminalSendOwnersJoined(at: sessionTime.now())
-            state.window.reclaimSlotsAfterTerminalJoin()
+            _ = transitionTransferRequest(
+                state.handle.identifier,
+                .terminalJoin(at: sessionTime.now())
+            )
             signalWriteTransfer(state)
         }
     }
@@ -15736,12 +17318,16 @@ extension SMBSession {
             if !state.window.isStopped {
                 stopReadTransfer(state, for: .sessionFailure(error), at: now)
             } else {
-                state.window.stop(
-                    for: .sessionFailure(error),
-                    at: now,
-                    cleanupTimeout: cleanupTimeout,
-                    operationDeadline: state.operationDeadline
+                _ = transitionTransferRequest(
+                    state.handle.identifier,
+                    .stop(
+                        .sessionFailure(error),
+                        at: now,
+                        cleanupTimeout: cleanupTimeout,
+                        operationDeadline: state.operationDeadline
+                    )
                 )
+                retireStoppedTransferTickets(in: state.window)
                 signalReadTransfer(state)
             }
         }
@@ -15750,7 +17336,7 @@ extension SMBSession {
     private func markReadTransfersTerminalClose(_ error: Error) {
         markReadTransfersSessionFailure(error)
         for state in readTransfers.values {
-            state.window.markTerminalClose()
+            _ = transitionTransferRequest(state.handle.identifier, .terminalClose)
             signalReadTransfer(state)
         }
     }
@@ -15758,8 +17344,10 @@ extension SMBSession {
     private func markReadTransfersTerminalJoinComplete() {
         for state in readTransfers.values {
             state.pendingReadDecodes.removeAll()
-            state.window.markTerminalSendOwnersJoined(at: sessionTime.now())
-            state.window.reclaimSlotsAfterTerminalJoin()
+            _ = transitionTransferRequest(
+                state.handle.identifier,
+                .terminalJoin(at: sessionTime.now())
+            )
             signalReadTransfer(state)
         }
     }

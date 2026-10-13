@@ -1162,6 +1162,214 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         XCTAssertEqual(lines, [], "Tree cleanup state writes escaped owner transitions at lines \(lines)")
     }
 
+    func testSourceShapeTransferNoTicketCloseUsesCanonicalSynchronousTransition() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = projectRoot.appendingPathComponent("Sources/SMBee/SMBClient.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let normalized = Self.normalizedSource(source)
+        let transitionStart = try XCTUnwrap(normalized.range(of: "privatefunctransitionTransferRequest("))
+        let sourceEOFStart = try XCTUnwrap(normalized.range(of: "case.sourceEOF(", range: transitionStart.lowerBound..<normalized.endIndex))
+        let sourceEOFEnd = try XCTUnwrap(normalized.range(of: "case.revokePreparing(", range: sourceEOFStart.upperBound..<normalized.endIndex))
+        let sourceEOF = normalized[sourceEOFStart.lowerBound..<sourceEOFEnd.lowerBound]
+
+        XCTAssertTrue(sourceEOF.contains("closeNoTicketTransferRequest(record,refunded:false)"))
+        XCTAssertTrue(sourceEOF.contains("reclaimActivePostAuthRequestRecordIfEligible(key.requestIdentity)"))
+        XCTAssertFalse(sourceEOF.contains("SMBRetirementReceipt("), "effect-free EOF must not allocate a receipt")
+        XCTAssertFalse(sourceEOF.contains("SMBRetirementReceiptCompletion("))
+        XCTAssertFalse(sourceEOF.contains("NSLock("))
+        XCTAssertFalse(sourceEOF.contains("Task("), "effect-free EOF must not create a Task")
+
+        let updateHelper = try XCTUnwrap(normalized.range(of: "privatefuncupdateActivePostAuthRecord("))
+        let updateHelperEnd = try XCTUnwrap(normalized.range(of: "privatefuncmessageId(for", range: updateHelper.upperBound..<normalized.endIndex))
+        let updateBody = normalized[updateHelper.lowerBound..<updateHelperEnd.lowerBound]
+        XCTAssertTrue(updateBody.contains("record.transferOwner==nil"), "generic record writes must leave transfer ownership to the transition")
+
+        let noTicketHelper = try XCTUnwrap(normalized.range(of: "privatefunccloseNoTicketTransferRequest("))
+        let noTicketHelperEnd = try XCTUnwrap(normalized.range(of: "privatefunccloseTransferRetirementReceiptIfReady(", range: noTicketHelper.upperBound..<normalized.endIndex))
+        let noTicketBody = normalized[noTicketHelper.lowerBound..<noTicketHelperEnd.lowerBound]
+        XCTAssertTrue(noTicketBody.contains("record.caller=.noWireWork"))
+        XCTAssertTrue(noTicketBody.contains("record.send=.neverSubmitted"))
+        XCTAssertTrue(noTicketBody.contains("record.wire=.notApplicable"))
+        XCTAssertTrue(noTicketBody.contains("record.credit=.notApplicable"))
+        XCTAssertTrue(noTicketBody.contains("owner.slotReleased=true"))
+        XCTAssertFalse(noTicketBody.contains("SMBRetirementReceipt("), "no-ticket close has no external effect to acknowledge")
+        XCTAssertFalse(noTicketBody.contains("SMBRetirementReceiptCompletion("))
+        XCTAssertFalse(noTicketBody.contains("NSLock("))
+        XCTAssertFalse(noTicketBody.contains("Task("))
+    }
+
+    func testSourceShapeTreeAdapterAndUnsentReceiptShareTheCanonicalTransition() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = projectRoot.appendingPathComponent("Sources/SMBee/SMBClient.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let normalized = Self.normalizedSource(source)
+        let transitionStart = try XCTUnwrap(normalized.range(of: "privatefunctransitionTransferRequest("))
+
+        let treeAdapterStart = try XCTUnwrap(normalized.range(of: "privatefuncrefuseTransferRequestForTree("))
+        let treeAdapterEnd = try XCTUnwrap(normalized.range(
+            of: "privatefuncterminateTransferAdmissionFailure(",
+            range: treeAdapterStart.upperBound..<normalized.endIndex
+        ))
+        let treeAdapter = normalized[treeAdapterStart.lowerBound..<treeAdapterEnd.lowerBound]
+        XCTAssertTrue(
+            treeAdapter.contains("transitionTransferRequest(ticket.transferIdentifier,.treeRefusal(ticket,error:error,at:now))"),
+            "Tree refusal must project record and window changes in one transition"
+        )
+        XCTAssertFalse(treeAdapter.contains("window.retireUnsent("))
+        XCTAssertFalse(treeAdapter.contains("window.releaseRetiredSlot("))
+
+        let retirementStart = try XCTUnwrap(normalized.range(of: "privatefuncretireUnsentTransferRequestInTransition("))
+        let retirementEnd = try XCTUnwrap(normalized.range(
+            of: "privatefuncreportTransferRequestOwnershipForTesting(",
+            range: retirementStart.upperBound..<normalized.endIndex
+        ))
+        let retirement = normalized[retirementStart.lowerBound..<retirementEnd.lowerBound]
+        let existingReceipt = try XCTUnwrap(retirement.range(of: "ifletreceipt=record.transferOwner?.retirementReceipt"))
+        let receiptCreation = try XCTUnwrap(retirement.range(of: "SMBRetirementReceipt("))
+        XCTAssertLessThan(existingReceipt.lowerBound, receiptCreation.lowerBound, "duplicate retirement must return the record's receipt")
+        XCTAssertTrue(retirement.contains("queuedPostAuthRequests.remove(at:queuedIndex)"), "retirement removes a queued item before the sender can select it")
+        XCTAssertTrue(retirement.contains("record.send=.neverSubmitted"))
+        XCTAssertTrue(retirement.contains("record.wire=.notApplicable"))
+
+        let precommitStart = try XCTUnwrap(normalized.range(of: "case.selectedPrecommit(letticket):", range: transitionStart.lowerBound..<normalized.endIndex))
+        let precommitEnd = try XCTUnwrap(normalized.range(of: "case.precommitRejected(", range: precommitStart.upperBound..<normalized.endIndex))
+        let precommit = normalized[precommitStart.lowerBound..<precommitEnd.lowerBound]
+        XCTAssertTrue(precommit.contains("record.transferOwner?.packetOwned=true"))
+
+        let selectedReturnStart = try XCTUnwrap(normalized.range(of: "case.selectedPrecommitReturned(letticket,", range: transitionStart.lowerBound..<normalized.endIndex))
+        let selectedReturnEnd = try XCTUnwrap(normalized.range(of: "case.wireCommitted(", range: selectedReturnStart.upperBound..<normalized.endIndex))
+        let selectedReturn = normalized[selectedReturnStart.lowerBound..<selectedReturnEnd.lowerBound]
+        XCTAssertTrue(selectedReturn.contains("record.transferOwner?.packetOwned=false"))
+        XCTAssertTrue(selectedReturn.contains("reportTransferRequestOwnershipForTesting(record)"))
+
+        let receiptCloseStart = try XCTUnwrap(normalized.range(of: "varcanCloseRetirementReceipt:Bool{"))
+        let receiptCloseEnd = try XCTUnwrap(normalized.range(of: "varcanReleaseRetiringSlot:Bool{", range: receiptCloseStart.upperBound..<normalized.endIndex))
+        let receiptClose = normalized[receiptCloseStart.lowerBound..<receiptCloseEnd.lowerBound]
+        XCTAssertTrue(receiptClose.contains("SMBTransferRetirementReceiptReadiness.isReady("))
+        let receiptReadinessStart = try XCTUnwrap(normalized.range(of: "enumSMBTransferRetirementReceiptReadiness{"))
+        let receiptReadinessEnd = try XCTUnwrap(
+            normalized.range(of: "structSMBTransferRequestOwnershipSnapshot:", range: receiptReadinessStart.upperBound..<normalized.endIndex)
+        )
+        let receiptReadiness = normalized[receiptReadinessStart.lowerBound..<receiptReadinessEnd.lowerBound]
+        XCTAssertTrue(receiptReadiness.contains("!supplierOwned"))
+        XCTAssertTrue(receiptReadiness.contains("!decodeOwned"))
+        XCTAssertTrue(receiptReadiness.contains("!deliveryOwned"))
+        XCTAssertTrue(receiptReadiness.contains("!selectedPrecommitOwned"))
+        XCTAssertTrue(receiptReadiness.contains("!packetOwned"))
+        XCTAssertTrue(receiptReadiness.contains("slotReleased"))
+
+        XCTAssertEqual(
+            normalized.components(separatedBy: "window.reclaimEpochOwner()").count - 1,
+            1,
+            "an owner acknowledgement can decrement the epoch count only through the common reclaimer"
+        )
+        let receiptArchivePattern = try NSRegularExpression(
+            pattern: #"[A-Za-z_][A-Za-z0-9_]*:\[SMBRequestIdentity:SMBRetirementReceipt\]"#
+        )
+        XCTAssertEqual(
+            receiptArchivePattern.numberOfMatches(
+                in: normalized,
+                range: NSRange(location: 0, length: (normalized as NSString).length)
+            ),
+            0,
+            "receipt values stay on request handles instead of a session identity archive"
+        )
+
+        let preparationAckStart = try XCTUnwrap(normalized.range(of: "case.preparationRetirementAcknowledged("))
+        let preparationAckEnd = try XCTUnwrap(
+            normalized.range(of: "case.sendStarted(", range: preparationAckStart.upperBound..<normalized.endIndex)
+        )
+        let preparationAck = normalized[preparationAckStart.lowerBound..<preparationAckEnd.lowerBound]
+        XCTAssertTrue(preparationAck.contains("pendingRefunds>0"), "duplicate preparation ack is an idempotent no-op")
+
+        let finalGrantAckStart = try XCTUnwrap(normalized.range(of: "case.finalCreditGrantAcknowledged("))
+        let finalGrantAckEnd = try XCTUnwrap(
+            normalized.range(of: "case.callerTerminal(", range: finalGrantAckStart.upperBound..<normalized.endIndex)
+        )
+        let finalGrantAck = normalized[finalGrantAckStart.lowerBound..<finalGrantAckEnd.lowerBound]
+        XCTAssertTrue(
+            finalGrantAck.contains("record.outstandingCreditGrantAcknowledgements>0"),
+            "duplicate final grant ack cannot decrement the record more than once"
+        )
+    }
+
+    func testSourceShapeTransferOwnershipWritesStayInsideCanonicalTransition() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = projectRoot.appendingPathComponent("Sources/SMBee/SMBClient.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        let memberEndSignatures = [
+            ("private func transitionTransferRequest(", "private func transferRecord(for ticket:"),
+            ("private func closeNoTicketTransferRequest(", "private func closeTransferRetirementReceiptIfReady("),
+            ("private func finishUnsentRetirementSlotIfReady(", "private func retireUnsentTransferRequestInTransition("),
+            ("private func retireUnsentTransferRequestInTransition(", "private func reportTransferRequestOwnershipForTesting(")
+        ]
+        var ownerWriteRanges: [Range<String.Index>] = []
+        for (startSignature, endSignature) in memberEndSignatures {
+            let start = try XCTUnwrap(source.range(of: startSignature), "missing state owner: \(startSignature)")
+            let end = try XCTUnwrap(source.range(of: endSignature, range: start.upperBound..<source.endIndex))
+            ownerWriteRanges.append(start.lowerBound..<end.lowerBound)
+        }
+        let nsSource = source as NSString
+        let assignmentPattern = try NSRegularExpression(
+            pattern: #"record\.transferOwner(?:[?!]?\.[A-Za-z_][A-Za-z0-9_]*)*\s*(?:=(?!=)|\+=|-=)"#
+        )
+        let optionalChainWrite = "record.transferOwner?.slotReleased = true"
+        let optionalChainMatches = assignmentPattern.matches(
+            in: optionalChainWrite,
+            range: NSRange(location: 0, length: (optionalChainWrite as NSString).length)
+        )
+        XCTAssertEqual(
+            optionalChainMatches.count,
+            1,
+            "the ownership source check must recognize optional-chain member assignments"
+        )
+        let forcedUnwrapWrite = "record.transferOwner!.slotReleased = true"
+        let forcedUnwrapMatches = assignmentPattern.matches(
+            in: forcedUnwrapWrite,
+            range: NSRange(location: 0, length: (forcedUnwrapWrite as NSString).length)
+        )
+        XCTAssertEqual(
+            forcedUnwrapMatches.count,
+            1,
+            "the ownership source check must recognize forced-unwrap member assignments"
+        )
+        let matches = assignmentPattern.matches(
+            in: source,
+            range: NSRange(location: 0, length: nsSource.length)
+        )
+        let outsideLines = matches.compactMap { match -> Int? in
+            guard let range = Range(match.range, in: source),
+                  !ownerWriteRanges.contains(where: { $0.lowerBound <= range.lowerBound && range.lowerBound < $0.upperBound }) else {
+                return nil
+            }
+            return nsSource.substring(to: match.range.location).filter { $0 == "\n" }.count + 1
+        }
+        XCTAssertEqual(
+            outsideLines,
+            [],
+            "all canonical transfer owner writes must use transitionTransferRequest or its private helpers; lines \(outsideLines)"
+        )
+
+        let finishDeliveryStart = try XCTUnwrap(source.range(of: "case .finishDelivery(let ticket, let advanceFrontier, let outcome):"))
+        let finishDeliveryEnd = try XCTUnwrap(
+            source.range(of: "case .releaseSlot(let ticket):", range: finishDeliveryStart.upperBound..<source.endIndex)
+        )
+        let finishDelivery = source[finishDeliveryStart.lowerBound..<finishDeliveryEnd.lowerBound]
+        XCTAssertTrue(
+            finishDelivery.contains("reclaimActivePostAuthRequestRecordIfEligible(ticket.requestIdentity)"),
+            "delivery owner return must re-evaluate canonical record reclamation"
+        )
+    }
+
     func testSourceShapeSenderHotPathHasNoNestedTasksOrGlobalExecutorHops() throws {
         // E6 puts the one sender-loop Task on the session executor, but that does not remove
         // the per-frame cost of accidentally adding more Tasks. Runtime placement is covered
@@ -2172,7 +2380,7 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         )
     }
 
-    func testWireReceiptCompletionHasOneOwnerBeforeEveryActiveRecordRemoval() throws {
+    func testActiveRecordRemovalUsesReclaimerAndTerminalJoinNormalization() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -2220,16 +2428,57 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         let receiptCheck = try XCTUnwrap(helperBody.range(of: "completeOperationBarrierIfWireWorkIsComplete(for:identity)"))
         let helperRemoval = try XCTUnwrap(helperBody.range(of: activeRecordRemovalToken))
         XCTAssertLessThan(receiptCheck.lowerBound, helperRemoval.lowerBound)
+        XCTAssertTrue(
+            helperBody.contains("outstandingCreditGrantAcknowledgements:record.outstandingCreditGrantAcknowledgements"),
+            "transfer record reclamation must include its outstanding grant acknowledgements"
+        )
+        let reclamationPolicyStart = try XCTUnwrap(normalized.range(of: "enumSMBTransferRecordReclamation{"))
+        let reclamationPolicyEnd = try XCTUnwrap(
+            normalized.range(of: "enumSMBTransferRetiringSlotRelease{", range: reclamationPolicyStart.upperBound..<normalized.endIndex)
+        )
+        let reclamationPolicy = normalized[reclamationPolicyStart.lowerBound..<reclamationPolicyEnd.lowerBound]
+        XCTAssertTrue(reclamationPolicy.contains("outstandingCreditGrantAcknowledgements==0"))
 
         let removeAllToken = "activePostAuthRequestRecords.removeAll()"
-        XCTAssertEqual(normalized.components(separatedBy: removeAllToken).count - 1, 1)
+        XCTAssertEqual(
+            normalized.components(separatedBy: removeAllToken).count - 1,
+            0,
+            "terminal join must normalize records and reclaim them individually"
+        )
         let terminalJoinFunction = try XCTUnwrap(normalized.range(of: "funccloseTransportAndWait("))
         let terminalJoin = try XCTUnwrap(normalized.range(of: "progress:.terminalJoinCompleted"))
-        let activeRecordRemovalAll = try XCTUnwrap(
-            normalized.range(of: removeAllToken, range: terminalJoin.lowerBound..<normalized.endIndex)
+        let terminalNormalization = try XCTUnwrap(
+            normalized.range(of: "normalizeActiveRequestRecordAtTerminalJoin(record)", range: terminalJoin.lowerBound..<normalized.endIndex)
         )
         XCTAssertLessThan(terminalJoinFunction.lowerBound, terminalJoin.lowerBound)
-        XCTAssertLessThan(terminalJoin.lowerBound, activeRecordRemovalAll.lowerBound)
+        XCTAssertLessThan(terminalJoin.lowerBound, terminalNormalization.lowerBound)
+        let terminalHelper = try XCTUnwrap(normalized.range(of: "privatefuncnormalizeActiveRequestRecordAtTerminalJoin("))
+        let terminalHelperOpenBrace = try XCTUnwrap(normalized[terminalHelper.upperBound...].firstIndex(of: "{"))
+        var terminalCursor = terminalHelperOpenBrace
+        var terminalDepth = 0
+        var terminalHelperEnd: String.Index?
+        while terminalCursor < normalized.endIndex {
+            switch normalized[terminalCursor] {
+            case "{": terminalDepth += 1
+            case "}":
+                terminalDepth -= 1
+                if terminalDepth == 0 { terminalHelperEnd = terminalCursor }
+            default: break
+            }
+            if terminalHelperEnd != nil { break }
+            normalized.formIndex(after: &terminalCursor)
+        }
+        let terminalEnd = try XCTUnwrap(terminalHelperEnd)
+        let terminalBody = normalized[terminalHelper.lowerBound..<terminalEnd]
+        XCTAssertTrue(terminalBody.contains("record.send=.failed"))
+        XCTAssertTrue(terminalBody.contains("record.wire=.sessionTerminal"))
+        XCTAssertTrue(terminalBody.contains("record.credit=.discardedOnTerminal"))
+        XCTAssertTrue(terminalBody.contains("record.outstandingCreditGrantAcknowledgements=0"))
+        XCTAssertTrue(terminalBody.contains("record.originalSendOwned=false"))
+        XCTAssertTrue(terminalBody.contains("record.cleanupTimeoutTask=nil"))
+        XCTAssertTrue(terminalBody.contains("record.cleanupTimeoutIdentity=nil"))
+        XCTAssertTrue(terminalBody.contains("record.wireDrainTask=nil"))
+        XCTAssertTrue(terminalBody.contains("record.wireDrainTimerIdentity=nil"))
     }
 
     private static func normalizedSource(_ source: String) -> String {

@@ -668,9 +668,6 @@ actor SMB2CreditWindow {
             requestIdentity: requestIdentity,
             cancellationToken: cancellationToken
         )
-        if let grantGate = cancellationToken.grantClaimedBeforeAcceptForTesting?(reservation.charge) {
-            await grantGate.value
-        }
         if reservation.charge > 0, !cancellationToken.acceptGrant() {
             throw CancellationError()
         }

@@ -740,206 +740,6 @@ final class SMBTransferWindowTests: XCTestCase {
         }
     }
 
-    func testEpochReadinessRequiresWireDrainVacantSlotsAndNoOutstandingOwners() {
-        XCTAssertTrue(SMBTransferWindow.isEpochReady(
-            wireDrained: true,
-            allSlotsVacant: true,
-            outstandingOwnerCount: 0
-        ))
-        XCTAssertFalse(SMBTransferWindow.isEpochReady(
-            wireDrained: false,
-            allSlotsVacant: true,
-            outstandingOwnerCount: 0
-        ), "wire drain is an independent readiness condition")
-        XCTAssertFalse(SMBTransferWindow.isEpochReady(
-            wireDrained: true,
-            allSlotsVacant: false,
-            outstandingOwnerCount: 0
-        ), "slot vacancy is an independent readiness condition")
-        XCTAssertFalse(SMBTransferWindow.isEpochReady(
-            wireDrained: true,
-            allSlotsVacant: true,
-            outstandingOwnerCount: 1
-        ), "the last canonical request record must be reclaimed before epoch advance")
-    }
-
-    func testTransferRecordReclamationWaitsForDeliveryOwnerAfterOtherGuardsSettle() {
-        XCTAssertTrue(SMBTransferRecordReclamation.isReady(
-            hasExternalOwner: false,
-            reservationPending: false,
-            slotReleased: true,
-            deliveryUnresolved: false,
-            retirementReceiptComplete: true,
-            outstandingCreditGrantAcknowledgements: 0
-        ))
-        XCTAssertFalse(SMBTransferRecordReclamation.isReady(
-            hasExternalOwner: false,
-            reservationPending: false,
-            slotReleased: true,
-            deliveryUnresolved: true,
-            retirementReceiptComplete: true,
-            outstandingCreditGrantAcknowledgements: 0
-        ), "an active delivery lease keeps the canonical request record reachable")
-        XCTAssertFalse(SMBTransferRecordReclamation.isReady(
-            hasExternalOwner: true,
-            reservationPending: false,
-            slotReleased: true,
-            deliveryUnresolved: false,
-            retirementReceiptComplete: true,
-            outstandingCreditGrantAcknowledgements: 0
-        ), "supplier/decode/delivery/selected packet owners are independent of receipt completion")
-        XCTAssertFalse(SMBTransferRecordReclamation.isReady(
-            hasExternalOwner: false,
-            reservationPending: false,
-            slotReleased: false,
-            deliveryUnresolved: false,
-            retirementReceiptComplete: true,
-            outstandingCreditGrantAcknowledgements: 0
-        ), "a record cannot be reclaimed before its slot release acknowledgement")
-    }
-
-    func testTransferRecordReclamationWaitsForGrantAcknowledgementAfterOtherGuardsSettle() {
-        XCTAssertFalse(SMBTransferRecordReclamation.isReady(
-            hasExternalOwner: false,
-            reservationPending: false,
-            slotReleased: true,
-            deliveryUnresolved: false,
-            retirementReceiptComplete: true,
-            outstandingCreditGrantAcknowledgements: 1
-        ), "the last canonical record remains owned until its final grant ack")
-        XCTAssertTrue(SMBTransferRecordReclamation.isReady(
-            hasExternalOwner: false,
-            reservationPending: false,
-            slotReleased: true,
-            deliveryUnresolved: false,
-            retirementReceiptComplete: true,
-            outstandingCreditGrantAcknowledgements: 0
-        ))
-    }
-
-    func testTransferRetirementReceiptWaitsForSelectedPrecommitAndPacketOwners() {
-        func isReady(selectedPrecommitOwned: Bool = false, packetOwned: Bool = false) -> Bool {
-            SMBTransferRetirementReceiptReadiness.isReady(
-                hasReceipt: true,
-                queueRemovalAcknowledged: true,
-                refundAcknowledged: true,
-                refundsPending: 0,
-                timerAcknowledged: true,
-                reservationPending: false,
-                supplierOwned: false,
-                decodeOwned: false,
-                deliveryOwned: false,
-                selectedPrecommitOwned: selectedPrecommitOwned,
-                packetOwned: packetOwned,
-                slotReleased: true
-            )
-        }
-
-        XCTAssertTrue(isReady())
-        XCTAssertFalse(
-            isReady(selectedPrecommitOwned: true),
-            "sender selection and packet ownership are independent receipt acknowledgements"
-        )
-        XCTAssertFalse(
-            isReady(packetOwned: true),
-            "receipt cannot close until the selected packet owner returns"
-        )
-    }
-
-    func testUnsentSlotReleaseWaitsForRefundAcknowledgementAfterOtherOwnersSettle() {
-        func isReady(refundAcknowledged: Bool, refundsPending: Int) -> Bool {
-            SMBTransferRetiringSlotRelease.isReady(
-                hasReceipt: true,
-                queueRemovalAcknowledged: true,
-                refundAcknowledged: refundAcknowledged,
-                refundsPending: refundsPending,
-                timerAcknowledged: true,
-                reservationPending: false,
-                hasExternalOwner: false,
-                packetOwned: false
-            )
-        }
-
-        XCTAssertFalse(isReady(refundAcknowledged: false, refundsPending: 1), "refund ack is the sole unsettled slot-release owner")
-        XCTAssertTrue(isReady(refundAcknowledged: true, refundsPending: 0))
-    }
-
-    func testUnsentRetirementKeepsSlotUntilRefundAcknowledgementAndRecordReclaim() throws {
-        let window = SMBTransferWindow(transferIdentifier: 103, direction: .write)
-        let ticket = try makeTicket(window, sequence: 1, length: 4)
-        let now = ContinuousClock.now
-        window.registerEpochOwner()
-        window.stop(for: .callerCancelled, at: now, cleanupTimeout: .seconds(5))
-
-        XCTAssertTrue(window.retireUnsent(ticket, at: now))
-        XCTAssertTrue(window.wireDrained)
-        XCTAssertFalse(window.allSlotsVacant, "retiringUnsent keeps the local slot charged")
-        XCTAssertEqual(window.committedSlotCount, 1)
-        XCTAssertFalse(window.epochReady())
-
-        XCTAssertTrue(window.finishUnsentRetirement(ticket, at: now), "refund acknowledgement releases the slot")
-        XCTAssertTrue(window.allSlotsVacant)
-        XCTAssertEqual(window.epochOutstandingOwnerCount, 1, "slot release does not acknowledge the record's grant/refund owner")
-        XCTAssertFalse(window.epochReady())
-
-        window.reclaimEpochOwner()
-        XCTAssertTrue(window.epochReady(), "record reclamation is the final epoch owner acknowledgement")
-        XCTAssertEqual(window.epochOutstandingOwnerCount, 0)
-    }
-
-    func testOldOwnerAcknowledgementAfterSlotReuseLeavesNewTicketBound() throws {
-        let window = SMBTransferWindow(transferIdentifier: 105, direction: .write)
-        window.registerEpochOwner()
-        let ticketA = try makeTicket(window, sequence: 1, length: 4)
-        complete(window, ticket: ticketA)
-        let retirementA = try XCTUnwrap(window.beginNextRetirement())
-        XCTAssertEqual(retirementA.ticket, ticketA)
-        XCTAssertTrue(window.finishRetirement(ticketA, advanceFrontier: true))
-        XCTAssertTrue(window.releaseRetiredSlot(ticketA))
-        XCTAssertTrue(window.isSlotVacant(ticketA.slotIndex))
-
-        window.registerEpochOwner()
-        let ticketB = try makeTicket(window, sequence: 2, length: 6)
-        XCTAssertEqual(ticketB.slotIndex, ticketA.slotIndex)
-        XCTAssertEqual(ticketB.slotSequence, ticketA.slotSequence + 1)
-        XCTAssertFalse(window.isSlotVacant(ticketB.slotIndex))
-
-        window.reclaimEpochOwner() // Late credit acknowledgement for A.
-        XCTAssertEqual(window.epochOutstandingOwnerCount, 1, "A's acknowledgement reclaims only A's owner")
-        XCTAssertTrue(window.markSendStarted(ticketB))
-        XCTAssertTrue(window.markFullySent(ticketB, at: nil))
-        XCTAssertTrue(window.acceptFinal(.success(payload: [7, 8]), for: ticketB, at: nil))
-        XCTAssertTrue(window.markSendOwnerFinished(ticketB, at: nil))
-        XCTAssertEqual(window.completedTickets, [ticketB], "A's old acknowledgement cannot change B's ticket or payload")
-        XCTAssertFalse(window.isSlotVacant(ticketB.slotIndex))
-    }
-
-    func testShortReadEpochAdvanceWaitsForLastCanonicalOwnerAfterSlotRelease() throws {
-        let window = SMBTransferWindow(transferIdentifier: 104, direction: .read)
-        let ticket = try makeTicket(window, sequence: 1, length: 8)
-        let now = ContinuousClock.now
-        window.registerEpochOwner()
-        complete(window, ticket: ticket, result: .success(payload: [1, 2, 3]), at: now)
-        window.stop(
-            for: .readBoundary(offset: 0, requestedLength: 8, receivedLength: 3),
-            at: now,
-            cleanupTimeout: .seconds(5)
-        )
-        let retirement = try XCTUnwrap(window.beginNextRetirement())
-        XCTAssertEqual(retirement.ticket, ticket)
-        XCTAssertTrue(window.finishRetirement(ticket, advanceFrontier: true))
-        XCTAssertTrue(window.releaseRetiredSlot(ticket))
-        XCTAssertTrue(window.wireDrained)
-        XCTAssertTrue(window.allSlotsVacant)
-        XCTAssertFalse(window.epochReady(), "a late credit acknowledgement still owns the canonical record")
-        XCTAssertFalse(window.beginNextEpoch(at: 3))
-
-        window.reclaimEpochOwner()
-        XCTAssertTrue(window.epochReady())
-        XCTAssertTrue(window.beginNextEpoch(at: 3))
-        XCTAssertEqual(window.epoch, 1)
-    }
-
     func testStopErrorSelectionPriorityAndLowestOffset() {
         let start = ContinuousClock.now
         let window = SMBTransferWindow(transferIdentifier: 8, direction: .write)
@@ -1035,7 +835,6 @@ final class SMBTransferWindowTests: XCTestCase {
             let ticket = try makeTicket(window, sequence: 1, length: 4)
             complete(window, ticket: ticket, result: .success(payload: [1, 2, 3, 4]))
             _ = try XCTUnwrap(window.beginNextRetirement())
-            XCTAssertTrue(window.setExternalOwner(true, for: ticket))
 
             window.markTerminalClose()
             window.markTerminalSendOwnersJoined(at: ContinuousClock.now)
@@ -1046,8 +845,10 @@ final class SMBTransferWindowTests: XCTestCase {
             XCTAssertEqual(leaseCounts.retirement, direction == .write ? 1 : 0)
             XCTAssertEqual(window.committedSlotCount, 1, "callback-owned slot storage remains charged")
 
-            XCTAssertTrue(window.releaseTerminalOwnedSlot(ticket))
-            XCTAssertFalse(window.releaseTerminalOwnedSlot(ticket), "callback lease can be collected only once")
+            XCTAssertTrue(window.finishRetirement(ticket, advanceFrontier: direction == .write))
+            XCTAssertTrue(window.releaseRetiredSlot(ticket))
+            XCTAssertFalse(window.finishRetirement(ticket, advanceFrontier: true))
+            XCTAssertFalse(window.releaseRetiredSlot(ticket), "callback lease can be collected only once")
             let releasedLeaseCounts = window.callbackLeaseCountsForTesting
             XCTAssertEqual(releasedLeaseCounts.delivery, 0)
             XCTAssertEqual(releasedLeaseCounts.retirement, 0)

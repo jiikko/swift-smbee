@@ -467,7 +467,12 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - D2 の修正が ticket 化の前の preparation の refund（Tree の隔離）に届いていない（逐次の await のまま）
   - 退役の effect ごとの独立した Task で、大量の退役で Task が一度に 4N 本できる → main agent の判断: 退役は hot path ではないので Task は許容するが、pump の Task を 1 つにしてその中の task group の子で回す（固定の worker 数には戻さない）
   - テスト: pump のテストの待ちに上限が無く退行で hang する、D1 の decode の返却の経路のテストが無い、source 検査が `!.` を素通りする、READ の回収の assert が operation の完了より先に走りうる
-  - 6 件を codex（luna-max）に直させる（実行中）
+  - 6 件を直した（worktree の 393c78b。pump は session ごとに coordinator の Task 1 つ + structured な task group の子。preparation の refund も共通の effect の work）。
+    検証（自分で実行）: macOS 857 件 × 2 / Linux 864 件 green、変更したテストを 20 回連続 green、cancel の stress 10 回 green、strict lint 0、smoke 3 profile
+- M1+M2 の敵対レビュー 3 周目（2026-10-13、sol-high 2 観点。所有と並行の観点は一度「model is at capacity」で落ちて起動し直した）:
+  - 所有と並行: production で壊せる経路を見つけられなかった（coordinator の二重起動・起床漏れ・終了と登録の競合、terminal の中の追加 work、grant の accept と取消の競合、ack の二重・漏れ）。**production は収束**
+  - テスト: P2 が 3 件（preparation の credit の返却を省いても通る、source 検査が `Task.detached` を数えない、preparation の fixture が coordinator の join の失敗を `try?` で握り潰す）
+  - 周回の打ち切り: 直すのはテストと source 検査だけで判定のロジックを新設せず、各テストは変異で直接確かめるので、規定の例外としてこの修正で周回を打ち切る（codex で修正中）
 
 ## 関連
 

@@ -472,7 +472,14 @@ commit の分け方（各 commit が単独で契約を満たす）:
 - M1+M2 の敵対レビュー 3 周目（2026-10-13、sol-high 2 観点。所有と並行の観点は一度「model is at capacity」で落ちて起動し直した）:
   - 所有と並行: production で壊せる経路を見つけられなかった（coordinator の二重起動・起床漏れ・終了と登録の競合、terminal の中の追加 work、grant の accept と取消の競合、ack の二重・漏れ）。**production は収束**
   - テスト: P2 が 3 件（preparation の credit の返却を省いても通る、source 検査が `Task.detached` を数えない、preparation の fixture が coordinator の join の失敗を `try?` で握り潰す）
-  - 周回の打ち切り: 直すのはテストと source 検査だけで判定のロジックを新設せず、各テストは変異で直接確かめるので、規定の例外としてこの修正で周回を打ち切る（codex で修正中）
+  - 周回の打ち切り: 直すのはテストと source 検査だけで判定のロジックを新設せず、各テストは変異で直接確かめるので、規定の例外としてこの修正で周回を打ち切った（b5f58fe）
+  - 実装中に 1 回だけ、全 suite が既存の `testCloseFromReconnectOverflowCallbackStopsBeforeNextWatchIteration` で 90 秒以上止まった。単体 50 回（M1+M2 / master とも）・全 suite 5 回では再現せず。未確認のリスクとして CI の hang の watchdog で観測する
+- **master へ（988bcba、1 commit に squash）→ x86 の性能 gate を超えたので revert した（e8e248c、ユーザーの判断。Commit 3 と同じ扱い）**:
+  - 988bcba の CI: Test・E2E は success。Performance は Release のテストのビルドで落ちた（`testWriteDrainDeadlineJoinsWireOwnersWhileAsyncSupplierIsSuspended` が #if DEBUG の中にだけある API を guard 無しで呼んだ）→ cd6355c で関数ごと #if DEBUG に入れた。
+    手元の検証（main agent も codex も）に Release のテストのビルド（`swift build -c release --build-tests -Xswiftc -enable-testing`）が入っていなかったのが漏れの原因（M3 以降の指示に足した）
+  - cd6355c の CI: Performance（run 38363228813、20 組、直前の成功した master と比較）で read_stream が gate を超えた: throughput −19.3%（−15%）、user CPU +29.2%（+25%）。
+    write_stream は throughput −9.0%・user CPU +11.2%（内側）。RSS・system CPU は雑音の範囲。macos-tsan で `testLateReadGrantAcknowledgementUsesCanonicalOwnerAfterSlotReuse` が 1 回落ちた（phase の待ちのずれの疑い）
+  - 次: worktree で、手元の arm64 container で master と交互に計測して再現 → 主要な指標（user CPU）の増加を chunk ごとの処理の内訳（callgrind 等）で説明 → 直す → 再計測 → 入れ直す（codex、実行中）
 
 ## 関連
 

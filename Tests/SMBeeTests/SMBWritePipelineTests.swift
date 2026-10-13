@@ -1551,6 +1551,7 @@ final class SMBWritePipelineTests: XCTestCase {
         await session.closeTransportAndWait(cause: "write_deadline_test_complete")
     }
 
+#if DEBUG
     func testWriteDrainDeadlineJoinsWireOwnersWhileAsyncSupplierIsSuspended() async throws {
         let transport = SMBWritePipelineScriptTransport()
         let virtualTime = SMBWritePipelineVirtualClock()
@@ -1702,6 +1703,7 @@ final class SMBWritePipelineTests: XCTestCase {
         XCTAssertEqual(lifecycleAfterSupplierReturn.wireOperationBarriers, 0)
         await session.setTransferRequestOwnershipHookForTesting(nil)
     }
+#endif
 
     func testTransportDisconnectTerminalizesAndJoinsWrites() async throws {
         let transport = SMBWritePipelineScriptTransport()

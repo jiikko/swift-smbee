@@ -1,7 +1,7 @@
 # 067 perf: 小さい部分 READ を安く回すための API が足りない（サムネイル生成用途）
 
-状態: **open（A は実装済み。C の前提となる正常系の複数 outstanding は E2E 確認済みだが、
-B / C / D と実サーバ計測は未着手）**
+状態: **open（A・knownSize・C は実装済み。残りは B（送信側の compound）と D（同時 open handle の上限）。
+どちらも着手の gate が未発火のため保留）**
 起票: 2026-07-27
 更新: 2026-07-27 — A: prefix read を実装（`9f20dbf` 実装 / `13acbdc` E2E / `4c36c12` 空ファイル unit）。
 `SMBClientSession.readPrefix` / `withPrefixReadStream` が使える。unit + perf regression
@@ -20,6 +20,38 @@ wire レベルまで確認した。ただし C の READ pipeline 自体は未実
 consumer 側: obaket `macOS/issues/437-feat-smb-thumbnail-display.md` /
 obaket `issues/done/460-architecture-large-exact-range-bypasses-window-split.md`（window 分割の設計） /
 obaket `issues/462-perf-video-range-window-prefetch.md`（C の consumer 側前提）
+
+## 2026-10-13 時点の棚卸し（以下の節は書いた時点の記録。現状はこの表が正）
+
+| 項目 | 状態 | 根拠 |
+|---|---|---|
+| A. prefix read | ✅ 実装済み | `SMBClientSession.readPrefix` / `withPrefixReadStream`（2026-07-27） |
+| A の代替案 `knownSize:`（QUERY_INFO を省く） | ✅ 実装済み | `read(path:range:knownSize:)` / `withReadStream(path:range:knownSize:...)`。`resolvedSize(knownSize:fileId:)` が渡された size を使い、`readBounds(...sizeIsCallerProvided:)` が超過を caller の誤りとして扱う |
+| C. READ のパイプライン化 | ✅ 実装済み | issue 102 #14（done）。`streamRead` と `readAll` が `SMBTransferWindow` の driver に載った。WRITE も #15 で同様 |
+| 受信側の compound 応答の分割 | ✅ 実装済み | issue 104（done）。`validateResponseChain` / `SMBValidatedResponseEffect.compound` |
+| issue 069（CLOSE cleanup の失敗が shared session を巻き添えにする） | ✅ done | C の節で「異常系は未確認」とした前提の 1 つ |
+| **B. CREATE + READ + CLOSE の送信側 compound 化** | 未着手 | 送信経路で `nextCommand` に 0 以外を入れる箇所は無い（2026-10-13 に `grep -n nextCommand Sources/SMBee/*.swift`。SMBClient の参照は受信側の分割 `validateResponseChain` 周辺だけで、header の初期値は 0） |
+| **D. 同時 open handle の上限とバックプレッシャー** | 未着手 | session 単位の handle 数の上限は無い（同日 grep） |
+
+「現状の事実」の 2（QUERY_INFO を省けない）と 4（`streamRead` が逐次）は**もう成り立たない**。1 は `knownSize:` を渡さない
+呼び出しには今も当てはまり、3（送信側の compound が無い）と 5（handle 数の上限が無い）は今も正しい。
+
+### B を保留している理由（2026-10-13 に見直した）
+
+- **gate が未発火**: consumer（obaket）からのサムネイル遅延の報告は無い。実 NAS での小さい READ の往復の実測も無い。
+- **既存の RTT の実測は小さい READ を測っていない**: `docs/performance-resource-baseline.md` の「2026-10-09」節は、container の Samba に
+  RTT を足して（0 / 5 / 20 ms）1 MiB と 64 MiB の転送を測ったもの。CREATE / CLOSE の往復が支配する小さい prefix read の件数比例のコストは
+  この測定に入っていない。localhost の実測（2026-08-01 追記、1 件あたり約 1.5 ms）からの見積もりのまま。
+- **wire の中核に触る**: chain 全体の credit charge、request ごとの署名、暗号化時の 1 transform への包み、related request の FileId の引き継ぎ、
+  部分失敗（CREATE 成功・READ 失敗で handle が残る）の後始末が要る。後始末は issue 106（未送信 request の退役と、転送の chunk の所有を
+  canonical な record に統合する Commit 5。2026-10-13 時点で性能の退行を調べるため revert 中）と同じ経路なので、**106 が片付くまで着手しない**。
+- **再開の trigger**: (1) obaket からサムネイル / 動画 window の遅延の報告が来る、または (2) 実 NAS（RTT が ms 級）で 64 KiB prefix read × N 件の
+  所要と往復回数を測り、CREATE / CLOSE の往復が支配的だと数字で示せたとき。どちらの場合も 106 の完了が前提。
+
+### D を保留している理由
+
+consumer は動画サムネイル生成を幅 1 の gate で直列化しており、同時に開く handle は実質 1 本（2026-08-05 の観測から変わっていない）。
+**trigger**: consumer が並列でサムネイルを作るようになった、またはサーバの handle 数の上限に当たって STATUS_* で失敗した報告が出たとき。
 
 ## 背景
 
@@ -106,7 +138,7 @@ API を用意する。現状は EOF クランプのために QUERY_INFO を強�
 実装コストは A より高く、compound 応答の分解・部分失敗（CREATE 成功 / READ 失敗で handle が
 残る）の扱いを決める必要がある。**A を先に入れて効果を測ってから判断する**のが妥当。
 
-### C. READ のパイプライン化（full fetch 経路）
+### C. READ のパイプライン化（full fetch 経路） — ✅ 実装済み（issue 102 #14。下の検証状況は 2026-08-12 時点の記録）
 
 `streamRead` で credit の許す範囲だけ先行して READ を投げる。chunk 順序の保証と
 onChunk の逐次呼び出し契約を壊さないこと（consumer は progressive decode に順序を仮定している）。

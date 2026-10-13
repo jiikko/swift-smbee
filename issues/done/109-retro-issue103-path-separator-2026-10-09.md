@@ -39,3 +39,11 @@
 
 - issue 103 の受け入れ条件の誤り（`a\\\u{0301}..` は受理が正しい）は issue 本文で訂正した
 - DFS キャッシュの鍵の `/` と `\` の不一致（性能のみ）は issue 103 に記録した
+
+## 決着（2026-10-13）
+
+codex（sol-high）に、4 本の retro の提案 11 個を反証の立場で審査させ、10 項目にまとめて 6 採用・4 却下とした（ユーザーの指示: 有意義なら適用）。採用分は dotfiles の commit `docs(rules): swift-smbee の retro 107 / 109 / 110 / 111 の提案のうち、codex の審査で既存に無いと確かめた 6 点を既存ルールへ追記する`（ace43ba1）。
+
+- A 採用（修正）: `verify-execution-not-just-exit-code.md` の確認表の「新規テスト」の行を「指定した検証経路で pass、テスト名・started・suite passed だけで判断せず、skip を実行の証拠に数えない」に置き換えた
+- B 却下: `mutation-verify-new-tests.md` の手順 1.5（ビルド段の成否をテストと別に見る、ビルド不能は第 3 の結果）と「この変異で最初に落ちるのはどの assert かを予測し、一致を確かめる」で足りる
+- C 却下: `verify-execution-not-just-exit-code.md` の canary 節（既知の入力で既知の答えが出ることを本走査の前に固定し、同じ関数を通す）で足りる

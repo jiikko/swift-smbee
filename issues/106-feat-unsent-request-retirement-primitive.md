@@ -480,6 +480,17 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - cd6355c の CI: Performance（run 38363228813、20 組、直前の成功した master と比較）で read_stream が gate を超えた: throughput −19.3%（−15%）、user CPU +29.2%（+25%）。
     write_stream は throughput −9.0%・user CPU +11.2%（内側）。RSS・system CPU は雑音の範囲。macos-tsan で `testLateReadGrantAcknowledgementUsesCanonicalOwnerAfterSlotReuse` が 1 回落ちた（phase の待ちのずれの疑い）
   - 次: worktree で、手元の arm64 container で master と交互に計測して再現 → 主要な指標（user CPU）の増加を chunk ごとの処理の内訳（callgrind 等）で説明 → 直す → 再計測 → 入れ直す（codex、実行中）
+- **性能の調査（2026-10-14、codex。worktree `swift-smbee-wt-c5m12-20261012-204015-38570` の a89bc8a、未 push）**:
+  - 再現: arm64 の Linux container で master と 5 組交互、read throughput −16.5% / user CPU +26.1%。handle → record の weak 参照で hash lookup を避ける案は効かず戻した
+  - Callgrind（1 run・1 iteration の synthetic read。XCTest の fixture と 1 MiB の warm-up を含む）: 候補は master 比 +6.88% Ir。上位は `transitionTransferRequest`（+622k）、enum tag の操作（+474k）、`swift_beginAccess`（+495k）、`swift_retain` / `release`（+446k / +411k）。
+    送信・応答・decode・delivery のたびに単一の遷移関数を通り、そのたびに exclusivity check・retain/release・enum の payload の処理が走る
+  - 直したこと（a89bc8a）: ticket が request key を handle から読む（2 重に持たない）、`SMBRequestIdentity` の hash を requestSequence だけにする（等価比較は 3 つ組のまま）、owner を class にして遷移ごとの値コピーと書き戻しをやめる。
+    reclaim の条件・receipt・epoch の owner 数・単一の遷移関数は変えていない。main agent が差分を読み、owner を控えてから使う箇所（`treeRefusalPreparation` 等）で class 化が結果を変えないこと、ticket の等価比較が key ベースのままであることを確かめた
+  - 計測（arm64 container、5 組）: read throughput −11.45%（95% CI −12.11〜−10.92%）、user CPU +12.89%（+10.33〜+15.37%）。write は −1.91% / +4.55%。目安の ±10% には届いていない
+  - 効かずに戻した案: ticket の hash を MessageId だけにする、read の経路で write の map の lookup を省く
+  - 検証: macOS の unit 859 件・失敗 0、strict lint 違反 0、Release のテストのビルド成功（main agent が実行）。Linux arm64 の unit と Release のビルドは codex の報告のみ（main agent は未実行）。TSan のテストは B の slot が fullySent かつ sendOwnerFinished になるまで待つ形に直し、20 回連続で通過（codex の報告）
+  - **x86 の gate は未実測**。前回は arm64 の −16.5% / +26.1% が CI の x86 で −19.3% / +29.2% になった。同じ比率なら今回は x86 で約 −13.5% / +14.5% の見積もり（gate は −15% / +25%）。throughput の余裕が小さい
+  - 残差を詰める案（未実装）: session ローカルの generation 付き record の slot table。handle から配列の slot を引き、generation と identity / key を照合して record に届く形にし、遷移ごとの identity の hash lookup を減らす。slot の再利用を receipt・epoch の条件と結び付ける設計とテストが要る
 
 ## 関連
 

@@ -460,7 +460,14 @@ commit の分け方（各 commit が単独で契約を満たす）:
     `finishDelivery` も false で戻って返却の event が失われる。driver は再送しないので、slot / record が残り epoch も転送も終わらない
   - D2（P2、3 観点）: refund の effect の pump の worker を 2 に固定したため、A と B の refund の await の間に C が dispatch されない（設計 G6 の「ack 待ちで別の effect を塞がない」に反する）
   - D3〜D5（P2、テストと検査）: 旧い ack のテストが production の ack の経路を通らない、既存 2 本が設計 §5 の 3 段を全部見ていない、所有の書き込みの source 検査の正規表現が optional chaining を拾わない
-  - 5 件すべてを codex（luna-max）に直させる（実行中）
+  - 5 件すべてを直した（worktree の b524e31。D1: join の前の返却も遷移で記録し slot は join で解放、D2: 退役のときだけ effect ごとに Task）。
+    検証（自分で実行）: macOS 853 件 × 2 / Linux 860 件 green、変更したテストを 20 回連続 green、cancel の stress 10 回 green、strict lint 0、smoke 3 profile
+  - 2 周目の起動は codex の weekly 枠の上限で一度落ちた（2026-10-13 未明。ユーザーが枠を戻して再開）
+- M1+M2 の敵対レビュー 2 周目（2026-10-13、sol-high 2 観点）: D1・D2 の修正そのものは壊せなかった。P2 が 4 件・P3 が 2 件:
+  - D2 の修正が ticket 化の前の preparation の refund（Tree の隔離）に届いていない（逐次の await のまま）
+  - 退役の effect ごとの独立した Task で、大量の退役で Task が一度に 4N 本できる → main agent の判断: 退役は hot path ではないので Task は許容するが、pump の Task を 1 つにしてその中の task group の子で回す（固定の worker 数には戻さない）
+  - テスト: pump のテストの待ちに上限が無く退行で hang する、D1 の decode の返却の経路のテストが無い、source 検査が `!.` を素通りする、READ の回収の assert が operation の完了より先に走りうる
+  - 6 件を codex（luna-max）に直させる（実行中）
 
 ## 関連
 

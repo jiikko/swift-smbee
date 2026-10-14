@@ -124,7 +124,7 @@ DOCKER_PULL_RETRY_FORCE=1 "${SCRIPT_DIR}/docker-pull-retry" "swift:${SWIFT_VERSI
 swift_image_digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "swift:${SWIFT_VERSION}")"
 samba_version="$(docker exec "${SAMBA_CONTAINER}" smbd --version | tr -d '\r')"
 runner_kernel="$(uname -r)"
-runner_cpu_model="$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | sed -E 's/^[^:]*:[[:space:]]*//' || true)"
+runner_cpu_model="$("${SCRIPT_DIR}/cpu-model")"
 runner_cpu_count="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN)"
 docker_version="$(docker version --format '{{.Server.Version}}')"
 

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+unset CDPATH
+
+# Prints the CPU model label that compare-resource-performance uses to decide whether two
+# performance runs are comparable. Prints nothing when no label can be read; the callers record that
+# as "unknown", and the comparison then refuses to compare.
+#
+# x86 kernels expose "model name" (older arm kernels "Hardware" / "Processor"). arm64 Linux kernels,
+# including GitHub's ubuntu-24.04-arm runners and Apple container, expose only "CPU implementer" and
+# "CPU part", so the label falls back to that pair, which identifies the core type. Without the fallback
+# every arm64 run recorded cpu_model=unknown and the regression gate was skipped (issue 112).
+#
+# Usage: cpu-model [cpuinfo-path]   (default /proc/cpuinfo; the argument is for tests)
+
+cpuinfo="${1:-/proc/cpuinfo}"
+if [ ! -r "${cpuinfo}" ]; then
+  exit 0
+fi
+
+field() {
+  grep -m1 -E "^($1)[[:space:]]*:" "${cpuinfo}" | sed -E 's/^[^:]*:[[:space:]]*//' || true
+}
+
+model="$(field 'model name|Hardware|Processor')"
+if [ -z "${model}" ]; then
+  implementer="$(field 'CPU implementer')"
+  part="$(field 'CPU part')"
+  if [ -n "${implementer}" ] && [ -n "${part}" ]; then
+    model="arm64 implementer ${implementer} part ${part}"
+  fi
+fi
+
+if [ -n "${model}" ]; then
+  printf '%s\n' "${model}"
+fi

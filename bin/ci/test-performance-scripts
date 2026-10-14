@@ -142,6 +142,7 @@ expect_resource_performance_docker_argv() {
     -v "${cache_dir}:/root/.cache/org.swift.swiftpm" \
     -v "${SCRIPT_DIR}/prewarm-swiftpm-artifacts:/workspace/bin/ci/prewarm-swiftpm-artifacts:ro" \
     -v "${SCRIPT_DIR}/resource-performance-container:/workspace/bin/ci/resource-performance-container:ro" \
+    -v "${SCRIPT_DIR}/cpu-model:/workspace/bin/ci/cpu-model:ro" \
     -w /workspace \
     swift:test \
     bash \
@@ -232,6 +233,7 @@ test_syntax_checks() {
     "${SCRIPT_DIR}/run-resource-performance" \
     "${SCRIPT_DIR}/prewarm-swiftpm-artifacts" \
     "${SCRIPT_DIR}/resource-performance-container" \
+    "${SCRIPT_DIR}/cpu-model" \
     "${SCRIPT_DIR}/resource-performance-metadata" \
     "${SCRIPT_DIR}/parse-resource-performance" \
     "${SCRIPT_DIR}/publish-network-performance-summary" \
@@ -529,6 +531,54 @@ test_prewarm_handles_path_with_space() {
 # steps that need /usr/bin/time, swift, or /root replaced. /usr/bin/time is an absolute path, so a PATH
 # shim could not stand in for it; replacing the functions after sourcing keeps the build-cache branch
 # and its call from main under test (issue 091).
+# cpu_model decides whether compare-resource-performance compares two runs at all. arm64 kernels
+# expose no "model name", and an empty label made the regression gate skip every arm64 run (issue 112).
+test_cpu_model() {
+  local scenario_dir
+  scenario_dir="$(new_scenario_dir)"
+  cat > "${scenario_dir}/x86" <<'EOF'
+processor	: 0
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
+EOF
+  cat > "${scenario_dir}/arm64" <<'EOF'
+processor	: 0
+BogoMIPS	: 2000.00
+CPU implementer	: 0x41
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0xd4f
+EOF
+  printf 'processor\t: 0\n' > "${scenario_dir}/bare"
+  # Check the exit status separately: diff on <(...) and an `if [ -n "$(...)" ]` both discard it, and
+  # the callers run the helper under set -e, where a non-zero exit stops the measurement.
+  local fixture expected actual
+  for fixture in x86 arm64 bare missing; do
+    case "${fixture}" in
+      x86) expected='Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz' ;;
+      arm64) expected='arm64 implementer 0x41 part 0xd4f' ;;
+      *) expected='' ;;
+    esac
+    if ! actual="$("${SCRIPT_DIR}/cpu-model" "${scenario_dir}/${fixture}")"; then
+      echo "cpu-model exited non-zero for the ${fixture} cpuinfo" >&2
+      return 1
+    fi
+    if [ "${actual}" != "${expected}" ]; then
+      printf 'cpu-model for %s: expected [%s], got [%s]\n' "${fixture}" "${expected}" "${actual}" >&2
+      return 1
+    fi
+  done
+  # Match the call itself, not just the name: a comment mentioning cpu-model must not satisfy this.
+  if ! grep -qF 'cpu_model="$(bin/ci/cpu-model)"' "${SCRIPT_DIR}/resource-performance-container"; then
+    echo 'resource-performance-container must read cpu_model through bin/ci/cpu-model' >&2
+    return 1
+  fi
+  if ! grep -qF 'runner_cpu_model="$("${SCRIPT_DIR}/cpu-model")"' "${SCRIPT_DIR}/network-performance-study-run"; then
+    echo 'network-performance-study-run must read cpu_model through bin/ci/cpu-model' >&2
+    return 1
+  fi
+}
+
 test_resource_performance_container_prewarm_branch() {
   local scenario_dir workspace marker skip_build
   scenario_dir="$(new_scenario_dir)"
@@ -540,6 +590,7 @@ test_resource_performance_container_prewarm_branch() {
 set -euo pipefail
 printf '%s\n' called >> "${FAKE_PREWARM_MARKER:?}"
 EOF
+  cp "${SCRIPT_DIR}/cpu-model" "${workspace}/bin/ci/cpu-model"
 
   for skip_build in false true; do
     rm -f "${marker}" "${scenario_dir}/steps"
@@ -2077,8 +2128,9 @@ run_scenario test_prewarm_refuses_unsafe_targets
 run_scenario test_prewarm_handles_path_with_space
 run_scenario test_resource_performance_container_prewarm_branch
 run_scenario test_prewarm_has_no_array_expansions
+run_scenario test_cpu_model
 
-expected_scenario_count=28
+expected_scenario_count=29
 printf 'ran %s scenarios\n' "${scenario_count}"
 if [ "${scenario_count}" -ne "${expected_scenario_count}" ]; then
   printf 'expected %s scenarios, ran %s\n' \

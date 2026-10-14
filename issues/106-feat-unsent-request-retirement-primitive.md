@@ -532,6 +532,17 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - fake の `respondToCreate` が毎回同じ FileId を返していたのを、CREATE の MessageId から一意に作る形に直した（同時に開いている handle が同じ FileId を持つことは実サーバでは起きない）。
     同じ FileId のせいで `testAsyncSupplierReentersSessionAndOversizedChunkSplitsUntilEOF` が落ちていた。原因の推定（stat の CLOSE intent が upload の準備中の record を拒む）は観測していない
   - 検証（サブエージェントの報告。main agent は macOS の unit 873 件・失敗 0 を再現）: Linux arm64 の unit 880 件・失敗 0、Release のテストのビルド（macOS / Linux）、strict lint・lint-analyze 違反 0、E2E（SMB 3.0.2）、変異 M1〜M7 がすべて red、新しいテスト 13 本を 20 回連続 green
+  - **レビュー 1 周目（2026-10-15、Claude のサブエージェント 3 本・read-only、15ad018 が対象）の台帳**:
+    | # | 観点 | 指摘 | 判定 |
+    |---|---|---|---|
+    | A | 素通り | 通常の経路（`signedWireTransaction`）の cancel の待ちにテストが無い | **確認済み**: 待ちの 1 行を消す変異で 873 件が緑（mutate-verify rc=6）。テストを足す |
+    | B | 壊す | `cleanup_ledger_limit` の 3 か所は同期の `closeTransport` で終端し join を起こさない → record が回収されず、cancel 後に待つ caller が戻らない（以前は漏れるだけ）。operation barrier と `discardedOnTerminal` の組も同じ根 | 未再現。3 か所が同期の `closeTransport` を呼ぶことは確認。再現テストを先に書く |
+    | C | 発見型 P2 | CLOSE が commit 前に放棄されても、通常の要求に付けた `admissionRefusal` が残り、後の cancel を codec error にすり替えて待ちを外す | 未再現。再現テストを先に書く |
+    | D | 発見型 P3 | CLOSE の admission に suspension 点が増え、generation を確かめずに `registerPendingResponse` へ進みうる | 実害未確認 |
+    | E | 発見型 P3 | 通常の CLOSE ごとに record を全件走査 | 性能。判断して記録 |
+    | F | 素通り | timeout のテストは待ちの有無を区別しない / `reclaimWaiters == 0` の assert は空振り / M7 は既存の終端化を見ているだけ / source-shape は M5 の箇所を見ていない | 対応する |
+    | G | 素通り | fake の FileId を一意にした件の原因の推定は未観測。同じ FileId の使い回しの場面のカバレッジが減った | 観測して確かめる |
+    壊せなかった攻め口: reclaim 以外で record が消える経路（1 か所だけ）、待ち始める前の回収、reconnect / close の join、自分の CLOSE との deadlock、queue の中の cancel、refund の二重化、committed ticket の退役、descriptor と refusal の混同、hot path への追加
   - 次: レビュー（発見型 1 + 敵対 2、codex が使えないので Claude のサブエージェント）→ 指摘への対応 → smoke（3 プロファイル）→ master へ
 
 ## 関連

@@ -187,7 +187,7 @@ jobs:
 
   linux-asan:
     name: linux-asan / .swift-version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -208,7 +208,7 @@ jobs:
     name: linux-build-test / .swift-version
     # Linux runner で、Network.framework 依存が SMB 本体へ漏れていないことと、
     # unit/vector テストが Linux 上でも通ることを PR 時点で明示的に確認する。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Read Swift version
@@ -231,7 +231,7 @@ jobs:
     # Samba launcher 2 本 (bin/e2e/container-samba.sh / test/e2e/start-samba-ci.sh) と共通 helper
     # (test/e2e/launcher-common.sh)、E2E の「実行された」判定 (bin/ci/require-xctest-passed) を
     # fake runtime で検査する (issues/087)。container runtime は使わない。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Test E2E launchers
@@ -243,7 +243,7 @@ jobs:
     # `swift test --list-tests` が新規 XCTest ファイル / class / method を拾えているかを確認する。
     # code coverage ではなく test registration coverage の smoke。source 側の `func test...` 数を
     # 下限として使い、Linux SwiftPM/XCTest 上の登録漏れを早めに検出する。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Read Swift version
@@ -265,7 +265,7 @@ jobs:
     # churn/計測揺れの false failure を避ける。coverage が上がったら床も一段ずつ引き上げる。
     # 注意: 分母には unit で測れない glue (SMBee.swift facade / smbcli の run() = E2E 担保) を
     # 含む。facade/CLI を大きく増やすと比率が下がるので、その場合は glue を分母から除外する方針へ。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Read Swift version

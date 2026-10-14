@@ -8,7 +8,8 @@ A pure-Swift SMB2/3 client.
 ## 対応環境
 
 - macOS 15 以降。macOS 13/14 はこの package version の deployment target 外です。
-- Linux with Swift 6.2 or later.
+- Linux（arm64）with Swift 6.2 or later.
+- x86_64 Linux はサポートを段階的に外している。既存のコードはそのまま残すが、CI では確認せず、x86_64 のための新しい実装・修正はしない（2026-10-14。性能 gate を含む CI は arm64 の runner で回す）。
 
 SMB のプロトコル / framing / NTLMv2 フロー / SMB3 の crypto framing は本ライブラリで
 **自作**し、AES-CMAC / AES-GCM / HMAC / SHA などの暗号プリミティブの計算は

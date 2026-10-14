@@ -11,7 +11,7 @@ permissions:
 jobs:
   wire-stress-e2e:
     name: Concurrent wire stress E2E
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     env:
       SAMBA_CONTAINER: smbee-samba-wire-stress

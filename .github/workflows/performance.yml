@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   ci-script-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
       - name: Test performance CI scripts
@@ -38,7 +38,7 @@ jobs:
 
   resource-performance:
     needs: ci-script-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     env:
       RESOURCE_BASELINE_RUNS: ${{ inputs.baseline_runs || '20' }}
       RESOURCE_SWIFTPM_CACHE_DIR: ${{ github.workspace }}/.build/swiftpm-cache
@@ -168,7 +168,7 @@ jobs:
 
   samba-network-performance:
     needs: ci-script-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     env:
       SAMBA_CONTAINER: smbee-samba-network-performance

@@ -59,7 +59,7 @@ permissions:
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
@@ -100,7 +100,7 @@ jobs:
 
   measure:
     needs: plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     strategy:
       fail-fast: false

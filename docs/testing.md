@@ -82,7 +82,7 @@ E2E ハーネスの流れ（XCTest から driver 経由 ⓥ）:
 
 ### CI 実行 — Docker / Linux runner
 
-- CI は **`ubuntu-latest` + Docker で Samba を起動**して E2E（`.github/workflows/e2e.yml`、Swift 6.2）。
+- CI は **`ubuntu-24.04-arm` + Docker で Samba を起動**して E2E（`.github/workflows/e2e.yml`、Swift 6.2）。
   ローカルは Apple container、CI は Docker、と起動手段を分ける。
 - **前提（再掲）**: Linux で動かす以上、SMBee が Linux ビルド可能であること（上の transport 制約）。
 - E2E テストは env gate（`SMBEE_E2E=1` + 接続情報 env）。未満足ならローカルの通常 `swift test` では skip。
@@ -174,7 +174,7 @@ SMBEE_TRACE_WIRE=1 SMBEE_TRACE_WIRE_FULL=1 \
 
 ### GitHub Actions での container CLI
 
-GitHub Actions の E2E は引き続き `ubuntu-latest` + Docker を使う。
+GitHub Actions の E2E は引き続き `ubuntu-24.04-arm` + Docker を使う。
 Apple `container` CLI は macOS 上で Linux container を動かす仕組みだが、GitHub-hosted macOS runner で
 常に使える CI 前提にはしていない。
 

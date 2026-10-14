@@ -20,7 +20,7 @@ concurrency:
 jobs:
   e2e-api:
     name: API E2E / ${{ matrix.profile }} / ${{ matrix.scope }} / Swift ${{ matrix.swift_version }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -131,7 +131,7 @@ jobs:
 
   e2e-cli:
     name: smbcli E2E / Swift ${{ matrix.swift_version }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     strategy:
       fail-fast: false

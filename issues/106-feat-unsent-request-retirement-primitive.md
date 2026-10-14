@@ -495,7 +495,15 @@ commit の分け方（各 commit が単独で契約を満たす）:
     artifact を落として `bin/ci/compare-resource-performance --fail-on-regression` を手元で当て、同じ判定を再現した（`verify-agent-performance` は push の run しか見ないので使えない）。
     arm64 の −11.5% / +12.9% は x86 では縮まなかった（前回の比率から見積もった −13.5% より悪い）。smoke（3 プロファイル）と Linux（unit 866 件・失敗 0、Release のテストのビルド）は通過
   - 判断（ユーザー、2026-10-14）: このまま入れず、slot table まで詰めて x86 で余裕を作ってから入れる
-  - 残差を詰める案（着手）: session ローカルの generation 付き record の slot table。handle から配列の slot を引き、generation と identity / key を照合して record に届く形にし、遷移ごとの identity の hash lookup を減らす。slot の再利用を receipt・epoch の条件と結び付ける設計とテストが要る
+  - **slot table を試して効かなかった（2026-10-14、codex。戻した）**: session 内の generation 付き slot table を作り、handle から slot を引いて generation・identity・owner handle を照合して record に届く形にした
+    （古い handle が同じ slot の新しい record に届かないテストを足し、generation の照合を外す変異で red を確認）。
+    - Callgrind: slot ありは identity の map だけの版より約 79k Ir 少ないだけで、master 比 +6.61M Ir（+7.30%）。事前の見積もり（0.3〜0.8M Ir 減）を大きく下回った。
+      上位は `transitionTransferRequest`（+632k）、`swift_beginAccess`（+577k）、`swift_retain`（+544k）、enum tag の store（+471k）、`swift_release`（+469k）、`AccessSet.insert`（+429k）。**hash lookup は主因ではなかった**
+    - arm64 の 5 組: read −13.0%（95% CI −13.11〜−12.91%）、user CPU +17.2%（+14.81〜+19.52%）。a89bc8a（−11.5% / +12.9%）より悪い
+    - owner を struct に戻す案は class より約 474k Ir 悪かった
+    - 判断: 効かなかった変更は戻す原則に従い、worktree を a89bc8a に戻した
+  - 分かったこと: 退行の本体は lookup ではなく、chunk ごとの各遷移（送信・応答・decode・delivery）が canonical な record を通るたびに走る exclusivity check・ARC・enum の payload の処理。
+    遷移の回数か、1 回の遷移の重さを減らす形にしないと縮まない
 
 ## 関連
 

@@ -504,6 +504,13 @@ commit の分け方（各 commit が単独で契約を満たす）:
     - 判断: 効かなかった変更は戻す原則に従い、worktree を a89bc8a に戻した
   - 分かったこと: 退行の本体は lookup ではなく、chunk ごとの各遷移（送信・応答・decode・delivery）が canonical な record を通るたびに走る exclusivity check・ARC・enum の payload の処理。
     遷移の回数か、1 回の遷移の重さを減らす形にしないと縮まない
+  - **正常系の遷移を 1 回にまとめる（2026-10-14、codex。ユーザーが選んだ方針。worktree に未コミットで残し、差分を tmp/c5/impl/coalesce-attempt.patch に控えた）**:
+    - 正常な READ の 1 chunk の遷移を 16 → 12 回にした。まとめたのは 4 組（`admitReadTransferRequest` の beginPreparing＋reservationPending と reservationSettled＋commit、
+      `runSenderLoop` の selectedPrecommit＋wireCommitted、`stepReadTransfer` の finishDecode＋beginDelivery）。suspension を挟む境界はまとめていない
+    - Callgrind: master 90.66M Ir → 候補 96.29M Ir（+6.21%）。**a89bc8a（96.81M）からの減りは約 0.5M Ir だけで、退行の約 1 割**。retain/release・beginAccess・AccessSet.insert は減ったが、enum の tag の store はほぼ減らない
+    - arm64 の 5 組は計測が成り立たなかった（同じ計測の中で master の read が 626〜2357 MiB/s と揺れた。マシンが混んでいた）。効果は主張できない
+    - テスト: slot の再利用のテストに finishDecode と delivery の開始の順序の assert を足し、`deliveryOwned = true` を落とす変異で red を確認。macOS unit 859 件・Linux unit 866 件・strict lint・Release のテストのビルドは通過（codex の報告。main agent は未実行）
+  - 見通し（main agent の見積もり）: まとめで消せるのは退行の 1 割程度で、x86 で −10% 以内に縮む見込みは低い。残りは遷移ごとの enum の payload・exclusivity・ARC で、単一の遷移関数と canonical な record を保つ限り大きくは減らない
 
 ## 関連
 

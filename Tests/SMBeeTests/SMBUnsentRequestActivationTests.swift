@@ -3,6 +3,45 @@ import XCTest
 @testable import SMBee
 
 final class SMBUnsentRequestActivationTests: XCTestCase {
+    func testM3AdmissionScopeMatchesTreeIncarnationAndFullFileKeyOnly() {
+        let sessionInstance = UUID()
+        let treeA = SMBTreeIdentity(
+            sessionInstance: sessionInstance,
+            generation: 3,
+            treeId: 0xA,
+            incarnationSequence: 7
+        )
+        let recycledTreeA = SMBTreeIdentity(
+            sessionInstance: sessionInstance,
+            generation: 3,
+            treeId: 0xA,
+            incarnationSequence: 8
+        )
+        let treeB = SMBTreeIdentity(
+            sessionInstance: sessionInstance,
+            generation: 3,
+            treeId: 0xB,
+            incarnationSequence: 9
+        )
+        let bytesA = [UInt8](repeating: 0xA1, count: 16)
+        let bytesB = [UInt8](repeating: 0xB2, count: 16)
+        let fileA = SMBFileIdLedgerKey(bytes: bytesA, treeIdentity: treeA)
+        let sameBytesInRecycledTree = SMBFileIdLedgerKey(bytes: bytesA, treeIdentity: recycledTreeA)
+        let sameBytesInOtherTree = SMBFileIdLedgerKey(bytes: bytesA, treeIdentity: treeB)
+        let otherFileInTreeA = SMBFileIdLedgerKey(bytes: bytesB, treeIdentity: treeA)
+
+        let fileScope = SMBTransferAdmissionScope.file(fileA)
+        XCTAssertTrue(fileScope.matches(treeIdentity: treeA, fileId: fileA))
+        XCTAssertFalse(fileScope.matches(treeIdentity: recycledTreeA, fileId: sameBytesInRecycledTree))
+        XCTAssertFalse(fileScope.matches(treeIdentity: treeB, fileId: sameBytesInOtherTree))
+        XCTAssertFalse(fileScope.matches(treeIdentity: treeA, fileId: otherFileInTreeA))
+
+        let treeScope = SMBTransferAdmissionScope.tree(treeA)
+        XCTAssertTrue(treeScope.matches(treeIdentity: treeA, fileId: fileA))
+        XCTAssertFalse(treeScope.matches(treeIdentity: recycledTreeA, fileId: sameBytesInRecycledTree))
+        XCTAssertFalse(treeScope.matches(treeIdentity: treeB, fileId: sameBytesInOtherTree))
+    }
+
     func testCancelledTreeRequestKeepsNextTreeDisconnectAndTreeBMessageIdsContiguous() async throws {
         let transport = SMBActivationEventTransport()
         let session = makeSession(transport: transport, initialCredits: 2)
@@ -153,6 +192,697 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         try await withHangGuard("post-refusal request final") { try await following.value }
         await session.closeTransportAndWait(cause: "final_file_admission_guard_test")
     }
+
+#if DEBUG
+    func testM3FileIdRefusalRetiresReadTransferLocally() async throws {
+        try await assertM3FileIdTransferRefusal(operation: .read)
+    }
+
+    func testM3FileIdRefusalRetiresWriteTransferLocally() async throws {
+        try await assertM3FileIdTransferRefusal(operation: .write)
+    }
+
+    func testM3FileRefusalSelectsOnlyTheFullTreeAndFileIdKey() async throws {
+        let transport = SMBActivationEventTransport()
+        let session = makeSession(transport: transport, initialCredits: 4)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 1_500)
+        let fileA = [UInt8](repeating: 0xA1, count: 16)
+        let fileB = [UInt8](repeating: 0xB2, count: 16)
+
+        let blocker = Task { try await session.echoThroughSenderLoopForTesting(treeId: 0xA) }
+        try await withHangGuard("scope blocker holds the sender") {
+            try await transport.waitForSendCount(1)
+        }
+        // A: the refused key. B: same Tree, other FileId. C: same FileId bytes, other Tree.
+        let readA = Task {
+            try await session.readTransferThroughPipelineForTesting(treeId: 0xA, fileId: fileA, length: 1)
+        }
+        try await withHangGuard("File A READ queues") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 1)
+        }
+        let readB = Task {
+            try await session.readTransferThroughPipelineForTesting(treeId: 0xA, fileId: fileB, length: 1)
+        }
+        try await withHangGuard("same-Tree File B READ queues") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 2)
+        }
+        let readC = Task {
+            try await session.readTransferThroughPipelineForTesting(treeId: 0xB, fileId: fileA, length: 1)
+        }
+        try await withHangGuard("other-Tree same-bytes READ queues") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 3)
+        }
+
+        let close = Task { await session.bestEffortClose(treeId: 0xA, fileId: fileA) }
+        do {
+            _ = try await withHangGuard("only File A receives the local refusal") { try await readA.value }
+            XCTFail("File A READ unexpectedly passed its CLOSE intent")
+        } catch let error as SMBCodecError {
+            XCTAssertEqual(error, .invalidValue("SMB FileId is unresolved after CLOSE"))
+        }
+
+        transport.releaseNextSend(command: SMB2Commands.echo)
+        try await withHangGuard("scope blocker full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let blockerHeader = try SMB2Header.decode(transport.sentPackets[0])
+        try transport.enqueueResponse(try echoResponse(
+            messageId: blockerHeader.messageId,
+            sessionId: 1,
+            credits: 1,
+            treeId: 0xA
+        ))
+        try await withHangGuard("scope blocker final") { try await blocker.value }
+
+        var payloadByTree: [UInt32: UInt8] = [0xA: 0x42, 0xB: 0x43]
+        for sendIndex in 1...3 {
+            try await withHangGuard("scope request \(sendIndex) reaches the transport") {
+                try await transport.waitForSendCount(sendIndex + 1)
+            }
+            let header = try SMB2Header.decode(transport.sentPackets[sendIndex])
+            transport.releaseNextSend(command: header.command)
+            try await withHangGuard("scope request \(sendIndex) full-send") {
+                await session.waitForRequestSentCountForTesting(atLeast: sendIndex + 1)
+            }
+            if header.command == SMB2Commands.read {
+                let payload = try XCTUnwrap(payloadByTree.removeValue(forKey: header.treeId))
+                try transport.enqueueResponse(try readResponse(
+                    payload: [payload],
+                    messageId: header.messageId,
+                    sessionId: 1,
+                    treeId: header.treeId,
+                    credits: 1
+                ))
+            } else {
+                XCTAssertEqual(header.command, SMB2Commands.close)
+                XCTAssertEqual(header.treeId, 0xA)
+                try transport.enqueueResponse(try statusResponse(
+                    command: SMB2Commands.close,
+                    messageId: header.messageId,
+                    sessionId: 1,
+                    treeId: 0xA,
+                    credits: 1
+                ))
+            }
+        }
+        let bytesB = try await withHangGuard("same-Tree File B READ completes") { try await readB.value }
+        let bytesC = try await withHangGuard("other-Tree same-bytes READ completes") { try await readC.value }
+        try await withHangGuard("File A CLOSE final") { await close.value }
+        XCTAssertEqual(bytesB, [0x42])
+        XCTAssertEqual(bytesC, [0x43])
+        XCTAssertTrue(payloadByTree.isEmpty, "both unrefused READs reached the wire")
+
+        let sessionClosed = await session.isTransportClosedForTesting()
+        let records = await session.activePostAuthRequestRecordCountForTesting()
+        let transfers = await session.transferLifecycleCountsForTesting()
+        XCTAssertFalse(sessionClosed)
+        XCTAssertEqual(records, 0)
+        XCTAssertEqual(transfers.readTransfers, 0)
+        await session.closeTransportAndWait(cause: "m3_file_refusal_scope_test")
+    }
+
+    func testM3TreeRefusalClosesOnlyTreeAReceiptAfterItsRefundAck() async throws {
+        let transport = SMBActivationEventTransport()
+        let session = makeSession(transport: transport, initialCredits: 3)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 1_600)
+        let ownership = SMBM3OwnershipLog()
+        await session.setTransferRequestOwnershipHookForTesting { ownership.append($0) }
+        let refundReached = SMBActivationEvent()
+        let releaseRefund = SMBActivationUncancelledGate()
+        await session.setCleanupCreditRefundInterleavingHookForTesting { point in
+            guard case .refundPending = point else { return }
+            refundReached.signal()
+            await releaseRefund.wait()
+        }
+
+        let blocker = Task { try await session.echoThroughSenderLoopForTesting(treeId: 0xC) }
+        try await withHangGuard("Tree isolation blocker holds the sender") {
+            try await transport.waitForSendCount(1)
+        }
+        let readA = Task {
+            try await session.readTransferThroughPipelineForTesting(
+                treeId: 0xA,
+                fileId: [UInt8](repeating: 0xA1, count: 16),
+                length: 1
+            )
+        }
+        try await withHangGuard("Tree A READ queues") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 1)
+        }
+        let readB = Task {
+            try await session.readTransferThroughPipelineForTesting(
+                treeId: 0xB,
+                fileId: [UInt8](repeating: 0xB2, count: 16),
+                length: 1
+            )
+        }
+        try await withHangGuard("Tree B READ queues") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 2)
+        }
+        let optionalTreeAIdentity = await session.ensureTreeIdentity(treeId: 0xA)
+        let treeAIdentity = try XCTUnwrap(optionalTreeAIdentity)
+        let intent = Task {
+            await session.prepareTreeCleanupIntent(treeAIdentity, facadeOwner: SMBFacadeOwnerAllocator.make())
+        }
+        try await withHangGuard("Tree A retirement reaches its gated refund") { await refundReached.wait() }
+        let receiptsWhileGated = ownership.receipts
+        let receiptTransfers = Set(receiptsWhileGated.map(\.transferIdentifier))
+        XCTAssertEqual(receiptTransfers.count, 1, "exactly one queued ticket (Tree A's) enters a retirement receipt")
+        let transferA = try XCTUnwrap(receiptTransfers.first)
+        XCTAssertFalse(receiptsWhileGated.contains { $0.complete }, "the receipt stays open until the refund ack")
+
+        await releaseRefund.signal()
+        do {
+            _ = try await withHangGuard("Tree A READ returns its local refusal") { try await readA.value }
+            XCTFail("Tree A READ unexpectedly passed its quarantine")
+        } catch let error as SMBError {
+            guard case .treeUnavailable(treeId: 0xA, operation: _) = error else {
+                XCTFail("Tree A READ returned an unexpected SMBError: \(error)")
+                throw error
+            }
+        }
+        let preparedIntent = await intent.value
+        XCTAssertNotNil(preparedIntent)
+        let receiptsAfterAck = ownership.receipts
+        XCTAssertEqual(Set(receiptsAfterAck.map(\.transferIdentifier)), [transferA])
+        XCTAssertTrue(receiptsAfterAck.contains { $0.complete }, "Tree A's receipt closes after its refund ack")
+
+        transport.releaseNextSend(command: SMB2Commands.echo)
+        try await withHangGuard("Tree isolation blocker full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let blockerHeader = try SMB2Header.decode(transport.sentPackets[0])
+        try transport.enqueueResponse(try echoResponse(
+            messageId: blockerHeader.messageId,
+            sessionId: 1,
+            credits: 1,
+            treeId: 0xC
+        ))
+        try await withHangGuard("Tree isolation blocker final") { try await blocker.value }
+        try await withHangGuard("Tree B READ reaches the transport") {
+            try await transport.waitForSendCount(2)
+        }
+        let readBHeader = try SMB2Header.decode(transport.sentPackets[1])
+        XCTAssertEqual(readBHeader.command, SMB2Commands.read)
+        XCTAssertEqual(readBHeader.treeId, 0xB)
+        XCTAssertEqual(readBHeader.messageId, blockerHeader.messageId + 1, "the retired Tree A ticket used no MessageId")
+        transport.releaseNextSend(command: SMB2Commands.read)
+        try await withHangGuard("Tree B READ full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
+        }
+        try transport.enqueueResponse(try readResponse(
+            payload: [0x42],
+            messageId: readBHeader.messageId,
+            sessionId: 1,
+            treeId: 0xB,
+            credits: 1
+        ))
+        let bytesB = try await withHangGuard("Tree B READ completes") { try await readB.value }
+        XCTAssertEqual(bytesB, [0x42])
+        XCTAssertFalse(
+            ownership.receipts.contains { $0.transferIdentifier != transferA },
+            "Tree B never receives a retirement receipt"
+        )
+
+        let sessionClosed = await session.isTransportClosedForTesting()
+        let records = await session.activePostAuthRequestRecordCountForTesting()
+        let transfers = await session.transferLifecycleCountsForTesting()
+        XCTAssertFalse(sessionClosed)
+        XCTAssertEqual(records, 0)
+        XCTAssertEqual(transfers.readTransfers, 0)
+        await session.setCleanupCreditRefundInterleavingHookForTesting(nil)
+        await session.setTransferRequestOwnershipHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "m3_tree_receipt_isolation_test")
+    }
+
+    func testM3CommitBeforeFileCleanupIntentKeepsCommittedReadWireOwner() async throws {
+        let transport = SMBActivationEventTransport()
+        let session = makeSession(transport: transport, initialCredits: 2, wireDrainGrace: .seconds(10))
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 1_100)
+        let fileId = [UInt8](repeating: 0xA1, count: 16)
+
+        let read = Task {
+            try await session.readTransferThroughPipelineForTesting(
+                treeId: 0xA,
+                fileId: fileId,
+                length: 1
+            )
+        }
+        try await withHangGuard("committed File A READ reaches transport") {
+            try await transport.waitForSendCount(1)
+        }
+        let readHeader = try SMB2Header.decode(transport.sentPackets[0])
+        XCTAssertEqual(readHeader.command, SMB2Commands.read)
+        transport.releaseNextSend(command: SMB2Commands.read)
+        try await withHangGuard("File A READ full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let creditBalanceBeforeClose = await session.creditBalanceForTesting()
+
+        // commit -> quarantine: the READ won the wire commit before the CLOSE intent, so the
+        // File refusal must keep its committed wire and credit owners on the existing drain.
+        let close = Task { await session.bestEffortClose(treeId: 0xA, fileId: fileId) }
+        try await withHangGuard("CLOSE reaches transport while the committed READ is on the wire") {
+            try await transport.waitForSendCount(2)
+        }
+        let closeHeader = try SMB2Header.decode(transport.sentPackets[1])
+        XCTAssertEqual(closeHeader.command, SMB2Commands.close)
+        XCTAssertEqual(closeHeader.messageId, readHeader.messageId + 1, "no MessageId hole between READ and CLOSE")
+        let committedSnapshot = await session.postAuthRequestRecordSnapshotForTesting(messageId: readHeader.messageId)
+        let creditBalanceAfterClose = await session.creditBalanceForTesting()
+        XCTAssertEqual(committedSnapshot?.credit, .committed(actualCharge: 1))
+        XCTAssertEqual(
+            creditBalanceAfterClose,
+            creditBalanceBeforeClose - 1,
+            "only CLOSE is charged; the committed READ is not locally refunded"
+        )
+
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("File A CLOSE full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
+        }
+        try transport.enqueueResponse(try readResponse(
+            payload: [0x41],
+            messageId: readHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        let bytes = try await withHangGuard("committed File A READ completes on its own final") {
+            try await read.value
+        }
+        XCTAssertEqual(bytes, [0x41], "the File refusal must not stop a committed READ's transfer")
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: closeHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        try await withHangGuard("File A CLOSE final") { await close.value }
+
+        let sessionClosed = await session.isTransportClosedForTesting()
+        let activeRecords = await session.activePostAuthRequestRecordCountForTesting()
+        let transferCounts = await session.transferLifecycleCountsForTesting()
+        let cleanupLedgerCount = await session.cleanupLedgerCountForTesting()
+        XCTAssertFalse(sessionClosed)
+        XCTAssertEqual(activeRecords, 0)
+        XCTAssertEqual(transferCounts.readTransfers, 0)
+        XCTAssertEqual(cleanupLedgerCount, 0)
+        await session.closeTransportAndWait(cause: "m3_committed_file_use_close_test")
+    }
+
+    func testM3WatchCancellationWaitsForChangeNotifyWireBeforeClose() async throws {
+        let harness = try await startM3CancelledWatch(firstMessageId: 1_200)
+        let transport = harness.transport
+        let session = harness.session
+        let registeredWaiters = await session.requestReclaimWaiterCountForTesting()
+        XCTAssertEqual(registeredWaiters, 1, "the cancelled CHANGE_NOTIFY caller registered its owner wait")
+        let notifyHeader = harness.notifyHeader
+
+        let originalDeadline = await session.wireDrainDeadlineForTesting(messageId: notifyHeader.messageId)
+        XCTAssertNotNil(originalDeadline)
+        let commandsBeforeNotifyFinal = try transport.sentPackets.map { try SMB2Header.decode($0).command }
+        XCTAssertEqual(commandsBeforeNotifyFinal, [
+            SMB2Commands.changeNotify,
+            SMB2Commands.cancel
+        ])
+
+        try transport.enqueueResponse(try changeNotifyResponse(
+            messageId: notifyHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        try await withHangGuard("watch CLOSE starts after CHANGE_NOTIFY final") {
+            try await transport.waitForSendCount(3)
+        }
+        let closeHeader = try SMB2Header.decode(transport.sentPackets[2])
+        XCTAssertEqual(closeHeader.command, SMB2Commands.close)
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("watch CLOSE full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
+        }
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: closeHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        try await withHangGuard("cancelled watch and cleanup CLOSE finish") { await harness.watch.value }
+        let cancellationWasObserved = try await withHangGuard("watch cancellation catch is observed") {
+            await harness.caughtCancellation.wait()
+        }
+        let finalDeadline = await session.wireDrainDeadlineForTesting(messageId: notifyHeader.messageId)
+        let sessionClosed = await session.isTransportClosedForTesting()
+        let reclaimWaiters = await session.requestReclaimWaiterCountForTesting()
+        let activeRecords = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertTrue(cancellationWasObserved)
+        XCTAssertNil(finalDeadline)
+        XCTAssertFalse(sessionClosed)
+        XCTAssertEqual(reclaimWaiters, 0)
+        XCTAssertEqual(activeRecords, 0)
+        XCTAssertEqual(try transport.sentPackets.map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.changeNotify,
+            SMB2Commands.cancel,
+            SMB2Commands.close
+        ])
+        await session.closeTransportAndWait(cause: "m3_watch_cancel_file_close_barrier_test")
+    }
+
+    func testM3CancelledOrdinaryFileIdRequestWaitsForItsWireBeforeClose() async throws {
+        // FLUSH goes through `signedWireTransaction`, not the long-poll path the watch uses.
+        let harness = try await startM3CancelledWatch(
+            firstMessageId: 1_800,
+            command: SMB2Commands.flush
+        ) { session, fileId in
+            try await session.flushThroughSenderLoopForTesting(treeId: 0xA, fileId: fileId)
+        }
+        let transport = harness.transport
+        let session = harness.session
+        let flushHeader = harness.notifyHeader
+        let registeredWaiters = await session.requestReclaimWaiterCountForTesting()
+        XCTAssertEqual(registeredWaiters, 1, "the cancelled FLUSH caller registered its owner wait")
+        XCTAssertEqual(try transport.sentPackets.map { try SMB2Header.decode($0).command }, [
+            SMB2Commands.flush,
+            SMB2Commands.cancel
+        ])
+
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.flush,
+            messageId: flushHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        try await withHangGuard("cleanup CLOSE starts after the cancelled FLUSH final") {
+            try await transport.waitForSendCount(3)
+        }
+        let closeHeader = try SMB2Header.decode(transport.sentPackets[2])
+        XCTAssertEqual(closeHeader.command, SMB2Commands.close)
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("cleanup CLOSE full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
+        }
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: closeHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        try await withHangGuard("cancelled FLUSH and cleanup CLOSE finish") { await harness.watch.value }
+        let cancellationWasObserved = try await withHangGuard("FLUSH cancellation catch is observed") {
+            await harness.caughtCancellation.wait()
+        }
+        let sessionClosed = await session.isTransportClosedForTesting()
+        let reclaimWaiters = await session.requestReclaimWaiterCountForTesting()
+        let activeRecords = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertTrue(cancellationWasObserved)
+        XCTAssertFalse(sessionClosed)
+        XCTAssertEqual(reclaimWaiters, 0, "the registered owner wait was released by the FLUSH record reclaim")
+        XCTAssertEqual(activeRecords, 0)
+        await session.closeTransportAndWait(cause: "m3_cancelled_flush_close_barrier_test")
+    }
+
+    func testM3LedgerLimitTerminationReleasesCancelledFileIdUseWaiter() async throws {
+        let harness = try await startM3CancelledWatch(
+            firstMessageId: 1_900,
+            command: SMB2Commands.flush
+        ) { session, fileId in
+            try await session.flushThroughSenderLoopForTesting(treeId: 0xA, fileId: fileId)
+        }
+        let session = harness.session
+        for index in 0..<64 {
+            var retired = [UInt8](repeating: 0xE0, count: 16)
+            retired[15] = UInt8(index)
+            await session.retireFileIdForTesting(retired, treeId: 0xA)
+        }
+        // A new CLOSE now trips the cleanup ledger limit, which ends the session with the
+        // synchronous closeTransport path while the cancelled FLUSH caller waits for its owner.
+        let limitClose = Task { await session.bestEffortClose(treeId: 0xA, fileId: [UInt8](repeating: 0xF1, count: 16)) }
+        try await withHangGuard("ledger-limit CLOSE returns") { await limitClose.value }
+        let sessionClosed = await session.isTransportClosedForTesting()
+        XCTAssertTrue(sessionClosed, "the ledger limit terminalizes the session")
+
+        // The regression (no terminal join) is the absence of any event, so only a bounded wait
+        // can show it; after the terminal close the count waiters return early on `wireFailure`.
+        // Margin: the whole test passes in at most 3 ms (20 macOS runs, 2026-10-15) against the
+        // 3 s hang guard, about three orders of magnitude.
+        let returned = SMBActivationRace()
+        let returnObserver = Task {
+            await harness.watch.value
+            returned.finish(true)
+        }
+        let watchReturned = try await withHangGuard("cancelled FLUSH caller returns after the ledger-limit terminal") {
+            await returned.wait()
+        }
+        XCTAssertTrue(watchReturned)
+        if watchReturned {
+            await returnObserver.value
+            let reclaimWaiters = await session.requestReclaimWaiterCountForTesting()
+            XCTAssertEqual(reclaimWaiters, 0)
+        }
+        await session.closeTransportAndWait(cause: "m3_ledger_limit_terminal_test")
+    }
+
+    func testM3AbandonedCloseIntentDoesNotRewriteLaterCommittedRequestError() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(transport: transport, initialCredits: 2, clock: clock, wireDrainGrace: .seconds(10))
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 2_000)
+        let fileId = [UInt8](repeating: 0xC7, count: 16)
+
+        let blocker = Task { try await session.echoThroughSenderLoopForTesting(treeId: 0xC) }
+        try await withHangGuard("abandoned-CLOSE blocker holds the sender") { try await transport.waitForSendCount(1) }
+        let flush = Task { () -> Error? in
+            do {
+                try await session.flushThroughSenderLoopForTesting(treeId: 0xA, fileId: fileId)
+                return nil
+            } catch {
+                return error
+            }
+        }
+        try await withHangGuard("FLUSH queues behind the blocker") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 1)
+        }
+        // The CLOSE intent marks the queued FLUSH, then the CLOSE is abandoned before commit.
+        let close = Task { try await session.close(treeId: 0xA, fileId: fileId) }
+        try await withHangGuard("CLOSE waits for credit after its intent") {
+            await session.waitForCreditWaiterCountForTesting(atLeast: 1)
+        }
+        let refusedOrdinaryRecords = await session.admissionRefusedOrdinaryRecordCountForTesting()
+        XCTAssertEqual(refusedOrdinaryRecords, 1, "the CLOSE intent marks the queued FLUSH on the same FileId")
+        close.cancel()
+        _ = try await withHangGuard("abandoned CLOSE returns") { await close.result }
+        let ledgerAfterAbandon = await session.cleanupLedgerCountForTesting()
+        XCTAssertEqual(ledgerAfterAbandon, 0, "the abandoned CLOSE released its FileId attempt")
+
+        transport.releaseNextSend(command: SMB2Commands.echo)
+        try await withHangGuard("abandoned-CLOSE blocker full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let blockerHeader = try SMB2Header.decode(transport.sentPackets[0])
+        try transport.enqueueResponse(try echoResponse(messageId: blockerHeader.messageId, sessionId: 1, credits: 1, treeId: 0xC))
+        try await withHangGuard("abandoned-CLOSE blocker final") { try await blocker.value }
+        try await withHangGuard("FLUSH commits after the CLOSE was abandoned") { try await transport.waitForSendCount(2) }
+        let flushHeader = try SMB2Header.decode(transport.sentPackets[1])
+        XCTAssertEqual(flushHeader.command, SMB2Commands.flush)
+        transport.releaseNextSend(command: SMB2Commands.flush)
+        try await withHangGuard("FLUSH full-send") { await session.waitForRequestSentCountForTesting(atLeast: 2) }
+
+        flush.cancel()
+        try await withHangGuard("FLUSH cancellation sends CANCEL") { try await transport.waitForSendCount(3) }
+        transport.releaseNextSend(command: SMB2Commands.cancel)
+        let waitOrReturn = SMBActivationRace()
+        let waitObserver = Task {
+            await session.waitForRequestReclaimWaiterCountForTesting(atLeast: 1)
+            waitOrReturn.finish(true)
+        }
+        let returnObserver = Task {
+            _ = await flush.value
+            waitOrReturn.finish(false)
+        }
+        let waited = try await withHangGuard("cancelled FLUSH waits for its owner or returns") { await waitOrReturn.wait() }
+        waitObserver.cancel()
+        try await withHangGuard("owner-wait observer exits") { await waitObserver.value }
+        XCTAssertTrue(waited, "the cancelled FLUSH keeps its CancellationError and waits for its wire owner")
+
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.flush,
+            messageId: flushHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        let flushError = try await withHangGuard("cancelled FLUSH returns") { await flush.value }
+        try await withHangGuard("FLUSH return observer exits") { await returnObserver.value }
+        XCTAssertTrue(flushError is CancellationError, "unexpected FLUSH error: \(String(describing: flushError))")
+        await session.closeTransportAndWait(cause: "m3_abandoned_close_intent_test")
+    }
+
+    func testM3CancelledFileIdUseWaitsForFinalCreditGrantAckBeforeClose() async throws {
+        let harness = try await startM3CancelledWatch(
+            firstMessageId: 2_100,
+            command: SMB2Commands.flush
+        ) { session, fileId in
+            try await session.flushThroughSenderLoopForTesting(treeId: 0xA, fileId: fileId)
+        }
+        let transport = harness.transport
+        let session = harness.session
+        let grantReached = SMBActivationEvent()
+        let releaseGrant = SMBActivationUncancelledGate()
+        await session.setCreditGrantAfterAwaitHookForTesting {
+            grantReached.signal()
+            await releaseGrant.wait()
+        }
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.flush,
+            messageId: harness.notifyHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        // The final is accepted but its credit grant has not been acknowledged yet: the FLUSH's
+        // credit owner is still alive, so the FileId use is not complete.
+        try await withHangGuard("cancelled FLUSH final reaches its credit grant") { await grantReached.wait() }
+        let waitersDuringGrant = await session.requestReclaimWaiterCountForTesting()
+        let commandsDuringGrant = try transport.sentPackets.map { try SMB2Header.decode($0).command }
+        XCTAssertEqual(waitersDuringGrant, 1, "the FLUSH caller still waits while its credit grant is unacknowledged")
+        XCTAssertEqual(commandsDuringGrant, [SMB2Commands.flush, SMB2Commands.cancel], "no CLOSE before the credit owner completes")
+
+        await releaseGrant.signal()
+        try await withHangGuard("cleanup CLOSE starts after the credit grant ack") {
+            try await transport.waitForSendCount(3)
+        }
+        await session.setCreditGrantAfterAwaitHookForTesting(nil)
+        let closeHeader = try SMB2Header.decode(transport.sentPackets[2])
+        XCTAssertEqual(closeHeader.command, SMB2Commands.close)
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("cleanup CLOSE full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
+        }
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: closeHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        try await withHangGuard("cancelled FLUSH and cleanup CLOSE finish") { await harness.watch.value }
+        let reclaimWaiters = await session.requestReclaimWaiterCountForTesting()
+        XCTAssertEqual(reclaimWaiters, 0)
+        await session.closeTransportAndWait(cause: "m3_credit_grant_ack_close_barrier_test")
+    }
+
+    func testM3WatchCancellationCloseWaitEndsAtExistingDrainDeadline() async throws {
+        let harness = try await startM3CancelledWatch(firstMessageId: 1_250)
+        let transport = harness.transport
+        let session = harness.session
+        let registeredWaiters = await session.requestReclaimWaiterCountForTesting()
+        XCTAssertEqual(registeredWaiters, 1, "the cancelled CHANGE_NOTIFY caller registered its owner wait")
+        let originalDeadline = await session.wireDrainDeadlineForTesting(messageId: harness.notifyHeader.messageId)
+        XCTAssertNotNil(originalDeadline)
+
+        // The server never answers the cancelled CHANGE_NOTIFY. The wait for its wire owner
+        // must not add a grace of its own: the request's existing fixed drain deadline ends it.
+        harness.clock.advance(by: .seconds(11), resumeDueSleeps: true)
+        try await withHangGuard("cancelled CHANGE_NOTIFY reaches its existing drain deadline") {
+            await session.waitForWireDrainTerminalizationCountForTesting(atLeast: 1)
+        }
+        try await withHangGuard("watch returns after the drain deadline") { await harness.watch.value }
+        let cancellationWasObserved = try await withHangGuard("watch cancellation catch is observed") {
+            await harness.caughtCancellation.wait()
+        }
+        let reclaimWaiters = await session.requestReclaimWaiterCountForTesting()
+        XCTAssertTrue(cancellationWasObserved)
+        XCTAssertEqual(reclaimWaiters, 0)
+        XCTAssertEqual(
+            try transport.sentPackets.map { try SMB2Header.decode($0).command },
+            [SMB2Commands.changeNotify, SMB2Commands.cancel],
+            "CLOSE must not reuse the FileId while the cancelled CHANGE_NOTIFY still owns the wire"
+        )
+        await session.closeTransportAndWait(cause: "m3_watch_cancel_drain_deadline_test")
+    }
+
+    func testM3TimedOutFileIdUseNeverLetsItsCleanupCloseReachTheWire() async throws {
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(
+            transport: transport,
+            initialCredits: 1,
+            clock: clock,
+            requestTimeout: .seconds(5)
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 1_700)
+        let fileId = [UInt8](repeating: 0xD4, count: 16)
+        // Mirrors the public `do { op } catch { bestEffortClose }` shape.
+        let caller = Task { () -> Bool in
+            do {
+                try await session.flushThroughSenderLoopForTesting(treeId: 0xA, fileId: fileId)
+                await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+                return false
+            } catch SMBTransportError.timedOut {
+                await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+                return true
+            } catch {
+                await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+                return false
+            }
+        }
+        try await withHangGuard("FileId FLUSH reaches transport") { try await transport.waitForSendCount(1) }
+        transport.releaseNextSend(command: SMB2Commands.flush)
+        try await withHangGuard("FileId FLUSH full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        try await withHangGuard("FileId FLUSH arms its request timeout") { await clock.waitForSleepCount(atLeast: 1) }
+
+        // A request timeout terminalizes the session before the caller resumes, so the
+        // FLUSH's wire owner can never be followed by a CLOSE for the same FileId on this wire.
+        clock.advance(by: .seconds(5), resumeDueSleeps: true)
+        let closeBoundaryRace = SMBActivationRace()
+        let closeObserver = Task {
+            do {
+                // Closing the transport also wakes this waiter, so only a real second send counts.
+                try await transport.waitForSendCount(2)
+                if transport.sentPackets.count >= 2 { closeBoundaryRace.finish(false) }
+            } catch {
+            }
+        }
+        let returnObserver = Task { () -> Bool in
+            let timedOut = await caller.value
+            closeBoundaryRace.finish(true)
+            return timedOut
+        }
+        let returnedWithoutClose = try await withHangGuard("timed-out FileId use returns or its CLOSE is sent") {
+            await closeBoundaryRace.wait()
+        }
+        closeObserver.cancel()
+        try await withHangGuard("timed-out CLOSE observer exits") { await closeObserver.value }
+        XCTAssertTrue(returnedWithoutClose, "the cleanup CLOSE must not reuse the FileId on the timed-out wire")
+        if !returnedWithoutClose {
+            await session.closeTransportAndWait(cause: "m3_timed_out_file_use_close_reached_wire")
+        }
+        let timedOut = try await withHangGuard("timed-out FileId use and its cleanup return") {
+            await returnObserver.value
+        }
+        let commands = try transport.sentPackets.map { try SMB2Header.decode($0).command }
+        let sessionClosed = await session.isTransportClosedForTesting()
+        XCTAssertTrue(timedOut)
+        XCTAssertTrue(sessionClosed)
+        XCTAssertEqual(commands, [SMB2Commands.flush], "the cleanup CLOSE must not reuse the FileId on the timed-out wire")
+        await session.closeTransportAndWait(cause: "m3_timed_out_file_use_test")
+    }
+
+    func testM3FileIdDescriptorMutationIsASeparateCodecFault() async throws {
+        try await assertM3FileIdDescriptorCodecFault(truncatePacket: false)
+    }
+
+    func testM3MalformedFileIdDescriptorIsASeparateCodecFault() async throws {
+        try await assertM3FileIdDescriptorCodecFault(truncatePacket: true)
+    }
+#endif
 
     func testCommittedChargeThreeRetirementPreservesRangeAndRemainingCredit() async throws {
         let transport = SMBActivationEventTransport()
@@ -1201,6 +1931,53 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         XCTAssertFalse(noTicketBody.contains("Task("))
     }
 
+    /// Every terminal transition must reach the terminal join: a session ended without it kept
+    /// records whose wire-drain timers were cancelled but never normalized (a reclaim waiter
+    /// never resumed). Only these functions may end the session without scheduling the join
+    /// themselves, because each of them joins or schedules the join right after.
+    func testSourceShapeOnlyJoiningTerminalizersEndTheSessionWithoutJoin() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = projectRoot.appendingPathComponent("Sources/SMBee/SMBClient.swift")
+        let lines = try String(contentsOf: sourceURL, encoding: .utf8).components(separatedBy: "\n")
+        let allowed: Set<String> = [
+            "closeTransport",
+            "closeTransportAndWait",
+            "beginSessionFaultTerminalization",
+            "beginWireDrainTerminalization",
+            "beginTransferDrainTerminalization"
+        ]
+        var enclosingFunction: String?
+        var callers: [String] = []
+        var bodies: [String: String] = [:]
+        for line in lines {
+            if let range = line.range(of: "func "),
+               let open = line[range.upperBound...].firstIndex(where: { $0 == "(" || $0 == "<" }) {
+                enclosingFunction = String(line[range.upperBound..<open])
+            }
+            if let name = enclosingFunction {
+                bodies[name, default: ""] += line.filter { !$0.isWhitespace }
+            }
+            guard line.contains("terminateTransportWithoutJoin("), !line.contains("func ") else { continue }
+            callers.append(enclosingFunction ?? "<top level>")
+        }
+        XCTAssertFalse(callers.isEmpty, "the scan must find the terminal entry's callers")
+        XCTAssertEqual(
+            Set(callers).subtracting(allowed),
+            [],
+            "only joining terminalizers may call terminateTransportWithoutJoin; use closeTransport elsewhere"
+        )
+        for name in ["closeTransport", "beginSessionFaultTerminalization", "beginWireDrainTerminalization",
+                     "beginTransferDrainTerminalization"] {
+            let body = try XCTUnwrap(bodies[name], "\(name) must exist")
+            XCTAssertTrue(body.contains("scheduleTerminalJoin("), "\(name) must schedule the terminal join")
+        }
+        let closeAndWait = try XCTUnwrap(bodies["closeTransportAndWait"])
+        XCTAssertTrue(closeAndWait.contains("normalizeActiveRequestRecordAtTerminalJoin("), "closeTransportAndWait is the join")
+    }
+
     func testSourceShapeTreeAdapterAndUnsentReceiptShareTheCanonicalTransition() throws {
         let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -1218,11 +1995,24 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         ))
         let treeAdapter = normalized[treeAdapterStart.lowerBound..<treeAdapterEnd.lowerBound]
         XCTAssertTrue(
-            treeAdapter.contains("transitionTransferRequest(ticket.transferIdentifier,.treeRefusal(ticket,error:error,at:now))"),
-            "Tree refusal must project record and window changes in one transition"
+            treeAdapter.contains("refuseTransferRequestForAdmission(ticket,refusal:refusal)"),
+            "Tree adapter must send its exact Tree scope through the common admission transition"
         )
         XCTAssertFalse(treeAdapter.contains("window.retireUnsent("))
         XCTAssertFalse(treeAdapter.contains("window.releaseRetiredSlot("))
+
+        let admissionRefusalStart = try XCTUnwrap(normalized.range(
+            of: "case.admissionRefusal(letticket,letrefusal,lettime):",
+            range: transitionStart.lowerBound..<normalized.endIndex
+        ))
+        let admissionRefusalEnd = try XCTUnwrap(normalized.range(
+            of: "case.admissionRefusalPreparation(",
+            range: admissionRefusalStart.upperBound..<normalized.endIndex
+        ))
+        let admissionRefusal = normalized[admissionRefusalStart.lowerBound..<admissionRefusalEnd.lowerBound]
+        XCTAssertTrue(admissionRefusal.contains("refusal.scope.matches(treeIdentity:record.treeIdentity,fileId:record.fileId)"))
+        XCTAssertTrue(admissionRefusal.contains("guardrecord.messageId==nilelse"))
+        XCTAssertTrue(admissionRefusal.contains("retireUnsentTransferRequestInTransition(ticket,window:window,at:time)"))
 
         let retirementStart = try XCTUnwrap(normalized.range(of: "privatefuncretireUnsentTransferRequestInTransition("))
         let retirementEnd = try XCTUnwrap(normalized.range(
@@ -3010,6 +3800,312 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         )
     }
 
+#if DEBUG
+    private enum M3FileTransferOperation: Sendable {
+        case read
+        case write
+    }
+
+    private func assertM3FileIdTransferRefusal(operation: M3FileTransferOperation) async throws {
+        let transport = SMBActivationEventTransport()
+        let session = makeSession(transport: transport, initialCredits: 2)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 1_300)
+        let fileA = [UInt8](repeating: 0xA1, count: 16)
+
+        let blocker = Task { try await session.echoThroughSenderLoopForTesting(treeId: 0xA) }
+        try await withHangGuard("File refusal blocker holds the sender") {
+            try await transport.waitForSendCount(1)
+        }
+        let transfer: Task<Void, Error>
+        switch operation {
+        case .read:
+            transfer = Task {
+                _ = try await session.readTransferThroughPipelineForTesting(
+                    treeId: 0xA,
+                    fileId: fileA,
+                    length: 1
+                )
+            }
+        case .write:
+            transfer = Task {
+                try await session.write(treeId: 0xA, fileId: fileA, data: [0x41])
+            }
+        }
+        try await withHangGuard("File A transfer queues before cleanup intent") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 1)
+        }
+
+        let close = Task { await session.bestEffortClose(treeId: 0xA, fileId: fileA) }
+        let refusalCompleted: Bool
+        do {
+            try await withHangGuard("File A transfer receives its local refusal") {
+                try await transfer.value
+            }
+            XCTFail("File A transfer unexpectedly continued through CLOSE admission")
+            refusalCompleted = false
+        } catch let error as SMBCodecError {
+            XCTAssertEqual(error, .invalidValue("SMB FileId is unresolved after CLOSE"))
+            refusalCompleted = true
+        } catch {
+            XCTFail("File A transfer returned an unexpected error: \(error)")
+            refusalCompleted = false
+        }
+        if !refusalCompleted {
+            await session.closeTransportAndWait(cause: "m3_file_transfer_refusal_mutation_cleanup")
+            try await withHangGuard("mutated File transfer exits after cleanup") { _ = await transfer.result }
+            try await withHangGuard("mutated File CLOSE exits after cleanup") { await close.value }
+            try await withHangGuard("mutated File blocker exits after cleanup") { _ = await blocker.result }
+            return
+        }
+
+        let sessionOpenAfterRefusal = !(await session.isTransportClosedForTesting())
+        XCTAssertTrue(sessionOpenAfterRefusal, "File refusal must not terminalize the session")
+        transport.releaseNextSend(command: SMB2Commands.echo)
+        try await withHangGuard("File refusal blocker full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        let blockerHeader = try SMB2Header.decode(transport.sentPackets[0])
+        try transport.enqueueResponse(try echoResponse(
+            messageId: blockerHeader.messageId,
+            sessionId: 1,
+            credits: 1,
+            treeId: 0xA
+        ))
+        try await withHangGuard("File refusal blocker final") { try await blocker.value }
+
+        try await withHangGuard("File A cleanup CLOSE reaches the transport") {
+            try await transport.waitForSendCount(2)
+        }
+        let closeHeader = try SMB2Header.decode(transport.sentPackets[1])
+        XCTAssertEqual(closeHeader.command, SMB2Commands.close)
+        transport.releaseNextSend(command: SMB2Commands.close)
+        try await withHangGuard("File A cleanup CLOSE full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 2)
+        }
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.close,
+            messageId: closeHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        try await withHangGuard("File A cleanup CLOSE final") { await close.value }
+
+        let fileB = [UInt8](repeating: 0xB2, count: 16)
+        let followingSameTree = Task { try await session.flushThroughSenderLoopForTesting(treeId: 0xA, fileId: fileB) }
+        try await withHangGuard("File B on the same Tree reaches the transport") {
+            try await transport.waitForSendCount(3)
+        }
+        let fileBHeader = try SMB2Header.decode(transport.sentPackets[2])
+        XCTAssertEqual(fileBHeader.command, SMB2Commands.flush)
+        XCTAssertEqual(fileBHeader.treeId, 0xA)
+        transport.releaseNextSend(command: SMB2Commands.flush)
+        try await withHangGuard("File B full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 3)
+        }
+        try transport.enqueueResponse(try statusResponse(
+            command: SMB2Commands.flush,
+            messageId: fileBHeader.messageId,
+            sessionId: 1,
+            treeId: 0xA,
+            credits: 1
+        ))
+        try await withHangGuard("File B on the same Tree completes") { try await followingSameTree.value }
+
+        let followingOtherTree = Task { try await session.echoThroughSenderLoopForTesting(treeId: 0xB) }
+        try await withHangGuard("request on another Tree reaches the transport") {
+            try await transport.waitForSendCount(4)
+        }
+        let otherTreeHeader = try SMB2Header.decode(transport.sentPackets[3])
+        XCTAssertEqual(otherTreeHeader.command, SMB2Commands.echo)
+        XCTAssertEqual(otherTreeHeader.treeId, 0xB)
+        transport.releaseNextSend(command: SMB2Commands.echo)
+        try await withHangGuard("other Tree request full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 4)
+        }
+        try transport.enqueueResponse(try echoResponse(
+            messageId: otherTreeHeader.messageId,
+            sessionId: 1,
+            credits: 1,
+            treeId: 0xB
+        ))
+        try await withHangGuard("other Tree request completes") { try await followingOtherTree.value }
+
+        let commands = try transport.sentPackets.map { try SMB2Header.decode($0).command }
+        let sessionClosed = await session.isTransportClosedForTesting()
+        let records = await session.activePostAuthRequestRecordCountForTesting()
+        let transfers = await session.transferLifecycleCountsForTesting()
+        XCTAssertEqual(commands, [
+            SMB2Commands.echo,
+            SMB2Commands.close,
+            SMB2Commands.flush,
+            SMB2Commands.echo
+        ])
+        XCTAssertFalse(sessionClosed)
+        XCTAssertEqual(records, 0)
+        XCTAssertEqual(transfers.readTransfers, 0)
+        XCTAssertEqual(transfers.writeTransfers, 0)
+        await session.closeTransportAndWait(cause: "m3_file_transfer_refusal_test")
+    }
+
+    private struct M3CancelledWatch {
+        let transport: SMBActivationEventTransport
+        let clock: SMBActivationTestClock
+        let session: SMBSession
+        let notifyHeader: SMB2Header
+        let watch: Task<Void, Never>
+        let caughtCancellation: SMBActivationRace
+    }
+
+    /// Mirrors the public `do { op } catch { bestEffortClose }` shape (`withChangeNotifications` by
+    /// default): the catch sends CLOSE for the FileId. Returns once the cancelled caller is waiting
+    /// for its own wire owner,
+    /// and fails if CLOSE reaches the wire first.
+    private func startM3CancelledWatch(
+        firstMessageId: UInt64,
+        command: UInt16 = SMB2Commands.changeNotify,
+        operation: @escaping @Sendable (SMBSession, [UInt8]) async throws -> Void = { session, fileId in
+            try await session.changeNotify(
+                treeId: 0xA,
+                fileId: fileId,
+                filter: .default,
+                watchTree: false,
+                onChange: { _ in }
+            )
+        }
+    ) async throws -> M3CancelledWatch {
+        let name = command == SMB2Commands.flush ? "FLUSH" : "CHANGE_NOTIFY"
+        let transport = SMBActivationEventTransport()
+        let clock = SMBActivationTestClock()
+        let session = makeSession(
+            transport: transport,
+            initialCredits: 2,
+            clock: clock,
+            wireDrainGrace: .seconds(10)
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: firstMessageId)
+        let fileId = [UInt8](repeating: 0xC3, count: 16)
+        let caughtCancellation = SMBActivationRace()
+        let watch = Task {
+            do {
+                try await operation(session, fileId)
+                caughtCancellation.finish(false)
+                await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+            } catch is CancellationError {
+                caughtCancellation.finish(true)
+                await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+            } catch {
+                caughtCancellation.finish(false)
+                await session.bestEffortClose(treeId: 0xA, fileId: fileId)
+            }
+        }
+
+        try await withHangGuard("FileId request reaches transport") {
+            try await transport.waitForSendCount(1)
+        }
+        let notifyHeader = try SMB2Header.decode(transport.sentPackets[0])
+        XCTAssertEqual(notifyHeader.command, command)
+        transport.releaseNextSend(command: command)
+        try await withHangGuard("\(name) full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+        watch.cancel()
+        try await withHangGuard("\(name) cancellation schedules CANCEL") {
+            try await transport.waitForSendCount(2)
+        }
+        let cancelHeader = try SMB2Header.decode(transport.sentPackets[1])
+        XCTAssertEqual(cancelHeader.command, SMB2Commands.cancel)
+        XCTAssertEqual(cancelHeader.messageId, notifyHeader.messageId)
+        transport.releaseNextSend(command: SMB2Commands.cancel)
+        try await withHangGuard("\(name) CANCEL full-send") {
+            await session.waitForSenderFrameCountForTesting(atLeast: 2)
+        }
+        try await withHangGuard("cancelled \(name) arms its existing fixed drain deadline") {
+            await clock.waitForSleepCount(atLeast: 1)
+        }
+
+        let closeBoundaryRace = SMBActivationRace()
+        let ownerWaitObserver = Task {
+            await session.waitForRequestReclaimWaiterCountForTesting(atLeast: 1)
+            closeBoundaryRace.finish(true)
+        }
+        let prematureCloseObserver = Task {
+            do {
+                // Closing the transport also wakes this waiter, so only a real third send counts.
+                try await transport.waitForSendCount(3)
+                if transport.sentPackets.count >= 3 { closeBoundaryRace.finish(false) }
+            } catch {
+            }
+        }
+        let ownerWaitWon = try await withHangGuard("cancelled \(name) caller waits or its CLOSE is observed") {
+            await closeBoundaryRace.wait()
+        }
+        ownerWaitObserver.cancel()
+        prematureCloseObserver.cancel()
+        try await withHangGuard("\(name) owner-wait observer exits") { await ownerWaitObserver.value }
+        try await withHangGuard("\(name) premature CLOSE observer exits") { await prematureCloseObserver.value }
+        XCTAssertTrue(ownerWaitWon, "the cancelled \(name) caller must wait for its wire owner before CLOSE")
+        return M3CancelledWatch(
+            transport: transport,
+            clock: clock,
+            session: session,
+            notifyHeader: notifyHeader,
+            watch: watch,
+            caughtCancellation: caughtCancellation
+        )
+    }
+
+    private func assertM3FileIdDescriptorCodecFault(truncatePacket: Bool) async throws {
+        let transport = SMBActivationEventTransport()
+        let session = makeSession(transport: transport, initialCredits: 2)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 1_400)
+        let fileId = [UInt8](repeating: 0xA1, count: 16)
+        await session.setPostAuthPacketMutationHookForTesting { command, packet in
+            guard command == SMB2Commands.read else { return packet }
+            if truncatePacket {
+                return Array(packet.prefix(SMB2Header.encodedSize + 8))
+            }
+            var changed = packet
+            changed[SMB2Header.encodedSize + 16] ^= 0x01
+            return changed
+        }
+
+        let blocker = Task { try await session.echoThroughSenderLoopForTesting(treeId: 0xA) }
+        try await withHangGuard("codec fault blocker holds the sender") {
+            try await transport.waitForSendCount(1)
+        }
+        let read = Task {
+            try await session.readTransferThroughPipelineForTesting(
+                treeId: 0xA,
+                fileId: fileId,
+                length: 1
+            )
+        }
+        try await withHangGuard("File A READ queues before descriptor mutation") {
+            await session.waitForQueuedPostAuthRequestCountForTesting(atLeast: 1)
+        }
+        transport.releaseNextSend(command: SMB2Commands.echo)
+        try await withHangGuard("codec fault blocker full-send") {
+            await session.waitForRequestSentCountForTesting(atLeast: 1)
+        }
+
+        do {
+            _ = try await withHangGuard("descriptor codec fault returns") { try await read.value }
+            XCTFail("mutated FileId descriptor unexpectedly passed final admission")
+        } catch let error as SMBCodecError {
+            XCTAssertEqual(error, .invalidValue("post-auth request FileId changed before commit"))
+        } catch {
+            XCTFail("FileId descriptor returned an unexpected error: \(error)")
+        }
+        let sessionTerminalBeforeCleanup = await session.isTransportClosedForTesting()
+        let nextMessageIdBeforeCleanup = await session.nextMessageIdForTesting()
+        XCTAssertTrue(sessionTerminalBeforeCleanup, "descriptor and codec faults must use the existing terminal policy")
+        XCTAssertEqual(nextMessageIdBeforeCleanup, 1_401, "a malformed descriptor must not commit a MessageId")
+        await session.closeTransportAndWait(cause: "m3_file_descriptor_codec_fault_test")
+        try await withHangGuard("codec fault blocker exits after terminal cleanup") { _ = await blocker.result }
+    }
+#endif
+
     private func runFinalAndOwnerBoundary(
         finalAt: Duration,
         ownerAt: Duration,
@@ -3134,6 +4230,52 @@ final class SMBUnsentRequestActivationTests: XCTestCase {
         return packet
     }
 
+    private func readResponse(
+        payload: [UInt8],
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        credits: UInt16
+    ) throws -> [UInt8] {
+        var packet = try SMB2Header(
+            command: SMB2Commands.read,
+            credits: credits,
+            flags: 0x0000_0001,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
+        packet.append(contentsOf: [17, 0, 80, 0])
+        let payloadLength = UInt32(payload.count)
+        packet.append(contentsOf: [
+            UInt8(truncatingIfNeeded: payloadLength),
+            UInt8(truncatingIfNeeded: payloadLength >> 8),
+            UInt8(truncatingIfNeeded: payloadLength >> 16),
+            UInt8(truncatingIfNeeded: payloadLength >> 24)
+        ])
+        packet.append(contentsOf: [0, 0, 0, 0, 0, 0, 0, 0])
+        packet.append(contentsOf: payload)
+        return packet
+    }
+
+    private func changeNotifyResponse(
+        messageId: UInt64,
+        sessionId: UInt64,
+        treeId: UInt32,
+        credits: UInt16
+    ) throws -> [UInt8] {
+        var packet = try SMB2Header(
+            command: SMB2Commands.changeNotify,
+            credits: credits,
+            flags: 0x0000_0001,
+            messageId: messageId,
+            treeId: treeId,
+            sessionId: sessionId
+        ).encode()
+        packet.append(contentsOf: [9, 0, 64, 0, 0, 0, 0, 0])
+        return packet
+    }
+
     private func statusResponse(
         command: UInt16,
         messageId: UInt64,
@@ -3199,6 +4341,32 @@ private final class SMBActivationWeakSessionReference: @unchecked Sendable {
 
     init(_ value: SMBSession) {
         self.value = value
+    }
+}
+
+private final class SMBM3OwnershipLog: @unchecked Sendable {
+    struct Receipt: Equatable {
+        let transferIdentifier: UInt64
+        let complete: Bool
+    }
+
+    private let lock = NSLock()
+    private var snapshots: [SMBTransferRequestOwnershipSnapshot] = []
+
+    func append(_ snapshot: SMBTransferRequestOwnershipSnapshot) {
+        lock.withLock { snapshots.append(snapshot) }
+    }
+
+    var receipts: [Receipt] {
+        lock.withLock {
+            snapshots.compactMap { snapshot in
+                guard snapshot.retirementReceiptIdentifier != nil else { return nil }
+                return Receipt(
+                    transferIdentifier: snapshot.transferIdentifier,
+                    complete: snapshot.retirementReceiptComplete
+                )
+            }
+        }
     }
 }
 

@@ -963,7 +963,14 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
         ).encode()
         response.append(contentsOf: Array(repeating: 0, count: 88))
         writeUInt16LE(89, to: &response, at: 64)
-        response.replaceSubrange(128..<144, with: Array(repeating: 0x55, count: 16))
+        // A server never hands two concurrently open handles the same FileId. Derive it from
+        // the CREATE's MessageId so reentrant opens (an async supplier's nested `stat`) get
+        // distinct handles, as File-scoped cleanup refusal keys on the full FileId.
+        var fileId = [UInt8](repeating: 0x55, count: 16)
+        for index in 0..<8 {
+            fileId[8 + index] = UInt8(truncatingIfNeeded: request.messageId >> (8 * UInt64(index)))
+        }
+        response.replaceSubrange(128..<144, with: fileId)
         try enqueue(response)
     }
 

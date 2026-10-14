@@ -5885,7 +5885,7 @@ private struct SMBResponseCorrelationState {
     var finalSeen: Bool
 }
 
-private struct SMBFileIdLedgerKey: Hashable {
+struct SMBFileIdLedgerKey: Hashable, Sendable {
     // FileIds are fixed at 16 bytes. Keeping their two words inline avoids allocating a
     // short Array every time a request is admitted or rechecked before MID commit.
     let treeIdentity: SMBTreeIdentity
@@ -5912,6 +5912,29 @@ private struct SMBFileIdLedgerKey: Hashable {
             )
         }
     }
+}
+
+enum SMBTransferAdmissionScope: Equatable, Sendable {
+    case tree(SMBTreeIdentity)
+    case file(SMBFileIdLedgerKey)
+
+    func matches(
+        treeIdentity: SMBTreeIdentity?,
+        fileId: SMBFileIdLedgerKey?
+    ) -> Bool {
+        switch self {
+        case .tree(let selectedTree):
+            return treeIdentity == selectedTree
+        case .file(let selectedFile):
+            return fileId == selectedFile
+        }
+    }
+}
+
+struct SMBTransferAdmissionRefusal: Error, Sendable {
+    let scope: SMBTransferAdmissionScope
+    let operation: String
+    let callerError: any Error
 }
 
 private struct SMBTreeCreditPreparation: Sendable {
@@ -6166,6 +6189,7 @@ private final class SMBTransferRequestOwner {
     var retirementRefundAcknowledged = false
     var retirementRefundsPending = 0
     var retirementTimerAcknowledged = true
+    var admissionRefusal: SMBTransferAdmissionRefusal?
 
     init(handle: SMBTransferRequestHandle, window: SMBTransferWindow, supplierOwned: Bool) {
         self.handle = handle
@@ -6234,8 +6258,8 @@ private enum SMBTransferRequestTransition {
     case callerTerminal(SMBTransferTicket, state: SMBRequestCallerState, wire: SMBRequestWireState?)
     case retirementRefundAcknowledged(SMBTransferTicket, at: ContinuousClock.Instant)
     case preparationRetirementAcknowledged(SMBRequestIdentity, at: ContinuousClock.Instant)
-    case treeRefusal(SMBTransferTicket, error: Error, at: ContinuousClock.Instant)
-    case treeRefusalPreparation(SMBRequestIdentity, error: Error, at: ContinuousClock.Instant)
+    case admissionRefusal(SMBTransferTicket, SMBTransferAdmissionRefusal, at: ContinuousClock.Instant)
+    case admissionRefusalPreparation(SMBRequestIdentity, SMBTransferAdmissionRefusal, at: ContinuousClock.Instant)
     case revokePreparing(slotIndex: Int, at: ContinuousClock.Instant?)
     case sourceEOF(slotIndex: Int, at: ContinuousClock.Instant)
     case supplierReturned(slotIndex: Int)
@@ -6316,6 +6340,7 @@ private final class SMBSessionActiveRequestRecord {
     var wireDrainTimerIdentity: UUID?
     var finalAcceptedAt: ContinuousClock.Instant?
     var outstandingCreditGrantAcknowledgements = 0
+    var admissionRefusal: SMBTransferAdmissionRefusal?
     var transferOwner: SMBTransferRequestOwner?
 
     init(
@@ -6564,6 +6589,7 @@ private enum SMBTestingCountWaitKind: Equatable {
     case queuedPostAuthRequests
     case queuedControlSends
     case wireDrainTerminalizations
+    case requestReclaimWaiters
 }
 
 private struct SMBCancelledRequestDrainWaiter {
@@ -6678,6 +6704,7 @@ actor SMBSession {
     private var operationBarrierByRequest: [SMBRequestIdentity: SMBOperationBarrierReceipt] = [:]
     private var completedOperationBarriers: [SMBOperationBarrierReceipt] = []
     private var cancelledRequestDrainWaiters: [SMBCancelledRequestDrainWaiter] = []
+    private var requestReclaimWaiters: [SMBRequestIdentity: [CheckedContinuation<Void, Never>]] = [:]
     private var testingCountWaiters: [SMBTestingCountWaiter] = []
     private var nextTestingCountWaiterId: UInt64 = 0
     private var requestSentWaiterRegistrationCountForTestingStorage = 0
@@ -6711,6 +6738,9 @@ actor SMBSession {
     private var transferCreditRetirementHookForTesting: (@Sendable (SMBRequestIdentity) async -> Void)?
     private var cleanupFullSendBoundaryHookForTesting: (@Sendable (UInt64) async -> Void)?
     private var senderPrecommitAdmissionHookForTesting: (@Sendable (UInt16) async -> Void)?
+#if DEBUG
+    private var postAuthPacketMutationHookForTesting: (@Sendable (UInt16, [UInt8]) -> [UInt8])?
+#endif
     private var creditFailureTask: Task<Void, Never>?
     private var activeSendTasks: [UUID: Task<Void, Never>] = [:]
     private var activeCancelTasks: [UUID: Task<Void, Never>] = [:]
@@ -8317,41 +8347,37 @@ actor SMBSession {
 
         let refusal = SMBError.treeUnavailable(treeId: identity.treeId, operation: "TREE_DISCONNECT")
         let refusalTime = sessionTime.now()
-        let transferQueuedItems = queuedPostAuthRequests.filter { item in
-            guard item.treeIdentity == identity,
-                  item.cleanupTreeIdentity == nil,
-                  case .transfer = item.completionTarget else { return false }
-            return true
-        }
         var shouldStartTransferRetirementPump = false
         var treeTransferPreparationRetirementIDs = Set<SMBRequestIdentity>()
         let transferRecords = Array(activePostAuthRequestRecords.values.filter {
             $0.treeIdentity == identity && $0.cleanupTreeIdentity == nil && $0.transferOwner != nil
         })
         for record in transferRecords {
+            let operation = transferOperationName(for: record.command)
+            let callerError = SMBError.treeUnavailable(treeId: identity.treeId, operation: operation)
+            let admissionRefusal = SMBTransferAdmissionRefusal(
+                scope: .tree(identity),
+                operation: operation,
+                callerError: callerError
+            )
             let transitionResult: SMBTransferRequestTransitionResult
-            if let ticket = record.transferOwner?.ticket, record.messageId == nil {
+            if let ticket = record.transferOwner?.ticket {
                 transitionResult = transitionTransferRequest(
                     ticket.transferIdentifier,
-                    .treeRefusal(ticket, error: refusal, at: refusalTime)
+                    .admissionRefusal(ticket, admissionRefusal, at: refusalTime)
                 )
-            } else if record.transferOwner?.ticket == nil {
+            } else {
                 if record.transferOwner?.reservationPending == true {
                     treeTransferPreparationRetirementIDs.insert(record.identity)
                 }
                 transitionResult = transitionTransferRequest(
                     record.transferOwner?.handle.key.transferIdentifier ?? 0,
-                    .treeRefusalPreparation(record.identity, error: refusal, at: refusalTime)
+                    .admissionRefusalPreparation(record.identity, admissionRefusal, at: refusalTime)
                 )
-            } else {
-                transitionResult = .none
             }
             if case .retirementDecision(_, let startPump) = transitionResult {
                 shouldStartTransferRetirementPump = shouldStartTransferRetirementPump || startPump
             }
-        }
-        for item in transferQueuedItems {
-            failQueuedPostAuthRequest(item, error: refusal)
         }
         if shouldStartTransferRetirementPump { startTransferRetirementEffectPumpIfNeeded() }
         for state in readTransfers.values where treeIdentityByTreeId[state.treeId] == identity {
@@ -8704,8 +8730,32 @@ actor SMBSession {
         await task.value
     }
 
+    /// Every terminal transition also schedules the terminal join. A synchronous close used
+    /// to end the session without it (cleanup ledger limit, send failure, validate-negotiate
+    /// failure, ...), leaving records whose wire-drain timers were cancelled but never
+    /// normalized; a caller waiting for such a record's reclaim never resumed.
     func closeTransport(cause: String = "unspecified", diagnosticError: Error? = nil) {
-        guard !readerLifecycle.isTerminal else { return }
+        guard terminateTransportWithoutJoin(cause: cause, diagnosticError: diagnosticError) else { return }
+        scheduleTerminalJoin(cause: cause, diagnosticError: diagnosticError)
+    }
+
+    private func scheduleTerminalJoin(
+        cause: String,
+        diagnosticError: Error?,
+        afterJoin: (@Sendable () async -> Void)? = nil
+    ) {
+        Task(executorPreference: sessionExecutor) { [self] in
+            sessionExecutor.recordExecutionContextForTesting(.terminalizerTask)
+            await closeTransportAndWait(cause: cause, diagnosticError: diagnosticError)
+            await afterJoin?()
+        }
+    }
+
+    /// Makes the lifecycle terminal synchronously. Callers either join themselves
+    /// (`closeTransportAndWait`, the drain terminalizers) or go through `closeTransport`.
+    @discardableResult
+    private func terminateTransportWithoutJoin(cause: String, diagnosticError: Error?) -> Bool {
+        guard !readerLifecycle.isTerminal else { return false }
         if SMBPerfLog.effectiveIsEnabled {
             let diagnostic = diagnosticError.map(Self.diagnosticError) ?? "none"
             SMBPerfLog.line("[wire] close_transport session=\(diagnosticSessionId) cause=\(cause) error=\(diagnostic)")
@@ -8725,13 +8775,14 @@ actor SMBSession {
         markReadTransfersTerminalClose(terminalError)
         markWriteTransfersTerminalClose(terminalError)
         transitionCleanupLedger(nil, .terminal)
+        return true
     }
 
     /// Explicit teardown observes the owned reader, send operations, CANCEL operations and
     /// credit drain. Fault paths remain synchronous so a reader never joins its own Task.
     func closeTransportAndWait(cause: String = "unspecified", diagnosticError: Error? = nil) async {
         sessionExecutor.recordExecutionContextForTesting(.closeJoin)
-        closeTransport(cause: cause, diagnosticError: diagnosticError)
+        terminateTransportWithoutJoin(cause: cause, diagnosticError: diagnosticError)
         let requestTimerTasks = Array(activePostAuthRequestRecords.values).flatMap { record in
             [record.cleanupTimeoutTask, record.wireDrainTask].compactMap { $0 }
         }
@@ -8955,6 +9006,12 @@ actor SMBSession {
     func setSenderPrecommitAdmissionHookForTesting(_ hook: (@Sendable (UInt16) async -> Void)?) {
         senderPrecommitAdmissionHookForTesting = hook
     }
+
+#if DEBUG
+    func setPostAuthPacketMutationHookForTesting(_ hook: (@Sendable (UInt16, [UInt8]) -> [UInt8])?) {
+        postAuthPacketMutationHookForTesting = hook
+    }
+#endif
 
     func setCreditReservationAcquiredHookForTesting(_ hook: (@Sendable (UInt16) async -> Void)?) async {
         await creditWindow.setReservationAcquiredHookForTesting(hook)
@@ -9395,6 +9452,18 @@ actor SMBSession {
         await waitForTestingCount(.wireDrainTerminalizations, atLeast: count)
     }
 
+    func waitForRequestReclaimWaiterCountForTesting(atLeast count: Int) async {
+        await waitForTestingCount(.requestReclaimWaiters, atLeast: count)
+    }
+
+    func admissionRefusedOrdinaryRecordCountForTesting() -> Int {
+        activePostAuthRequestRecords.values.filter { $0.transferOwner == nil && $0.admissionRefusal != nil }.count
+    }
+
+    func requestReclaimWaiterCountForTesting() -> Int {
+        requestReclaimWaiters.values.reduce(0) { $0 + $1.count }
+    }
+
     func installSenderLoopStateForTesting(sessionId: UInt64 = 1, firstMessageId: UInt64 = 0) {
         self.sessionId = sessionId
         messageId = firstMessageId
@@ -9420,6 +9489,23 @@ actor SMBSession {
     func flushThroughSenderLoopForTesting(treeId: UInt32, fileId: [UInt8]) async throws {
         try await flush(treeId: treeId, fileId: fileId)
     }
+
+#if DEBUG
+    func readTransferThroughPipelineForTesting(
+        treeId: UInt32,
+        fileId: [UInt8],
+        length: UInt64
+    ) async throws -> [UInt8] {
+        try await SMBClient.readAll(
+            session: self,
+            treeId: treeId,
+            fileId: fileId,
+            offset: 0,
+            length: length,
+            progress: SMBReadStreamProgress()
+        )
+    }
+#endif
 
     func retireFileIdForTesting(_ fileId: [UInt8], treeId: UInt32 = 0) {
         guard fileId.count == 16 else { return }
@@ -9587,6 +9673,8 @@ actor SMBSession {
             value = queuedControlSends.count
         case .wireDrainTerminalizations:
             value = wireDrainTerminalizationCountForTestingStorage
+        case .requestReclaimWaiters:
+            value = requestReclaimWaiters.values.reduce(0) { $0 + $1.count }
         }
         return isAtLeast ? value >= target : value == target
     }
@@ -9770,7 +9858,15 @@ actor SMBSession {
                 }
             }
         }
-        let response = try await transaction()
+        let response: SMBReceivedFrame
+        do {
+            response = try await transaction()
+        } catch {
+            if cleanupFileId == nil, cleanupTreeIdentity == nil {
+                await awaitAbandonedFileIdUseOwners(requestIdentity, command: requestHeader.command, error: error)
+            }
+            throw error
+        }
         return response.bytes
     }
 
@@ -9832,7 +9928,30 @@ actor SMBSession {
         guard let requestIdentity = makeRequestIdentity(generation: generation) else {
             throw SMBCodecError.invalidValue("SMB request sequence exhausted")
         }
-        let response = try await withTaskCancellationHandler {
+        let response: SMBReceivedFrame
+        do {
+            response = try await longPollDemuxedWireTransaction(
+                packet: packet,
+                requestHeader: requestHeader,
+                responseLabel: responseLabel,
+                requestIdentity: requestIdentity,
+                generation: generation
+            )
+        } catch {
+            await awaitAbandonedFileIdUseOwners(requestIdentity, command: requestHeader.command, error: error)
+            throw error
+        }
+        return response.bytes
+    }
+
+    private func longPollDemuxedWireTransaction(
+        packet: [UInt8],
+        requestHeader: SMB2Header,
+        responseLabel: String,
+        requestIdentity: SMBRequestIdentity,
+        generation: UInt64
+    ) async throws -> SMBReceivedFrame {
+        try await withTaskCancellationHandler {
             try await demuxedWireTransaction(
                 packet: packet,
                 suppliedRequestHeader: requestHeader,
@@ -9866,7 +9985,45 @@ actor SMBSession {
                 }
             }
         }
-        return response.bytes
+    }
+
+    /// A cancelled or timed-out caller returns before its request's wire / credit owners
+    /// settle (the cancellation tombstone keeps the pending MID until the final, the CANCEL
+    /// answer, or the request's existing fixed wire-drain deadline). Public file operations
+    /// send CLOSE right after such an error, so a FileId use is only complete once this
+    /// request's canonical record is reclaimed. No new deadline is introduced: every owner
+    /// the record waits for is already bounded by the wire-drain deadline or session terminal.
+    /// The wait ignores task cancellation because the caller is already cancelled.
+    /// An ordinary request only sees `.timedOut` together with session terminalization (request
+    /// timeout / wire-drain deadline), so for timeouts the wait is bounded by the terminal join.
+    /// `.timedOut` is still waited on so "use complete = wire / credit owners complete" holds
+    /// for any future timeout that does not terminalize. Today no test can tell the wait apart:
+    /// the terminal close already keeps the follow-up CLOSE off the wire, and the timed-out
+    /// record can be reclaimed (wire = sessionTerminal) before this catch runs.
+    private func awaitAbandonedFileIdUseOwners(
+        _ identity: SMBRequestIdentity,
+        command: UInt16,
+        error: Error
+    ) async {
+        guard command != SMB2Commands.close,
+              Self.fileIdOffsetInRequest(command: command) != nil,
+              Self.isAbandonedCallerError(error),
+              activePostAuthRequestRecords[identity]?.transferOwner == nil,
+              activePostAuthRequestRecords[identity] != nil else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            if activePostAuthRequestRecords[identity] == nil {
+                continuation.resume()
+            } else {
+                requestReclaimWaiters[identity, default: []].append(continuation)
+                resumeSatisfiedTestingCountWaiters()
+            }
+        }
+    }
+
+    private static func isAbandonedCallerError(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let transportError = error as? SMBTransportError, transportError == .timedOut { return true }
+        return false
     }
 
     private func demuxedWireTransaction(
@@ -9971,6 +10128,9 @@ actor SMBSession {
                 throw SMBTransportError.connectionClosed
             }
             transitionCleanupLedger(cleanupKey, owner: requestIdentity, .beginAttempt)
+            if requestHeader.command == SMB2Commands.close {
+                await beginFileCleanupIntent(cleanupKey, owner: requestIdentity)
+            }
         }
         return try await withCheckedThrowingContinuation { continuation in
             registerPendingResponse(
@@ -10107,6 +10267,9 @@ actor SMBSession {
                 throw SMBTransportError.connectionClosed
             }
             transitionCleanupLedger(cleanupKey, owner: identity, .beginAttempt)
+            if header.command == SMB2Commands.close {
+                await beginFileCleanupIntent(cleanupKey, owner: identity)
+            }
         }
         let maximumCreditCharge = creditReservation?.charge ?? max(1, header.creditCharge)
         let creditCancellationToken = creditReservation?.cancellationToken
@@ -10287,6 +10450,14 @@ actor SMBSession {
             let propagatedError: Error
             if softExpiredCleanupOwners.contains(identity) || cleanupRetiredForDeadline {
                 propagatedError = SMBTransportError.timedOut
+            } else if activeRecordForError?.messageId == nil,
+                      let refusal = activeRecordForError?.admissionRefusal {
+                // A File refusal only applies to an owner that never committed. Its CLOSE may
+                // have been abandoned and the request committed afterwards; from then on the
+                // existing drain / terminal policy (and the caller's own error) applies.
+                propagatedError = refusal.callerError
+            } else if let refusal = activeRecordForError?.transferOwner?.admissionRefusal {
+                propagatedError = refusal.callerError
             } else if let tree = activeRecordForError?.treeIdentity,
                       activeRecordForError?.cleanupTreeIdentity == nil,
                       case .some = treeLifecycle[tree] {
@@ -10374,7 +10545,9 @@ actor SMBSession {
         case .transaction(let continuation):
             continuation.resume(throwing: error)
         case .transfer(let ticket):
-            if isTreeUnavailable(error) {
+            if let refusal = error as? SMBTransferAdmissionRefusal {
+                refuseTransferRequestForAdmission(ticket, refusal: refusal)
+            } else if isTreeUnavailable(error) {
                 refuseTransferRequestForTree(ticket, error: error)
             } else {
                 failTransferRequest(ticket, error: error)
@@ -10383,23 +10556,59 @@ actor SMBSession {
     }
 
     private func isTreeUnavailable(_ error: Error) -> Bool {
-        guard let error = error as? SMBError else { return false }
+        let underlyingError: Error
+        if let refusal = error as? SMBTransferAdmissionRefusal {
+            underlyingError = refusal.callerError
+        } else {
+            underlyingError = error
+        }
+        guard let error = underlyingError as? SMBError else { return false }
         if case .treeUnavailable = error { return true }
         return false
     }
 
-    private func transferTreeRefusalError(for record: SMBSessionActiveRequestRecord) -> SMBError {
-        SMBError.treeUnavailable(
-            treeId: record.treeId,
-            operation: record.command == SMB2Commands.read ? "READ" : "WRITE"
-        )
+    private func transferOperationName(for command: UInt16) -> String {
+        switch command {
+        case SMB2Commands.read: return "READ"
+        case SMB2Commands.write: return "WRITE"
+        case SMB2Commands.close: return "CLOSE"
+        case SMB2Commands.flush: return "FLUSH"
+        case SMB2Commands.lock: return "LOCK"
+        case SMB2Commands.ioctl: return "IOCTL"
+        case SMB2Commands.queryDirectory: return "QUERY_DIRECTORY"
+        case SMB2Commands.changeNotify: return "CHANGE_NOTIFY"
+        case SMB2Commands.setInfo: return "SET_INFO"
+        case SMB2Commands.queryInfo: return "QUERY_INFO"
+        default: return "SMB2 command \(command)"
+        }
     }
 
     private func refuseTransferRequestForTree(_ ticket: SMBTransferTicket, error: Error) {
+        guard let record = transferRecord(for: ticket),
+              let treeIdentity = record.treeIdentity else { return }
+        let operation = transferOperationName(for: record.command)
+        let refusal: SMBTransferAdmissionRefusal
+        if let existing = error as? SMBTransferAdmissionRefusal,
+           existing.scope.matches(treeIdentity: record.treeIdentity, fileId: record.fileId) {
+            refusal = existing
+        } else {
+            refusal = SMBTransferAdmissionRefusal(
+                scope: .tree(treeIdentity),
+                operation: operation,
+                callerError: error
+            )
+        }
+        refuseTransferRequestForAdmission(ticket, refusal: refusal)
+    }
+
+    private func refuseTransferRequestForAdmission(
+        _ ticket: SMBTransferTicket,
+        refusal: SMBTransferAdmissionRefusal
+    ) {
         let now = sessionTime.now()
         if case .retirementDecision(_, let shouldStartPump) = transitionTransferRequest(
             ticket.transferIdentifier,
-            .treeRefusal(ticket, error: error, at: now)
+            .admissionRefusal(ticket, refusal, at: now)
         ), shouldStartPump {
             startTransferRetirementEffectPumpIfNeeded()
         }
@@ -10413,6 +10622,142 @@ actor SMBSession {
         }
     }
 
+    /// Runs once per CLOSE (never per READ/WRITE chunk) and scans the active records and Tree
+    /// credit preparations. Both are bounded by in-flight requests (the credit window), so a
+    /// FileId index was not added: it would be one more structure to keep in step with every
+    /// record insert/reclaim on the chunk path. Revisit if CLOSE becomes frequent while many
+    /// requests are in flight (e.g. a profile shows this scan in a directory-walk workload).
+    private func beginFileCleanupIntent(
+        _ fileKey: SMBFileIdLedgerKey,
+        owner closingRequest: SMBRequestIdentity
+    ) async {
+        let callerError = SMBCodecError.invalidValue("SMB FileId is unresolved after CLOSE")
+        var refusalRecords: [SMBSessionActiveRequestRecord] = []
+        for record in activePostAuthRequestRecords.values {
+            if record.identity == closingRequest { continue }
+            if record.fileId != fileKey { continue }
+            refusalRecords.append(record)
+        }
+        var reservationWaiterIdentities = Set<SMBRequestIdentity>()
+        var transferPreparationIdentities = Set<SMBRequestIdentity>()
+        var lateGrantRefunds: [(identity: SMBRequestIdentity, charge: UInt16)] = []
+        var transferPreparationRefunds: [(identity: SMBRequestIdentity, transferIdentifier: UInt64, charge: UInt16)] = []
+        var affectedTransferIdentifiers = Set<UInt64>()
+        var shouldStartTransferRetirementPump = false
+        let refusalTime = sessionTime.now()
+
+        for record in refusalRecords {
+            let operation = transferOperationName(for: record.command)
+            let refusal = SMBTransferAdmissionRefusal(
+                scope: .file(fileKey),
+                operation: operation,
+                callerError: callerError
+            )
+            if let transferOwner = record.transferOwner {
+                affectedTransferIdentifiers.insert(transferOwner.handle.key.transferIdentifier)
+                if let ticket = transferOwner.ticket {
+                    if case .retirementDecision(_, let shouldStartPump) = transitionTransferRequest(
+                        transferOwner.handle.key.transferIdentifier,
+                        .admissionRefusal(ticket, refusal, at: refusalTime)
+                    ), shouldStartPump {
+                        shouldStartTransferRetirementPump = true
+                    }
+                } else {
+                    if transferOwner.reservationPending {
+                        transferPreparationIdentities.insert(record.identity)
+                    }
+                    _ = transitionTransferRequest(
+                        transferOwner.handle.key.transferIdentifier,
+                        .admissionRefusalPreparation(record.identity, refusal, at: refusalTime)
+                    )
+                }
+            } else if record.messageId == nil {
+                // Committed ordinary requests keep the existing drain / terminal policy.
+                record.admissionRefusal = refusal
+            }
+
+            if record.creditCancellationToken != nil,
+               record.transferOwner?.ticket == nil {
+                reservationWaiterIdentities.insert(record.identity)
+                if let lateGrant = record.creditCancellationToken?.cancel() {
+                    if let transferOwner = record.transferOwner,
+                       transferOwner.reservationPending {
+                        transferPreparationRefunds.append((
+                            record.identity,
+                            transferOwner.handle.key.transferIdentifier,
+                            lateGrant
+                        ))
+                    } else {
+                        lateGrantRefunds.append((record.identity, lateGrant))
+                    }
+                }
+            }
+        }
+
+        for (requestIdentity, preparation) in treeCreditPreparations {
+            if preparation.treeIdentity != fileKey.treeIdentity { continue }
+            guard let record = activePostAuthRequestRecords[requestIdentity],
+                  record.fileId == fileKey else { continue }
+            reservationWaiterIdentities.insert(requestIdentity)
+            transferPreparationIdentities.insert(requestIdentity)
+            if let lateGrant = preparation.cancellationToken.cancel() {
+                if let transferIdentifier = record.transferOwner?.handle.key.transferIdentifier {
+                    transferPreparationRefunds.append((requestIdentity, transferIdentifier, lateGrant))
+                } else {
+                    lateGrantRefunds.append((requestIdentity, lateGrant))
+                }
+            }
+        }
+
+        if !reservationWaiterIdentities.isEmpty {
+            _ = await creditWindow.cancelWaiters(
+                treeIdentity: fileKey.treeIdentity,
+                requestIdentities: reservationWaiterIdentities,
+                error: callerError
+            )
+        }
+
+        let transferRefundIdentitySet = Set(transferPreparationRefunds.map(\.identity))
+        for requestIdentity in transferPreparationIdentities
+        where !transferRefundIdentitySet.contains(requestIdentity) {
+            guard let transferIdentifier = activePostAuthRequestRecords[requestIdentity]?.transferOwner?.handle.key.transferIdentifier else {
+                continue
+            }
+            _ = transitionTransferRequest(
+                transferIdentifier,
+                .preparationRetirementAcknowledged(requestIdentity, at: sessionTime.now())
+            )
+        }
+        for refund in transferPreparationRefunds {
+            transferRetirementRefundWorklist.append(
+                SMBTransferRetirementRefundWork(
+                    requestIdentity: refund.identity,
+                    transferIdentifier: refund.transferIdentifier,
+                    ticket: nil,
+                    charge: refund.charge
+                )
+            )
+            shouldStartTransferRetirementPump = true
+        }
+
+        for refund in lateGrantRefunds {
+            await refundCredit(charge: refund.charge)
+            if let record = activePostAuthRequestRecords[refund.identity], record.transferOwner == nil {
+                record.credit = .refunded
+                record.creditRefundPending = false
+                reclaimActivePostAuthRequestRecordIfEligible(refund.identity)
+            }
+        }
+        if shouldStartTransferRetirementPump {
+            startTransferRetirementEffectPumpIfNeeded()
+        }
+        for transferIdentifier in affectedTransferIdentifiers {
+            if let state = readTransfers[transferIdentifier] { signalReadTransfer(state) }
+            if let state = writeTransfers[transferIdentifier] { signalWriteTransfer(state) }
+        }
+        await completeReadyOperationBarriers()
+    }
+
     private func terminateTransferAdmissionFailure(_ ticket: SMBTransferTicket, error: Error) {
         failTransferRequest(ticket, error: error)
         failWire(error: error)
@@ -10422,11 +10767,8 @@ actor SMBSession {
     /// Fault owners close synchronously, then hand the join to a distinct task so they never
     /// await a snapshot that can contain the reader/sender/send owner which found the fault.
     private func beginSessionFaultTerminalization(cause: String, error: Error) {
-        closeTransport(cause: cause, diagnosticError: error)
-        Task(executorPreference: sessionExecutor) { [self] in
-            sessionExecutor.recordExecutionContextForTesting(.terminalizerTask)
-            await closeTransportAndWait(cause: cause, diagnosticError: error)
-        }
+        terminateTransportWithoutJoin(cause: cause, diagnosticError: error)
+        scheduleTerminalJoin(cause: cause, diagnosticError: error)
     }
 
     private func runSenderLoop(taskID: UUID, generation: UInt64) async {
@@ -10501,6 +10843,11 @@ actor SMBSession {
 
             var committedMessageId: UInt64?
             do {
+#if DEBUG
+                if let hook = postAuthPacketMutationHookForTesting {
+                    packet = hook(item.command, packet)
+                }
+#endif
                 // Scope and generation admission are repeated at the final actor turn before
                 // MID allocation. A local refusal therefore cannot leave a sequence hole.
                 guard item.command == activeRecord.command,
@@ -10520,18 +10867,30 @@ actor SMBSession {
                     retireCleanupBeforeCommit(identity: item.identity, record: activeRecord)
                     throw SMBTransportError.timedOut
                 }
+                let isTransferAdmission: Bool
+                if case .transfer = item.completionTarget {
+                    isTransferAdmission = true
+                } else {
+                    isTransferAdmission = false
+                }
+                let admissionOperation = isTransferAdmission
+                    ? transferOperationName(for: activeRecord.command)
+                    : item.responseLabel
                 try validateTreeAdmission(
                     treeId: item.treeId,
                     command: item.command,
-                    operation: item.responseLabel,
+                    operation: admissionOperation,
                     owner: item.identity,
-                    cleanupTreeIdentity: item.cleanupTreeIdentity
+                    cleanupTreeIdentity: item.cleanupTreeIdentity,
+                    typedTransferRefusal: isTransferAdmission
                 )
                 try validateFileIdAdmission(
                     packet: packet,
                     command: activeRecord.command,
                     cleanupKey: activeRecord.cleanupKey,
-                    treeIdentity: activeRecord.treeIdentity
+                    treeIdentity: activeRecord.treeIdentity,
+                    operation: admissionOperation,
+                    typedTransferRefusal: isTransferAdmission
                 )
                 guard isGenerationActive(generation) else {
                     throw wireFailure ?? SMBTransportError.connectionClosed
@@ -10636,10 +10995,12 @@ actor SMBSession {
                     beginSessionFaultTerminalization(cause: "post_auth_send_failure", error: error)
                     break
                 }
+                let transferAdmissionRefusal = error as? SMBTransferAdmissionRefusal
+                let callerError = transferAdmissionRefusal?.callerError ?? error
                 let precommitCaller: SMBRequestCallerState
-                if error is CancellationError {
+                if callerError is CancellationError {
                     precommitCaller = .cancelled
-                } else if error is SMBCodecError {
+                } else if callerError is SMBCodecError || transferAdmissionRefusal != nil {
                     precommitCaller = .localRefusal
                 } else {
                     precommitCaller = .transportError
@@ -10677,7 +11038,9 @@ actor SMBSession {
                     transferTicket = nil
                 }
                 if let transferTicket {
-                    if isTreeUnavailable(error) {
+                    if let transferAdmissionRefusal {
+                        refuseTransferRequestForAdmission(transferTicket, refusal: transferAdmissionRefusal)
+                    } else if isTreeUnavailable(error) {
                         refuseTransferRequestForTree(transferTicket, error: error)
                     } else {
                         terminateTransferAdmissionFailure(transferTicket, error: error)
@@ -11053,11 +11416,9 @@ actor SMBSession {
            let identity = activePostAuthRequestRecords.first(where: { $0.value.wireDrainTimerIdentity == timerIdentity })?.key {
             updateActivePostAuthRecord(identity) { $0.wire = .sessionTerminal }
         }
-        closeTransport(cause: cause, diagnosticError: error)
-        Task(executorPreference: sessionExecutor) { [self] in
-            sessionExecutor.recordExecutionContextForTesting(.terminalizerTask)
-            await closeTransportAndWait(cause: cause, diagnosticError: error)
-            await self.finishWireDrainTerminalization(timerTask: timerTask, timerIdentity: timerIdentity)
+        terminateTransportWithoutJoin(cause: cause, diagnosticError: error)
+        scheduleTerminalJoin(cause: cause, diagnosticError: error) { [self] in
+            await finishWireDrainTerminalization(timerTask: timerTask, timerIdentity: timerIdentity)
         }
     }
 
@@ -11522,6 +11883,9 @@ actor SMBSession {
         completeOperationBarrierIfWireWorkIsComplete(for: identity)
         guard operationBarrierByRequest[identity] == nil else { return }
         guard activePostAuthRequestRecords.removeValue(forKey: identity) != nil else { return }
+        if !requestReclaimWaiters.isEmpty, let waiters = requestReclaimWaiters.removeValue(forKey: identity) {
+            for waiter in waiters { waiter.resume() }
+        }
         if let owner = record.transferOwner {
             owner.window.reclaimEpochOwner()
             signalTransferWindowOwnerChange(owner.handle.key.transferIdentifier)
@@ -11713,7 +12077,8 @@ actor SMBSession {
         command: UInt16,
         operation: String,
         owner: SMBRequestIdentity,
-        cleanupTreeIdentity: SMBTreeIdentity?
+        cleanupTreeIdentity: SMBTreeIdentity?,
+        typedTransferRefusal: Bool = false
     ) throws {
         switch command {
         case SMB2Commands.sessionSetup, SMB2Commands.treeConnect,
@@ -11734,7 +12099,15 @@ actor SMBSession {
             return
         }
         if let currentIdentity, case .some = treeLifecycle[currentIdentity] {
-            throw SMBError.treeUnavailable(treeId: treeId, operation: operation)
+            let callerError = SMBError.treeUnavailable(treeId: treeId, operation: operation)
+            if typedTransferRefusal {
+                throw SMBTransferAdmissionRefusal(
+                    scope: .tree(currentIdentity),
+                    operation: operation,
+                    callerError: callerError
+                )
+            }
+            throw callerError
         }
     }
 
@@ -11742,7 +12115,9 @@ actor SMBSession {
         packet: [UInt8],
         command: UInt16,
         cleanupKey: SMBFileIdLedgerKey?,
-        treeIdentity: SMBTreeIdentity?
+        treeIdentity: SMBTreeIdentity?,
+        operation: String? = nil,
+        typedTransferRefusal: Bool = false
     ) throws {
         guard let offset = Self.fileIdOffsetInRequest(command: command) else {
             if cleanupKey != nil {
@@ -11765,7 +12140,15 @@ actor SMBSession {
             return
         }
         guard cleanupLedger[fileKey] == nil else {
-            throw SMBCodecError.invalidValue("SMB FileId is unresolved after CLOSE")
+            let callerError = SMBCodecError.invalidValue("SMB FileId is unresolved after CLOSE")
+            if typedTransferRefusal {
+                throw SMBTransferAdmissionRefusal(
+                    scope: .file(fileKey),
+                    operation: operation ?? transferOperationName(for: command),
+                    callerError: callerError
+                )
+            }
+            throw callerError
         }
     }
 
@@ -14409,6 +14792,9 @@ actor SMBSession {
                     progress: .precommitRetirementSettled
                 )
                 await completeReadyOperationBarriers()
+                if let refusal = activePostAuthRequestRecords[requestIdentity]?.transferOwner?.admissionRefusal {
+                    throw refusal.callerError
+                }
                 throw SMBError.treeUnavailable(treeId: treeId, operation: operation)
             }
             treeCreditPreparations.removeValue(forKey: requestIdentity)
@@ -14418,6 +14804,16 @@ actor SMBSession {
             )
             await completeReadyOperationBarriers()
             throw error
+        }
+        if let refusal = activePostAuthRequestRecords[requestIdentity]?.transferOwner?.admissionRefusal {
+            if reservation.charge > 0 { await refundCredit(charge: reservation.charge) }
+            treeCreditPreparations.removeValue(forKey: requestIdentity)
+            completeOperationBarrierIfWireWorkIsComplete(
+                for: requestIdentity,
+                progress: .precommitRetirementSettled
+            )
+            await completeReadyOperationBarriers()
+            throw refusal.callerError
         }
         if treeLifecycle[treeIdentity] != nil {
             if reservation.charge > 0 { await refundCredit(charge: reservation.charge) }
@@ -14949,25 +15345,38 @@ extension SMBSession {
         case .retireUnsent(let ticket, let time):
             return retireUnsentTransferRequestInTransition(ticket, window: window, at: time)
 
-        case .treeRefusal(let ticket, _, let time):
-            guard let record = transferRecord(for: ticket), record.messageId == nil else {
+        case .admissionRefusal(let ticket, let refusal, let time):
+            guard let record = transferRecord(for: ticket),
+                  let owner = record.transferOwner,
+                  refusal.scope.matches(treeIdentity: record.treeIdentity, fileId: record.fileId) else {
+                return .retirementDecision(.committedNeedsWireDrain(ticket.requestIdentity), shouldStartPump: false)
+            }
+            // A wire commit that won the race keeps the existing drain / terminal policy: the
+            // refusal neither records a caller error on it nor stops its window.
+            guard record.messageId == nil else {
                 return retireUnsentTransferRequestInTransition(ticket, window: window, at: time)
             }
-            let refusal = transferTreeRefusalError(for: record)
-            let reason = SMBTransferStopReason.offsetFailure(offset: ticket.offset, error: refusal)
-            window.stop(
+            record.admissionRefusal = refusal
+            owner.admissionRefusal = refusal
+            let reason = SMBTransferStopReason.offsetFailure(offset: ticket.offset, error: refusal.callerError)
+            owner.window.stop(
                 for: reason,
                 at: time,
                 cleanupTimeout: cleanupTimeout,
-                operationDeadline: readState?.operationDeadline ?? writeState?.operationDeadline
+                operationDeadline: record.operationDeadline
             )
             return retireUnsentTransferRequestInTransition(ticket, window: window, at: time)
 
-        case .treeRefusalPreparation(let identity, _, let time):
+        case .admissionRefusalPreparation(let identity, let refusal, let time):
             guard let record = activePostAuthRequestRecords[identity],
-                  let owner = record.transferOwner else { return .none }
-            let refusal = transferTreeRefusalError(for: record)
-            let reason = SMBTransferStopReason.offsetFailure(offset: owner.window.requestFrontier, error: refusal)
+                  let owner = record.transferOwner,
+                  refusal.scope.matches(treeIdentity: record.treeIdentity, fileId: record.fileId) else { return .none }
+            record.admissionRefusal = refusal
+            owner.admissionRefusal = refusal
+            let reason = SMBTransferStopReason.offsetFailure(
+                offset: owner.window.requestFrontier,
+                error: refusal.callerError
+            )
             owner.window.stop(
                 for: reason,
                 at: time,
@@ -15849,7 +16258,13 @@ extension SMBSession {
                 handle.identifier,
                 .revokePreparing(slotIndex: slotIndex, at: failureTime)
             )
-            if Task.isCancelled {
+            if let refusal = activePostAuthRequestRecords[requestIdentity]?.transferOwner?.admissionRefusal {
+                stopWriteTransfer(
+                    state,
+                    for: .offsetFailure(offset: offset, error: refusal.callerError),
+                    at: failureTime
+                )
+            } else if Task.isCancelled {
                 stopWriteTransferForOwnerCancellation(state, at: failureTime)
             } else if isTreeUnavailable(error) {
                 stopWriteTransfer(
@@ -15997,7 +16412,9 @@ extension SMBSession {
                     transferTicket: ticket
                 )
             } catch {
-                if isTreeUnavailable(error) {
+                if let refusal = activePostAuthRequestRecords[requestIdentity]?.transferOwner?.admissionRefusal {
+                    refuseTransferRequestForAdmission(ticket, refusal: refusal)
+                } else if isTreeUnavailable(error) {
                     refuseTransferRequestForTree(ticket, error: error)
                 } else {
                     terminateTransferAdmissionFailure(ticket, error: error)
@@ -16255,7 +16672,13 @@ extension SMBSession {
                 handle.identifier,
                 .revokePreparing(slotIndex: slotIndex, at: failureTime)
             )
-            if Task.isCancelled {
+            if let refusal = activePostAuthRequestRecords[preparationIdentity]?.transferOwner?.admissionRefusal {
+                stopReadTransfer(
+                    state,
+                    for: .offsetFailure(offset: requestFrontier, error: refusal.callerError),
+                    at: failureTime
+                )
+            } else if Task.isCancelled {
                 stopReadTransferForOwnerCancellation(state, at: failureTime)
             } else if isTreeUnavailable(error) {
                 stopReadTransfer(
@@ -16431,7 +16854,9 @@ extension SMBSession {
                     transferTicket: ticket
                 )
             } catch {
-                if isTreeUnavailable(error) {
+                if let refusal = activePostAuthRequestRecords[requestIdentity]?.transferOwner?.admissionRefusal {
+                    refuseTransferRequestForAdmission(ticket, refusal: refusal)
+                } else if isTreeUnavailable(error) {
                     refuseTransferRequestForTree(ticket, error: error)
                 } else {
                     terminateTransferAdmissionFailure(ticket, error: error)
@@ -17190,11 +17615,8 @@ extension SMBSession {
     /// still be suspended in a user callback, while this separate task joins the wire owners
     /// and reclaims the session's active request records.
     private func beginTransferDrainTerminalization(cause: String, error: Error) {
-        closeTransport(cause: cause, diagnosticError: error)
-        Task(executorPreference: sessionExecutor) { [self] in
-            sessionExecutor.recordExecutionContextForTesting(.terminalizerTask)
-            await closeTransportAndWait(cause: cause, diagnosticError: error)
-        }
+        terminateTransportWithoutJoin(cause: cause, diagnosticError: error)
+        scheduleTerminalJoin(cause: cause, diagnosticError: error)
     }
 
     private func finishWriteTransferAfterDrain(_ handle: SMBWriteTransferHandle) async -> SMBWriteTransferDrainResult {

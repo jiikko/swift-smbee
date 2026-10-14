@@ -511,6 +511,10 @@ commit の分け方（各 commit が単独で契約を満たす）:
     - arm64 の 5 組は計測が成り立たなかった（同じ計測の中で master の read が 626〜2357 MiB/s と揺れた。マシンが混んでいた）。効果は主張できない
     - テスト: slot の再利用のテストに finishDecode と delivery の開始の順序の assert を足し、`deliveryOwned = true` を落とす変異で red を確認。macOS unit 859 件・Linux unit 866 件・strict lint・Release のテストのビルドは通過（codex の報告。main agent は未実行）
   - 見通し（main agent の見積もり）: まとめで消せるのは退行の 1 割程度で、x86 で −10% 以内に縮む見込みは低い。残りは遷移ごとの enum の payload・exclusivity・ARC で、単一の遷移関数と canonical な record を保つ限り大きくは減らない
+  - **x86 をサポート対象外にした（2026-10-14、ユーザー判断。issue 112）**。CI の Linux の job は arm64（ubuntu-24.04-arm）で回す
+  - **arm64 の CI の gate（2026-10-14）**: 候補（a89bc8a と同じコードを 6af8706 の上に載せ直した 6cdcf20）を branch で手動起動（run 38553263839、20 組、cpu_model は両側とも arm64 implementer 0x41 part 0xd49）。
+    gate は PASS: read throughput −10.7%（paired −11.18%、95% CI −12.21〜−9.90%）、user CPU +15.5%（+15.79%、+14.00〜+17.44%）。write は −6.2% / +9.8%。
+    上限（−15% / +25%）まで throughput で約 3.8 ポイント、user CPU で約 9 ポイントの余裕。artifact を落として `compare-resource-performance --fail-on-regression` で同じ判定を再現した
 
 ## 関連
 

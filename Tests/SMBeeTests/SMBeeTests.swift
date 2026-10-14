@@ -2205,6 +2205,34 @@ private final class TestContinuationResumer<Success: Sendable>: @unchecked Senda
 
 // swiftlint:disable:next type_body_length
 final class SMBeeTests: XCTestCase {
+    func testRecursiveFailureCollectorPreservesTypedSMBError() throws {
+        let error = SMBError.accessDenied(status: SMB2Status.accessDenied, operation: "CREATE")
+        let collector = SMBRecursiveFailureCollector()
+        collector.record(path: "root", error: error)
+        XCTAssertThrowsError(try collector.throwIfNeeded()) { thrown in
+            guard case let SMBError.recursiveOperationIncomplete(failures) = thrown else {
+                return XCTFail("expected recursiveOperationIncomplete, got \(thrown)")
+            }
+            XCTAssertEqual(failures.count, 1)
+            XCTAssertEqual(failures.first?.error, error)
+            XCTAssertEqual(failures.first?.message, String(describing: error))
+            XCTAssertEqual(failures.first?.path, "root")
+        }
+    }
+
+    func testRecursiveFailureRetainsUnknownAndLegacyMessages() {
+        let collector = SMBRecursiveFailureCollector()
+        collector.record(path: "child", error: CancellationError())
+        XCTAssertNil(collector.failures.first?.error)
+        XCTAssertEqual(collector.failures.first?.message, String(describing: CancellationError()))
+        let legacy = SMBRecursiveFailure(path: "root", message: "accessDenied")
+        XCTAssertNil(legacy.error)
+        XCTAssertEqual(legacy.message, "accessDenied")
+        let typed = SMBRecursiveFailure(path: "root", error: SMBError.transport("failed"))
+        XCTAssertEqual(typed, SMBRecursiveFailure(path: "root", error: SMBError.transport("failed")))
+        XCTAssertNotEqual(typed, SMBRecursiveFailure(path: "root", message: typed.message))
+    }
+
     // These tests model a server with enough negotiated credits for one large request.
     fileprivate let negotiatedServerCredits: UInt32 = 64
     func testVersionIsNotEmpty() {
@@ -12901,6 +12929,7 @@ final class SMBeeTests: XCTestCase {
         } catch let SMBError.recursiveOperationIncomplete(failures) {
             XCTAssertEqual(failures.count, 1)
             XCTAssertEqual(failures[0].path, "src\\bad.txt")
+            XCTAssertEqual(failures[0].error, .accessDenied(status: SMB2Status.accessDenied, operation: "CREATE"))
             let requests = try unframed(transport.outbound)
             XCTAssertEqual(requests.count, 17)
             XCTAssertEqual(try SMB2Header.decode(requests[9]).command, SMB2Commands.create)
@@ -13134,6 +13163,35 @@ final class SMBeeTests: XCTestCase {
             SMB2Commands.queryDirectory,
             SMB2Commands.close
         ])
+    }
+
+    func testRecursiveDeleteEmptyDirectoryPreservesAccessDeniedWithoutActions() async throws {
+        let rootFileId = hexBytes("00000000000000000000000000000043")
+        let inbound = try framed([
+            try smb2CreateResponse(fileId: rootFileId, messageId: 0, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.noMoreFiles, command: SMB2Commands.queryDirectory, messageId: 1, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.success, command: SMB2Commands.close, messageId: 2, treeId: 0x3344),
+            try smb2StatusResponse(status: SMB2Status.accessDenied, command: SMB2Commands.create, messageId: 3, treeId: 0x3344)
+        ])
+        let transport = InMemoryTransport(inbound: inbound)
+        let session = SMBSession(
+            host: "server", port: 445,
+            credential: SMBCredential(username: "user", password: "pass"),
+            transport: transport, signingKey: Array(repeating: UInt8(0x11), count: 16)
+        )
+        let recorder = RecursiveActionRecorder()
+        do {
+            try await session.deleteRecursively(
+                treeId: 0x3344, path: "root", directory: true, continueOnError: true
+            ) { recorder.append($0) }
+            XCTFail("expected recursiveOperationIncomplete")
+        } catch let SMBError.recursiveOperationIncomplete(failures) {
+            XCTAssertEqual(failures.count, 1)
+            XCTAssertEqual(failures.first?.path, "root")
+            XCTAssertEqual(failures.first?.error, .accessDenied(status: SMB2Status.accessDenied, operation: "CREATE"))
+        }
+        XCTAssertTrue(recorder.actions.isEmpty)
+        XCTAssertEqual(try unframed(transport.outbound).count, 4)
     }
 
     func testSessionRecursiveDeleteRemovesReparsePointWithoutFollowingTarget() async throws {

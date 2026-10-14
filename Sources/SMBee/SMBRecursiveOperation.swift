@@ -3,10 +3,19 @@ import Foundation
 public struct SMBRecursiveFailure: Equatable, Sendable {
     public let path: String
     public let message: String
+    /// The originating SMB failure, when available. Message-only and non-SMB failures retain nil.
+    public let error: SMBError?
 
     public init(path: String, message: String) {
         self.path = path
         self.message = message
+        self.error = nil
+    }
+
+    public init(path: String, error: any Error) {
+        self.path = path
+        self.message = String(describing: error)
+        self.error = error as? SMBError
     }
 }
 
@@ -35,7 +44,7 @@ final class SMBRecursiveFailureCollector: @unchecked Sendable {
 
     func record(path: String, error: Error) {
         lock.lock()
-        storage.append(SMBRecursiveFailure(path: path, message: String(describing: error)))
+        storage.append(SMBRecursiveFailure(path: path, error: error))
         lock.unlock()
     }
 

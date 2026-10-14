@@ -8,6 +8,14 @@ SMBee exposes three error families:
 - ``SMBTransportError`` for connection failures and operation deadlines.
 - ``SMBCodecError`` for invalid input, malformed wire messages, and consistency checks.
 
+Recursive operations with `continueOnError: true` report `SMBError.recursiveOperationIncomplete`.
+Each ``SMBRecursiveFailure`` retains its path and diagnostic message; its `error` is the
+originating `SMBError`, or `nil` for non-SMB errors and values constructed with the
+message-only initializer. Equality includes the typed error, so a typed failure and a
+message-only failure need not compare equal even when their path and message match.
+Aggregated failures do not imply that no work completed; callers must also account for
+successful actions before deciding how to present a failure or whether to retry.
+
 Swift task cancellation is reported as `CancellationError`. An operation deadline
 reports `SMBTransportError.timedOut`, but it is cooperative: the call waits for the
 operation task to finish and may return later than the configured duration.

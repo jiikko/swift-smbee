@@ -515,6 +515,13 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - **arm64 の CI の gate（2026-10-14）**: 候補（a89bc8a と同じコードを 6af8706 の上に載せ直した 6cdcf20）を branch で手動起動（run 38553263839、20 組、cpu_model は両側とも arm64 implementer 0x41 part 0xd49）。
     gate は PASS: read throughput −10.7%（paired −11.18%、95% CI −12.21〜−9.90%）、user CPU +15.5%（+15.79%、+14.00〜+17.44%）。write は −6.2% / +9.8%。
     上限（−15% / +25%）まで throughput で約 3.8 ポイント、user CPU で約 9 ポイントの余裕。artifact を落として `compare-resource-performance --fail-on-regression` で同じ判定を再現した
+- **master へ入れ直した（2026-10-14、ユーザー判断）**: commit `feat(session): issue 106 Commit 5 の M1+M2 — 転送の chunk の所有期間と未送信の退役の receipt を canonical な record に統合する`（2d3923c、1 commit に squash）。
+  - 性能（2d3923c の push の Performance、arm64、20 組、reference は c938d1a）: read throughput −8.5%（95% CI −9.61〜−7.34%）、user CPU +12.0%（+9.57〜+13.06%）、write −3.4% / +4.3%。gate PASS
+  - 2d3923c の CI で macos-tsan の `testStoppedReadRetiresQueuedUnsentRequestsBeforeMIDCommit` が落ちた（4 vs 1）。退役した record の回収は refund の子 task の後なのに、queue が空になった時点で数えていた。
+    commit `test(read): issue 106 — 送らずに退役させた READ の record が refund の後に回収されるのを待ってから数える`（b1ce109）で直した
+  - b1ce109 の CI: code-coverage の 1 本と network 性能テストの crash（issue 113）が単発で落ち、回し直しで両方通った。`verify-agent-push` rc=0
+  - 採らなかったもの: slot table（効かず）と正常系の遷移のまとめ（Callgrind で約 0.5% 減のみ）。後者の差分は tmp/c5/impl/coalesce-attempt.patch に控えたが、一時領域なので消えうる
+  - **Commit 5 の残り: M3（型付きの拒否、watch の cancel → CLOSE の待ち）と M4**
 
 ## 関連
 

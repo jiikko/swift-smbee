@@ -282,6 +282,13 @@ final class SMBReadPipelineTests: XCTestCase {
         XCTAssertEqual(transport.readRequests.map(\.header.messageId), [1])
         let cursorAfterQueuedRetirement = await session.nextMessageIdForTesting()
         XCTAssertEqual(cursorAfterQueuedRetirement, 17, "queued READs must not allocate MessageIds")
+        // Leaving the sender queue is not reclamation: each retired record is reaped only after its credit refund
+        // runs in the retirement effect pump's child task, which can still be pending here (CI macos-tsan saw 4).
+        try await smbIssue102AwaitWithTimeout("retired queued READ records are reclaimed after their refunds") {
+            while await session.activePostAuthRequestRecordCountForTesting() > 1 {
+                await Task.yield()
+            }
+        }
         let activeRecordsBeforeFirstFinal = await session.activePostAuthRequestRecordCountForTesting()
         XCTAssertEqual(activeRecordsBeforeFirstFinal, 1, "only the first sent READ remains active")
 

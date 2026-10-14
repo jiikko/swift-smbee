@@ -543,7 +543,14 @@ commit の分け方（各 commit が単独で契約を満たす）:
     | F | 素通り | timeout のテストは待ちの有無を区別しない / `reclaimWaiters == 0` の assert は空振り / M7 は既存の終端化を見ているだけ / source-shape は M5 の箇所を見ていない | 対応する |
     | G | 素通り | fake の FileId を一意にした件の原因の推定は未観測。同じ FileId の使い回しの場面のカバレッジが減った | 観測して確かめる |
     壊せなかった攻め口: reclaim 以外で record が消える経路（1 か所だけ）、待ち始める前の回収、reconnect / close の join、自分の CLOSE との deadlock、queue の中の cancel、refund の二重化、committed ticket の退役、descriptor と refusal の混同、hot path への追加
-  - 次: レビュー（発見型 1 + 敵対 2、codex が使えないので Claude のサブエージェント）→ 指摘への対応 → smoke（3 プロファイル）→ master へ
+- **M3 を master へ入れた（2026-10-15）**: commit `feat(session): issue 106 Commit 5 の M3 — 型付きの admission refusal と、FileId を使う要求の cancel / timeout の後に CLOSE を wire の決着まで待たせる`（736f9ea）。
+  - レビュー 1 周目の対応: A（通常の経路の待ちにテスト）・B（`closeTransport` を同期の終端と terminal join の予約に分け、どの経路で終端しても join に届く。再現テストで hang を確認してから直した）・
+    C（放棄された intent の refusal で commit 後の error をすり替えない。再現してから直した）・D（到達しない：CLOSE は認証後は必ず placeholder の経路を通る）・E（直さない理由をコードに記載）・F・G（旧 fake で原因の推定を観測して確認）
+  - レビュー 2 周目（敵対 2 本）: 製品のコードを壊す経路は組めなかった。テストの穴（待ちを record の回収より早く起こす退行・呼び出し元を join なしの終端に差し替える退行・C の前提）を埋め、
+    join の予約を 1 か所に寄せた。修正はテストと挙動を変えない整理だけで、それぞれ変異で確認したので 3 周目は回していない
+  - 検証: macOS unit 878 件・Linux arm64 unit 885 件（失敗 0）、strict lint、Release のテストのビルド、smoke 3 プロファイル。main agent が A・B・R1 の変異を当て直して red を確認
+  - CI（736f9ea / 6f3308c、`verify-agent-push` rc=0）: arm64 の性能 gate PASS。M3 の上乗せは read −3.9% / user CPU +4.3%、write −0.4% / +0.8%
+  - **Commit 5 の残り: M4**
 
 ## 関連
 

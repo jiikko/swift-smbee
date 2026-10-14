@@ -991,11 +991,19 @@ class SMBContinuationWatchTransport: SMBContinuationScriptTransport, @unchecked 
         try enqueue(response)
     }
 
-    func completeTreeDisconnect(status: UInt32 = SMB2Status.success) throws {
+    func completeTreeDisconnect(status: UInt32 = SMB2Status.success, credits: UInt16 = 1) throws {
         guard let request = watchLock.withLock({ treeDisconnectRequest }) else {
             throw SMBCodecError.invalidValue("test transport has no TREE_DISCONNECT request")
         }
-        try respond(status: status, to: request)
+        let response = try SMB2Header(
+            status: status,
+            command: request.command,
+            credits: credits,
+            messageId: request.messageId,
+            treeId: request.treeId,
+            sessionId: request.sessionId
+        ).encode()
+        try enqueue(response)
     }
 
     func completeClose(status: UInt32 = SMB2Status.success) throws {

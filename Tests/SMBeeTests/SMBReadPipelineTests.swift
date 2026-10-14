@@ -4,6 +4,30 @@ import XCTest
 final class SMBReadPipelineTests: XCTestCase {
     private let chunkSize = 1_048_576
 
+    func testSuspendedReadRecoveryCountsAreAssertedAfterOperationJoin() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath),
+            encoding: .utf8
+        )
+        let testStart = try XCTUnwrap(
+            source.range(of: "\n    func testSuspendedAsyncReadCallbackDoesNotHoldSessionOrTerminalWireLease()")
+        )
+        let testEnd = try XCTUnwrap(
+            source.range(
+                of: "\n    func testReadCallbackReturningBeforeTerminalJoinReleasesSlotAtJoin()",
+                range: testStart.upperBound..<source.endIndex
+            )
+        )
+        let testBody = source[testStart.lowerBound..<testEnd.lowerBound]
+        let operationJoin = try XCTUnwrap(testBody.range(of: "try await operation.value"))
+        let transferRecoveryCounts = try XCTUnwrap(testBody.range(of: "let lifecycleAfterReturn"))
+        XCTAssertLessThan(
+            operationJoin.lowerBound,
+            transferRecoveryCounts.lowerBound,
+            "the final transfer and timer recovery assertions must follow the bounded operation.value wait"
+        )
+    }
+
     func testSessionDownloadClosesAndCleansLocalTempBeforePendingProgressFinishesAfterReadError() async throws {
         let testChunkSize = chunkSize
         let fileSize = UInt64(testChunkSize * 3)
@@ -274,6 +298,165 @@ final class SMBReadPipelineTests: XCTestCase {
         XCTAssertEqual(activeRecordsAfterDrain, 0)
     }
 
+    func testLateReadGrantAcknowledgementUsesCanonicalOwnerAfterSlotReuse() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let ownershipSnapshots = SMBReadTransferOwnershipSnapshotRecorder()
+        let chunks = SMBReadPipelineChunkCollector()
+        let grantEntered = SMBContinuationCountBarrier()
+        let releaseGrant = SMBAsyncCallbackSuspensionGate()
+        let grantAcknowledged = SMBContinuationCountBarrier()
+        await session.setTransferRequestOwnershipHookForTesting { snapshot in
+            ownershipSnapshots.append(snapshot)
+        }
+        defer {
+            releaseGrant.release()
+            transport.failConnection()
+        }
+
+        let operation = Task {
+            try await client.withReadStream(
+                path: "late-grant-slot-reuse.bin",
+                knownSize: UInt64(testChunkSize * 5)
+            ) { data in
+                _ = chunks.append(data)
+            }
+        }
+        try await waitForCommand(transport, SMB2Commands.create, label: "late-grant READ CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 4)
+        let firstEpoch = transport.readRequests
+        let requestA = try XCTUnwrap(firstEpoch.first { $0.offset == 0 })
+        XCTAssertEqual(firstEpoch.map(\.offset), (0..<4).map { UInt64($0 * testChunkSize) })
+        await session.setCreditGrantAfterAwaitHookForTesting {
+            if grantEntered.currentCount == 0 {
+                grantEntered.signal()
+                await releaseGrant.suspend()
+            }
+        }
+        await session.setFinalCreditGrantAcknowledgedHookForTesting {
+            grantAcknowledged.signal()
+        }
+
+        try transport.respond(
+            to: requestA,
+            payload: Array(repeating: 0xa1, count: testChunkSize),
+            credits: 1
+        )
+        try await smbIssue102AwaitWithTimeout("A's production credit grant reaches its acknowledgement gate") {
+            try await grantEntered.waitForCount(1)
+        }
+        let ownerA = try await smbIssue102AwaitWithTimeout("A is delivered and its slot is released while grant ack waits") {
+            try await ownershipSnapshots.waitForSnapshot {
+                $0.command == SMB2Commands.read
+                    && $0.offset == 0
+                    && $0.slotReleased
+                    && $0.outstandingCreditGrantAcknowledgements == 1
+            }
+        }
+        try await smbIssue102AwaitWithTimeout("A's released slot is reused by a later READ") {
+            try await transport.waitForReadCount(5)
+        }
+        let reusedRequest = try XCTUnwrap(transport.readRequests.first { $0.offset == UInt64(testChunkSize * 4) })
+        let ownerB = try XCTUnwrap(ownershipSnapshots.first {
+            $0.command == SMB2Commands.read
+                && $0.offset == UInt64(testChunkSize * 4)
+                && $0.packetOwned
+        }, "the reused slot has a new canonical request identity")
+        XCTAssertNotEqual(ownerB.identity, ownerA.identity)
+        XCTAssertEqual(ownerB.transferIdentifier, ownerA.transferIdentifier)
+        XCTAssertEqual(ownerB.slotIndex, ownerA.slotIndex)
+        XCTAssertEqual(ownerB.slotSequence, ownerA.slotSequence + 1)
+        let slotBeforeAck = try await smbIssue102AwaitWithTimeout(
+            "B's sender callback finishes before A's delayed grant is released",
+            timeout: .seconds(10)
+        ) {
+            while true {
+                if let snapshot = await session.transferSlotSnapshotForTesting(
+                    transferIdentifier: ownerB.transferIdentifier,
+                    slotIndex: ownerB.slotIndex
+                ), snapshot.sendPhase == "fullySent", snapshot.sendOwnerFinished {
+                    return snapshot
+                }
+                try await Task.sleep(for: .milliseconds(1))
+            }
+        }
+        XCTAssertEqual(slotBeforeAck.requestIdentity, ownerB.identity)
+        XCTAssertEqual(ownerB.offset, reusedRequest.offset)
+        XCTAssertEqual(slotBeforeAck.offset, UInt64(testChunkSize * 4))
+        XCTAssertEqual(slotBeforeAck.slotSequence, ownerB.slotSequence)
+        XCTAssertEqual(slotBeforeAck.phase, "committed")
+        XCTAssertEqual(slotBeforeAck.sendPhase, "fullySent")
+        XCTAssertTrue(slotBeforeAck.sendOwnerFinished)
+        XCTAssertNil(slotBeforeAck.payload)
+        let ownerCountBeforeAck = slotBeforeAck.epochOutstandingOwnerCount
+
+        releaseGrant.release()
+        try await smbIssue102AwaitWithTimeout("A's delayed production grant ack is applied") {
+            try await grantAcknowledged.waitForCount(1)
+        }
+        let ownerAAfterAck = try XCTUnwrap(ownershipSnapshots.latest(for: ownerA.identity))
+        XCTAssertEqual(ownerAAfterAck.outstandingCreditGrantAcknowledgements, 0)
+        let ownerARecordAfterAck = await session.postAuthRequestRecordSnapshotForTesting(messageId: requestA.header.messageId)
+        XCTAssertNil(ownerARecordAfterAck, "A's canonical record is reclaimed through the production ack path")
+        let optionalSlotAfterAck = await session.transferSlotSnapshotForTesting(
+            transferIdentifier: ownerB.transferIdentifier,
+            slotIndex: ownerB.slotIndex
+        )
+        let slotAfterAck = try XCTUnwrap(optionalSlotAfterAck)
+        XCTAssertEqual(slotAfterAck.transferIdentifier, slotBeforeAck.transferIdentifier)
+        XCTAssertEqual(slotAfterAck.epoch, slotBeforeAck.epoch)
+        XCTAssertEqual(slotAfterAck.requestFrontier, slotBeforeAck.requestFrontier)
+        XCTAssertEqual(slotAfterAck.retireFrontier, slotBeforeAck.retireFrontier)
+        XCTAssertEqual(slotAfterAck.epochOutstandingOwnerCount, ownerCountBeforeAck - 1)
+        XCTAssertEqual(slotAfterAck.phase, slotBeforeAck.phase)
+        XCTAssertEqual(slotAfterAck.requestIdentity, slotBeforeAck.requestIdentity)
+        XCTAssertEqual(slotAfterAck.slotSequence, slotBeforeAck.slotSequence)
+        XCTAssertEqual(slotAfterAck.offset, slotBeforeAck.offset)
+        XCTAssertEqual(slotAfterAck.requestedLength, slotBeforeAck.requestedLength)
+        XCTAssertEqual(slotAfterAck.sendPhase, slotBeforeAck.sendPhase)
+        XCTAssertEqual(slotAfterAck.sendOwnerFinished, slotBeforeAck.sendOwnerFinished)
+        XCTAssertEqual(slotAfterAck.payload, slotBeforeAck.payload)
+        XCTAssertEqual(slotAfterAck.hasFailure, slotBeforeAck.hasFailure)
+        XCTAssertFalse(slotAfterAck.externalOwner)
+
+        let remainingRequests = transport.readRequests.filter { $0.header.messageId != requestA.header.messageId }
+        XCTAssertEqual(remainingRequests.count, 4)
+        for (index, request) in remainingRequests.enumerated() {
+            let marker = UInt8(0xb0 + index)
+            try transport.respond(
+                to: request,
+                payload: Array(repeating: marker, count: testChunkSize),
+                credits: 1
+            )
+        }
+        try await smbIssue102AwaitWithTimeout("late-grant READ completes with the reused slot's payload intact") {
+            try await operation.value
+        }
+        XCTAssertEqual(chunks.chunks, [
+            Array(repeating: 0xa1, count: testChunkSize),
+            Array(repeating: 0xb0, count: testChunkSize),
+            Array(repeating: 0xb1, count: testChunkSize),
+            Array(repeating: 0xb2, count: testChunkSize),
+            Array(repeating: 0xb3, count: testChunkSize)
+        ])
+        let activeRecordsAfterRead = await session.activePostAuthRequestRecordCountForTesting()
+        let pendingAfterRead = await session.pendingCountForTesting()
+        let lifecycleAfterRead = await session.transferLifecycleCountsForTesting()
+        XCTAssertEqual(activeRecordsAfterRead, 0)
+        XCTAssertEqual(pendingAfterRead, 0)
+        XCTAssertEqual(lifecycleAfterRead.readTransfers, 0)
+        XCTAssertEqual(lifecycleAfterRead.readTimers, 0)
+        XCTAssertEqual(lifecycleAfterRead.slotLeases, 0)
+        await session.setCreditGrantAfterAwaitHookForTesting(nil)
+        await session.setFinalCreditGrantAcknowledgedHookForTesting(nil)
+        await session.setTransferRequestOwnershipHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "late_grant_slot_reuse_test_complete")
+    }
+
     func testSuspendedAsyncReadCallbackDoesNotHoldSessionOrTerminalWireLease() async throws {
         let testChunkSize = chunkSize
         let transport = SMBReadPipelineScriptTransport()
@@ -300,6 +483,14 @@ final class SMBReadPipelineTests: XCTestCase {
         let callbackGate = SMBAsyncCallbackSuspensionGate()
         let operationReturned = SMBContinuationCountBarrier()
         let readerJoinStarted = SMBContinuationCountBarrier()
+        let terminalJoinCompleted = SMBContinuationCountBarrier()
+        let ownershipSnapshots = SMBReadTransferOwnershipSnapshotRecorder()
+        await session.setTerminalJoinCompletedHookForTesting {
+            terminalJoinCompleted.signal()
+        }
+        await session.setTransferRequestOwnershipHookForTesting { snapshot in
+            ownershipSnapshots.append(snapshot)
+        }
         await session.setReaderTaskJoinSnapshotHookForTesting { _ in
             readerJoinStarted.signal()
         }
@@ -349,15 +540,38 @@ final class SMBReadPipelineTests: XCTestCase {
         try await smbIssue102AwaitWithTimeout("transfer deadline starts reader join while callback is suspended") {
             try await readerJoinStarted.waitForCount(1)
         }
-        try await smbIssue102AwaitWithTimeout("transfer deadline reclaims active request records while callback is suspended") {
-            while await session.activePostAuthRequestRecordCountForTesting() != 0 {
-                await Task.yield()
-            }
+        try await smbIssue102AwaitWithTimeout("terminal join completes while callback is suspended") {
+            try await terminalJoinCompleted.waitForCount(1)
         }
         let joinedLeaseCounts = await session.readTransferCallbackLeaseCountsForTesting()
         XCTAssertEqual(joinedLeaseCounts.delivery, 1)
         let activeRecordsAfterJoin = await session.activePostAuthRequestRecordCountForTesting()
-        XCTAssertEqual(activeRecordsAfterJoin, 0)
+        XCTAssertEqual(activeRecordsAfterJoin, 1, "the callback's canonical request record remains owned until callback return")
+        let senderTasksAfterJoin = await session.senderTaskCountForTesting()
+        let readerTasksAfterJoin = await session.readerTaskCountForTesting()
+        let pendingAfterJoin = await session.pendingCountForTesting()
+        let wireRecordsAfterJoin = await session.wirePendingRecordCountForTesting()
+        let lifecycleAfterJoin = await session.transferLifecycleCountsForTesting()
+        XCTAssertEqual(senderTasksAfterJoin, 0)
+        XCTAssertEqual(readerTasksAfterJoin, 0)
+        XCTAssertEqual(pendingAfterJoin, 0)
+        XCTAssertEqual(wireRecordsAfterJoin, 0)
+        XCTAssertEqual(lifecycleAfterJoin.readTransfers, 1)
+        XCTAssertEqual(lifecycleAfterJoin.writeTransfers, 0)
+        XCTAssertEqual(lifecycleAfterJoin.pendingReadDecodes, 0)
+        XCTAssertEqual(lifecycleAfterJoin.supplierLeases, 0)
+        XCTAssertEqual(lifecycleAfterJoin.deliveryLeases, 1)
+        XCTAssertEqual(lifecycleAfterJoin.slotLeases, 1)
+        XCTAssertEqual(lifecycleAfterJoin.wireOperationBarriers, 0)
+        let callbackOwner = try XCTUnwrap(ownershipSnapshots.first {
+            $0.command == SMB2Commands.read && $0.deliveryOwned
+        })
+        let joinedCallbackOwner = try XCTUnwrap(ownershipSnapshots.latest(for: callbackOwner.identity))
+        XCTAssertTrue(joinedCallbackOwner.deliveryOwned)
+        XCTAssertTrue(joinedCallbackOwner.deliveryUnresolved)
+        XCTAssertEqual(joinedCallbackOwner.wire, .sessionTerminal)
+        XCTAssertFalse(joinedCallbackOwner.slotReleased, "terminal join retains the callback's slot lease")
+        XCTAssertFalse(joinedCallbackOwner.slotVacant, "the callback's slot cannot be reused before its lease returns")
         XCTAssertEqual(transport.closeCount, 1)
         let drainWake = try XCTUnwrap(executorEvents.observation(for: .readTransferDrainTimerWake))
         XCTAssertTrue(drainWake.isOnExecutorQueue)
@@ -370,6 +584,14 @@ final class SMBReadPipelineTests: XCTestCase {
         try await smbIssue102AwaitWithTimeout("suspended READ callback returned") {
             try await callbackReturned.waitForCount(1)
         }
+        let callbackLeaseReturned = try await smbIssue102AwaitWithTimeout("callback return releases its slot lease") {
+            try await ownershipSnapshots.waitForSnapshot(for: callbackOwner.identity) {
+                !$0.deliveryOwned && $0.slotReleased && $0.deliveryDiscarded
+            }
+        }
+        XCTAssertFalse(callbackLeaseReturned.deliveryOwned)
+        XCTAssertTrue(callbackLeaseReturned.slotReleased)
+        XCTAssertTrue(callbackLeaseReturned.slotVacant)
         let operationFailed = try await smbIssue102AwaitWithTimeout("cancelled READ operation completes after callback") {
             do {
                 try await operation.value
@@ -382,9 +604,303 @@ final class SMBReadPipelineTests: XCTestCase {
         try await smbIssue102AwaitWithTimeout("operation return is recorded once") {
             try await operationReturned.waitForCount(1)
         }
+        let readLeaseCountsAfterReturn = await session.readTransferCallbackLeaseCountsForTesting()
+        let lifecycleAfterReturn = await session.transferLifecycleCountsForTesting()
+        let senderTasksAfterReturn = await session.senderTaskCountForTesting()
+        let readerTasksAfterReturn = await session.readerTaskCountForTesting()
+        let pendingAfterReturn = await session.pendingCountForTesting()
+        let wireRecordsAfterReturn = await session.wirePendingRecordCountForTesting()
+        XCTAssertEqual(readLeaseCountsAfterReturn.delivery, 0)
+        XCTAssertEqual(readLeaseCountsAfterReturn.retirement, 0)
+        XCTAssertEqual(lifecycleAfterReturn.readTransfers, 0)
+        XCTAssertEqual(lifecycleAfterReturn.writeTransfers, 0)
+        XCTAssertEqual(lifecycleAfterReturn.pendingReadDecodes, 0)
+        XCTAssertEqual(lifecycleAfterReturn.readTimers, 0)
+        XCTAssertEqual(lifecycleAfterReturn.writeTimers, 0)
+        XCTAssertEqual(lifecycleAfterReturn.supplierLeases, 0)
+        XCTAssertEqual(lifecycleAfterReturn.deliveryLeases, 0)
+        XCTAssertEqual(lifecycleAfterReturn.slotLeases, 0)
+        XCTAssertEqual(lifecycleAfterReturn.wireOperationBarriers, 0)
+        XCTAssertEqual(senderTasksAfterReturn, 0)
+        XCTAssertEqual(readerTasksAfterReturn, 0)
+        XCTAssertEqual(pendingAfterReturn, 0)
+        XCTAssertEqual(wireRecordsAfterReturn, 0)
         let releasedCounts = await session.readTransferCallbackLeaseCountsForTesting()
         XCTAssertEqual(releasedCounts.delivery, 0)
         XCTAssertEqual(releasedCounts.retirement, 0)
+        let activeRecordsAfterCallbackReturn = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertEqual(activeRecordsAfterCallbackReturn, 0)
+        await session.setTransferRequestOwnershipHookForTesting(nil)
+    }
+
+    func testReadCallbackReturningBeforeTerminalJoinReleasesSlotAtJoin() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let virtualTime = SMBReadPipelineVirtualClock()
+        let cleanupSleeper = SMBKeyedManualSleeper()
+        let sessionTime = SMBSessionMonotonicTime(
+            now: { virtualTime.now() },
+            sleep: { try await cleanupSleeper.sleep(for: $0) }
+        )
+        let session = makeSession(
+            transport: transport,
+            credits: 81,
+            cleanupTimeout: .seconds(30),
+            sessionTime: sessionTime,
+            cleanupTimeoutSleeper: { try await cleanupSleeper.sleep(for: $0) }
+        )
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let callbackEntered = SMBContinuationCountBarrier()
+        let callbackReturned = SMBContinuationCountBarrier()
+        let callbackGate = SMBAsyncCallbackSuspensionGate()
+        let readerJoinStarted = SMBContinuationCountBarrier()
+        let readerExitEntered = SMBContinuationCountBarrier()
+        let readerExitGate = SMBAsyncCallbackSuspensionGate()
+        let terminalJoinCompleted = SMBContinuationCountBarrier()
+        let ownershipSnapshots = SMBReadTransferOwnershipSnapshotRecorder()
+        await session.setTerminalJoinCompletedHookForTesting {
+            terminalJoinCompleted.signal()
+        }
+        await session.setTransferRequestOwnershipHookForTesting { snapshot in
+            ownershipSnapshots.append(snapshot)
+        }
+        await session.setReaderTaskJoinSnapshotHookForTesting { _ in
+            readerJoinStarted.signal()
+        }
+        await session.setReaderTaskExitHookForTesting { _ in
+            readerExitEntered.signal()
+            await readerExitGate.suspend()
+        }
+        defer {
+            callbackGate.release()
+            readerExitGate.release()
+            transport.failConnection()
+        }
+
+        let operation = Task {
+            try await client.withReadStream(path: "prejoin-callback-return.bin", knownSize: UInt64(testChunkSize * 4)) { _ in
+                callbackEntered.signal()
+                await callbackGate.suspend()
+                callbackReturned.signal()
+            }
+        }
+
+        try await waitForCommand(transport, SMB2Commands.create, label: "prejoin callback READ CREATE")
+        try transport.completeCreate()
+        try await waitForReadCount(transport, 4)
+        let request = transport.readRequests[0]
+        try transport.respond(to: request, payload: Array(repeating: 0x5a, count: testChunkSize))
+        try await smbIssue102AwaitWithTimeout("async READ callback enters before terminal close") {
+            try await callbackEntered.waitForCount(1)
+        }
+
+        operation.cancel()
+        try await smbIssue102AwaitWithTimeout("prejoin callback cancellation stops the transfer") {
+            await session.waitForReadTransfersStoppedForTesting()
+        }
+        try await smbIssue102AwaitWithTimeout("prejoin callback drain timer is installed") {
+            await cleanupSleeper.waitUntilSleeping(for: .seconds(30))
+        }
+        virtualTime.advance(by: .seconds(31))
+        cleanupSleeper.fire(for: .seconds(30))
+        try await smbIssue102AwaitWithTimeout("terminal close starts while callback is suspended") {
+            try await transport.waitForCloseCount(1)
+        }
+        try await smbIssue102AwaitWithTimeout("terminal join snapshots its reader before callback return") {
+            try await readerJoinStarted.waitForCount(1)
+        }
+        try await smbIssue102AwaitWithTimeout("reader exit is held inside terminal join") {
+            try await readerExitEntered.waitForCount(1)
+        }
+
+        let callbackOwner = try XCTUnwrap(ownershipSnapshots.first {
+            $0.command == SMB2Commands.read && $0.deliveryOwned
+        })
+        callbackGate.release()
+        try await smbIssue102AwaitWithTimeout("callback returns before terminal reader join") {
+            try await callbackReturned.waitForCount(1)
+        }
+        let prejoinReturn: SMBTransferRequestOwnershipSnapshot
+        do {
+            prejoinReturn = try await smbIssue102AwaitWithTimeout("prejoin delivery return is recorded") {
+                try await ownershipSnapshots.waitForSnapshot(for: callbackOwner.identity) {
+                    !$0.deliveryOwned && $0.deliveryDiscarded
+                }
+            }
+        } catch {
+            readerExitGate.release()
+            _ = try? await smbIssue102AwaitWithTimeout("failure cleanup releases the held reader join") {
+                try await terminalJoinCompleted.waitForCount(1)
+            }
+            throw error
+        }
+        XCTAssertFalse(prejoinReturn.deliveryOwned)
+        XCTAssertTrue(prejoinReturn.deliveryDiscarded)
+        XCTAssertFalse(prejoinReturn.slotReleased, "the slot stays charged until terminal send owners join")
+        XCTAssertFalse(prejoinReturn.slotVacant)
+        let activeRecordsBeforeJoin = await session.activePostAuthRequestRecordCountForTesting()
+        XCTAssertEqual(activeRecordsBeforeJoin, 1)
+
+        readerExitGate.release()
+        try await smbIssue102AwaitWithTimeout("terminal join releases the returned callback slot") {
+            try await terminalJoinCompleted.waitForCount(1)
+        }
+        let joinedReturn = try XCTUnwrap(ownershipSnapshots.latest(for: callbackOwner.identity))
+        XCTAssertTrue(joinedReturn.slotReleased)
+        XCTAssertTrue(joinedReturn.slotVacant)
+        XCTAssertFalse(joinedReturn.deliveryOwned)
+        let activeRecordsAfterJoin = await session.activePostAuthRequestRecordCountForTesting()
+        let lifecycleAfterJoin = await session.transferLifecycleCountsForTesting()
+        XCTAssertEqual(activeRecordsAfterJoin, 0)
+        XCTAssertEqual(lifecycleAfterJoin.slotLeases, 0)
+        XCTAssertEqual(lifecycleAfterJoin.wireOperationBarriers, 0)
+        let operationFailed = try await smbIssue102AwaitWithTimeout("READ operation completes after terminal join") {
+            do {
+                try await operation.value
+                return false
+            } catch {
+                return true
+            }
+        }
+        XCTAssertTrue(operationFailed)
+        await session.setTransferRequestOwnershipHookForTesting(nil)
+        await session.setReaderTaskExitHookForTesting(nil)
+    }
+
+    func testDecodeFinishBeforeTerminalJoinReclaimsReturnedOwnerAfterJoin() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        await session.installSenderLoopStateForTesting(sessionId: 1, firstMessageId: 0)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let decodeEntered = SMBContinuationCountBarrier()
+        let decodeGate = SMBAsyncCallbackSuspensionGate()
+        let readerJoinStarted = SMBContinuationCountBarrier()
+        let readerExitEntered = SMBContinuationCountBarrier()
+        let readerExitGate = SMBAsyncCallbackSuspensionGate()
+        let terminalJoinCompleted = SMBContinuationCountBarrier()
+        let ownershipSnapshots = SMBReadTransferOwnershipSnapshotRecorder()
+        await session.setTerminalJoinCompletedHookForTesting {
+            terminalJoinCompleted.signal()
+        }
+        await session.setReaderTaskJoinSnapshotHookForTesting { _ in
+            readerJoinStarted.signal()
+        }
+        await session.setReaderTaskExitHookForTesting { _ in
+            readerExitEntered.signal()
+            await readerExitGate.suspend()
+        }
+        await session.setTransferRequestOwnershipHookForTesting { snapshot in
+            ownershipSnapshots.append(snapshot)
+        }
+
+        let operation = Task {
+            try await SMBDownloadTestSeams.$beforeReadDecodeFinishForTesting.withValue({ ticket in
+                guard ticket.offset == 0 else { return nil }
+                return Task {
+                    decodeEntered.signal()
+                    await decodeGate.suspend()
+                }
+            }, operation: {
+                try await client.withReadStream(
+                    path: "terminal-decode-owner.bin",
+                    knownSize: UInt64(testChunkSize)
+                ) { _ in }
+            })
+        }
+
+        var terminalClose: Task<Void, Never>?
+        var testFailure: Error?
+        do {
+            try await waitForCommand(transport, SMB2Commands.create, label: "terminal decode CREATE")
+            try transport.completeCreate()
+            try await smbIssue102AwaitWithTimeout("terminal decode READ request") {
+                try await transport.waitForReadCount(1)
+            }
+            let readRequest = try XCTUnwrap(transport.readRequests.first { $0.offset == 0 })
+            try transport.respond(to: readRequest, payload: Array(repeating: 0x6d, count: testChunkSize))
+            try await smbIssue102AwaitWithTimeout("production READ decode reaches its return gate") {
+                try await decodeEntered.waitForCount(1)
+            }
+
+            let decodeOwner = try XCTUnwrap(ownershipSnapshots.first {
+                $0.command == SMB2Commands.read && $0.offset == 0 && $0.decodeOwned
+            })
+            XCTAssertFalse(decodeOwner.deliveryOwned)
+            XCTAssertFalse(decodeOwner.slotReleased)
+            XCTAssertFalse(decodeOwner.slotVacant)
+
+            let closeTask = Task { await session.closeTransportAndWait(cause: "terminal_decode_owner_join") }
+            terminalClose = closeTask
+            try await smbIssue102AwaitWithTimeout("terminal join snapshots its reader before decode return") {
+                try await readerJoinStarted.waitForCount(1)
+            }
+            try await smbIssue102AwaitWithTimeout("reader exit remains held before terminal join") {
+                try await readerExitEntered.waitForCount(1)
+            }
+
+            decodeGate.release()
+            let decodeReturnedBeforeJoin = try await smbIssue102AwaitWithTimeout(
+                "production READ finishDecode returns before terminal send-owner join"
+            ) {
+                try await ownershipSnapshots.waitForSnapshot(for: decodeOwner.identity) {
+                    !$0.decodeOwned
+                }
+            }
+            XCTAssertFalse(decodeReturnedBeforeJoin.slotReleased)
+            XCTAssertFalse(decodeReturnedBeforeJoin.slotVacant)
+            let recordsBeforeJoin = await session.activePostAuthRequestRecordCountForTesting()
+            let lifecycleBeforeJoin = await session.transferLifecycleCountsForTesting()
+            XCTAssertEqual(recordsBeforeJoin, 1)
+            XCTAssertEqual(lifecycleBeforeJoin.slotLeases, 1)
+
+            readerExitGate.release()
+            try await smbIssue102AwaitWithTimeout("terminal join completes after decode owner return") {
+                try await terminalJoinCompleted.waitForCount(1)
+            }
+            try await smbIssue102AwaitWithTimeout("terminal close task joins") {
+                await closeTask.value
+            }
+            let ownerAfterJoin = try XCTUnwrap(ownershipSnapshots.latest(for: decodeOwner.identity))
+            XCTAssertFalse(ownerAfterJoin.decodeOwned)
+            XCTAssertTrue(ownerAfterJoin.slotReleased)
+            XCTAssertTrue(ownerAfterJoin.slotVacant)
+            let operationFailed = try await smbIssue102AwaitWithTimeout("terminal READ operation completes") {
+                do {
+                    try await operation.value
+                    return false
+                } catch {
+                    return true
+                }
+            }
+            XCTAssertTrue(operationFailed, "terminal READ unexpectedly succeeded")
+            let recordsAfterJoin = await session.activePostAuthRequestRecordCountForTesting()
+            let lifecycleAfterJoin = await session.transferLifecycleCountsForTesting()
+            XCTAssertEqual(recordsAfterJoin, 0)
+            XCTAssertEqual(lifecycleAfterJoin.readTransfers, 0)
+            XCTAssertEqual(lifecycleAfterJoin.pendingReadDecodes, 0)
+            XCTAssertEqual(lifecycleAfterJoin.deliveryLeases, 0)
+            XCTAssertEqual(lifecycleAfterJoin.slotLeases, 0)
+        } catch {
+            testFailure = error
+        }
+
+        decodeGate.release()
+        readerExitGate.release()
+        transport.failConnection()
+        if let terminalClose {
+            try? await smbIssue102AwaitWithTimeout("terminal decode fixture close cleanup") {
+                await terminalClose.value
+            }
+        }
+        try? await smbIssue102AwaitWithTimeout("terminal decode fixture operation cleanup") {
+            _ = try? await operation.value
+        }
+        await session.setTransferRequestOwnershipHookForTesting(nil)
+        await session.setReaderTaskJoinSnapshotHookForTesting(nil)
+        await session.setReaderTaskExitHookForTesting(nil)
+        if let testFailure { throw testFailure }
     }
 
     func testSynchronousReadCallbackOccupiesSessionExecutorUntilItReturns() async throws {
@@ -855,6 +1371,101 @@ final class SMBReadPipelineTests: XCTestCase {
         XCTAssertEqual(pendingAfterRebase, 0)
         XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
         await session.closeTransportAndWait(cause: "read_short_rebase_test_complete")
+    }
+
+    func testShortReadDiscardsBoundaryOverflowBeforeGrantAckAndWakesOnAck() async throws {
+        let testChunkSize = chunkSize
+        let transport = SMBReadPipelineScriptTransport()
+        let session = makeSession(transport: transport, credits: 81)
+        let client = SMBClientSession(session: session, treeId: 1)
+        let collector = SMBReadPipelineChunkCollector()
+        let callbackReturned = SMBContinuationCountBarrier()
+        let grantEntered = SMBContinuationCountBarrier()
+        let releaseGrant = SMBAsyncCallbackSuspensionGate()
+        let ownershipSnapshots = SMBReadTransferOwnershipSnapshotRecorder()
+        defer {
+            releaseGrant.release()
+            transport.failConnection()
+        }
+        await session.setTransferRequestOwnershipHookForTesting { snapshot in
+            ownershipSnapshots.append(snapshot)
+        }
+
+        let operation = Task {
+            try await client.withReadStream(path: "short-owner-join.bin", knownSize: UInt64(testChunkSize * 2)) { data in
+                _ = collector.append(data)
+                callbackReturned.signal()
+            }
+        }
+        try await waitForCommand(transport, SMB2Commands.create, label: "short owner-join READ CREATE")
+        try transport.completeCreate(credits: 81)
+        try await waitForReadCount(transport, 2)
+        let firstEpoch = transport.readRequests
+        XCTAssertEqual(firstEpoch.map(\.offset), [0, UInt64(testChunkSize)])
+
+        let dispatchCountBeforeShortFinal = await session.receivedPacketDispatchCountForTesting()
+        try transport.respond(
+            to: firstEpoch[0],
+            payload: Array(repeating: 0x31, count: testChunkSize / 2),
+            credits: 16
+        )
+        await session.waitForReceivedPacketDispatchCountForTesting(atLeast: dispatchCountBeforeShortFinal + 1)
+        try await smbIssue102AwaitWithTimeout("short prefix delivery completes before overflow final") {
+            try await callbackReturned.waitForCount(1)
+        }
+
+        await session.setCreditGrantAfterAwaitHookForTesting {
+            grantEntered.signal()
+            await releaseGrant.suspend()
+        }
+        try transport.respond(
+            to: firstEpoch[1],
+            payload: Array(repeating: 0x42, count: testChunkSize),
+            credits: 0
+        )
+        try await smbIssue102AwaitWithTimeout("grant-zero overflow final reaches its acknowledgement gate") {
+            try await grantEntered.waitForCount(1)
+        }
+        let overflowDiscarded = try await smbIssue102AwaitWithTimeout("overflow slot is discarded before its grant ack") {
+            try await ownershipSnapshots.waitForSnapshot {
+                $0.command == SMB2Commands.read
+                    && $0.offset == UInt64(testChunkSize)
+                    && $0.deliveryDiscarded
+                    && $0.slotReleased
+                    && $0.outstandingCreditGrantAcknowledgements == 1
+            }
+        }
+        XCTAssertGreaterThan(overflowDiscarded.epochOutstandingOwnerCount, 0)
+        XCTAssertEqual(transport.readRequests.count, 2, "epoch cannot rebase while the canonical overflow record awaits its grant ack")
+        XCTAssertEqual(collector.chunks, [Array(repeating: 0x31, count: testChunkSize / 2)])
+
+        releaseGrant.release()
+        try await waitForReadCount(transport, 4)
+        let rebased = Array(transport.readRequests.dropFirst(2))
+        XCTAssertEqual(rebased.map(\.offset), [UInt64(testChunkSize / 2), UInt64(testChunkSize + testChunkSize / 2)])
+        XCTAssertEqual(rebased.map(\.length), [UInt32(testChunkSize), UInt32(testChunkSize / 2)])
+        for request in rebased {
+            try transport.respond(
+                to: request,
+                payload: Array(repeating: 0x53, count: Int(request.length)),
+                credits: 16
+            )
+        }
+        try await smbIssue102AwaitWithTimeout("last grant ack alone wakes the short READ rebase") {
+            try await operation.value
+        }
+        XCTAssertEqual(collector.chunks, [
+            Array(repeating: 0x31, count: testChunkSize / 2),
+            Array(repeating: 0x53, count: testChunkSize),
+            Array(repeating: 0x53, count: testChunkSize / 2)
+        ])
+        let activeRecordsAfterRebase = await session.activePostAuthRequestRecordCountForTesting()
+        let pendingAfterRebase = await session.pendingCountForTesting()
+        XCTAssertEqual(activeRecordsAfterRebase, 0)
+        XCTAssertEqual(pendingAfterRebase, 0)
+        await session.setCreditGrantAfterAwaitHookForTesting(nil)
+        await session.setTransferRequestOwnershipHookForTesting(nil)
+        await session.closeTransportAndWait(cause: "read_short_owner_ack_test_complete")
     }
 
     func testEOFAndEmptySuccessFailWithoutRebase() async throws {
@@ -2257,6 +2868,50 @@ private final class SMBReadPipelineChunkCollector: @unchecked Sendable {
 
     var chunks: [[UInt8]] {
         lock.withLock { storage }
+    }
+}
+
+private final class SMBReadTransferOwnershipSnapshotRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SMBTransferRequestOwnershipSnapshot] = []
+    private let snapshotBarrier = SMBContinuationCountBarrier()
+
+    func append(_ snapshot: SMBTransferRequestOwnershipSnapshot) {
+        lock.withLock { storage.append(snapshot) }
+        snapshotBarrier.signal()
+    }
+
+    func first(where predicate: (SMBTransferRequestOwnershipSnapshot) -> Bool) -> SMBTransferRequestOwnershipSnapshot? {
+        lock.withLock { storage.first(where: predicate) }
+    }
+
+    func latest(for identity: SMBRequestIdentity) -> SMBTransferRequestOwnershipSnapshot? {
+        lock.withLock { storage.last(where: { $0.identity == identity }) }
+    }
+
+    func waitForSnapshot(
+        for identity: SMBRequestIdentity,
+        where predicate: @Sendable (SMBTransferRequestOwnershipSnapshot) -> Bool
+    ) async throws -> SMBTransferRequestOwnershipSnapshot {
+        while true {
+            let nextSnapshotCount = snapshotBarrier.currentCount + 1
+            if let snapshot = latest(for: identity), predicate(snapshot) {
+                return snapshot
+            }
+            try await snapshotBarrier.waitForCount(nextSnapshotCount)
+        }
+    }
+
+    func waitForSnapshot(
+        where predicate: @Sendable (SMBTransferRequestOwnershipSnapshot) -> Bool
+    ) async throws -> SMBTransferRequestOwnershipSnapshot {
+        while true {
+            let nextSnapshotCount = snapshotBarrier.currentCount + 1
+            if let snapshot = lock.withLock({ storage.last(where: predicate) }) {
+                return snapshot
+            }
+            try await snapshotBarrier.waitForCount(nextSnapshotCount)
+        }
     }
 }
 

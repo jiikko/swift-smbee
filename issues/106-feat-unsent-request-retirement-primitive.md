@@ -522,6 +522,17 @@ commit の分け方（各 commit が単独で契約を満たす）:
   - b1ce109 の CI: code-coverage の 1 本と network 性能テストの crash（issue 113）が単発で落ち、回し直しで両方通った。`verify-agent-push` rc=0
   - 採らなかったもの: slot table（効かず）と正常系の遷移のまとめ（Callgrind で約 0.5% 減のみ）。後者の差分は tmp/c5/impl/coalesce-attempt.patch に控えたが、一時領域なので消えうる
   - **Commit 5 の残り: M3（型付きの拒否、watch の cancel → CLOSE の待ち）と M4**
+- **M3 の進捗（2026-10-15、codex-drive。worktree `swift-smbee-wt-c5m3-20261014-230108-11038` の 15ad018、WIP・未 push）**:
+  - codex（luna-max）が実装の途中で 5h 枠を使い切って止まり（weekly も 100%）、続きを Claude のサブエージェントが引き継いだ（ユーザー指示）
+  - 型付きの admission refusal: `SMBTransferAdmissionRefusal`（scope・operation・caller error）。File は `SMBFileIdLedgerKey`、Tree は `SMBTreeIdentity` で照合し、CLOSE intent と final の admission guard の両方から同じ遷移を通る。File の refusal は session を terminal にしない
+  - **ユーザー判断（2026-10-15）**: 「cancel / timeout の後、wire が決着してから CLOSE する」を watch だけでなく、FileId を使うすべての通常の要求（stat / list / rename / ACL / copy など）に広げた（`awaitAbandonedFileIdUseOwners`）。
+    これらの cancel は wire が決着するまで（最長で既存の drain の期限まで）戻らない。待ちは record の回収で起こされ、回収の関数を通らない record の消去は無い（1 か所だけ）。
+    新しい失敗の形: record が回収されずに残ると、これまでは漏れるだけだったのが、cancel した呼び出し元が戻らなくなる
+  - codex が入れた「すべての CLOSE が同じ FileId の利用の終わりを期限なしで待つ」機構は設計から外れていた（期限なし・callback の owner まで待つ・chunk ごとの経路に処理を足す）ので撤去した
+  - fake の `respondToCreate` が毎回同じ FileId を返していたのを、CREATE の MessageId から一意に作る形に直した（同時に開いている handle が同じ FileId を持つことは実サーバでは起きない）。
+    同じ FileId のせいで `testAsyncSupplierReentersSessionAndOversizedChunkSplitsUntilEOF` が落ちていた。原因の推定（stat の CLOSE intent が upload の準備中の record を拒む）は観測していない
+  - 検証（サブエージェントの報告。main agent は macOS の unit 873 件・失敗 0 を再現）: Linux arm64 の unit 880 件・失敗 0、Release のテストのビルド（macOS / Linux）、strict lint・lint-analyze 違反 0、E2E（SMB 3.0.2）、変異 M1〜M7 がすべて red、新しいテスト 13 本を 20 回連続 green
+  - 次: レビュー（発見型 1 + 敵対 2、codex が使えないので Claude のサブエージェント）→ 指摘への対応 → smoke（3 プロファイル）→ master へ
 
 ## 関連
 

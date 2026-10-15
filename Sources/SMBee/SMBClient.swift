@@ -6682,6 +6682,9 @@ actor SMBSession {
     private var transferRetirementEffectPumpWakeContinuation: CheckedContinuation<Void, Never>?
     private var transferRetirementEffectPumpWakeRevision: UInt64 = 0
     private var transferRetirementEffectPumpCompletedChildren = 0
+#if DEBUG
+    private var transferRetirementEffectPumpStartCountForTestingStorage = 0
+#endif
     private var pendingMessageIdByIdentity: [SMBRequestIdentity: UInt64] = [:]
     private var queuedPostAuthRequests: [SMBQueuedPostAuthRequest] = []
     private var queuedControlSends: [SMBQueuedControlSend] = []
@@ -6719,6 +6722,10 @@ actor SMBSession {
     private var readerTaskJoinWillAwaitHookForTesting: (@Sendable (UUID) -> Void)?
     private var activePostAuthRequestRecordReapedHookForTesting: (@Sendable (UInt64) -> Void)?
     private var terminalJoinCompletedHookForTesting: (@Sendable () -> Void)?
+#if DEBUG
+    private var readTransferDrainTimerCancellationHookForTesting: (@Sendable (UUID) async -> Void)?
+    private var readTransferDrainTimerWillJoinHookForTesting: (@Sendable (UUID) -> Void)?
+#endif
     private var finalCreditGrantAcknowledgedHookForTesting: (@Sendable () -> Void)?
     private var transferRequestOwnershipHookForTesting:
         (@Sendable (SMBTransferRequestOwnershipSnapshot) -> Void)?
@@ -8935,6 +8942,16 @@ actor SMBSession {
         terminalJoinCompletedHookForTesting = hook
     }
 
+#if DEBUG
+    func setReadTransferDrainTimerCancellationHookForTesting(_ hook: (@Sendable (UUID) async -> Void)?) {
+        readTransferDrainTimerCancellationHookForTesting = hook
+    }
+
+    func setReadTransferDrainTimerWillJoinHookForTesting(_ hook: (@Sendable (UUID) -> Void)?) {
+        readTransferDrainTimerWillJoinHookForTesting = hook
+    }
+#endif
+
     func setTransferRequestOwnershipHookForTesting(
         _ hook: (@Sendable (SMBTransferRequestOwnershipSnapshot) -> Void)?
     ) {
@@ -9125,12 +9142,43 @@ actor SMBSession {
         )
     }
 
+    func transferRetirementEffectPumpStartCountForTesting() -> Int {
+        transferRetirementEffectPumpStartCountForTestingStorage
+    }
+
+    @discardableResult
+    func dispatchDuplicateTransferGrantAcknowledgementForTesting(messageId: UInt64) -> Bool {
+        guard let record = activePostAuthRequestRecords.values.first(where: { $0.messageId == messageId }),
+              let owner = record.transferOwner,
+              let ticket = owner.ticket,
+              record.outstandingCreditGrantAcknowledgements == 1 else {
+            return false
+        }
+        _ = transitionTransferRequest(
+            owner.handle.key.transferIdentifier,
+            .finalCreditGrantAcknowledged(ticket)
+        )
+        guard record.outstandingCreditGrantAcknowledgements == 0 else { return false }
+        _ = transitionTransferRequest(
+            owner.handle.key.transferIdentifier,
+            .finalCreditGrantAcknowledged(ticket)
+        )
+        return record.outstandingCreditGrantAcknowledgements == 0
+    }
+
     func transferSlotSnapshotForTesting(
         transferIdentifier: UInt64,
         slotIndex: Int
     ) -> SMBTransferWindowSlotSnapshotForTesting? {
         readTransfers[transferIdentifier]?.window.slotSnapshotForTesting(slotIndex)
             ?? writeTransfers[transferIdentifier]?.window.slotSnapshotForTesting(slotIndex)
+    }
+
+    func queuedTransferRequestCountForTesting(command: UInt16) -> Int {
+        queuedPostAuthRequests.reduce(into: 0) { count, request in
+            guard request.command == command else { return }
+            if case .transfer = request.completionTarget { count += 1 }
+        }
     }
 
     func senderTaskCountForTesting() -> Int {
@@ -15172,6 +15220,9 @@ extension SMBSession {
             } else {
                 record.credit = .notApplicable
             }
+#if DEBUG
+            reportTransferRequestOwnershipForTesting(record)
+#endif
             return .none
 
         case .supplierReturned(let slotIndex):
@@ -15772,6 +15823,9 @@ extension SMBSession {
         // effects do not create Tasks until the pump registers them with its task group. A fixed
         // worker count would serialize independent retirement effects and is intentionally avoided.
         transferRetirementEffectPumpCompletedChildren = 0
+#if DEBUG
+        transferRetirementEffectPumpStartCountForTestingStorage += 1
+#endif
         transferRetirementEffectPumpTask = Task(executorPreference: sessionExecutor) { [weak self] in
             await self?.runTransferRetirementEffectPump()
         }
@@ -17243,10 +17297,16 @@ extension SMBSession {
         let sleeper = cleanupTimeoutSleeper
         let transferIdentifier = state.handle.identifier
         let executor = sessionExecutor
+#if DEBUG
+        let cancellationHook = readTransferDrainTimerCancellationHookForTesting
+#endif
         state.drainTimer = Task.detached(executorPreference: executor) { [weak self] in
             do {
                 try await sleeper(duration)
             } catch {
+#if DEBUG
+                await cancellationHook?(identity)
+#endif
                 return
             }
             executor.recordExecutionContextForTesting(.readTransferDrainTimerWake)
@@ -17307,8 +17367,14 @@ extension SMBSession {
 
     private func cancelReadTransferDrainTimer(_ state: SMBSessionReadTransfer) async {
         let timer = state.drainTimer
+#if DEBUG
+        let timerIdentity = state.drainTimerIdentity
+#endif
         state.drainTimer = nil
         state.drainTimerIdentity = nil
+#if DEBUG
+        if let timerIdentity { readTransferDrainTimerWillJoinHookForTesting?(timerIdentity) }
+#endif
         timer?.cancel()
         await timer?.value
     }
@@ -17317,6 +17383,12 @@ extension SMBSession {
     func waitForReadTransfersStoppedForTesting() async {
         while let state = readTransfers.values.first(where: { !$0.window.isStopped }) {
             await waitForReadTransferEvent(state.handle, after: state.revision)
+        }
+    }
+
+    func waitForWriteTransfersStoppedForTesting() async {
+        while let state = writeTransfers.values.first(where: { !$0.window.isStopped }) {
+            await waitForWriteTransferEvent(state.handle, after: state.revision)
         }
     }
 

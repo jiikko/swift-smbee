@@ -639,6 +639,107 @@ final class SMBTransferWindowTests: XCTestCase {
         XCTAssertTrue(late.drainDeadlineHasWon(at: deadline.advanced(by: .seconds(1))))
     }
 
+    func testFixedDrainDeadlineSurvivesLateFailureAndCancellationAtEpsilonBoundaries() async throws {
+        // The 24 manual-sleeper fixtures completed in 2 ms locally; each 3-second
+        // wait cap is over 1,000x larger, so a missed wake fails boundedly without hanging.
+        let start = ContinuousClock.now
+        let deadline = start.advanced(by: .seconds(5))
+        let epsilon = Duration.nanoseconds(1)
+        let boundaryOffsets: [(label: String, offset: Duration, expectedToWin: Bool)] = [
+            ("D−ε", .nanoseconds(-1), false),
+            ("D", .zero, true),
+            ("D+ε", .nanoseconds(1), true)
+        ]
+
+        var nextIdentifier: UInt64 = 90
+        for firstReasonIsCancellation in [false, true] {
+            for boundary in boundaryOffsets {
+                for drainEventFirst in [false, true] {
+                    for deadlineWakeFirst in [false, true] {
+                        let identifier = nextIdentifier
+                        nextIdentifier += 1
+                        let window = SMBTransferWindow(transferIdentifier: identifier, direction: .read)
+                        let ticket = try makeTicket(window, sequence: identifier, length: 4)
+
+                        let firstReason: SMBTransferStopReason = firstReasonIsCancellation
+                            ? .callerCancelled
+                            : .sessionFailure(SMBTransferWindowTestError.sessionFailure)
+                        let lateReason: SMBTransferStopReason = firstReasonIsCancellation
+                            ? .sessionFailure(SMBTransferWindowTestError.sessionFailure)
+                            : .callerCancelled
+                        window.stop(for: firstReason, at: start, cleanupTimeout: .seconds(5))
+                        XCTAssertEqual(window.drainDeadline, deadline, "initial stop fixes D")
+
+                        let boundaryTime = deadline.advanced(by: boundary.offset)
+                        let timerSleeper = SMBKeyedManualSleeper()
+                        let timerWake = Task { try await timerSleeper.sleep(for: .seconds(5)) }
+                        _ = try await smbIssue102AwaitWithTimeout("fixed D manual timer registration") {
+                            await timerSleeper.waitUntilSleeping(for: .seconds(5))
+                            return true
+                        }
+
+                        if deadlineWakeFirst {
+                            timerSleeper.fire(for: .seconds(5))
+                            _ = try await smbIssue102AwaitWithTimeout("fixed D manual timer wake") {
+                                try await timerWake.value
+                                return true
+                            }
+                            XCTAssertEqual(window.drainDeadlineHasWon(at: boundaryTime), boundary.expectedToWin)
+                        }
+                        if drainEventFirst {
+                            complete(window, ticket: ticket, at: boundaryTime)
+                        }
+                        window.stop(
+                            for: lateReason,
+                            at: boundaryTime,
+                            cleanupTimeout: .seconds(100),
+                            operationDeadline: boundaryTime.advanced(by: epsilon)
+                        )
+                        if !drainEventFirst {
+                            complete(window, ticket: ticket, at: boundaryTime)
+                        }
+                        if !deadlineWakeFirst {
+                            timerSleeper.fire(for: .seconds(5))
+                            _ = try await smbIssue102AwaitWithTimeout("fixed D manual timer wake") {
+                                try await timerWake.value
+                                return true
+                            }
+                        }
+
+                        XCTAssertEqual(
+                            window.drainDeadline,
+                            deadline,
+                            "\(boundary.label), cancellationFirst=\(firstReasonIsCancellation), drainFirst=\(drainEventFirst), timerFirst=\(deadlineWakeFirst)"
+                        )
+                        XCTAssertEqual(
+                            window.drainDeadlineHasWon(at: boundaryTime),
+                            boundary.expectedToWin,
+                            "\(boundary.label), cancellationFirst=\(firstReasonIsCancellation), drainFirst=\(drainEventFirst), timerFirst=\(deadlineWakeFirst)"
+                        )
+                        if !boundary.expectedToWin {
+                            let finalEpsilonWake = Task {
+                                try await timerSleeper.sleep(for: epsilon)
+                            }
+                            _ = try await smbIssue102AwaitWithTimeout("fixed D epsilon timer registration") {
+                                await timerSleeper.waitUntilSleeping(for: epsilon)
+                                return true
+                            }
+                            timerSleeper.fire(for: epsilon)
+                            _ = try await smbIssue102AwaitWithTimeout("fixed D epsilon timer wake") {
+                                try await finalEpsilonWake.value
+                                return true
+                            }
+                            XCTAssertFalse(
+                                window.drainDeadlineHasWon(at: deadline),
+                                "a drain completed at D−ε remains the winner after the manual timer retry"
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func testShortReadBoundaryOutranksLaterOffsetFailure() {
         let start = ContinuousClock.now
         let window = SMBTransferWindow(transferIdentifier: 75, direction: .read)

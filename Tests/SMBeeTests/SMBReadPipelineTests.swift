@@ -983,6 +983,7 @@ final class SMBReadPipelineTests: XCTestCase {
     }
 #endif
 
+#if DEBUG
     func testClientSessionReadUsesFourPipelinedReadsAndReturnsOffsetOrderedBytes() async throws {
         let testChunkSize = chunkSize
         let totalSize = testChunkSize * 5
@@ -1054,6 +1055,16 @@ final class SMBReadPipelineTests: XCTestCase {
         XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
         let pendingAfterSuccess = await session.pendingCountForTesting()
         XCTAssertEqual(pendingAfterSuccess, 0)
+#if DEBUG
+        let activeRecordsAfterSuccess = await session.activePostAuthRequestRecordCountForTesting()
+        let lifecycleAfterSuccess = await session.transferLifecycleCountsForTesting()
+        XCTAssertEqual(activeRecordsAfterSuccess, 0, "successful READ delivery reclaims canonical records before session close")
+        XCTAssertEqual(lifecycleAfterSuccess.readTransfers, 0)
+        XCTAssertEqual(lifecycleAfterSuccess.writeTransfers, 0)
+        XCTAssertEqual(lifecycleAfterSuccess.readTimers, 0)
+        XCTAssertEqual(lifecycleAfterSuccess.slotLeases, 0)
+        XCTAssertEqual(transport.closeCount, 0, "the recovery oracle runs on an open session")
+#endif
         await session.closeTransportAndWait(cause: "read_driver_executor_placement_test")
 #if DEBUG
         executorEventContinuation.finish()
@@ -1073,6 +1084,7 @@ final class SMBReadPipelineTests: XCTestCase {
         XCTAssertFalse(progressContext.taskExecutorMatches)
 #endif
     }
+#endif
 
     func testClientSessionReadShortChunkThenEOFKeepsShortReadErrorAndProgress() async throws {
         let requested = 64 * 1024

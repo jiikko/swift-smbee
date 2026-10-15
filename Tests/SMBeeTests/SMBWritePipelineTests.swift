@@ -201,6 +201,7 @@ final class SMBWritePipelineTests: XCTestCase {
         XCTAssertEqual(transport.writeRequests.flatMap(\.data), data)
     }
 
+#if DEBUG
     func testZeroCreditWithNoCommittedWriteStillCallsSupplier() async throws {
         let transport = SMBWritePipelineScriptTransport()
         let session = makeSession(transport: transport, credits: 1)
@@ -257,7 +258,7 @@ final class SMBWritePipelineTests: XCTestCase {
         }
         XCTAssertEqual(calls.value, 2)
         XCTAssertEqual(transport.writeRequests.count, 1)
-        let noTicketClose = try XCTUnwrap(ownershipSnapshots.first {
+        let noTicketClose = try XCTUnwrap(ownershipSnapshots.snapshots.last {
             $0.command == SMB2Commands.write && $0.offset == nil
         })
         XCTAssertEqual(noTicketClose.caller, .noWireWork)
@@ -275,9 +276,19 @@ final class SMBWritePipelineTests: XCTestCase {
         XCTAssertEqual(activeRequestRecords, 0, "no-ticket supplier failure reclaims its canonical chunk record")
         let activeIdentities = await session.activeRequestIdentityCountForTesting()
         XCTAssertEqual(activeIdentities, 0)
+#if DEBUG
+        let noTicketLifecycle = await session.transferLifecycleCountsForTesting()
+        XCTAssertEqual(noTicketLifecycle.writeTransfers, 0)
+        XCTAssertEqual(noTicketLifecycle.writeTimers, 0)
+        XCTAssertEqual(noTicketLifecycle.slotLeases, 0)
+        let retirementPumpStarts = await session.transferRetirementEffectPumpStartCountForTesting()
+        XCTAssertEqual(retirementPumpStarts, 0)
+#endif
+        XCTAssertEqual(transport.closeCount, 0, "no-ticket supplier failure is recovered while the session remains open")
         await session.setTransferRequestOwnershipHookForTesting(nil)
         await session.closeTransportAndWait(cause: "write_zero_credit_supplier_test_complete")
     }
+#endif
 
     func testTransferRefundPumpDispatchesThirdEffectWhileTwoRefundsAreGated() async throws {
         let transport = SMBWritePipelineScriptTransport()
@@ -1052,6 +1063,7 @@ final class SMBWritePipelineTests: XCTestCase {
         XCTAssertEqual(pending, 0)
     }
 
+#if DEBUG
     func testFourWritesStayOutstandingAndReverseResponsesPreserveOffsetData() async throws {
         let transport = SMBWritePipelineScriptTransport()
         let session = makeSession(transport: transport, credits: 81)
@@ -1089,8 +1101,19 @@ final class SMBWritePipelineTests: XCTestCase {
         XCTAssertFalse(transport.sentCommands.contains(SMB2Commands.cancel))
         let pending = await session.pendingCountForTesting()
         XCTAssertEqual(pending, 0)
+#if DEBUG
+        let activeRecords = await session.activePostAuthRequestRecordCountForTesting()
+        let lifecycle = await session.transferLifecycleCountsForTesting()
+        XCTAssertEqual(activeRecords, 0, "successful WRITE delivery reclaims canonical records before session close")
+        XCTAssertEqual(lifecycle.readTransfers, 0)
+        XCTAssertEqual(lifecycle.writeTransfers, 0)
+        XCTAssertEqual(lifecycle.writeTimers, 0)
+        XCTAssertEqual(lifecycle.slotLeases, 0)
+        XCTAssertEqual(transport.closeCount, 0, "the recovery oracle runs on an open session")
+#endif
         await session.closeTransportAndWait(cause: "write_pipeline_success_test_complete")
     }
+#endif
 
     func testAsyncSupplierReentersSessionAndOversizedChunkSplitsUntilEOF() async throws {
         let transport = SMBWritePipelineScriptTransport()

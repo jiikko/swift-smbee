@@ -368,10 +368,31 @@ final class SMBKeyedManualSleeper: @unchecked Sendable {
         }
     }
 
+    func isSleeping(for duration: Duration) -> Bool {
+        lock.withLock { sleeps.contains(where: { $0.duration == duration }) }
+    }
+
+    func activeSleepCount(for duration: Duration) -> Int {
+        lock.withLock { sleeps.filter { $0.duration == duration }.count }
+    }
+
+    var activeSleepCount: Int {
+        lock.withLock { sleeps.count }
+    }
+
     func fire(for duration: Duration) {
         let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
             let ready = sleeps.filter { $0.duration == duration }.map(\.continuation)
             sleeps.removeAll { $0.duration == duration }
+            return ready
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    func fireAll() {
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
+            let ready = sleeps.map(\.continuation)
+            sleeps.removeAll()
             return ready
         }
         ready.forEach { $0.resume() }

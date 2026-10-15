@@ -389,15 +389,6 @@ final class SMBKeyedManualSleeper: @unchecked Sendable {
         ready.forEach { $0.resume() }
     }
 
-    func fireAll() {
-        let ready = lock.withLock { () -> [CheckedContinuation<Void, Error>] in
-            let ready = sleeps.map(\.continuation)
-            sleeps.removeAll()
-            return ready
-        }
-        ready.forEach { $0.resume() }
-    }
-
     private func cancel(_ id: UUID) {
         let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
             guard let index = sleeps.firstIndex(where: { $0.id == id }) else { return nil }

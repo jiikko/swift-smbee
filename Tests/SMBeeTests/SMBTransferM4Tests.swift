@@ -1383,16 +1383,5 @@ private final class SMBM4OwnershipRecorder: @unchecked Sendable {
     func first(where predicate: (SMBTransferRequestOwnershipSnapshot) -> Bool) -> SMBTransferRequestOwnershipSnapshot? {
         lock.withLock { snapshots.first(where: predicate) }
     }
-
-    func waitForSnapshot(
-        for identity: SMBRequestIdentity,
-        where predicate: @Sendable (SMBTransferRequestOwnershipSnapshot) -> Bool
-    ) async throws -> SMBTransferRequestOwnershipSnapshot {
-        while true {
-            let nextCount = changed.currentCount + 1
-            if let snapshot = latest(for: identity), predicate(snapshot) { return snapshot }
-            try await changed.waitForCount(nextCount)
-        }
-    }
 }
 #endif

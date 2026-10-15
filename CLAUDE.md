@@ -46,7 +46,7 @@ swift build && swift test          # 1. まず unit（サーバ不要・必須�
 bin/e2e/container-samba.sh          # 2. production を触ったら container Samba E2E smoke
 ```
 
-関数・型・import を置き換えたり消したりしたら `make lint-analyze` も回す（unused_declaration /
+関数・型・import を置き換えたり消したりしたら（参照だけを消して宣言が未使用になったときも）`make lint-analyze` も回す（unused_declaration /
 unused_import。`swift build` の lint plugin では走らない analyzer rules で、CI の `swiftlint-analyze`
 job と同じもの。手元で build 30s + analyze 2 分強）。
 

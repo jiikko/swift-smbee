@@ -39,6 +39,8 @@ Thread 0 crashed:
   M1+M2 の前（c938d1a）と後（2d3923c）で起き方を比べる。timer の取り消しの数を観測する
 - [ ] 起きないなら（今のところこちら）: 発生の記録として残し、次に起きたときに比べられるよう、この issue に run と commit を追記する
 
+- 2026-10-16: issue 106 は done へ移った（M3・M4 も master に入り、その後の CI で network 性能テストは 3 回とも通った）。この issue は発生の記録として継続
+
 ## 同じ時期の別の失敗（関係は未確認）
 
 同じ commit（b1ce109）の Test workflow の `code-coverage` の job（Linux arm64）で、

@@ -37,6 +37,8 @@ CI で Linux を使うのは Samba の E2E を Docker で動かすためで（ma
 
 - 「比べられなければ skipped で exit 0」の既存の設計は変えていない（今回の欠陥が CI の上で緑に見えた原因）。fail-closed にするかは別途判断
 
+- 2026-10-16: 経緯の issue 106 は done へ移った（Commit 1〜5 がすべて master に入った）。この issue は x86 の扱いとして継続
+
 ## 再評価の trigger
 
 x86_64 Linux で SMBee を使う consumer が現れたら、CI に x86 の job を戻すかを判断し直す。

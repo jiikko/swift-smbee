@@ -167,7 +167,7 @@ TREE_DISCONNECT の期限切れで共有 session が落ちたことが観測さ�
 ## 2026-10-12: M2 を issue 106 の Commit 4 として master へ入れた
 
 - commit `feat(session): issue 106 Commit 4 — issue 069 M2 の統合 (Tree の隔離と scoped な後始末、固定の soft / hard の期限、結果の報告)`。
-  設計・敵対レビュー（実装後 5 周）・変異の記録は [`106`](../106-feat-unsent-request-retirement-primitive.md) の「Commit 4」節が正本
+  設計・敵対レビュー（実装後 5 周）・変異の記録は [`106`](106-feat-unsent-request-retirement-primitive.md) の「Commit 4」節が正本
 - 完了条件（追記）の 2 つ:
   - 「cleanup が deadline を超えても同じ session の他の in-flight 操作が失敗しない」: File の CLOSE は M1 で固定済み。Tree の後始末は
     `testTreeDisconnectSoftExpiryKeepsOtherTreeOperationsAliveThroughDrain` で固定した（Tree A の TREE_DISCONNECT が soft を過ぎて drain している間に、

@@ -45,6 +45,7 @@ obaket `issues/462-perf-video-range-window-prefetch.md`（C の consumer 側前�
 - **wire の中核に触る**: chain 全体の credit charge、request ごとの署名、暗号化時の 1 transform への包み、related request の FileId の引き継ぎ、
   部分失敗（CREATE 成功・READ 失敗で handle が残る）の後始末が要る。後始末は issue 106（未送信 request の退役と、転送の chunk の所有を
   canonical な record に統合する Commit 5。2026-10-13 時点で性能の退行を調べるため revert 中）と同じ経路なので、**106 が片付くまで着手しない**。
+  → 2026-10-16: issue 106 の Commit 1〜5 がすべて master に入った（106 で解消）。B の残りの条件は (1) / (2) の trigger だけ。
 - **再開の trigger**: (1) obaket からサムネイル / 動画 window の遅延の報告が来る、または (2) 実 NAS（RTT が ms 級）で 64 KiB prefix read × N 件の
   所要と往復回数を測り、CREATE / CLOSE の往復が支配的だと数字で示せたとき。どちらの場合も 106 の完了が前提。
 

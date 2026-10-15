@@ -550,7 +550,16 @@ commit の分け方（各 commit が単独で契約を満たす）:
     join の予約を 1 か所に寄せた。修正はテストと挙動を変えない整理だけで、それぞれ変異で確認したので 3 周目は回していない
   - 検証: macOS unit 878 件・Linux arm64 unit 885 件（失敗 0）、strict lint、Release のテストのビルド、smoke 3 プロファイル。main agent が A・B・R1 の変異を当て直して red を確認
   - CI（736f9ea / 6f3308c、`verify-agent-push` rc=0）: arm64 の性能 gate PASS。M3 の上乗せは read −3.9% / user CPU +4.3%、write −0.4% / +0.8%
-  - **Commit 5 の残り: M4**
+- **M4 を master へ入れた（2026-10-16、codex-drive）**: commit `test(session): issue 106 Commit 5 の M4 — mixed MID、競合、正常時の回収の統合テスト`（1731eef）と
+  `test(session): issue 106 M4 — 使われなくなったテスト用の helper（SMBM4OwnershipRecorder.waitForSnapshot・SMBKeyedManualSleeper.fireAll）を消す`（5d34f7f）。
+  - 製品の実行経路は変えていない（足したのは #if DEBUG のテスト用 API と hook だけ。テストで製品の不具合は見つからなかった）
+  - 実装は codex（luna-max）。レビューは codex（sol-high）の 2 周: 1 周目（発見型・素通り・壊す）で 7 件、直した差分への 2 周目（素通り）で 4 件。すべてテストの検知力の指摘で、
+    どれも直す前に変異ですり抜けることを確かめてから直した。1 周目の重複 ack のテストは、hook が CREATE で止まり ack 0 件のまま何もしない dispatch を数えていた（codex の初回報告の「二重減算で red」は誤りだった）
+  - 1731eef の CI で SwiftLint analyzer（unused_declaration）が 2 件で落ちた: 2 周目の修正で使われなくなった helper。codex は「関数を消していない」として make lint-analyze を最後まで回しておらず、
+    main agent も strict lint だけで analyze を回していなかった。消して 5d34f7f で直した
+  - 性能（1731eef の push の Performance、arm64、20 組、reference は M3 の 69fefaa、cpu_model は両側とも記録）: read +2.2% / user CPU −3.4%、write +1.3% / −0.5%、RSS ±0%。gate PASS（製品の変更が無いので揺れの範囲）
+  - 5d34f7f の CI: Test / E2E / Performance / Issues とも success、`verify-agent-push` rc=0
+- **Commit 5（M1〜M4）が終わり、設計 §8 の Commit 1〜5 がすべて master に入った（2026-10-16）**
 
 ## 関連
 

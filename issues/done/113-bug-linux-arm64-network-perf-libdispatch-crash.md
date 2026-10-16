@@ -35,11 +35,31 @@ Thread 0 crashed:
 ## 次にやること
 
 - [x] 同じ run の落ちた job を 1 回だけ回し直した（2026-10-14、ユーザー承認済み）。`samba-network-performance` も `code-coverage` も success で、どちらも再現しなかった
-- [ ] 再び起きる / 別の run でも起きるなら: 手元の arm64 container で network 性能テストを繰り返して再現を試し、
-  M1+M2 の前（c938d1a）と後（2d3923c）で起き方を比べる。timer の取り消しの数を観測する
-- [ ] 起きないなら（今のところこちら）: 発生の記録として残し、次に起きたときに比べられるよう、この issue に run と commit を追記する
+- [x] 調査した（2026-10-16）。結論は下の「調査の結果」
 
 - 2026-10-16: issue 106 は done へ移った（M3・M4 も master に入り、その後の CI で network 性能テストは 3 回とも通った）。この issue は発生の記録として継続
+
+## 調査の結果（2026-10-16）
+
+**結論: crash したのは SMBee のテストのプロセスではなく、テストのビルドを始める前の SwiftPM の道具（`swift test` そのもの。Swift 6.2.4、Linux arm64）。SMBee のコードは動いていない。**
+
+- 根拠（ログの順序）: 成功した run（例: 5d34f7f の Performance、run 38804287433）では、`+ swift test -c release ...` の直後に
+  `[1/1] Compiling plugin SwiftLintCommandPlugin` → `Building for production...` → SMBee のコンパイル → テストの出力が続く。
+  crash した run では、`+ swift test ...` の直後、plugin のコンパイルの 1 行も出る前に crash している（テストの出力 `Test Suite` も 0 行）。
+  テストのバイナリが作られる前なので、SMBee の timer・executor・transport は関係しない。
+  ただし backtrace の image の一覧は 73 件が省略されていて、落ちたプログラムの名前そのものは出ていない（推定の根拠は出力の順序だけ）
+- 発生の頻度: arm64 に移してから（643c50b 以降）の CI の run 29 本（Test / E2E / Performance。各 run の最新の試行のログ）を
+  `Program crashed|Signal 11|Fatal error|Backtracing from` で走査して 0 件。crash は b1ce109 の Performance の最初の試行の 1 回だけ
+- 手元の再現: Apple container の Linux arm64（指定の swift:6.2 の digest、4G）から Samba（SMB 3.0.2 暗号化必須）の container へ、
+  同じ `swift test -c release --filter SMBeeNetworkPerformanceE2ETests` を 30 回（1 回目はビルドから、以降は `--skip-build`）。30 回とも pass、crash 0
+- SMBee は DispatchSource を直接使っていない（`SMBSessionExecutor` は DispatchQueue の上の serial executor）。既知の不具合の検索
+  （`_dispatch_event_loop_drain` × Linux aarch64）では同じ形は見つからなかった
+
+**扱い**: SMBee の側で直すものは無いので done へ移す。
+
+**再開の trigger**: CI か手元で同じ backtrace（`_dispatch_event_loop_drain` の SIGSEGV）がまた出たとき。そのときは、crash の直前の行を見て
+**テストの出力（`Test Suite` / `PERF_NETWORK`）が出た後か前か**を最初に確かめる。出た後なら SMBee のプロセスなので、この issue を開き直して
+M1+M2 の前（c938d1a）と後で起き方を比べる。出る前なら SwiftPM の道具の不具合として、Swift の版と一緒に記録する（頻発するなら CI の toolchain の版を上げることを検討する）
 
 ## 同じ時期の別の失敗（関係は未確認）
 

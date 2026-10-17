@@ -1,7 +1,7 @@
 # 067 perf: 小さい部分 READ を安く回すための API が足りない（サムネイル生成用途）
 
 状態: **open（A・knownSize・C は実装済み。残りは B（送信側の compound）と D（同時 open handle の上限）。
-どちらも着手の gate が未発火のため保留）**
+どちらも着手の gate が未発火のため保留。前提だった issue 106 は 2026-10-16 に完了）**
 起票: 2026-07-27
 更新: 2026-07-27 — A: prefix read を実装（`9f20dbf` 実装 / `13acbdc` E2E / `4c36c12` 空ファイル unit）。
 `SMBClientSession.readPrefix` / `withPrefixReadStream` が使える。unit + perf regression
@@ -15,13 +15,14 @@ window ごとに CREATE+QUERY_INFO+CLOSE を払っていることが裏付けら
 `a2efb8b` / `d81c668` では同一セッション上の正常系の並行 ranged read を container Samba E2E で
 wire レベルまで確認した。ただし C の READ pipeline 自体は未実装で、issue 069 の異常系も未確認。
 あわせて、暗号化必須 Samba CI の WRITE 遅延と E2E suite の timeout 余裕不足を記録した。
+更新: 2026-10-17 — 冒頭の棚卸しを更新（106 の完了、B に見合うかを決める計測の手順を追加）。
 関連: `Sources/SMBee/SMBClient.swift`（`read` / `withReadStream` / `streamRead` / `readBounds`） /
 `Sources/SMBee/SMB2Header.swift`（`nextCommand` / `SMB2CreditWindow`） /
 consumer 側: obaket `macOS/issues/437-feat-smb-thumbnail-display.md` /
 obaket `issues/done/460-architecture-large-exact-range-bypasses-window-split.md`（window 分割の設計） /
 obaket `issues/462-perf-video-range-window-prefetch.md`（C の consumer 側前提）
 
-## 2026-10-13 時点の棚卸し（以下の節は書いた時点の記録。現状はこの表が正）
+## 2026-10-17 時点の棚卸し（以下の節は書いた時点の記録。現状はこの節が正）
 
 | 項目 | 状態 | 根拠 |
 |---|---|---|
@@ -30,24 +31,36 @@ obaket `issues/462-perf-video-range-window-prefetch.md`（C の consumer 側前�
 | C. READ のパイプライン化 | ✅ 実装済み | issue 102 #14（done）。`streamRead` と `readAll` が `SMBTransferWindow` の driver に載った。WRITE も #15 で同様 |
 | 受信側の compound 応答の分割 | ✅ 実装済み | issue 104（done）。`validateResponseChain` / `SMBValidatedResponseEffect.compound` |
 | issue 069（CLOSE cleanup の失敗が shared session を巻き添えにする） | ✅ done | C の節で「異常系は未確認」とした前提の 1 つ |
-| **B. CREATE + READ + CLOSE の送信側 compound 化** | 未着手 | 送信経路で `nextCommand` に 0 以外を入れる箇所は無い（2026-10-13 に `grep -n nextCommand Sources/SMBee/*.swift`。SMBClient の参照は受信側の分割 `validateResponseChain` 周辺だけで、header の初期値は 0） |
+| issue 106（未送信の要求の退役と、転送の chunk の所有を canonical な record に統合） | ✅ done（2026-10-16） | B の部分失敗の後始末が乗る土台。Commit 1〜5 がすべて master に入った |
+| **B. CREATE + READ + CLOSE の送信側 compound 化** | 未着手 | 送信経路で `nextCommand` に 0 以外を入れる箇所は無い（2026-10-17 に `grep -n nextCommand Sources/SMBee/*.swift`。SMBClient の参照は受信側の分割 `validateResponseChain` 周辺だけで、header の初期値は 0） |
 | **D. 同時 open handle の上限とバックプレッシャー** | 未着手 | session 単位の handle 数の上限は無い（同日 grep） |
 
 「現状の事実」の 2（QUERY_INFO を省けない）と 4（`streamRead` が逐次）は**もう成り立たない**。1 は `knownSize:` を渡さない
 呼び出しには今も当てはまり、3（送信側の compound が無い）と 5（handle 数の上限が無い）は今も正しい。
 
-### B を保留している理由（2026-10-13 に見直した）
+### B を保留している理由（2026-10-17 に見直した）
 
 - **gate が未発火**: consumer（obaket）からのサムネイル遅延の報告は無い。実 NAS での小さい READ の往復の実測も無い。
-- **既存の RTT の実測は小さい READ を測っていない**: `docs/performance-resource-baseline.md` の「2026-10-09」節は、container の Samba に
-  RTT を足して（0 / 5 / 20 ms）1 MiB と 64 MiB の転送を測ったもの。CREATE / CLOSE の往復が支配する小さい prefix read の件数比例のコストは
-  この測定に入っていない。localhost の実測（2026-08-01 追記、1 件あたり約 1.5 ms）からの見積もりのまま。
-- **wire の中核に触る**: chain 全体の credit charge、request ごとの署名、暗号化時の 1 transform への包み、related request の FileId の引き継ぎ、
-  部分失敗（CREATE 成功・READ 失敗で handle が残る）の後始末が要る。後始末は issue 106（未送信 request の退役と、転送の chunk の所有を
-  canonical な record に統合する Commit 5。2026-10-13 時点で性能の退行を調べるため revert 中）と同じ経路なので、**106 が片付くまで着手しない**。
-  → 2026-10-16: issue 106 の Commit 1〜5 がすべて master に入った（106 で解消）。B の残りの条件は (1) / (2) の trigger だけ。
-- **再開の trigger**: (1) obaket からサムネイル / 動画 window の遅延の報告が来る、または (2) 実 NAS（RTT が ms 級）で 64 KiB prefix read × N 件の
-  所要と往復回数を測り、CREATE / CLOSE の往復が支配的だと数字で示せたとき。どちらの場合も 106 の完了が前提。
+- **小さい READ のコストは未実測**: `docs/performance-resource-baseline.md` の「2026-10-09」節は、container の Samba に RTT を足して（0 / 5 / 20 ms）
+  1 MiB と 64 MiB の転送を測ったもの。CREATE / CLOSE の往復が支配する小さい prefix read の件数比例のコストは入っていない。
+  localhost の実測（2026-08-01 追記、1 件あたり約 1.5 ms）からの見積もりのまま（30〜60 件で 50〜90 ms）。下の「B に見合うかを決める計測」を先にやる
+- **規模が大きい**: 送信の中核（複数の MID の確定・chain 全体の credit charge・要求ごとの署名・暗号化時に chain を 1 つの transform で包む・
+  related の要求での FileId の引き継ぎ）と、部分失敗（CREATE 成功・READ 失敗で handle が残る）の後始末が要る。後始末は issue 106 の
+  canonical な record・退役・FileId の利用の待ち（M3）とつながるので、M3 / M4 と同じ規模のレビューが要る見込み。
+  MS-SMB2 の compound の規則（related の要求のエラーの伝わり方など）を実サーバ（Samba / macOS / Windows）で確かめる必要もある
+- 前提だった issue 106 は 2026-10-16 に完了したので、「106 が片付くまで着手しない」の条件は解消した
+- **再開の trigger**: (1) obaket からサムネイル / 動画 window の遅延の報告が来る、または (2) 下の計測で、CREATE / CLOSE の往復が
+  支配的で B による削減が consumer の体感に届く大きさだと数字で示せたとき
+
+### B に見合うかを決める計測（未実施）
+
+既存の `network-performance-study`（`.github/workflows/network-performance-study.yml`、`bin/ci/network-performance-study-run`）は
+MiB 単位のファイル全体の転送しか測れない（`sizes_mib`）。小さい READ を測るには実験を足す必要がある:
+
+- 測るもの: 64 KiB の `readPrefix` を N 件（例: 30 / 60）、`knownSize:` あり / なし、RTT 0 / 5 / 20 ms（既存の `rtt_levels` と同じ足し方）
+- 出すもの: N 件の所要の合計と 1 件あたり、1 件あたりの往復回数（CREATE / QUERY_INFO / READ / CLOSE の数。perf regression の契約と同じ数え方）
+- 判断: 「RTT × 往復の削減数 × N」の見積もりが実測と合うかを確かめ、B で減らせる量（1 件あたり CREATE + CLOSE の 2 往復）が、
+  consumer の画面に効く大きさ（例: 可視 30〜60 件で数百 ms 以上）かを判断する。実 NAS で測れるなら、そちらを優先する
 
 ### D を保留している理由
 

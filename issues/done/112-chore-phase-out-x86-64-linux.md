@@ -32,12 +32,14 @@ CI で Linux を使うのは Samba の E2E を Docker で動かすためで（ma
   arm64 の kernel は /proc/cpuinfo に model name を出さず、cpu_model=unknown になって `compare-resource-performance` が比較を拒んだ（CI は success、`verify-agent-push` は失敗として検出）。
   commit `ci: arm64 の runner でも cpu_model を記録し、性能の gate が「比べられない」で飛ばされないようにする` で `bin/ci/cpu-model` を足して直した。
   その commit（6af8706）の CI で cpu_model=`arm64 implementer 0x41 part 0xd49` が両側に記録され、gate が 20 組を比べて PASS、`verify-agent-push` rc=0
-- [ ] `docs/performance-resource-baseline.md` の `Linux/X64` は過去の計測の条件の記録なので残す。arm64 の runner の baseline は、次に baseline を取り直すときに足す
-- [ ] `bin/ci/test-performance-scripts` の fixture にある `Linux 6.8.0 x86_64` は文字列の fixture で、判定に影響しないので触らない
+- [x] 判断済み（作業なし）: `docs/performance-resource-baseline.md` の `Linux/X64` は過去の計測の条件の記録なので残す。arm64 の runner の baseline は、次に baseline を取り直すときに足す
+- [x] 判断済み（作業なし）: `bin/ci/test-performance-scripts` の fixture にある `Linux 6.8.0 x86_64` は文字列の fixture で、判定に影響しないので触らない
 
-- 「比べられなければ skipped で exit 0」の既存の設計は変えていない（今回の欠陥が CI の上で緑に見えた原因）。fail-closed にするかは別途判断
+- 「比べられなければ skipped で exit 0」の既存の設計は変えていない（今回の欠陥が CI の上で緑に見えた原因）。x86 とは別の話なので、fail-closed にするかは必要になったら別 issue で判断する（`verify-agent-push` は skip を失敗として扱うので、手元の検証では見逃さない）
 
 - 2026-10-16: 経緯の issue 106 は done へ移った（Commit 1〜5 がすべて master に入った）。この issue は x86 の扱いとして継続
+
+- 2026-10-17: 残りの項目はすべて判断済みで作業が無いので done へ移した
 
 ## 再評価の trigger
 

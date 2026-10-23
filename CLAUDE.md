@@ -42,9 +42,12 @@ synthetic frame なので「自分のエンコードを自分でデコードし�
 （実サーバが `INVALID_PARAMETER` を返す類）。実サーバ照合は smoke でしか担保できない。
 
 ```sh
-swift build && swift test          # 1. まず unit（サーバ不要・必須）
+make test                           # 1. まず unit（サーバ不要・必須）。swift build → swift test --skip SMBeeE2ETests (CI の macOS と同じ)
 bin/e2e/container-samba.sh          # 2. production を触ったら container Samba E2E smoke
 ```
+
+`make test` は dotfiles の serial-run (重いコマンドの待ち列。既定はこの repo の中で 1 本ずつ、`SERIAL_RUN_SCOPE=machine` ならマシン全体) に並んでから走る。dotfiles が無い機械では並ばずにそのまま走る。
+外すときは `SERIAL_RUN_MAKE_DISABLE=1 make test`。
 
 関数・型・import を置き換えたり消したりしたら（参照だけを消して宣言が未使用になったときも）`make lint-analyze` も回す（unused_declaration /
 unused_import。`swift build` の lint plugin では走らない analyzer rules で、CI の `swiftlint-analyze`
